@@ -21,12 +21,17 @@
 #   syncspin-core/src/framing.rs:263         the in-flight message was just checked as present
 #   syncspin-core/src/noise.rs:408           a 43-character canonical key always decodes to 32 bytes
 
+# The floor is 96.5 against a measured 96.73 with `--all-features`: high enough that a real
+# regression fails, low enough that tightening a branch around an unreachable guard does not. The
+# pairing code is included on purpose — a coverage run on default features would silently skip
+# `pake.rs`, `wrap.rs` and `code.rs`, which is most of the new crypto.
+
 set -euo pipefail
 
-FLOOR="${COVERAGE_FLOOR:-99.15}"
+FLOOR="${COVERAGE_FLOOR:-96.5}"
 cd "$(dirname "$0")/.."
 
-args=(--workspace --locked --ignore-filename-regex 'examples/')
+args=(--workspace --all-features --locked --ignore-filename-regex 'examples/')
 case "${1:-}" in
   --missing) args+=(--show-missing-lines) ;;
   --html) args+=(--html) ;;

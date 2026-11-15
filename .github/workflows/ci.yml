@@ -89,6 +89,11 @@ jobs:
           cargo --version
       - name: cargo test (MSRV)
         run: cargo test --workspace --locked
+      # The pairing crates pull `elligator2`, `chacha20poly1305` and `hmac`, all
+      # optional. Without this step a dependency bump could raise their MSRV and
+      # the gate would stay green while 1.85 consumers cannot build.
+      - name: cargo test with every feature (MSRV)
+        run: cargo test --workspace --features pairing-code,storage-file --locked
 
   arm:
     name: arm
@@ -121,13 +126,16 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Coverage floor
-        # 99.15 against a measured 99.17: every reachable line is covered and a
-        # new gap still fails. The eight unexecuted lines are guards no input can
-        # reach; scripts/coverage.sh names them.
+        # `--all-features` is deliberate: on default features the run never sees
+        # `pairing/pake.rs`, `wrap.rs` or `code.rs`, so most of the new crypto had
+        # no coverage number at all. 96.5 against a measured 96.73 leaves room for
+        # unreachable guards without letting a real regression through.
+        # This job is not a required check: a percentage gate that pages on a
+        # refactor teaches people to lower the floor. It reports; it does not block.
         env:
-          COVERAGE_FLOOR: "99.15"
+          COVERAGE_FLOOR: "96.5"
         run: |
-          cargo llvm-cov --workspace --locked --ignore-filename-regex 'examples/' \
+          cargo llvm-cov --workspace --all-features --locked --ignore-filename-regex 'examples/' \
             --lcov --output-path lcov.info --fail-under-lines "${COVERAGE_FLOOR}"
       - name: Upload report
         if: always()
@@ -175,6 +183,20 @@ jobs:
       # a failure.
       - name: cargo deny
         run: cargo deny check
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    # Publishing is the only moment a broken manifest, a missing README, a licence
+    # path or an unused dependency is noticed today. `syncspin-client` cannot be
+    # packaged until `syncspin-core` is on crates.io, so only core is checked here;
+    # that is the crate the client depends on.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo package (core)
+        run: cargo package -p syncspin-core --locked
 
   docs:
     name: docs
