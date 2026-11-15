@@ -117,7 +117,26 @@ dependency is a path dependency that `cargo package` rewrites to a registry depe
 `syncspin-server` is `publish = false` and stays out of the release.
 
 `CHANGELOG.md` is generated with [git-cliff](https://github.com/orhun/git-cliff) from the tags and
-the conventional commits; do not edit it by hand.
+the conventional commits; do not edit it by hand. Regenerate it before the tag:
+
+```sh
+git cliff --tag v0.2.0 --output CHANGELOG.md
+git commit -am "chore(release): add the 0.2.0 changelog section"
+```
+
+Then push the tag and let the pipeline do the rest:
+
+```sh
+git tag -a v0.2.0 -m "syncspin 0.2.0" && git push origin v0.2.0
+```
+
+[`release.yml`](.github/workflows/release.yml) verifies the commit under the tag, refuses a tag that
+does not match the workspace version, publishes `syncspin-core`, waits for the index, publishes
+`syncspin-client`, and writes the GitHub release from the changelog section. It runs in the `release`
+environment, which holds the `CARGO_REGISTRY_TOKEN` secret; add required reviewers there if a pushed
+tag should not be able to publish on its own. A manual run packages without uploading unless
+`dry_run` is cleared, and every step skips a version that is already on the registry, so a partial
+run can be repeated.
 
 ## Licence of contributions
 
