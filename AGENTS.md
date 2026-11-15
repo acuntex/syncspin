@@ -52,7 +52,8 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
 - **This repository is public.** No personal names, home-directory paths, device names, hostnames,
   IP addresses, account names or details of downstream or private projects may appear in code,
   comments, tests, commit messages or docs. When porting code from elsewhere, rewrite the comments
-  instead of copying them.
+  instead of copying them. The account in a repository URL is a location, not an account name; it is
+  the one permitted occurrence.
 - Everything in this repository is English: code, comments, commits, docs. Conventional Commits,
   small verified steps.
 
