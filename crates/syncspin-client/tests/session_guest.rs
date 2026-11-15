@@ -2108,3 +2108,41 @@ async fn websocket_control_frames_are_handled_without_reaching_the_session() {
     }
     assert_eq!(handle.control().volume(), 100);
 }
+
+#[tokio::test]
+async fn a_control_handle_after_the_connection_ended_is_an_error() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let recordings = Recordings::default();
+    let sink = Box::new(RecordingSink::failing_on(recordings, 1));
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+    let control = handle.control();
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    server.audio(now_us(), 0, vec![0x5b; 32]);
+
+    loop {
+        if let Event::Disconnected { .. } = next_event(&mut events).await {
+            break;
+        }
+    }
+    let outcome = handle.finished().await;
+    assert!(outcome.is_err(), "the sink failure ends the task");
+
+    // The task is gone, so the command channel has no receiver. This is a different failure from
+    // a request made while the task is alive but between attempts.
+    let error = control
+        .set_volume(50)
+        .await
+        .expect_err("a connection that ended cannot carry a request");
+    assert!(
+        format!("{error:#}").contains("the connection has ended"),
+        "the error must say the connection is gone, got: {error:#}"
+    );
+    assert_eq!(control.volume(), 100, "the level in force is still readable");
+}
