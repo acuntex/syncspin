@@ -15,40 +15,46 @@ resolves new versions tells you nothing about the code that will be released.
 
 What the suite must never do:
 
-- open a socket, or connect to anything outside the machine;
+- open a socket other than an ephemeral loopback listener the test owns, or connect to anything
+  outside the machine;
 - start an audio process or touch an audio device;
 - read a real identity, pairing record or configuration file;
 - depend on a live Music Assistant server.
 
-Nothing in the workspace listens on a port today: the tests drive the protocol in memory against an
-independent `snow` peer built inside the test. When the session loop lands, its fake server may bind
-`127.0.0.1:0` — an ephemeral loopback port that the suite owns and closes — and nothing else. A test
-that needs a fixed port, a hostname or a device is wrong by construction.
+Ports: the client session suite binds one ephemeral loopback port per test (`127.0.0.1:0`, owned and
+closed by the test, never a fixed one); the core suites open no socket at all. A test that needs a
+fixed port, a hostname or a device is wrong by construction.
 
 ### What each suite covers
 
-| Suite                                           | Covers                                                                                                                                                                                                                                                                                                                                                             |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `crates/syncspin-core/tests/noise_handshake.rs` | The Noise `KKpsk2` wire behaviour against a `snow` peer that is built independently of the code under test: initiator/responder roles, PSK location, the init exchange as prologue, the message-2 payload, the published Sentinel PSK id, a tampered prologue failing the handshake, transport-mode replay and size limits, and finishing the handshake too early. |
-| `crates/syncspin-core/tests/messages.rs`        | Exact JSON keys of every message this revision implements, envelope round trips for the cleartext and encrypted phases, unknown types being ignorable while a malformed known type is an error, and binary framing: message ids, the exact fragmentation boundary, reassembly rejecting missing, misplaced and oversized fragments.                                |
-| `crates/syncspin-core/tests/clock.rs`           | Clock-filter convergence under jitter, the readiness threshold, an outlier not moving the estimate, the local/server timestamp round trip and the reset.                                                                                                                                                                                                           |
-| In-module unit tests (`crates/*/src`)           | Small invariants next to the code they guard, such as the workspace version and the message length helpers.                                                                                                                                                                                                                                                        |
+| Suite                                           | Covers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/syncspin-core/tests/noise_handshake.rs` | The Noise `KKpsk2` wire behaviour against a `snow` peer that is built independently of the code under test: initiator/responder roles, PSK location, the init exchange as prologue, the message-2 payload, the published Sentinel PSK id, a tampered prologue failing the handshake, the transport nonce advancing per message (equal plaintexts differ on the wire), the oversize-plaintext limit, and finishing the handshake too early.                                                                                                                            |
+| `crates/syncspin-core/tests/messages.rs`        | Exact JSON keys of every message this revision implements, envelope round trips for the cleartext and encrypted phases, unknown types being ignorable while a malformed known type is an error, and binary framing: message ids, the exact fragmentation boundary, reassembly rejecting missing, misplaced and oversized fragments.                                                                                                                                                                                                                                   |
+| `crates/syncspin-core/tests/clock.rs`           | Clock-filter convergence under jitter, the readiness threshold, an outlier not moving the estimate, the local/server timestamp round trip and the reset.                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `crates/syncspin-client/tests/session_guest.rs` | The guest session end to end: connect and report an encrypted connection, `stream/start` opening the sink with the announced format, audio chunks reaching the sink with their length and a playout deadline once the clock is ready, a volume command and controller state, fragmented audio reassembly, a wrong `psk_id` falling back to the Sentinel key, malformed PSK metadata closing without a second handshake message, unknown types ignored while a malformed known type closes the connection, and a server that never starts the handshake being refused. |
+| `crates/syncspin-client/tests/fake_server.rs`   | The harness the session suite runs against: a loopback WebSocket listener that plays the Noise initiator with `snow` and records what the sink received. It carries no tests of its own.                                                                                                                                                                                                                                                                                                                                                                              |
+| In-module unit tests (`crates/*/src`)           | The per-crate `version()` test, the prologue parsing and identity-redaction tests beside `noise.rs`, and the PSK-selection, endpoint and codec-name tests beside the client code.                                                                                                                                                                                                                                                                                                                                                                                     |
 
 A fake server, not a live Music Assistant, is the reference peer for anything that needs a peer.
 
 ## MSRV
 
 The workspace declares `rust-version = "1.85"`, and `rust-toolchain.toml` pins the `stable` channel,
-which wins over any toolchain chosen for the shell. The MSRV run therefore has to override the file:
+which wins over any toolchain chosen for the shell. A machine with only `stable` installed needs the
+toolchain first:
 
 ```sh
+rustup toolchain install 1.85.0
+
 RUSTUP_TOOLCHAIN=1.85.0 cargo test --workspace --locked
 ```
 
-Without `RUSTUP_TOOLCHAIN` this would silently test the current stable and pass while 1.85 is
-broken. The `msrv` CI job does the same thing, and prints `rustc --version` first so the log shows
-which compiler ran. A dependency that demands a newer compiler is pinned or replaced; raising the
-MSRV is a deliberate, documented decision, not a side effect of an update.
+Without the install the second line fails to resolve the toolchain; without `RUSTUP_TOOLCHAIN` it
+would silently test the current stable and pass while 1.85 is broken. The `msrv` CI job does the same
+thing, and prints `rustc --version` first so the log shows which compiler ran. A dependency that
+demands a newer compiler is pinned or replaced; raising the MSRV is a deliberate, documented
+decision, not a side effect of an update.
 
 ## ARMv7 compile guard
 
@@ -62,8 +68,8 @@ cargo check -p syncspin-core -p syncspin-client \
 ```
 
 This is a compile guard, not a release build: it catches a dependency that does not compile for the
-target, which is the failure that actually happens. Once the crates link real dependencies, use the
-full cross build so the glibc baseline is exercised:
+target, which is the failure that actually happens. Once the `player`/`controller` features exist,
+use the full cross build so the glibc baseline is exercised:
 
 ```sh
 cargo zigbuild --target armv7-unknown-linux-gnueabihf --no-default-features --features player,controller
@@ -78,19 +84,23 @@ does not build for this target; it is an opt-in feature and stays out of the ARM
 Not part of CI: it needs a server, a shared audio output and ears. Run it before a release and after
 any change to the handshake, the session loop or the sink contract.
 
-The workspace has no runnable client binary yet — the example player is still planned. Until it
-exists, run these steps with any build that embeds `syncspin-client`; the sequence is the same.
+The workspace still has no runnable client binary: the example player (`examples/player-pipe`, PCM to
+stdout) is planned, and `syncspin-client` now contains the guest session but ships no binary. This
+section is therefore a checklist for the first build that depends on `syncspin-client` and implements
+its `Sink` — the example player when it lands, or a consumer build before that. Read each item as an
+acceptance criterion and tick it against the running server.
 
 ### What to start
 
-1. A Music Assistant server with its Sendspin endpoint enabled. Note the address and path it
-   listens on (`ws://<server>:8927/sendspin` is the convention) and, if the server only grants
-   playback to paired clients, whatever setting admits an unpaired client for the run. A 0.1 client
-   has no pairing yet, so a server that insists on a paired client will refuse or park the session —
-   that is a configuration result, not a library failure.
-2. The client, pointed at that URL, with a storage directory of its own. The first run generates a
-   keypair there; keep it for the whole session, because a new keypair is a new player identity on
-   the server.
+1. A Music Assistant server with the **Sendspin provider** enabled — the server side of the protocol.
+   Note the address and path it listens on (`ws://<server>:8927/sendspin` is the convention) and turn
+   on **unpaired access** (`unpaired_access`) in that provider's settings for the run: a 0.1 client
+   has no pairing yet, and the guest session announces `unpaired_access` with `enabled: true`. Without
+   the server-side setting the session is kept out of playback, which is a configuration result, not
+   a library failure.
+2. The client, pointed at that URL, with a keypair the build owns. `ClientConfig` takes an
+   `Identity`; the build generates one on first run and stores it, because a fresh keypair makes the
+   server treat the player as a new device. The library itself never writes that file.
 3. Keep the server's log and the client's output visible side by side; the interesting failures are
    visible in both.
 
@@ -107,14 +117,18 @@ exists, run these steps with any build that embeds `syncspin-client`; the sequen
 - **Audio at the sink.** Audio actually reaches the output, at the right rate and without gaps: the
   sink's underrun counter stays at zero after the first buffer, and the first frames are not
   swallowed. Silence with a healthy connection usually means a playout deadline in the past.
-- **State.** Title, artist and playback state in the client match what the server is playing, and a
-  pause/resume or track skip from the server is reflected without reconnecting.
-- **Volume.** A volume change from the server reaches the sink and the applied value is reported
-  back — the reported value, not the requested one.
+- **State.** Title and artist arrive from `server/state.metadata`, and volume, mute and the supported
+  commands from `server/state.controller`. The group's `playback_state` and `group_id` travel in
+  `group/update`, which the library does not handle yet, so playing/stopped is not observable — see
+  [`spec-deviations.md`](spec-deviations.md).
+- **Volume.** A volume command from the server arrives as a volume event; the hosting build applies
+  its platform limit and reports the applied value back — the applied value, not the requested one.
 - **Sync.** With two clients in the same group, both stay audibly aligned; drift over several
   minutes points at the clock filter or at a sink that does not report latency.
-- **Recovery.** Stop the server: the client reports a disconnect and retries with backoff. Start it
-  again: the client reconnects and plays without a restart.
+- **Recovery.** Stop the server: the session reports a disconnect and leaves the retry to the build
+  that hosts it (`ClientConfig::max_backoff` bounds the delay; the crate does not schedule retries in
+  this revision). Start the server again and the reconnect plays without a restart — a build that
+  never retries is a consumer gap, not a protocol one.
 
 ### Cleaning up
 
@@ -124,7 +138,7 @@ exists, run these steps with any build that embeds `syncspin-client`; the sequen
   a deleted identity leaves a stale entry behind, and a kept one is a player nobody uses.
 - Restore anything shared that the run changed: output volume, mute, the active group. Leave
   hardware and other people's sessions as you found them.
-- Delete a throwaway storage directory only after the stale player entry is gone.
+- Delete a throwaway keypair only after the stale player entry is gone.
 - Confirm nothing is left connected: `ss -tn | grep 8927` should be empty.
 - Never paste a pairing token, a keypair or a pairing record into a log excerpt, an issue or a
   commit. Redact before sharing.

@@ -23,10 +23,10 @@ never knows a transport. A dependency pointing from core towards a crate is a bu
 ## Commands
 
 ```sh
-cargo test --workspace
+cargo test --workspace --locked
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
-cargo zigbuild --target armv7-unknown-linux-gnueabihf --no-default-features --features player,controller
+cargo zigbuild --target armv7-unknown-linux-gnueabihf   # once the player/controller features land
 cargo deny check                                       # licences, advisories, sources
 ```
 
@@ -48,9 +48,10 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
   published crates.
 - **Spec deviations are documented** in `docs/spec-deviations.md` and covered by a test. Where
   Music Assistant and the spec disagree, the spec wins.
-- **This repository is public.** No personal names, home-directory paths, device names or details of
-  downstream or private projects may appear in code, comments, tests, commit messages or docs. When
-  porting code from elsewhere, rewrite the comments instead of copying them.
+- **This repository is public.** No personal names, home-directory paths, device names, hostnames,
+  IP addresses, account names or details of downstream or private projects may appear in code,
+  comments, tests, commit messages or docs. When porting code from elsewhere, rewrite the comments
+  instead of copying them.
 - Everything in this repository is English: code, comments, commits, docs. Conventional Commits,
   small verified steps.
 
@@ -71,6 +72,6 @@ Consequences for changes here:
   the workspace tests pass.
 - Key material and pairing records belong to the consumer. This crate never rotates a keypair on its
   own and never writes into a file it does not own.
-- A consumer's behaviour must stay identical across internal refactorings; its volume-clamp tests
-  (at most +20 per command above 40, with the applied value reported back) are part of the
-  acceptance criteria for changes in `syncspin-client`.
+- A consumer's behaviour must stay identical across internal refactorings; its behaviour tests
+  (volume clamp, mute, platform integration) are part of the acceptance criteria for changes in
+  `syncspin-client`.

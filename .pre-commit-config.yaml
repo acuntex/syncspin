@@ -24,19 +24,15 @@ repos:
         files: \.(rs|toml)$
         pass_filenames: false
 
-      # Prettier is not vendored: the version is pinned here to the one the
-      # sibling repository uses, so formatting cannot
-      # drift between the two.
-      #
-      # Markdown is deliberately left out. `AGENTS.md` and `README.md` are prose
-      # written before any prettier config existed and are not prettier-clean;
-      # reformatting them is not part of this change, and a hook that fails on
-      # an untouched file is worse than no hook. Machine formats are checked.
+      # Prettier is not vendored: the version is pinned here so formatting
+      # cannot drift between machines. Markdown is included because `docs/`,
+      # `AGENTS.md` and `README.md` are kept prettier-clean; the hook checks
+      # only the files a commit touches.
       - id: prettier
         name: prettier
         entry: npx --yes prettier@3.9.10 --check
         language: system
-        files: \.(ya?ml|json|json5)$
+        files: \.(md|ya?ml|json|json5)$
 
 # `cargo deny check` is deliberately not a hook: it needs `cargo-deny` and the
 # advisory database over the network, and would block a commit on a machine
