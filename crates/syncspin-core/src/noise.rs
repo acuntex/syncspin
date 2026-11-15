@@ -210,9 +210,13 @@ impl Responder {
             .context("failed to parse the Noise protocol parameters")?;
         let handshake = snow::Builder::new(params)
             .local_private_key(&identity.secret)
+            .context("failed to set the local static key")?
             .remote_public_key(peer_public)
+            .context("failed to set the peer static key")?
             .psk(2, &SENTINEL_PSK)
+            .context("failed to set the handshake PSK")?
             .prologue(prologue)
+            .context("failed to set the Noise prologue")?
             .build_responder()
             .context("failed to build the Noise responder")?;
         Ok(Responder { handshake })

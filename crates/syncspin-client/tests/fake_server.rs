@@ -431,10 +431,10 @@ async fn serve_connection(
     let mut prologue = client_init_text.into_bytes();
     prologue.extend_from_slice(server_init_text.as_bytes());
     let mut initiator = Builder::new(NOISE_PARAMS.parse()?)
-        .local_private_key(&keypair.private)
-        .remote_public_key(&client_public)
-        .psk(2, &options.psk)
-        .prologue(&prologue)
+        .local_private_key(&keypair.private)?
+        .remote_public_key(&client_public)?
+        .psk(2, &options.psk)?
+        .prologue(&prologue)?
         .build_initiator()
         .context("failed to build the Noise initiator")?;
 

@@ -49,9 +49,13 @@ fn generate_keypair() -> Keypair {
 fn initiator(server: &Keypair, client_public: &[u8], prologue: &[u8]) -> HandshakeState {
     Builder::new(NOISE_PARAMS.parse().expect("valid Noise parameters"))
         .local_private_key(&server.private)
+        .expect("set the local static key")
         .remote_public_key(client_public)
+        .expect("set the peer static key")
         .psk(2, &SENTINEL_PSK)
+        .expect("set the handshake PSK")
         .prologue(prologue)
+        .expect("set the Noise prologue")
         .build_initiator()
         .expect("build the Noise initiator")
 }
