@@ -58,10 +58,15 @@
 //! `ControlHandle::release_holdback` is called, the deliberate operator action the spec requires.
 //!
 //! A pairing record can also be dropped from the server's side. `server/unpair` removes it, reports
-//! [`Event::Unpaired`] and closes the connection; a server that announces a `psk_id` the client does
-//! not hold is reported once per connection as [`Event::PairingRequired`] with reason
-//! [`PairingRequiredReason::CredentialMismatch`], so a host can offer pairing again instead of the
-//! lost record going unnoticed.
+//! [`Event::Unpaired`] and closes the connection after `client/goodbye` with reason `unpaired`; a
+//! server that announces a `psk_id` the client does not hold is reported once per connection as
+//! [`Event::PairingRequired`] with reason [`PairingRequiredReason::CredentialMismatch`], so a host
+//! can offer pairing again instead of the lost record going unnoticed. A deliberate close -
+//! [`ClientHandle::close`] or dropping the handle - sends `client/goodbye` with its reason, so the
+//! server can tell a restart from a shutdown and does not treat the close as a dropped link.
+//!
+//! [`ControlHandle::pairing_token`] hands the operator the version-0 `SP:` token while a store is
+//! configured; it is a credential, so a host renders it only when the operator needs it.
 //!
 //! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
 //! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
@@ -82,9 +87,9 @@ pub mod storage;
 
 pub use client::{
     clamp_volume, clamp_volume_with, connect, connect_with_psks, next_backoff, Client,
-    ClientHandle, ControlHandle, Event, EventStream, PairingFailure, PairingRequiredReason,
-    PlaybackState, StreamEndReason, DEFAULT_PAIRING_TIMEOUT, INITIAL_BACKOFF,
-    NORMAL_PLAYBACK_SPEED,
+    ClientHandle, ControlHandle, Event, EventStream, GoodbyeReason, PairingFailure,
+    PairingRequiredReason, PlaybackState, StreamEndReason, DEFAULT_PAIRING_TIMEOUT,
+    INITIAL_BACKOFF, NORMAL_PLAYBACK_SPEED,
 };
 pub use config::{
     AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, MAX_PLAYER_NAME_LEN,
@@ -323,6 +328,6 @@ mod tests {
 
     #[test]
     fn version_is_the_workspace_version() {
-        assert_eq!(version(), "0.1.0");
+        assert_eq!(version(), "0.1.1");
     }
 }

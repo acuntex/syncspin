@@ -130,12 +130,11 @@ output. The CPace layer is unaudited — see [Status](#status).
 
 ## What does not work yet
 
-- **Pairing control surface.** There is no `ControlHandle::pairing_token()`, so a host that wants the
-  operator-facing `SP:` token assembles it from the identity's public key and `Storage::pairing_psk()`
-  with the encoder in `syncspin_core::pairing::token` — `player-pipe --pairing-token` does exactly
-  that. There is no `client/goodbye` writer, so a graceful close carries no reason and
-  `concurrent_attempt` cannot be sent as a goodbye reason; with one connection that reason is
-  unreachable anyway. Unpaired access is always admitted, and nothing turns it off.
+- **Unpaired access.** The client always admits it: `client/hello` carries
+  `unpaired_access: { enabled: true }` unconditionally, there is no setting that turns it off, and
+  nothing closes an unpaired connection with reason `pairing_required`. A deliberate close sends
+  `client/goodbye` with a reason the host chooses; the reasons for states this revision cannot
+  detect (`unauthorized`, `concurrent_attempt`) are never sent.
 - **Server.** `syncspin-server` is a stub; the listener, streams, roles and pairing server arrive in
   0.2.
 - **Discovery.** Clients do not advertise over mDNS and do not accept server-initiated connections.

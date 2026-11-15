@@ -525,7 +525,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "player-pipe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "getrandom 0.3.4",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "syncspin-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "syncspin-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "syncspin-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "syncspin-core",
 ]

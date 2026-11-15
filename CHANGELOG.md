@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 
+## [0.1.1] - 2026-11-15
+
+### Added
+
+- **client:** Expose the pairing token and say goodbye
+
+### Fixed
+
+- **client:** Bound the goodbye and observe shutdown while connecting
+
 ## [0.1.0] - 2026-11-15
 
 ### Added
@@ -25,6 +35,8 @@ Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 - **client:** Let a host observe stream lifecycle and own the volume policy
 
 - **client:** Let the host report its own level and identity
+
+- Pairing for the client (#8)
 
 ### Fixed
 
