@@ -107,11 +107,11 @@ pub enum Event {
     /// before the next attempt, one step of the reconnect policy: it is two seconds after an
     /// attempt that never reached [`Event::Connected`], doubles with every further failed attempt
     /// up to [`ClientConfig::max_backoff`], and drops to one second again after a session that
-    /// connected.
+    /// connected. It is [`Duration::ZERO`] when no attempt follows, because the audio sink failed.
     Disconnected {
         /// Why the attempt ended.
         reason: String,
-        /// How long to wait before the next attempt.
+        /// How long to wait before the next attempt; zero when none follows.
         retry_in: Duration,
     },
     /// A stream was announced with the given format.
@@ -324,9 +324,11 @@ pub(crate) struct ControlRequest {
 
 /// The receiving end of a session's [`Event`] stream.
 ///
-/// [`EventStream::next`] returns `None` after the last event, which follows
-/// [`Event::Disconnected`]. Dropping the stream stops the session: the next time it would emit an
-/// event, it ends instead.
+/// [`EventStream::next`] returns `None` once the connection has ended. An [`Event::Disconnected`]
+/// is not necessarily the last event: the client reconnects and reports the next attempt's events
+/// on the same stream, and only a fatal audio-sink failure or a dropped handle ends the sequence.
+/// Dropping the stream ends the connection: the next time the client would emit an event, it stops
+/// instead.
 #[derive(Debug)]
 pub struct EventStream {
     events: mpsc::UnboundedReceiver<Event>,
@@ -570,14 +572,22 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
             error.context("the audio sink rejected a flush after the connection ended")
         });
 
-        delay = next_backoff(delay, attempt.connected, connection.config.max_backoff);
+        // A broken output cannot be repaired by reconnecting, and neither can a flush that fails
+        // after the session; both end the connection instead of scheduling another attempt.
+        let fatal = attempt.sink_failed || flush_error.is_some();
+        delay = if fatal {
+            // No attempt follows, so there is no delay to recommend.
+            Duration::ZERO
+        } else {
+            next_backoff(delay, attempt.connected, connection.config.max_backoff)
+        };
         connection.emit(Event::Disconnected {
             reason: attempt.ending.reason(),
             retry_in: delay,
         });
 
         if attempt.sink_failed {
-            // A broken output cannot be repaired by reconnecting; the host has to fix the sink.
+            // The host has to fix the sink; a retry would only fail the same way.
             return match attempt.ending {
                 session::Ending::Failed(error) => Err(error),
                 session::Ending::Closed => Err(anyhow!("the audio sink failed")),

@@ -1,14 +1,20 @@
 //! Audio output abstraction.
 //!
-//! The session owns the connection and the clock; the host owns the speakers. Everything that
+//! The client owns the connection and the clock; the host owns the speakers. Everything that
 //! touches an audio device sits behind [`Sink`], which keeps this crate free of platform
 //! dependencies and lets a test record the frames instead of playing them.
 //!
-//! The session calls the sink from its own task. Calls are strictly ordered: [`Sink::open`] once
-//! per stream, then [`Sink::write`] for every audio chunk, and [`Sink::flush`] at a stream
-//! boundary. A sink may block only as long as it takes to enqueue the frame: a write that never
-//! returns stalls the session, because the trait is synchronous and the session has no second
-//! thread to read the connection.
+//! A sink is moved into [`connect`](crate::connect) once and reused for every connection attempt
+//! the client makes, so a reconnect does not need the host to build another one. Calls are strictly
+//! ordered and come from the client's task: a flush and then [`Sink::open`] when a stream starts,
+//! [`Sink::write`] for every audio chunk, and a flush at each boundary listed on
+//! [`Sink::flush`]. A sink may block only as long as it takes to enqueue the frame: a write that
+//! never returns stalls the connection, because the trait is synchronous and the client has no
+//! second thread to read the socket.
+//!
+//! An error from [`Sink::open`], [`Sink::write`] or [`Sink::flush`] is fatal for the connection:
+//! the client reports it and stops instead of retrying a broken output, so the host has to build a
+//! new sink and call [`connect`](crate::connect) again.
 
 use std::fmt;
 use std::time::Duration;
@@ -113,14 +119,17 @@ pub struct AudioFormat {
 
 /// Audio output owned by the host application.
 ///
-/// A sink is moved into the session and lives as long as the connection. Dropping it must stop
-/// playback: the session drops the sink when the connection ends.
+/// A sink is moved into the connection and reused across reconnects, so its output device may stay
+/// open for the whole lifetime of the connection rather than per session. Dropping it must stop
+/// playback: the client drops the sink when the connection ends.
 pub trait Sink: Send + 'static {
     /// Prepares the output for `format`.
     ///
-    /// The session calls this once per announced stream, after flushing the previous one, and
-    /// before it hands over the first chunk. A format the sink cannot play is an error, which ends
-    /// the session.
+    /// The client calls this once per announced stream, after flushing the previous one, and
+    /// before it hands over the first chunk. The same sink sees the streams of every connection
+    /// attempt, and a new attempt announces its own format, so an implementation must not assume
+    /// that the format it last saw is still current. A format the sink cannot play is an error,
+    /// which ends the connection: the client does not retry a sink that failed.
     fn open(&mut self, format: AudioFormat) -> anyhow::Result<()>;
 
     /// Writes one frame.
@@ -128,30 +137,39 @@ pub trait Sink: Send + 'static {
     /// `due` is the local instant at which the first sample of the frame should reach the
     /// speakers. It is a playout deadline, not a wake-up call: a sink that buffers ahead compares
     /// it with its own clock, and a deadline that is already past means "play as soon as
-    /// possible". The session reports [`std::time::Instant::now`] while its clock estimate is not
+    /// possible". The client reports [`std::time::Instant::now`] while its clock estimate is not
     /// ready, so the deadline carries no guarantee in that state.
     ///
-    /// An error ends the session: the host cannot recover a broken output from here.
+    /// An error ends the connection: the host cannot recover a broken output from here, and the
+    /// client does not retry a sink that failed.
     fn write(&mut self, frame: AudioFrame<'_>, due: std::time::Instant) -> anyhow::Result<()>;
 
     /// Drops audio that is buffered but not audible yet.
     ///
-    /// The session calls this before opening a new stream, when the server ends or clears the
-    /// stream, and when the player role is removed. It must succeed when no stream is open, so a
-    /// sink can treat it as "discard everything, keep the output device".
+    /// Called:
+    ///
+    /// - on `stream/start`, after the previous stream and before [`Sink::open`] for the new one,
+    /// - on `stream/end`,
+    /// - on `stream/clear`, which seeks or restarts the stream without ending it,
+    /// - when the server removes the `player@v1` role, and
+    /// - after a connection attempt ends, before the client reconnects, so audio buffered for the
+    ///   session that ended cannot become audible on the next one.
+    ///
+    /// It must succeed when no stream is open, so a sink can treat it as "discard everything, keep
+    /// the output device". An error ends the connection.
     fn flush(&mut self) -> anyhow::Result<()>;
 
     /// Reports the output delay the sink adds beyond the audio port.
     ///
-    /// The session uses it when it reports its timing to the server. `None` means the sink does
-    /// not know, which the session treats as no additional delay.
+    /// The client uses it when it reports its timing to the server. `None` means the sink does not
+    /// know, which the client treats as no additional delay.
     fn latency(&self) -> Option<Duration> {
         None
     }
 
     /// Reports how many times the output ran empty since it was opened.
     ///
-    /// This is diagnostic only; the session never changes its behaviour because of it.
+    /// This is diagnostic only; the client never changes its behaviour because of it.
     fn underruns(&self) -> u64 {
         0
     }

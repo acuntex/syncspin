@@ -537,8 +537,13 @@ async fn a_sink_error_ends_the_session_with_a_disconnect_event() {
     server.audio(now_us(), 0, vec![0x22; 64]);
 
     match next_event(&mut events).await {
-        Event::Disconnected { reason, .. } => {
+        Event::Disconnected { reason, retry_in } => {
             assert!(reason.contains("sink"), "unexpected reason: {reason}");
+            assert_eq!(
+                retry_in,
+                Duration::ZERO,
+                "a broken sink is not retried, so no delay is recommended"
+            );
         }
         other => panic!("expected Disconnected, got {other:?}"),
     }

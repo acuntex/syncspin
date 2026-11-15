@@ -58,6 +58,11 @@ pub struct ServerOptions {
     ///
     /// The client reconnects on its own, so a test that exercises that sets this above one.
     pub connections: usize,
+    /// Whether connections after the first omit `active_roles` in their first `server/activate`.
+    ///
+    /// The first connection always announces them, so a test can seed the client with roles and
+    /// then reconnect into an activation that carries none.
+    pub omit_active_roles_after_the_first: bool,
 }
 
 impl Default for ServerOptions {
@@ -76,6 +81,7 @@ impl Default for ServerOptions {
             answer_time_limit: None,
             manual_time: false,
             connections: 1,
+            omit_active_roles_after_the_first: false,
         }
     }
 }
@@ -358,7 +364,7 @@ async fn serve(
     mut commands: UnboundedReceiver<Command>,
     observations: UnboundedSender<Observation>,
 ) -> Result<()> {
-    for _ in 0..options.connections {
+    for index in 0..options.connections {
         let (tcp, _peer) = listener
             .accept()
             .await
@@ -366,7 +372,16 @@ async fn serve(
         let socket = accept_async(tcp)
             .await
             .context("the WebSocket upgrade failed")?;
-        serve_connection(socket, &keypair, &options, &mut commands, &observations).await?;
+        let announce_roles = index == 0 || !options.omit_active_roles_after_the_first;
+        serve_connection(
+            socket,
+            &keypair,
+            &options,
+            &mut commands,
+            &observations,
+            announce_roles,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -378,6 +393,7 @@ async fn serve_connection(
     options: &ServerOptions,
     commands: &mut UnboundedReceiver<Command>,
     observations: &UnboundedSender<Observation>,
+    announce_roles: bool,
 ) -> Result<()> {
     // 1. client/init, whose exact bytes start the Noise prologue.
     let client_init_text = read_text(&mut socket).await?;
@@ -484,13 +500,13 @@ async fn serve_connection(
         _ => bail!("expected client/hello"),
     }
 
-    // 7. server/activate with the player role.
+    // 7. server/activate with the announced roles.
     send_encrypted(
         &mut socket,
         &mut noise,
         &Incoming::ServerActivate(ServerActivate {
             activities: vec!["playback".to_owned()],
-            active_roles: Some(options.active_roles.clone()),
+            active_roles: announce_roles.then(|| options.active_roles.clone()),
             pairing: None,
         }),
     )

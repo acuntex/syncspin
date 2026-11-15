@@ -88,7 +88,7 @@ async fn run(options: Options) -> Result<()> {
 
     // The client owns the reconnect loop: a dropped session is reported on the stream and retried
     // with the same sink and identity, so this example only prints what it sees.
-    let (_handle, mut events) = Client::connect(config, Box::new(PipeSink::new())).await?;
+    let (handle, mut events) = Client::connect(config, Box::new(PipeSink::new())).await?;
     loop {
         tokio::select! {
             interrupted = signal::ctrl_c() => {
@@ -98,8 +98,9 @@ async fn run(options: Options) -> Result<()> {
             }
             event = events.next() => {
                 let Some(event) = event else {
-                    eprintln!("the connection ended");
-                    return Ok(());
+                    // The stream ends when the connection does. Its outcome carries the reason, and
+                    // a sink failure must not look like a clean shutdown.
+                    return handle.finished().await;
                 };
                 match event {
                     Event::Connected { server_id, encrypted } => {

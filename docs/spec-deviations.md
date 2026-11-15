@@ -30,6 +30,7 @@ harmless.
 | 16  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                    |
 | 17  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume`      |
 | 18  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`     |
+| 19  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`         |
 
 ## 1. Client-initiated connections only
 
@@ -62,12 +63,12 @@ and is _admissible_ only when those form an allowed set for the matched PSK and 
 playback-capable connection carries `active_roles`. An inadmissible activation must be rejected with
 `client/goodbye` (`pairing_required`, `unauthorized`) or `pair/abort` (`method_not_supported`).
 
-**What we do:** `Session::start` starts the first sync burst once the connection is ready.
-`apply_activate` records `active_roles`, starts a burst only when a re-added `player@v1` has no
-sample yet, and flushes the player stream when the role disappears; it never inspects `activities`,
-never evaluates the playback-capable rule and never re-evaluates persisted roles. There is no
-`client/goodbye` writer and no `pair/abort` writer, so an inadmissible activation is accepted and
-the session carries on.
+**What we do:** the session starts the first sync burst once the connection is ready
+(`session::attempt`). `apply_activate` records `active_roles`, starts a burst only when a re-added
+`player@v1` has no sample yet, and flushes the player stream when the role disappears; it never
+inspects `activities`, never evaluates the playback-capable rule and never re-evaluates persisted
+roles. There is no `client/goodbye` writer and no `pair/abort` writer, so an inadmissible activation
+is accepted and the session carries on.
 
 **Why:** the allowed set depends on the matched PSK and its category. The Sentinel row alone already
 allows four sets — `[]`, `['pairing']`, `['playback']` and `['playback','pairing']` — so this is not
@@ -399,6 +400,32 @@ closes with the first controller state, which the server sends promptly after ac
 **Removing it:** expose the known commands on the connection (an `Event::State` snapshot or a
 `ControlHandle` query) and let the host disable its buttons until the first state arrives, then
 refuse every command while the set is unknown.
+
+## 19. A reconnect keeps the last known `active_roles`
+
+**Spec:** `messaging.md`, `server/activate`. `active_roles` is required on the first activation of a
+connection and persists across later activations that omit it; a client treats a first
+`server/activate` that omits it as carrying an empty `active_roles`.
+
+**What we do:** the connection carries the roles of the session that ended into the next attempt
+(`Carried::active_roles`), and the handshake uses them when the first activation omits
+`active_roles` (`handshake`, `activate.active_roles.unwrap_or_else(|| previous_roles.to_vec())`).
+The `player@v1` role therefore stays active across a reconnect even when the server omits the field:
+the new session reports its `client/state` and starts its clock burst as if the roles had been
+announced. Roles the client has no `client/state` object for - `metadata@v1` and `controller@v1` -
+are kept in the set but produce no state of their own.
+`an_activation_without_roles_keeps_the_roles_of_the_previous_connection` pins the player case: the
+second connection's first activation carries no roles, and the client still reports its player
+state.
+
+**Why:** the previous connection had those roles, so treating them as empty would silence a player
+whose server merely repeats a non-conformant activation. Closing the connection or dropping the
+roles would punish the audible output for a field the server is required to send, and a reconnect
+is exactly when a silent player is hardest to notice.
+
+**Removing it:** treat an omitted first `active_roles` as empty, as the spec says, and wait for the
+server to send a conformant activation; test that no `client/state` and no audio follow until it
+does.
 
 ## How to update this file
 
