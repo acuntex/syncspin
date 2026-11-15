@@ -316,10 +316,10 @@ pub enum Event {
     /// A pairing completed and the record is stored.
     ///
     /// Reported after `server/pair-finalize`, once [`Storage`](crate::storage::Storage) accepted
-    /// the record. The record is what authenticates the next connection to that server: a paired
-    /// connection is keyed by the new long-term PSK from then on. A server also rotates the live
-    /// connection with an in-band re-handshake; this revision does not answer that yet (see
-    /// `docs/spec-deviations.md`, entry 10), so the record takes effect on the next connection.
+    /// the record. The record authenticates later connections to that server, and the server
+    /// normally rotates the live connection to it with an in-band re-handshake: the session swaps
+    /// its keys without reopening the stream, so playback continues and the next connection is
+    /// keyed by the same long-term PSK.
     Paired {
         /// Static public key of the server the record belongs to, as 43 base64url characters.
         server_id: String,

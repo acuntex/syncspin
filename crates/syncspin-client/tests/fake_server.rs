@@ -96,6 +96,11 @@ pub struct ServerOptions {
     ///
     /// With `false` the attempt hangs, which is what a server that went silent looks like.
     pub acknowledge_pairing: bool,
+    /// Whether a re-handshake is followed by one more message under the previous keys.
+    ///
+    /// A conformant server sends nothing after Noise message 1, but a client has to survive a frame
+    /// that was already on its way: the client may discard such a message without acting on it.
+    pub stale_message_on_rehandshake: bool,
 }
 
 impl Default for ServerOptions {
@@ -127,6 +132,7 @@ impl Default for ServerOptions {
             activate_override: None,
             first_activate: None,
             acknowledge_pairing: true,
+            stale_message_on_rehandshake: false,
         }
     }
 }
@@ -151,6 +157,13 @@ pub enum Command {
     Activate(Vec<String>),
     /// Sends a complete `server/activate`, including a pairing attempt.
     ActivateMessage(Box<ServerActivate>),
+    /// Re-runs the Noise handshake in transport mode, then activates under the new keys.
+    Rehandshake {
+        /// Key the new handshake is sealed with.
+        psk: [u8; 32],
+        /// Category announced for it.
+        category: String,
+    },
     /// Sends `server/state` with title and artist.
     Metadata {
         title: &'static str,
@@ -218,6 +231,8 @@ pub enum Observation {
         /// The key the client proposed; the server stores it as its record.
         long_term_psk: PairingKey,
     },
+    /// The client sent a Noise handshake message 2 inside the transport and it authenticated.
+    RehandshakeMessage2,
     /// The client aborted a pairing attempt, with the reason it reported.
     PairingAborted(String),
     /// The connection closed.
@@ -231,6 +246,10 @@ pub struct FakeServer {
     commands: UnboundedSender<Command>,
     observations: UnboundedReceiver<Observation>,
     task: JoinHandle<()>,
+    /// The handshake hash `h` of every handshake of the connection, oldest first.
+    ///
+    /// A test compares these bytes; nothing formats them, because `h` must never reach a log.
+    hashes: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 
 impl FakeServer {
@@ -249,20 +268,25 @@ impl FakeServer {
         let (observation_tx, observations) = mpsc::unbounded_channel();
         // The server-side record of one completed pairing: the key the next handshake announces.
         let paired = Arc::new(Mutex::new(None));
-        let task = tokio::spawn(async move {
-            if let Err(error) = serve(
-                listener,
-                keypair,
-                options,
-                command_rx,
-                observation_tx,
-                paired,
-            )
-            .await
-            {
-                // A test that waits for an observation fails with its own timeout; the reason is
-                // printed to make that failure diagnosable.
-                eprintln!("fake server stopped: {error:#}");
+        let hashes = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn({
+            let hashes = Arc::clone(&hashes);
+            async move {
+                if let Err(error) = serve(
+                    listener,
+                    keypair,
+                    options,
+                    command_rx,
+                    observation_tx,
+                    paired,
+                    hashes,
+                )
+                .await
+                {
+                    // A test that waits for an observation fails with its own timeout; the reason is
+                    // printed to make that failure diagnosable.
+                    eprintln!("fake server stopped: {error:#}");
+                }
             }
         });
 
@@ -272,6 +296,7 @@ impl FakeServer {
             commands,
             observations,
             task,
+            hashes,
         })
     }
 
@@ -381,6 +406,41 @@ impl FakeServer {
                 active_roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
                 pairing: None,
             })));
+    }
+
+    /// Re-runs the Noise handshake inside the transport, sealed with `psk` and announced as
+    /// `category`, then sends the `server/activate` the spec requires under the new keys.
+    ///
+    /// The new handshake's prologue is the hash of the handshake in force.
+    pub fn rehandshake(&self, psk: [u8; 32], category: &str) {
+        let _ = self.commands.send(Command::Rehandshake {
+            psk,
+            category: category.to_owned(),
+        });
+    }
+
+    /// Waits until the client's re-handshake message 2 authenticated.
+    pub async fn wait_for_rehandshake(&mut self) -> bool {
+        loop {
+            match self.observation().await {
+                Some(Observation::RehandshakeMessage2) => return true,
+                Some(Observation::ClosedBeforeMessage2) | Some(Observation::Closed) | None => {
+                    return false
+                }
+                Some(_) => continue,
+            }
+        }
+    }
+
+    /// The handshake hash `h` of every Noise handshake on this connection, oldest first.
+    ///
+    /// The value is a transcript hash and never goes into a log or an error; a test compares the
+    /// bytes directly, which is how the spec derives a pairing `sid` from `h`.
+    pub fn handshake_hashes(&self) -> Vec<[u8; 32]> {
+        self.hashes
+            .lock()
+            .expect("the fake server's hash lock is not poisoned")
+            .clone()
     }
 
     /// Sends `server/state` with the given metadata.
@@ -529,6 +589,7 @@ async fn serve(
     mut commands: UnboundedReceiver<Command>,
     observations: UnboundedSender<Observation>,
     paired: Arc<Mutex<Option<[u8; 32]>>>,
+    hashes: Arc<Mutex<Vec<[u8; 32]>>>,
 ) -> Result<()> {
     for index in 0..options.connections {
         let (tcp, _peer) = listener
@@ -547,6 +608,7 @@ async fn serve(
             &observations,
             announce_roles,
             &paired,
+            &hashes,
         )
         .await?;
     }
@@ -554,6 +616,7 @@ async fn serve(
 }
 
 /// Serves one accepted WebSocket until it closes.
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     mut socket: Socket,
     keypair: &Keypair,
@@ -562,6 +625,7 @@ async fn serve_connection(
     observations: &UnboundedSender<Observation>,
     announce_roles: bool,
     paired: &Arc<Mutex<Option<[u8; 32]>>>,
+    hashes: &Arc<Mutex<Vec<[u8; 32]>>>,
 ) -> Result<()> {
     // 1. client/init, whose exact bytes start the Noise prologue.
     let client_init_text = read_text(&mut socket).await?;
@@ -671,6 +735,15 @@ async fn serve_connection(
             return Ok(());
         }
     }
+    // `h` is final once message 2 is read; a later re-handshake mixes it in as the prologue.
+    let mut handshake_hash: [u8; 32] = initiator
+        .get_handshake_hash()
+        .try_into()
+        .map_err(|_| anyhow!("the Noise handshake hash is not 32 bytes"))?;
+    hashes
+        .lock()
+        .expect("the fake server's hash lock is not poisoned")
+        .push(handshake_hash);
     let mut noise = initiator
         .into_transport_mode()
         .context("failed to finish the Noise handshake")?;
@@ -839,6 +912,39 @@ async fn serve_connection(
                 )
                 .await?;
             }
+            LinkEvent::Command(Some(Command::Rehandshake { psk, category })) => {
+                let swapped = rehandshake(
+                    &mut socket,
+                    &mut noise,
+                    keypair,
+                    &client_public,
+                    &handshake_hash,
+                    psk,
+                    &category,
+                    observations,
+                    hashes,
+                    options.stale_message_on_rehandshake,
+                )
+                .await?;
+                let Some((new_noise, new_hash)) = swapped else {
+                    socket.close(None).await?;
+                    let _ = observations.send(Observation::Closed);
+                    return Ok(());
+                };
+                noise = new_noise;
+                handshake_hash = new_hash;
+                // The activation is mandatory and is the first message under the new keys.
+                send_encrypted(
+                    &mut socket,
+                    &mut noise,
+                    &Incoming::ServerActivate(ServerActivate {
+                        activities: vec!["playback".to_owned()],
+                        active_roles: Some(options.active_roles.clone()),
+                        pairing: None,
+                    }),
+                )
+                .await?;
+            }
             LinkEvent::Command(Some(Command::Metadata { title, artist })) => {
                 send_encrypted(
                     &mut socket,
@@ -994,6 +1100,104 @@ fn answer_time(request: ClientTime) -> Incoming {
         server_received: now_us(),
         server_transmitted: now_us(),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rehandshake(
+    socket: &mut Socket,
+    noise: &mut SnowTransport,
+    keypair: &Keypair,
+    client_public: &[u8; 32],
+    previous_hash: &[u8; 32],
+    psk: [u8; 32],
+    category: &str,
+    observations: &UnboundedSender<Observation>,
+    hashes: &Arc<Mutex<Vec<[u8; 32]>>>,
+    stale_message_on_rehandshake: bool,
+) -> Result<Option<(SnowTransport, [u8; 32])>> {
+    let mut initiator = Builder::new(NOISE_PARAMS.parse()?)
+        .local_private_key(&keypair.private)?
+        .remote_public_key(client_public)?
+        .psk(2, &psk)?
+        .prologue(previous_hash)?
+        .build_initiator()
+        .context("failed to build the re-handshake initiator")?;
+
+    let metadata = format!(
+        r#"{{"psk_id":"{}","psk_category":"{category}"}}"#,
+        psk_id_for(&psk)
+    );
+    let message_1 = write_handshake(&mut initiator, metadata.as_bytes())?;
+    send_encrypted(
+        socket,
+        noise,
+        &Incoming::NoiseHandshake(NoiseHandshake {
+            data: URL_SAFE_NO_PAD.encode(message_1),
+        }),
+    )
+    .await?;
+
+    if stale_message_on_rehandshake {
+        // One frame under the previous keys after message 1: a client must survive it, not act on
+        // it, and keep waiting for the activation.
+        send_encrypted(
+            socket,
+            noise,
+            &Incoming::ServerState(ServerState {
+                metadata: Some(Metadata {
+                    title: Some("Under the previous keys".to_owned()),
+                    ..Metadata::default()
+                }),
+                controller: None,
+            }),
+        )
+        .await?;
+    }
+
+    // Every frame until message 2 still carries the previous keys: the client may have sent an
+    // application message before it saw message 1, and a server discards those.
+    let message_2 = loop {
+        match socket.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                let plaintext = decrypt(noise, &bytes)?;
+                let Some(&0) = plaintext.first() else {
+                    continue;
+                };
+                let text = std::str::from_utf8(&plaintext[1..])
+                    .context("client JSON is not valid UTF-8")?;
+                if let Some(Incoming::NoiseHandshake(handshake)) = Incoming::parse(text)? {
+                    break URL_SAFE_NO_PAD
+                        .decode(&handshake.data)
+                        .context("re-handshake message 2 is not unpadded base64url")?;
+                }
+            }
+            Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await?,
+            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                let _ = observations.send(Observation::ClosedBeforeMessage2);
+                return Ok(None);
+            }
+            Some(Ok(_)) => {}
+        }
+    };
+
+    let mut payload = vec![0u8; MAX_MESSAGE_LEN];
+    if let Err(error) = initiator.read_message(&message_2, &mut payload) {
+        let _ = observations.send(Observation::HandshakeMessage2Rejected(error.to_string()));
+        return Ok(None);
+    }
+    let hash: [u8; 32] = initiator
+        .get_handshake_hash()
+        .try_into()
+        .map_err(|_| anyhow!("the Noise handshake hash is not 32 bytes"))?;
+    hashes
+        .lock()
+        .expect("the fake server's hash lock is not poisoned")
+        .push(hash);
+    let swapped = initiator
+        .into_transport_mode()
+        .context("failed to finish the re-handshake")?;
+    let _ = observations.send(Observation::RehandshakeMessage2);
+    Ok(Some((swapped, hash)))
 }
 
 /// Reads the next text frame, answering pings.

@@ -132,6 +132,17 @@ impl Candidates {
         self.pairing.map(|psk| *psk.as_bytes())
     }
 
+    /// Adds a record this client just persisted, so a re-handshake to it can select the key.
+    ///
+    /// The store was read once, at the start of the attempt; a pairing that completes while the
+    /// connection is live writes a record the set did not hold yet, and the server rotates the
+    /// connection to exactly that key. One record per server, as [`Candidates::load`] keeps it.
+    pub(crate) fn remember(&mut self, record: StoredPsk) {
+        self.records
+            .retain(|held| held.server_id != record.server_id);
+        self.records.push(record);
+    }
+
     /// Returns the records that may seal this connection.
     pub(crate) fn records(&self) -> &[StoredPsk] {
         &self.records
@@ -288,6 +299,30 @@ mod tests {
         let candidates = Candidates::load(None, &[], Some(pairing)).unwrap();
         assert_eq!(candidates.pairing(), Some(KEY));
         assert!(candidates.records().is_empty());
+    }
+
+    #[test]
+    fn a_record_stored_during_the_connection_becomes_a_candidate() {
+        let mut candidates =
+            Candidates::load(None, &[record("from-host")], None).expect("the set builds");
+        assert_eq!(candidates.records().len(), 1);
+
+        // A later store for the same server replaces the earlier record instead of duplicating it.
+        candidates.remember(record("from-host"));
+        assert_eq!(
+            candidates.records().len(),
+            1,
+            "one record per server, as the store keeps it"
+        );
+
+        // A server this client had no record for is added, so its re-handshake can select it.
+        candidates.remember(record("just-paired"));
+        let ids: Vec<&str> = candidates
+            .records()
+            .iter()
+            .map(|record| record.server_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["from-host", "just-paired"]);
     }
 
     #[test]

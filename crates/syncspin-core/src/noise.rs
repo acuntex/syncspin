@@ -277,11 +277,21 @@ impl Responder {
     /// Fails if a handshake message is still outstanding, which
     /// [`Responder::handshake_finished`] reports ahead of time.
     pub fn into_transport(self) -> Result<TransportState> {
+        // `h` is final once the second message has been processed, and `into_transport_mode`
+        // consumes the handshake state that holds it.
+        let handshake_hash: [u8; 32] = self
+            .handshake
+            .get_handshake_hash()
+            .try_into()
+            .context("the Noise handshake hash is not 32 bytes")?;
         let state = self
             .handshake
             .into_transport_mode()
             .context("failed to finish the Noise handshake")?;
-        Ok(TransportState { state })
+        Ok(TransportState {
+            state,
+            handshake_hash,
+        })
     }
 }
 
@@ -292,9 +302,22 @@ impl Responder {
 /// send more than a single Noise message can carry has to split the data itself.
 pub struct TransportState {
     state: snow::TransportState,
+    /// The handshake hash `h` of the handshake that produced these keys.
+    handshake_hash: [u8; 32],
 }
 
 impl TransportState {
+    /// Returns the handshake hash `h` of the handshake these keys came from.
+    ///
+    /// Noise finalises `h` when the second handshake message is processed, and nothing after that
+    /// changes it. Sendspin uses it once: a [re-handshake](https://github.com/Sendspin/spec/blob/main/connection.md#re-handshake)
+    /// mixes the previous handshake's `h` in as its prologue, so a second handshake that reuses
+    /// these keys must be built with this value. It is a transcript hash, not key material, but it
+    /// must still never be logged.
+    pub fn handshake_hash(&self) -> &[u8; 32] {
+        &self.handshake_hash
+    }
+
     /// Encrypts one plaintext into a Noise transport message.
     ///
     /// Fails if the plaintext does not fit into a single Noise message, that is if it is larger

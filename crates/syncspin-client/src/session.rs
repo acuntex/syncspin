@@ -5,6 +5,11 @@
 //! messages travel as cleartext text, and every application message is a Noise transport message.
 //! A server that does not start the handshake times out; there is no plaintext path to fall back
 //! to.
+//!
+//! The server may repeat the Noise handshake inside the encrypted channel to rotate the session
+//! keys; that second handshake keeps the WebSocket, the open stream, the buffered audio and the
+//! clock estimate, and changes nothing but the keys and the pairing index. See
+//! `Session::begin_rehandshake`.
 
 use std::future::pending;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -45,6 +50,9 @@ use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 use crate::storage::persist_pairing;
 
 /// How long the Noise handshake may take, from `client/init` to the first `server/activate`.
+///
+/// The same bound applies to a re-handshake: from the moment message 2 puts the new keys in place,
+/// the server has this long to send the activation they belong to.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of `client/time` round trips in one clock-sync burst.
@@ -183,6 +191,21 @@ struct Ready {
     matched: MatchedPsk,
 }
 
+/// A re-handshake whose keys are already in place, waiting for its activation.
+///
+/// The client is the responder, as in the initial handshake, but the two `noise/handshake`
+/// messages travel inside the encrypted channel: message 1 arrives under the keys in force,
+/// message 2 goes back the same way, and the keys change as soon as it is written. This window
+/// spans the gap between those new keys and the `server/activate` that must be their first
+/// message; while it is open the client sends no application message and acts on none.
+struct Rehandshake {
+    /// The keys of the previous handshake, kept only to recognise and discard a message the server
+    /// sent before it processed message 2. Dropped when the activation ends the window.
+    previous: NoiseTransport,
+    /// Deadline for the activation under the new keys.
+    deadline: Instant,
+}
+
 /// State a connection keeps across attempts.
 pub(crate) struct Carried {
     /// Audio output, moved into each session and returned when it ends.
@@ -304,11 +327,17 @@ pub(crate) struct Session<'a> {
     server_id: String,
     /// Which key sealed the handshake.
     matched: MatchedPsk,
-    /// Pairing `server/activate` messages received since the handshake, the `pairing_index` a
+    /// The keys this connection may seal a re-handshake with, and the records a pairing completed
+    /// on this connection adds to them.
+    candidates: Candidates,
+    /// Pairing `server/activate` messages received since the last handshake, the `pairing_index` a
     /// `client/pair-init` carries.
     pairing_index: u32,
     /// The pairing attempt in progress, or `None` when this connection is not pairing.
     pairing: Option<PairingAttempt>,
+    /// A re-handshake whose new keys are in place, or `None` when the connection is not switching
+    /// keys.
+    rehandshake: Option<Rehandshake>,
 }
 
 /// Runs one connection attempt: the handshake, then the session loop.
@@ -387,8 +416,10 @@ pub(crate) async fn attempt(
         controller_commands: None,
         server_id: ready.server_id.clone(),
         matched: ready.matched,
+        candidates,
         pairing_index: 0,
         pairing: None,
+        rehandshake: None,
     };
     session.publish_volume();
 
@@ -440,19 +471,27 @@ impl Session<'_> {
                 return Ok(());
             }
 
-            self.drive_clock().await?;
+            // A re-handshake suspends the clock work: no application message may be sent until the
+            // new activation arrives, so a burst is not started and no request is put on the wire.
+            if self.rehandshake.is_none() {
+                self.drive_clock().await?;
+            }
 
             // While a request is on the wire the read has its reply deadline; the overall burst
             // deadline and the pairing attempt's deadline are the backstops. Any other frame still
-            // arrives normally, and a control request is served between frames.
-            let deadline = [
-                self.reply_deadline,
-                self.burst_deadline,
-                self.pairing_deadline(),
-            ]
-            .into_iter()
-            .flatten()
-            .min();
+            // arrives normally, and a control request is served between frames. A re-handshake
+            // replaces all of them with its own deadline for the activation.
+            let deadline = match &self.rehandshake {
+                Some(window) => Some(window.deadline),
+                None => [
+                    self.reply_deadline,
+                    self.burst_deadline,
+                    self.pairing_deadline(),
+                ]
+                .into_iter()
+                .flatten()
+                .min(),
+            };
 
             // The control receiver outlives individual handles: dropping the last one disables the
             // branch instead of ending the session.
@@ -486,7 +525,14 @@ impl Session<'_> {
                     SocketMessage::Closed => return Ok(()),
                     SocketMessage::Binary(ciphertext) => self.receive(&ciphertext).await?,
                 },
-                Wakeup::Clock => self.handle_clock_timeout().await?,
+                Wakeup::Clock => {
+                    if self.rehandshake.is_some() {
+                        // The server must send its activation under the new keys; staying silent
+                        // leaves the client with no channel it may use.
+                        bail!("timed out waiting for the server/activate of a re-handshake")
+                    }
+                    self.handle_clock_timeout().await?;
+                }
             }
         }
     }
@@ -588,11 +634,31 @@ impl Session<'_> {
     }
 
     /// Decrypts one transport message and dispatches the message it carries.
+    ///
+    /// While a re-handshake waits for its activation, the only message the client may act on is
+    /// that activation. A message that still authenticates under the previous keys was sent by the
+    /// server before it processed message 2: the spec allows discarding it, and it must not end a
+    /// connection that is otherwise fine.
     async fn receive(&mut self, ciphertext: &[u8]) -> Result<()> {
-        let plaintext = self.noise.decrypt(ciphertext)?;
+        let plaintext = match self.noise.decrypt(ciphertext) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                let tolerated = self
+                    .rehandshake
+                    .as_mut()
+                    .is_some_and(|window| window.previous.decrypt(ciphertext).is_ok());
+                if tolerated {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
         let Some((id, body)) = self.reassembler.push(&plaintext)? else {
             return Ok(());
         };
+        if self.rehandshake.is_some() {
+            return self.handle_activation_message(id, &body).await;
+        }
         // The kind of the message decides how strict the dispatch is: a control message that does
         // not decode is ignored, while a malformed audio chunk stays a protocol error.
         match MessageKind::of(id) {
@@ -603,19 +669,46 @@ impl Session<'_> {
         }
     }
 
+    /// Acts on the one message a re-handshake window admits: its `server/activate`.
+    ///
+    /// The spec makes that activation the server's first message under the new keys and forbids
+    /// every other application message until it arrives, so anything else ends the attempt. The
+    /// failure is silent on the wire, like every other handshake failure.
+    async fn handle_activation_message(&mut self, id: u8, body: &[u8]) -> Result<()> {
+        if id != BINARY_MESSAGE_ID_JSON {
+            bail!("the server sent a non-control message instead of activating a re-handshake")
+        }
+        let text = std::str::from_utf8(body).context("decrypted JSON is not valid UTF-8")?;
+        match Incoming::parse(text) {
+            Ok(Some(Incoming::ServerActivate(activate))) => self.finish_rehandshake(activate).await,
+            Ok(_) => {
+                bail!("the server sent an application message before activating a re-handshake")
+            }
+            Err(error) => {
+                bail!(
+                    "the server sent a malformed message before activating a re-handshake: {error}"
+                )
+            }
+        }
+    }
+
     /// Dispatches one decrypted control or state message.
     ///
     /// A `type` this revision does not implement is ignored, as the protocol requires. A message
     /// that does not decode is ignored as well, with a line on stderr, instead of ending the
     /// session: one malformed field must not silence playback, and a message the client cannot
     /// decode carries nothing it could act on. The audio path keeps the strict rule - a malformed
-    /// chunk header is a protocol error. See `docs/spec-deviations.md`, entry 20.
+    /// chunk header is a protocol error. See `docs/spec-deviations.md`, entry 19.
     ///
     /// A body that is not valid UTF-8 is a framing error and still closes the connection.
     async fn handle_control_message(&mut self, body: &[u8]) -> Result<()> {
         let text = std::str::from_utf8(body).context("decrypted JSON is not valid UTF-8")?;
         match Incoming::parse(text) {
             Ok(None) => Ok(()), // A type this revision does not implement is ignored.
+            // `noise/handshake` inside the transport is the server starting a re-handshake.
+            Ok(Some(Incoming::NoiseHandshake(handshake))) => {
+                self.begin_rehandshake(handshake).await
+            }
             Ok(Some(message)) => self.dispatch(message).await,
             Err(error) => {
                 eprintln!("ignoring a malformed control message: {error}");
@@ -646,6 +739,72 @@ impl Session<'_> {
         }
     }
 
+    /// Starts the in-band re-handshake a `noise/handshake` message 1 announces.
+    ///
+    /// The new handshake's prologue is the hash of the handshake that established the current keys,
+    /// and the client answers with message 2 without waiting for anything: both messages travel
+    /// inside the channel the previous keys encrypt, and no init exchange is repeated. The new keys
+    /// take over as soon as message 2 is written; from then until the `server/activate` that must
+    /// follow, the client sends no application message and acts on none.
+    ///
+    /// A key none of the candidates matches ends the connection: a re-handshake has no Sentinel
+    /// fallback, because falling back would silently drop the pairing the previous handshake
+    /// authenticated. The failure is silent on the wire, like every other handshake failure.
+    async fn begin_rehandshake(&mut self, handshake: NoiseHandshake) -> Result<()> {
+        if self.rehandshake.is_some() {
+            bail!("the server started a second Noise handshake before the first was activated");
+        }
+        let message_1 = URL_SAFE_NO_PAD
+            .decode(&handshake.data)
+            .context("noise/handshake data is not unpadded base64url")?;
+        let peer = decode_server_key(&self.server_id)?;
+        let prologue = *self.noise.handshake_hash();
+        let mut responder = Responder::with_peer(&self.config.identity, &peer, &prologue)?;
+        let metadata_payload = responder
+            .read_message(&message_1)
+            .context("failed to read Noise re-handshake message 1")?;
+        let metadata = PskMetadata::parse(&metadata_payload)?;
+        let selected = select_psk(&metadata, &self.candidates, &self.server_id, false)?;
+        responder.set_psk(&selected.psk)?;
+
+        // Message 2 is the last message the client sends under the previous keys.
+        let message_2 = Incoming::NoiseHandshake(NoiseHandshake {
+            data: URL_SAFE_NO_PAD.encode(responder.write_message()?),
+        });
+        self.send_json(&message_2).await?;
+        let previous = std::mem::replace(&mut self.noise, responder.into_transport()?);
+
+        // The burst belonged to the previous keys. The estimate itself stays: suspension only drops
+        // the requests in flight, so playout deadlines keep their meaning across the swap.
+        self.suspend_burst();
+        // The index counts pairing activations since the last handshake, and this is a new one.
+        self.pairing_index = 0;
+        self.matched = selected.matched;
+        self.rehandshake = Some(Rehandshake {
+            previous,
+            deadline: Instant::now() + HANDSHAKE_TIMEOUT,
+        });
+        Ok(())
+    }
+
+    /// Ends a re-handshake with the server's first activation under the new keys.
+    async fn finish_rehandshake(&mut self, activate: ServerActivate) -> Result<()> {
+        self.rehandshake = None;
+        self.apply_activate(activate).await
+    }
+
+    /// Drops the run of clock requests while keeping the estimate they produced.
+    ///
+    /// Used whenever the connection has to stop sending for a moment: removing the player role and
+    /// swapping session keys both cancel the requests an older state put on the wire.
+    fn suspend_burst(&mut self) {
+        self.sync_remaining = 0;
+        self.burst_deadline = None;
+        self.reply_deadline = None;
+        self.outstanding_sent_us = None;
+        self.burst_samples.clear();
+    }
+
     /// Applies a `server/activate`: role changes, stream teardown, pairing and state reporting.
     ///
     /// An activation that adds the `pairing` activity admits one pairing attempt; one that does not
@@ -667,11 +826,7 @@ impl Session<'_> {
         if had_player && !has_player {
             // The player role is gone: nothing that is still buffered may become audible.
             self.state_sent = false;
-            self.sync_remaining = 0;
-            self.burst_deadline = None;
-            self.reply_deadline = None;
-            self.outstanding_sent_us = None;
-            self.burst_samples.clear();
+            self.suspend_burst();
             self.stop_stream(StreamEndReason::RoleRemoved)?;
         } else if !had_player && has_player {
             // A re-added role reports itself again, from the existing estimate when there is one.
@@ -773,8 +928,11 @@ impl Session<'_> {
             psk: attempt.psk(),
             server_id: self.server_id.clone(),
         };
-        persist_pairing(storage, record, Some(&self.server_id))
+        persist_pairing(storage, record.clone(), Some(&self.server_id))
             .context("cannot store the pairing record")?;
+        // The server rotates this connection to the key it just persisted, and the candidate set
+        // was read before that record existed.
+        self.candidates.remember(record);
         self.emit(Event::Paired {
             server_id: self.server_id.clone(),
         });
@@ -1130,6 +1288,9 @@ impl Session<'_> {
     /// controller state is left open, because nothing is known yet. A level the host reports above
     /// the protocol range is refused here as well, since `client/state` cannot carry it.
     fn check_control(&self, action: &ControlAction) -> Result<()> {
+        if self.rehandshake.is_some() {
+            bail!("the connection is switching keys and cannot send yet");
+        }
         match action {
             ControlAction::Transport(command) => {
                 if !self.role_active(CONTROLLER_ROLE) {
@@ -1240,7 +1401,13 @@ impl Session<'_> {
     }
 
     /// Encrypts and sends one control message.
+    ///
+    /// During a re-handshake the client may send nothing but message 2, so a send here is a bug;
+    /// failing loudly is better than putting a frame under the wrong keys on the wire.
     async fn send_json(&mut self, message: &Incoming) -> Result<()> {
+        if self.rehandshake.is_some() {
+            bail!("the client may not send an application message during a re-handshake");
+        }
         let ciphertext = encrypt_json(&mut self.noise, message)?;
         self.transport.send_binary(ciphertext).await
     }
@@ -1505,6 +1672,19 @@ fn affects_player(roles: Option<&[String]>) -> bool {
             .iter()
             .any(|role| role == PLAYER_STREAM_ROLE || role == PLAYER_ROLE),
     }
+}
+
+/// Decodes the server's static public key from the `server_id` it announced.
+///
+/// A re-handshake does not repeat `server/init`, so the key the responder needs comes from the
+/// initial handshake's announcement. The value is a public key, not key material.
+fn decode_server_key(server_id: &str) -> Result<[u8; 32]> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(server_id)
+        .context("server_id is not unpadded base64url")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("server_id does not decode to a 32-byte X25519 key"))
 }
 
 /// Whether `value` is the canonical unpadded base64url encoding of a 32-byte key id.
@@ -1891,8 +2071,10 @@ mod tests {
             controller_commands: None,
             server_id: SERVER_ID.to_owned(),
             matched: MatchedPsk::Sentinel,
+            candidates: Candidates::load(None, &[], None).expect("an empty candidate set builds"),
             pairing_index: 0,
             pairing: None,
+            rehandshake: None,
         }
     }
 

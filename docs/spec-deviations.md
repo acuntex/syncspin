@@ -21,17 +21,16 @@ harmless.
 | 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                           |
 | 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
 | 9   | No `client/goodbye` writer                                      | [`messaging.md` — `client/goodbye`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clientgoodbye)                                                         | Stage 1b                           |
-| 10  | Transport-mode re-handshake ignored                             | [`connection.md` — Re-handshake](https://github.com/Sendspin/spec/blob/main/connection.md#re-handshake)                                                                           | Stage 2                            |
-| 11  | No `server/unpair` and no pairing-required signal                | [`pairing.md` — Pairing Records](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-records)                                                                            | Stage 2                            |
-| 12  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
-| 13  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
-| 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
-| 15  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                           |
-| 16  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                         |
-| 17  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`      |
-| 18  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
-| 19  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
-| 20  | A malformed control message is ignored, not fatal               | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
+| 10  | No `server/unpair` and no pairing-required signal               | [`pairing.md` — Pairing Records](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-records)                                                                           | Stage 2                            |
+| 11  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
+| 12  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
+| 13  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
+| 14  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                           |
+| 15  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                         |
+| 16  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`      |
+| 17  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
+| 18  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
+| 19  | A malformed control message is ignored, not fatal               | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
 
 ## 1. Client-initiated connections only
 
@@ -240,29 +239,7 @@ sites would be an API nobody can reach.
 shutdown, restart, another server), then test on the fake server that the server sees the reason
 before the close.
 
-## 10. Transport-mode re-handshake ignored
-
-**Spec:** `connection.md`, _Re-handshake_. Once the transport is established, the server may send
-Noise message 1 again to rotate the connection to a paired PSK; the client answers with message 2
-over the same transport, without repeating the cleartext init exchange.
-
-**What we do:** `handshake` runs once per WebSocket. `serve` decrypts later messages and
-`handle_control_message` parses them into `Incoming`, where `dispatch` has no arm for
-`Incoming::NoiseHandshake`, so a re-handshake arrives as an ignored message and the connection keeps
-its original key. There is no second handshake path at all.
-
-**Why:** the in-band upgrade belongs with the pairing flow it serves: the server rotates the
-connection to the long-term PSK it just received, so the client has to have stored the record and
-recognise the announced key before it can answer message 2. Until that path exists, a connection
-whose server rotates after a pairing drops and is re-established by the ordinary reconnect, which
-re-runs the full initial handshake under the new record.
-
-**Removing it:** add a re-handshake state entered on an encrypted `noise/handshake` message 1,
-answer with message 2 over the same transport, swap the `TransportState`, and fail the connection
-when the selected key is a miss (no Sentinel fallback). Test the successful rotation and the miss
-against the fake server.
-
-## 11. No `server/unpair` and no pairing-required signal
+## 10. No `server/unpair` and no pairing-required signal
 
 **Spec:** `pairing.md`, _Pairing Records_ and _Unpaired Access_, and `messaging.md`,
 `server/unpair`. A server that drops a client's record tells it with `server/unpair`, and a client
@@ -285,7 +262,7 @@ the next step after the PSK flow.
 `psk_id` as `Event::PairingRequired { server_id, reason: CredentialMismatch }`, once per connection;
 and test all three against the fake server.
 
-## 12. Scheduled metadata applied immediately
+## 11. Scheduled metadata applied immediately
 
 **Spec:** `messaging.md`, `server/state` → `metadata.timestamp`. The field is the server time at
 which the metadata becomes valid; a client that buffers audio ahead of playout should schedule the
@@ -304,7 +281,7 @@ queue.
 and emit at the mapped deadline. Test a future timestamp, a past one, and a change superseded before
 it becomes valid.
 
-## 13. In-place format change flushes buffered audio
+## 12. In-place format change flushes buffered audio
 
 **Spec:** `messaging.md`, `stream/start`. The server may send it again with a new format to
 reconfigure a running stream.
@@ -321,7 +298,7 @@ offers, and the current consumer's format does not change mid-stream.
 for the old buffer to drain at the switch timestamp, and test a mid-stream change against a sink
 that records the boundary.
 
-## 14. `Sink::underruns()` is not used
+## 13. `Sink::underruns()` is not used
 
 **Spec:** none; this is the design's sink contract (`docs/design/syncspin-design.md`, _Playout
 timing_), which expects underrun counts to feed buffer corrections.
@@ -339,7 +316,7 @@ number into playback would be an unverified control loop.
 `min_buffer_ms` (bounded) when the count rises, and test the reported value against a fake sink that
 returns a fixed count.
 
-## 15. `stream/clear` with `from_timestamp` flushes everything
+## 14. `stream/clear` with `from_timestamp` flushes everything
 
 **Spec:** `messaging.md`, `stream/clear`. A `from_timestamp` asks the client to discard the buffered
 audio from that server time onward and keep what is earlier; an absent timestamp clears everything.
@@ -359,7 +336,7 @@ at a seek, but leaving stale audio buffered would be worse.
 into the session) and discard only frames whose deadline is at or after the mapped timestamp; test a
 clear in the middle of a burst of buffered frames.
 
-## 16. Playout deadlines begin after three clock bursts
+## 15. Playout deadlines begin after three clock bursts
 
 **Spec:** `messaging.md`, _Clock Synchronization_. The client estimates the server clock from bursts
 of `client/time`/`server/time`, one request at a time, and schedules each frame's playout from that
@@ -383,7 +360,7 @@ required earlier, seed the filter from the first three bursts before reporting t
 readiness with an explicit accuracy bound; test deadlines with one, two and three answered
 requests.
 
-## 17. A player volume above 100 is capped, not rejected
+## 16. A player volume above 100 is capped, not rejected
 
 **Spec:** `roles/player/v1.md`, `server/command` player object. `volume` is an integer in the range
 0-100, and `messaging.md` says a field value outside the fixed range its definition gives is a
@@ -405,7 +382,7 @@ belongs with the failure handling that `server/error` and typed protocol errors 
 connection with a protocol-error reason once that path exists, or reject the value at the parser
 with the same effect. Test the closed connection instead of the capped level.
 
-## 18. A transport command before the controller state is not checked
+## 17. A transport command before the controller state is not checked
 
 **Spec:** `roles/controller/v1.md`, `client/command` controller object. `command` MUST be one of
 the values listed in `supported_commands` from the latest controller state the client received in
@@ -425,7 +402,7 @@ closes with the first controller state, which the server sends promptly after ac
 `ControlHandle` query) and let the host disable its buttons until the first state arrives, then
 refuse every command while the set is unknown.
 
-## 19. A reconnect keeps the last known `active_roles`
+## 18. A reconnect keeps the last known `active_roles`
 
 **Spec:** `messaging.md`, `server/activate`. `active_roles` is required on the first activation of a
 connection and persists across later activations that omit it; a client treats a first
@@ -451,7 +428,7 @@ is exactly when a silent player is hardest to notice.
 server to send a conformant activation; test that no `client/state` and no audio follow until it
 does.
 
-## 20. A malformed control message is ignored, not fatal
+## 19. A malformed control message is ignored, not fatal
 
 **Spec:** `messaging.md`, _Communication_ and _Binary Message ID Structure_. A field value in a
 recognized message that is outside the fixed range or length limit its definition gives is a

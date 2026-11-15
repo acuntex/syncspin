@@ -832,7 +832,7 @@ async fn a_malformed_control_message_is_ignored() {
 
     // A known type whose payload does not deserialize: `volume` is an integer on the wire, so 300
     // does not fit. A value in 101-255 decodes and stays capped by the volume policy
-    // (`docs/spec-deviations.md`, entry 17), which is not a decode failure.
+    // (`docs/spec-deviations.md`, entry 16), which is not a decode failure.
     server.json(
         r#"{"type":"server/command","payload":{"player":{"command":"volume","volume":300}}}"#,
     );

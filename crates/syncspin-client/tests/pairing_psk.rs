@@ -10,7 +10,7 @@ mod fake_server;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use syncspin_client::storage::Storage;
@@ -112,6 +112,109 @@ impl Sink for NullSink {
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// One frame a recording sink received, with its playout deadline.
+struct WrittenFrame {
+    data: Vec<u8>,
+    due: Instant,
+}
+
+/// What a recording sink saw, shared with the test that owns the assertion.
+#[derive(Default)]
+struct Recordings {
+    opened: Mutex<Vec<syncspin_client::AudioFormat>>,
+    written: Mutex<Vec<WrittenFrame>>,
+    flushes: Mutex<usize>,
+}
+
+impl Recordings {
+    fn opened(&self) -> usize {
+        self.opened
+            .lock()
+            .expect("the recordings lock is poisoned")
+            .len()
+    }
+
+    fn written(&self) -> Vec<(Vec<u8>, Instant)> {
+        self.written
+            .lock()
+            .expect("the recordings lock is poisoned")
+            .iter()
+            .map(|frame| (frame.data.clone(), frame.due))
+            .collect()
+    }
+
+    fn flushes(&self) -> usize {
+        *self
+            .flushes
+            .lock()
+            .expect("the recordings lock is poisoned")
+    }
+}
+
+/// A sink that records frames instead of playing them.
+struct RecordingSink {
+    recordings: Arc<Recordings>,
+}
+
+impl Sink for RecordingSink {
+    fn open(&mut self, format: syncspin_client::AudioFormat) -> Result<()> {
+        self.recordings
+            .opened
+            .lock()
+            .expect("the recordings lock is poisoned")
+            .push(format);
+        Ok(())
+    }
+
+    fn write(&mut self, frame: syncspin_client::AudioFrame<'_>, due: Instant) -> Result<()> {
+        let data = match frame {
+            syncspin_client::AudioFrame::Pcm(data) => data.to_vec(),
+            syncspin_client::AudioFrame::Encoded { data, .. } => data.to_vec(),
+        };
+        self.recordings
+            .written
+            .lock()
+            .expect("the recordings lock is poisoned")
+            .push(WrittenFrame { data, due });
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        *self
+            .recordings
+            .flushes
+            .lock()
+            .expect("the recordings lock is poisoned") += 1;
+        Ok(())
+    }
+}
+
+/// Creates a recording sink and the record it writes to.
+fn recording_sink() -> (Arc<Recordings>, Box<dyn Sink>) {
+    let recordings = Arc::new(Recordings::default());
+    (
+        Arc::clone(&recordings),
+        Box::new(RecordingSink { recordings }),
+    )
+}
+
+/// Waits until the sink received at least `count` frames.
+async fn wait_for_writes(recordings: &Recordings, count: usize) -> Vec<(Vec<u8>, Instant)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let written = recordings.written();
+        if written.len() >= count {
+            return written;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} sink writes, saw {}",
+            written.len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
@@ -668,6 +771,245 @@ async fn a_pairing_activity_without_parameters_ends_the_attempt_with_an_error() 
         other => panic!("expected Disconnected, got {other:?}"),
     }
     assert_still_reconnecting(handle).await;
+}
+
+/// Waits for the client's first `client/state`, which follows its first clock measurement.
+async fn wait_for_client_state(server: &mut FakeServer) {
+    tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_state())
+        .await
+        .expect("the client must report its state")
+        .expect("the connection must not close before the state report");
+}
+
+/// The CPace session id of a pairing attempt: the label, the handshake hash and two indexes.
+///
+/// `pairing.md` defines `sid` as `"sendspin-pair-pake-v1" || h || pairing_index || round`, all raw.
+/// A re-handshake mixes in a new `h` and resets the index, so the `sid` of the next attempt differs.
+fn pake_sid(handshake_hash: &[u8; 32], pairing_index: u32, round: u32) -> Vec<u8> {
+    let mut sid = Vec::from(b"sendspin-pair-pake-v1".as_slice());
+    sid.extend_from_slice(handshake_hash);
+    sid.extend_from_slice(&pairing_index.to_be_bytes());
+    sid.extend_from_slice(&round.to_be_bytes());
+    sid
+}
+
+/// Current wall clock in microseconds since the Unix epoch, the domain of server timestamps.
+fn now_us() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn audio_survives_a_rehandshake_mid_stream() {
+    let pairing_psk = [0x2b; 32];
+    let storage = MemoryStorage::holding(pairing_psk);
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (handle, mut events) = connect(config_for(&server, Some(storage)), sink)
+        .await
+        .expect("the client must connect to the fake server");
+    expect_connected(&mut events, &server).await;
+
+    // A usable clock estimate needs three bursts; the 24 replies are ordered before the audio.
+    wait_for_client_state(&mut server).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_time_replies(24))
+            .await
+            .expect("the fake server must answer the initial bursts"),
+        "the connection must stay open while the clock estimate forms"
+    );
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    server.audio(now_us() + 250_000, 250_000, vec![0x11; 64]);
+    let written = wait_for_writes(&recordings, 1).await;
+    assert_eq!(written[0].0, vec![0x11; 64]);
+    assert!(
+        written[0].1 > Instant::now() + Duration::from_millis(100),
+        "the frame before the swap must be scheduled from the clock estimate, got {:?}",
+        written[0].1
+    );
+
+    // The server rotates the live connection to the pairing PSK, mid-stream, and activates under
+    // the new keys. Nothing about the stream or the clock may change with the keys.
+    let flushes_before = recordings.flushes();
+    server.rehandshake(pairing_psk, "pr");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_rehandshake())
+            .await
+            .expect("the client must answer the re-handshake"),
+        "the re-handshake must complete instead of closing"
+    );
+
+    server.audio(now_us() + 250_000, 250_000, vec![0x22; 64]);
+    let written = wait_for_writes(&recordings, 2).await;
+    assert_eq!(
+        written[1].0,
+        vec![0x22; 64],
+        "audio must arrive again under the new keys"
+    );
+    assert!(
+        written[1].1 > Instant::now() + Duration::from_millis(100),
+        "the clock estimate must survive the key swap, got {:?}",
+        written[1].1
+    );
+    assert_eq!(
+        recordings.opened(),
+        1,
+        "a key swap must not reopen the stream"
+    );
+    assert_eq!(
+        recordings.flushes(),
+        flushes_before,
+        "a key swap must not drop buffered audio"
+    );
+    assert_still_reconnecting(handle).await;
+}
+
+#[tokio::test]
+async fn a_pairing_after_a_rehandshake_uses_index_one() {
+    let pairing_psk = [0x6c; 32];
+    let storage = MemoryStorage::holding(pairing_psk);
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (mut events, _handle) = connect_to(&server, Some(storage)).await;
+    expect_connected(&mut events, &server).await;
+    wait_for_hello(&mut server).await;
+
+    // The first pairing activation of this handshake is not admissible, because the connection is
+    // Sentinel-keyed; it ends in an abort, but it still advances the pairing index to 1. The
+    // activation clears the roles as well, so the (empty) player stream ends on the way.
+    server.activate_pairing("pairing_psk");
+    loop {
+        match next_event(&mut events).await {
+            Event::PairingFailed { reason } => {
+                assert_eq!(reason, PairingFailure::MethodNotSupported);
+                break;
+            }
+            Event::StreamEnd { .. } => continue,
+            other => panic!("expected PairingFailed, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_pairing_abort())
+            .await
+            .expect("the client must answer the activation")
+            .as_deref(),
+        Some("method_not_supported")
+    );
+
+    let hashes_before = server.handshake_hashes();
+    server.rehandshake(pairing_psk, "pr");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_rehandshake())
+            .await
+            .expect("the client must answer the re-handshake"),
+        "the re-handshake must complete instead of closing"
+    );
+    let hashes_after = server.handshake_hashes();
+    assert_eq!(
+        hashes_before.len(),
+        1,
+        "one handshake happened before the swap"
+    );
+    assert_eq!(hashes_after.len(), 2, "the swap is a second handshake");
+
+    // The index counts pairing activations since the last handshake, so this is index 1 again
+    // even though the connection already saw one before the swap (it would be 2 without the
+    // reset).
+    server.activate_pairing("pairing_psk");
+    let pairing_index = tokio::time::timeout(Duration::from_secs(5), server.wait_for_pair_init())
+        .await
+        .expect("the client must start the pairing attempt")
+        .expect("the connection must not close before client/pair-init");
+    assert_eq!(pairing_index, 1, "a re-handshake resets the pairing index");
+
+    // The CPace `sid` mixes in `h` and the pairing index; both differ from the first handshake.
+    assert_ne!(
+        hashes_before[0], hashes_after[1],
+        "a new handshake must produce a new `h` for the `sid`"
+    );
+    assert_ne!(
+        pake_sid(&hashes_before[0], 0, 1),
+        pake_sid(&hashes_after[1], pairing_index, 1),
+        "the `sid` of an attempt after a re-handshake must differ from index 0"
+    );
+}
+
+#[tokio::test]
+async fn a_rehandshake_to_an_unknown_key_closes_without_a_second_message() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    // No store and no host records: the announced key of the new handshake is a lookup miss.
+    let (mut events, handle) = connect_to(&server, None).await;
+    expect_connected(&mut events, &server).await;
+    wait_for_hello(&mut server).await;
+
+    // A miss during a re-handshake fails it: there is no Sentinel fallback once the connection is
+    // authenticated, and the close carries no message of its own.
+    server.rehandshake([0x4d; 32], "lt");
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => assert!(
+            reason.contains("re-handshake"),
+            "the reason must name the refused re-handshake, got: {reason}"
+        ),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    match tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match server.observation().await {
+                Some(Observation::RehandshakeMessage2) => break false,
+                Some(Observation::ClosedBeforeMessage2) | Some(Observation::Closed) | None => {
+                    break true
+                }
+                Some(_) => continue,
+            }
+        }
+    })
+    .await
+    .expect("the fake server must notice the close")
+    {
+        true => {}
+        false => panic!("the client must not answer a re-handshake whose key it does not hold"),
+    }
+    assert_still_reconnecting(handle).await;
+}
+
+#[tokio::test]
+async fn a_message_under_the_previous_keys_is_discarded() {
+    let pairing_psk = [0x3d; 32];
+    let storage = MemoryStorage::holding(pairing_psk);
+    let mut server = FakeServer::start(ServerOptions {
+        stale_message_on_rehandshake: true,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (mut events, _handle) = connect_to(&server, Some(storage)).await;
+    expect_connected(&mut events, &server).await;
+    wait_for_hello(&mut server).await;
+
+    server.rehandshake(pairing_psk, "pr");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_rehandshake())
+            .await
+            .expect("the client must answer the re-handshake"),
+        "a frame under the previous keys must not end the connection"
+    );
+
+    // The frame the harness sent between message 1 and its message 2 carried the previous keys and
+    // arrived before the activation; acting on it would report a track the new session never sent.
+    server.metadata("Under the new keys", "An artist");
+    match next_event(&mut events).await {
+        Event::Track { title, .. } => assert_eq!(
+            title, "Under the new keys",
+            "a message under the previous keys must be discarded, not delivered"
+        ),
+        other => panic!("expected Track, got {other:?}"),
+    }
 }
 
 /// Waits for the [`Event::Disconnected`] that ends an attempt.
