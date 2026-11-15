@@ -36,3 +36,6 @@ tokio-tungstenite.workspace = true
 base64.workspace = true
 snow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+all-features = true
