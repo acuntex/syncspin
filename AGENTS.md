@@ -41,8 +41,9 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
   There is no plaintext fallback and no downgrade - not behind a flag, not in a test.
 - **Never log key material or pairing records.** No static keys, no PSKs, no pairing blobs, no
   Noise handshake hashes - not at `trace`, not in `Debug` output, not in error strings.
-- **Default features stay `player`, `controller`, `metadata`.** `artwork`, `visualizer`, `color`
-  and `source` stay off unless a caller opts in.
+- **When the feature flags land, the defaults stay `player`, `controller`, `metadata`.**
+  `artwork`, `visualizer`, `color` and `source` stay off unless a caller opts in. No crate has a
+  `[features]` table today, so this is a constraint on the work, not a description of it.
 - **MSRV 1.85.** A dependency that demands more is pinned or replaced, not silently accepted; the
   `msrv` CI job is the gate.
 - **Names and licence are fixed:** crates `syncspin-core`, `syncspin-client` and `syncspin-server`;
