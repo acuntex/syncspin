@@ -5,14 +5,13 @@
 //! It knows no transport and no device integration, and it never depends on the
 //! `syncspin-client` or `syncspin-server` crates.
 //!
-//! This is a `0.1` work in progress: the Noise layer, the message types, the framing layer and
-//! the clock filter exist so far.
+//! This is a `0.1` work in progress: the Noise layer, the message types, the framing layer, the
+//! clock filter and the pairing token exist so far.
 
 pub mod clock;
 pub mod framing;
 pub mod messages;
 pub mod noise;
-#[cfg(feature = "pairing-code")]
 pub mod pairing;
 
 /// Returns the version of this crate as recorded in its manifest.
