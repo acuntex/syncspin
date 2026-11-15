@@ -56,7 +56,7 @@ others, and so the consumer focuses on device integration.
   only with vetted primitives.
 - **MSRV:** 1.85, with a dedicated CI job and a README line; if a dependency demands more, pin it or
   raise the MSRV deliberately and document it.
-- **Trademark:** "Sendspin" is governed by spec/TRADEMARKS.md → crate name `syncspin`, README
+- **Trademark:** "Sendspin" is governed by spec/TRADEMARKS.md → project name `syncspin`, README
   describes it as a "Sendspin protocol client and server library", no logos, no claim of being
   official.
 - **License:** MIT OR Apache-2.0 (same as `sendspin-rs`, Rust convention).
@@ -342,8 +342,9 @@ not stage 3:
   verified by test.
 - **Pairing UX:** 0.1 ships the library API only (`pairing_token()`, `open_pairing_window()`,
   `release_holdback()`); code display and the remote-control gesture belong to the consumer's UI.
-- **Repository:** the project's own public GitHub repository, name `syncspin`. Crate names stay
-  `syncspin`, `syncspin-core`, `syncspin-client`, `syncspin-server`. The repository is **public from
+- **Repository:** the project's own public GitHub repository, name `syncspin`. The workspace ships
+  three crates — `syncspin-core`, `syncspin-client`, `syncspin-server`; a facade crate named
+  `syncspin` was considered and dropped, so no crate carries the bare project name. The repository is **public from
   day one**, which is what makes the Renovate App free and the Actions minutes unlimited.
 - **MSRV:** 1.85, checked by a CI job.
 - **Feature defaults:** `player`, `controller`, `metadata` are on; `artwork`, `visualizer`, `color`,
