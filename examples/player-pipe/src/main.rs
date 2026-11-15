@@ -440,6 +440,14 @@ where
             "--static-code" | "--open-window" => bail!(
                 "the code flows need the storage-file feature: a completed pairing has to be stored"
             ),
+            #[cfg(all(not(feature = "pairing-code"), feature = "storage-file"))]
+            "--static-code" | "--open-window" => bail!(
+                "the code flows need the pairing-code feature: rebuild with --features pairing-code"
+            ),
+            #[cfg(not(any(feature = "pairing-code", feature = "storage-file")))]
+            "--static-code" | "--open-window" => bail!(
+                "the code flows need two features: rebuild with --features pairing-code,storage-file"
+            ),
             other => bail!("unknown argument {other:?}; try --help"),
         }
     }
@@ -587,7 +595,7 @@ Options:
     ));
     #[cfg(feature = "storage-file")]
     text.push_str(&format!(
-        "\
+        "
       --pairing-token         Print this client's version-0 pairing token (SP:...)
                               and exit; the token carries the identity and the
                               pairing PSK, so treat it as a credential
@@ -598,7 +606,7 @@ Options:
     ));
     #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
     text.push_str(
-        "\
+        "
       --static-code <code>    Static pairing code, exactly eight digits, shared
                               with the server; treat it as a credential
                               (needs --open-window)
@@ -607,7 +615,7 @@ Options:
 ",
     );
     text.push_str(
-        "\
+        "
   -h, --help                  Print this help and exit
 
 Audio goes to standard output as raw samples in the announced format; status
@@ -772,6 +780,35 @@ mod tests {
         assert!(text.contains("--pairing-store"), "got: {text}");
         #[cfg(feature = "pairing-code")]
         assert!(text.contains("--open-window"), "got: {text}");
+    }
+
+    #[cfg(feature = "storage-file")]
+    #[test]
+    fn every_flag_starts_its_own_indented_line() {
+        let text = usage();
+        for line in [
+            "\n      --pairing-token",
+            "\n      --pairing-store",
+            "\n  -h, --help",
+        ] {
+            assert!(
+                text.contains(line),
+                "the help text must keep {line:?} indented rather than glued to the line above, got: {text}"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "storage-file", not(feature = "pairing-code")))]
+    #[test]
+    fn a_missing_feature_is_named_in_the_error() {
+        let Err(error) = parse(&["--server", "host", "--open-window"]) else {
+            panic!("--open-window without the pairing-code feature must be rejected");
+        };
+        let text = format!("{error}");
+        assert!(
+            text.contains("--features pairing-code"),
+            "the error must name the feature that adds the flag, got: {text}"
+        );
     }
 
     #[test]
