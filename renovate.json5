@@ -1,0 +1,58 @@
+{
+  // Dependency automation for syncspin. Renovate reads this file from the
+  // default branch (`main`); the Dependency Dashboard issue is the single place
+  // where approval-gated updates are approved or declined.
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  extends: [
+    "config:recommended",
+    ":semanticCommits",
+    ":dependencyDashboard",
+    // Rewrites `uses: owner/action@v4` into a commit SHA, keeping the tag as a
+    // trailing comment. `.github/workflows/ci.yml` pins actions by tag on
+    // purpose; this preset turns them into digests on its first run.
+    "helpers:pinGitHubActionDigests",
+  ],
+
+  // Keep the PR queue reviewable: at most five dependency PRs open at once.
+  prConcurrentLimit: 5,
+
+  packageRules: [
+    {
+      // Non-major cargo updates arrive as one weekly PR, so the review is one
+      // changelog read instead of ten. Majors and pins stay separate.
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["patch", "minor"],
+      groupName: "cargo non-major",
+      schedule: ["before 06:00 on monday"],
+    },
+    {
+      // Action bumps are one PR a week and carry the tag-to-SHA pinning from
+      // `helpers:pinGitHubActionDigests` above.
+      matchManagers: ["github-actions"],
+      groupName: "github-actions",
+      schedule: ["before 06:00 on monday"],
+    },
+    {
+      // Automerge only where CI is the whole contract: dev-dependencies (test
+      // harnesses) on patch and minor updates. No dev-dependencies exist yet;
+      // the rule is here before the first test harness lands.
+      matchManagers: ["cargo"],
+      matchDepTypes: ["devDependencies"],
+      matchUpdateTypes: ["patch", "minor"],
+      automerge: true,
+    },
+    {
+      // Crypto and the async runtime decide the MSRV (1.85) and, through `snow`
+      // and `x25519-dalek`, the wire protocol. These are never automerged and
+      // their PR is only opened after approval on the Dependency Dashboard, so
+      // a human reads the changelog and the ARMv7 impact first. Listed last so
+      // this rule wins over the grouping and automerge rules above, and with
+      // its own group so approval does not block the weekly cargo PR.
+      matchPackageNames: ["snow", "x25519-dalek", "tokio", "tokio-tungstenite"],
+      groupName: "cargo crypto and runtime (manual review)",
+      automerge: false,
+      dependencyDashboardApproval: true,
+    },
+  ],
+}

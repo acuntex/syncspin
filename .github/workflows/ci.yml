@@ -1,0 +1,128 @@
+# Continuous integration for the syncspin workspace.
+#
+# The job names `lint`, `test`, `msrv`, `arm`, `deny` and `docs` are the gates
+# branch protection refers to; renaming one silently drops it from the required
+# set, so keep the names stable.
+#
+# Actions are pinned by version tag, not by commit SHA. Renovate's
+# `helpers:pinGitHubActionDigests` preset (see `renovate.json5`) rewrites them to
+# SHAs on its first run; hand-written SHAs would only be guesses today.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The repository is public and no job needs a secret, so every job gets the
+# read-only default: no token can write, comment or publish.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    # `rust-toolchain.toml` pins `stable` and wins over a job-level toolchain
+    # selection, so this job must override the file explicitly. Without
+    # `RUSTUP_TOOLCHAIN` the MSRV gate would silently test the current stable
+    # (1.95) and pass while 1.85 is broken.
+    env:
+      RUSTUP_TOOLCHAIN: "1.85.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: toolchain in use
+        run: |
+          rustc --version
+          cargo --version
+      - name: cargo test (MSRV)
+        run: cargo test --workspace
+
+  arm:
+    name: arm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: rustup target add armv7
+        run: rustup target add armv7-unknown-linux-gnueabihf
+      # Compile guard, not a release build. The crates are stubs with no
+      # features yet (`--all-features` is a no-op and `--features
+      # player,controller` does not exist), so `cargo check` is all that can be
+      # asserted today. Once a crate links a real dependency or the `wss`
+      # feature lands this must become
+      # `cargo zigbuild --target armv7-unknown-linux-gnueabihf` (installing
+      # `cargo-zigbuild` and a `zig` binary) so the glibc 2.24 baseline is
+      # actually exercised.
+      - name: cargo check (armv7)
+        run: cargo check --workspace --target armv7-unknown-linux-gnueabihf
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      # No `-D warnings`: `license-not-encountered` (formerly
+      # `unused-allowed-license`) reports every allowed licence that no
+      # dependency uses yet, which is every entry of the allowlist at 0.1. That
+      # warning is expected until the dependency tree grows; do not turn it into
+      # a failure.
+      - name: cargo deny
+        run: cargo deny check
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+
+  # `semver` is deliberately absent. `cargo-semver-checks`
+  # (`taiki-e/install-action@v2` with `tool: cargo-semver-checks`) needs a
+  # published baseline, and no crate has ever been published, so the job would
+  # fail on every run. It belongs to the release workflow once `0.1.0` is on
+  # crates.io; add it here only if the baseline becomes a git tag.

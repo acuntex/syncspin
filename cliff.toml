@@ -1,0 +1,56 @@
+# git-cliff configuration: Conventional Commits -> Keep a Changelog sections.
+#
+# Release step - regenerate the changelog, then normalise the whitespace
+# git-cliff leaves at the end of the file:
+#   git cliff --output CHANGELOG.md
+#   npx --yes prettier@3.9.10 --write CHANGELOG.md
+# `git cliff --unreleased --tag v0.1.0 --prepend CHANGELOG.md` also works, but
+# the section it inserts ends without a blank line before the previous release.
+
+[changelog]
+header = """# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+"""
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}
+{% endfor %}\
+{% endfor %}
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = true
+# Conventional Commits are a hard rule in AGENTS.md, so an unconventional
+# subject is a mistake, not changelog material.
+filter_unconventional = true
+split_commits = false
+protect_breaking_commits = false
+filter_commits = false
+tag_pattern = "v[0-9]*"
+skip_tags = ""
+sort_commits = "oldest"
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^security", group = "Security" },
+  { message = "^deprecat", group = "Deprecated" },
+  { message = "^(perf|refactor|change)", group = "Changed" },
+  { message = "^(remove|revert)", group = "Removed" },
+  # Keep a Changelog has no section for these; the commits stay in `git log`.
+  { message = "^(docs|test|tests|style|chore|ci|build|release)", skip = true },
+  { message = "^Merge", skip = true },
+]

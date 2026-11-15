@@ -1,0 +1,43 @@
+# Local gates, run before every commit. Install with `pre-commit install` and
+# run everything with `pre-commit run --all-files`. CI runs the same checks
+# (`.github/workflows/ci.yml`); this file is the fast copy, not a second source
+# of truth.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+      # Prettier is not vendored: the version is pinned here to the one the
+      # sibling repository uses, so formatting cannot
+      # drift between the two.
+      #
+      # Markdown is deliberately left out. `AGENTS.md` and `README.md` are prose
+      # written before any prettier config existed and are not prettier-clean;
+      # reformatting them is not part of this change, and a hook that fails on
+      # an untouched file is worse than no hook. Machine formats are checked.
+      - id: prettier
+        name: prettier
+        entry: npx --yes prettier@3.9.10 --check
+        language: system
+        files: \.(ya?ml|json|json5)$
+
+# `cargo deny check` is deliberately not a hook: it needs `cargo-deny` and the
+# advisory database over the network, and would block a commit on a machine
+# without them. The `deny` job in CI is the gate.
