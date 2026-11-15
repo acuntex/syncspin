@@ -18,8 +18,10 @@ mod config;
 mod session;
 mod sink;
 
-pub use client::{connect, Client, ClientHandle, Event, EventStream, PlaybackState};
-pub use config::{AudioMode, ClientConfig, MAX_PLAYER_NAME_LEN};
+pub use client::{
+    connect, connect_with_psks, Client, ClientHandle, Event, EventStream, PlaybackState,
+};
+pub use config::{AudioMode, ClientConfig, PskCategory, StoredPsk, MAX_PLAYER_NAME_LEN};
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};
 
 // The identity is part of [`ClientConfig`], so a host that builds a configuration needs it. A

@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use snow::{Builder, HandshakeState, Keypair, TransportState as SnowTransport};
@@ -25,8 +25,8 @@ use tokio_tungstenite::{accept_async, WebSocketStream};
 
 use syncspin_core::framing::{split_binary, MAX_PLAINTEXT_LEN};
 use syncspin_core::messages::{
-    ClientHello, ClientTime, Incoming, Metadata, NoiseHandshake, ServerActivate, ServerHello,
-    ServerState, ServerTime, StreamStart, StreamStartPlayer,
+    ClientHello, ClientState, ClientTime, Incoming, Metadata, NoiseHandshake, ServerActivate,
+    ServerHello, ServerState, ServerTime, StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
 };
 use syncspin_core::noise::{MAX_MESSAGE_LEN, NOISE_PARAMS, SENTINEL_PSK, SENTINEL_PSK_ID};
 
@@ -47,8 +47,10 @@ pub struct ServerOptions {
     /// With `false` the server answers `server/init` and then waits, which is the "a server that
     /// does not speak the protocol" case.
     pub start_handshake: bool,
-    /// Whether `client/time` requests are answered.
-    pub answer_time: bool,
+    /// Roles the first `server/activate` announces.
+    pub active_roles: Vec<String>,
+    /// How many `client/time` requests to answer; `None` answers all, `Some(0)` none.
+    pub answer_time_limit: Option<usize>,
 }
 
 impl Default for ServerOptions {
@@ -59,7 +61,8 @@ impl Default for ServerOptions {
             psk: SENTINEL_PSK,
             metadata: None,
             start_handshake: true,
-            answer_time: true,
+            active_roles: vec!["player@v1".to_owned(), "metadata@v1".to_owned()],
+            answer_time_limit: None,
         }
     }
 }
@@ -74,7 +77,14 @@ pub enum Command {
         sample_rate: u32,
         channels: u8,
         bit_depth: u8,
+        codec_header: Option<String>,
     },
+    /// Sends `stream/end`.
+    StreamEnd,
+    /// Sends `stream/clear`.
+    StreamClear { from_timestamp: Option<i64> },
+    /// Sends `server/activate` with a new role set.
+    Activate(Vec<String>),
     /// Sends `server/state` with title and artist.
     Metadata {
         title: &'static str,
@@ -86,6 +96,8 @@ pub enum Command {
         send_ahead: u32,
         data: Vec<u8>,
     },
+    /// Sends a raw transport plaintext, for malformed frames a structured command cannot build.
+    Binary(Vec<u8>),
     /// Closes the WebSocket cleanly.
     Close,
 }
@@ -100,8 +112,10 @@ pub enum Observation {
     ClosedBeforeMessage2,
     /// The client announced itself.
     ClientHello(Box<ClientHello>),
-    /// The client reported its state once the clock estimate was ready.
-    ClientState,
+    /// The client reported its state.
+    ClientState(Box<ClientState>),
+    /// The server answered the nth `client/time` request.
+    TimeReply(usize),
     /// The connection closed.
     Closed,
 }
@@ -162,14 +176,44 @@ impl FakeServer {
         let _ = self.commands.send(Command::Json(body.into()));
     }
 
-    /// Sends `stream/start` with the given format.
+    /// Sends `stream/start` with the given format and no codec header.
     pub fn stream_start(&self, codec: &'static str, sample_rate: u32, channels: u8, bit_depth: u8) {
+        self.stream_start_with_header(codec, sample_rate, channels, bit_depth, None);
+    }
+
+    /// Sends `stream/start` with a codec header, encoded as standard base64.
+    pub fn stream_start_with_header(
+        &self,
+        codec: &'static str,
+        sample_rate: u32,
+        channels: u8,
+        bit_depth: u8,
+        codec_header: Option<&[u8]>,
+    ) {
         let _ = self.commands.send(Command::StreamStart {
             codec,
             sample_rate,
             channels,
             bit_depth,
+            codec_header: codec_header.map(|header| STANDARD.encode(header)),
         });
+    }
+
+    /// Sends `stream/end`.
+    pub fn stream_end(&self) {
+        let _ = self.commands.send(Command::StreamEnd);
+    }
+
+    /// Sends `stream/clear`, optionally from a server timestamp.
+    pub fn stream_clear(&self, from_timestamp: Option<i64>) {
+        let _ = self.commands.send(Command::StreamClear { from_timestamp });
+    }
+
+    /// Sends `server/activate` with a new role set.
+    pub fn activate(&self, roles: &[&str]) {
+        let _ = self.commands.send(Command::Activate(
+            roles.iter().map(|role| (*role).to_owned()).collect(),
+        ));
     }
 
     /// Sends `server/state` with the given metadata.
@@ -186,6 +230,11 @@ impl FakeServer {
         });
     }
 
+    /// Sends a raw plaintext as one Noise transport message.
+    pub fn binary(&self, plaintext: Vec<u8>) {
+        let _ = self.commands.send(Command::Binary(plaintext));
+    }
+
     /// Closes the connection cleanly.
     pub fn close(&self) {
         let _ = self.commands.send(Command::Close);
@@ -194,6 +243,17 @@ impl FakeServer {
     /// Waits for the next thing the server observed.
     pub async fn observation(&mut self) -> Option<Observation> {
         self.observations.recv().await
+    }
+
+    /// Waits until at least `count` clock requests were answered.
+    pub async fn wait_for_time_replies(&mut self, count: usize) -> bool {
+        loop {
+            match self.observation().await {
+                Some(Observation::TimeReply(answered)) if answered >= count => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
     }
 
     /// Waits until the client announces itself.
@@ -207,13 +267,13 @@ impl FakeServer {
         }
     }
 
-    /// Waits until the client reports its state, which happens once its clock estimate is ready.
-    pub async fn wait_for_client_state(&mut self) -> bool {
+    /// Waits until the client reports its player state.
+    pub async fn wait_for_client_state(&mut self) -> Option<ClientState> {
         loop {
             match self.observation().await {
-                Some(Observation::ClientState) => return true,
+                Some(Observation::ClientState(state)) => return Some(*state),
                 Some(_) => continue,
-                None => return false,
+                None => return None,
             }
         }
     }
@@ -362,13 +422,14 @@ async fn serve(
         &mut noise,
         &Incoming::ServerActivate(ServerActivate {
             activities: vec!["playback".to_owned()],
-            active_roles: Some(vec!["player@v1".to_owned(), "metadata@v1".to_owned()]),
+            active_roles: Some(options.active_roles.clone()),
             pairing: None,
         }),
     )
     .await?;
 
     // 8. Serve until a close.
+    let mut answered_time = 0usize;
     loop {
         // The two sources are turned into one event first, so the socket is only borrowed by the
         // select itself and the handlers can still write to it.
@@ -379,8 +440,15 @@ async fn serve(
         match event {
             LinkEvent::Socket(Some(Ok(Message::Binary(bytes)))) => {
                 let plaintext = decrypt(&mut noise, &bytes)?;
-                handle_client_message(&plaintext, &mut socket, &mut noise, &options, &observations)
-                    .await?;
+                handle_client_message(
+                    &plaintext,
+                    &mut socket,
+                    &mut noise,
+                    &options,
+                    &mut answered_time,
+                    &observations,
+                )
+                .await?;
             }
             LinkEvent::Socket(Some(Ok(Message::Ping(payload)))) => {
                 socket.send(Message::Pong(payload)).await?;
@@ -399,6 +467,7 @@ async fn serve(
                 sample_rate,
                 channels,
                 bit_depth,
+                codec_header,
             })) => {
                 send_encrypted(
                     &mut socket,
@@ -410,8 +479,40 @@ async fn serve(
                             sample_rate,
                             channels,
                             bit_depth,
-                            codec_header: None,
+                            codec_header,
                         }),
+                    }),
+                )
+                .await?;
+            }
+            LinkEvent::Command(Some(Command::StreamEnd)) => {
+                send_encrypted(
+                    &mut socket,
+                    &mut noise,
+                    &Incoming::StreamEnd(StreamEnd { roles: None }),
+                )
+                .await?;
+            }
+            LinkEvent::Command(Some(Command::StreamClear { from_timestamp })) => {
+                send_encrypted(
+                    &mut socket,
+                    &mut noise,
+                    &Incoming::StreamClear(StreamClear {
+                        server_transmitted: now_us(),
+                        from_timestamp,
+                        roles: None,
+                    }),
+                )
+                .await?;
+            }
+            LinkEvent::Command(Some(Command::Activate(roles))) => {
+                send_encrypted(
+                    &mut socket,
+                    &mut noise,
+                    &Incoming::ServerActivate(ServerActivate {
+                        activities: Vec::new(),
+                        active_roles: Some(roles),
+                        pairing: None,
                     }),
                 )
                 .await?;
@@ -451,6 +552,10 @@ async fn serve(
                     socket.send(Message::binary(ciphertext)).await?;
                 }
             }
+            LinkEvent::Command(Some(Command::Binary(plaintext))) => {
+                let ciphertext = encrypt(&mut noise, &plaintext)?;
+                socket.send(Message::binary(ciphertext)).await?;
+            }
             LinkEvent::Command(Some(Command::Close)) | LinkEvent::Command(None) => {
                 socket.close(None).await?;
                 let _ = observations.send(Observation::Closed);
@@ -474,6 +579,7 @@ async fn handle_client_message(
     socket: &mut Socket,
     noise: &mut SnowTransport,
     options: &ServerOptions,
+    answered_time: &mut usize,
     observations: &UnboundedSender<Observation>,
 ) -> Result<()> {
     let Some(&0) = plaintext.first() else {
@@ -481,12 +587,18 @@ async fn handle_client_message(
     };
     let text = std::str::from_utf8(&plaintext[1..]).context("client JSON is not UTF-8")?;
     match Incoming::parse(text)? {
-        Some(Incoming::ClientTime(request)) if options.answer_time => {
+        Some(Incoming::ClientTime(request))
+            if options
+                .answer_time_limit
+                .is_none_or(|limit| *answered_time < limit) =>
+        {
+            *answered_time += 1;
             let reply = answer_time(request);
             send_encrypted(socket, noise, &reply).await?;
+            let _ = observations.send(Observation::TimeReply(*answered_time));
         }
-        Some(Incoming::ClientState(_)) => {
-            let _ = observations.send(Observation::ClientState);
+        Some(Incoming::ClientState(state)) => {
+            let _ = observations.send(Observation::ClientState(Box::new(state)));
         }
         // client/hello, client/time while answers are disabled, and future types.
         _ => {}

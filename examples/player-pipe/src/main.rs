@@ -172,7 +172,7 @@ async fn serve(config: &ClientConfig) -> Result<Ending> {
                         "stream: {} {} Hz, {} channels, {}-bit",
                         format.codec, format.sample_rate, format.channels, format.bit_depth
                     ),
-                    Event::Track { title, artist } => {
+                    Event::Track { title, artist, .. } => {
                         let label = match (artist.as_str(), title.as_str()) {
                             ("", "") => "(none)".to_owned(),
                             ("", title) => title.to_owned(),
@@ -182,8 +182,14 @@ async fn serve(config: &ClientConfig) -> Result<Ending> {
                         eprintln!("track: {label}");
                     }
                     Event::Volume { level, muted } => {
-                        let mute = if muted { ", muted" } else { "" };
-                        eprintln!("volume: {level}{mute}");
+                        let mut parts: Vec<String> = Vec::new();
+                        if let Some(level) = level {
+                            parts.push(format!("level {level}"));
+                        }
+                        if let Some(muted) = muted {
+                            parts.push(if muted { "muted".to_owned() } else { "unmuted".to_owned() });
+                        }
+                        eprintln!("volume command: {}", parts.join(", "));
                     }
                     Event::State(state) => {
                         let mut parts: Vec<String> = Vec::new();
@@ -205,6 +211,8 @@ async fn serve(config: &ClientConfig) -> Result<Ending> {
                     Event::Disconnected { reason, retry_in } => {
                         return Ok(Ending::Disconnected { reason, retry_in, connected });
                     }
+                    // A later revision can add events; this example only prints the ones it knows.
+                    _ => {}
                 }
             }
         }

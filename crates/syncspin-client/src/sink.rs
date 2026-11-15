@@ -90,7 +90,11 @@ impl From<String> for Codec {
 /// The fields are the wire values of the stream announcement, unchanged. For [`Codec::Pcm`] the
 /// samples are signed 16-bit little-endian when `bit_depth` is 16, interleaved by channel; other
 /// depths keep the same convention scaled to the announced width.
+///
+/// The struct is non-exhaustive so a later protocol revision can add a field without breaking a
+/// sink implementation. A sink only receives it from [`Sink::open`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AudioFormat {
     /// Codec of the stream.
     pub codec: Codec,
@@ -100,6 +104,11 @@ pub struct AudioFormat {
     pub channels: u8,
     /// Bits per sample; meaningful for [`Codec::Pcm`] and [`Codec::Flac`].
     pub bit_depth: u8,
+    /// Codec header carried by the stream announcement, decoded from its base64 form.
+    ///
+    /// For FLAC this is the `fLaC` marker followed by `STREAMINFO`; a decoder needs it before the
+    /// first frame. Absent for PCM and Opus. The bytes are exactly what the server sent.
+    pub codec_header: Option<Vec<u8>>,
 }
 
 /// Audio output owned by the host application.

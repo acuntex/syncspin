@@ -21,6 +21,11 @@ harmless.
 | 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                   | Stage 1b                      |
 | 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections) | Closes in 0.2                 |
 | 9   | No `client/goodbye` writer                                      | [`messaging.md` — `client/goodbye`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clientgoodbye)               | Stage 1b                      |
+| 10  | Transport-mode re-handshake ignored                             | [`connection.md` — Re-handshake](https://github.com/Sendspin/spec/blob/main/connection.md#re-handshake)                                 | Stage 2                       |
+| 11  | `pairing_psk` advertised without the Pairing PSK flow           | [`messaging.md` — `client/hello`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clienthello)                   | Stage 2                       |
+| 12  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                   | Stage 1b                      |
+| 13  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                   | Stage 1b                      |
+| 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                     | Stage 1b                      |
 
 ## 1. Client-initiated connections only
 
@@ -100,7 +105,10 @@ Sentinel PSK and hands the decrypted message-1 payload back verbatim; the caller
 with `Responder::set_psk` between reading message 1 and writing message 2. The selecting and
 validating is the session layer's job: `PskMetadata::parse` rejects an unknown category and a
 non-canonical id, and `select_psk` applies the matching key and falls back to the Sentinel key only
-on the initial handshake. `core` itself enforces none of that.
+on the initial handshake. A host can pass pairing records through `connect_with_psks`
+(`StoredPsk`: category, key and `server_id`); `select_psk` matches category and id, then checks the
+record's `server_id` against `server/init`. `connect` passes no records, so the guest path always
+falls back. `core` itself enforces none of that.
 
 **Why:** the Noise module owns no storage and no policy, so it cannot enumerate candidate PSKs or
 decide what a category mismatch means. Splitting it this way keeps `core` free of file I/O and lets
@@ -108,8 +116,9 @@ a host with its own identity store drive selection.
 
 **Consequence while it stands:** a caller that drives `Responder` directly and ignores the payload
 completes a handshake against any announced `psk_id`/`psk_category` pair, with no fallback decision
-made for it. The client path is covered: the session validates the metadata and, because it stores no
-pairing keys yet, falls back to the Sentinel key on the initial handshake only.
+made for it. The client path is covered: the session validates the metadata, checks the category,
+id and server id of a stored record, and falls back to the Sentinel key on the initial handshake
+only. No pairing record is generated or persisted by this crate yet.
 
 **Removing it:** give `core` a PSK resolver (a trait the session implements over its storage, passed
 into the responder) so the handshake cannot finish without a matched category and id, and enforce
@@ -211,6 +220,96 @@ sites would be an API nobody can reach.
 **Removing it:** add the typed writer and send it on the paths that have a reason (user request,
 shutdown, restart, another server), then test on the fake server that the server sees the reason
 before the close.
+
+## 10. Transport-mode re-handshake ignored
+
+**Spec:** `connection.md`, _Re-handshake_. Once the transport is established, the server may send
+Noise message 1 again to rotate the connection to a paired PSK; the client answers with message 2
+over the same transport, without repeating the cleartext init exchange.
+
+**What we do:** `handshake` runs once per WebSocket. `serve` decrypts later messages and
+`handle_json` has no arm for `Incoming::NoiseHandshake`, so a re-handshake arrives as an ignored
+message and the connection keeps its original key. There is no second handshake path at all.
+
+**Why:** the guest client only ever uses the published Sentinel key, and no pairing PSK exists to
+rotate to (entries 3 and 5). A half-implemented re-handshake that ignored a failed message 2 would
+be worse than leaving the upgrade to stage 2, where records and the server-id binding exist.
+
+**Removing it:** add a re-handshake state entered on an encrypted `noise/handshake` message 1,
+answer with message 2 over the same transport, swap the `TransportState`, and fail the connection
+when the selected key is a miss (no Sentinel fallback). Test the successful rotation and the miss
+against the fake server.
+
+## 11. `pairing_psk` advertised before the Pairing PSK flow exists
+
+**Spec:** `messaging.md`, `client/hello` → `supported_pair_methods`. A client that advertises
+`pairing_psk` MUST be able to run the Pairing PSK flow, and a server may select the method from
+that advertisement.
+
+**What we do:** `client_hello` always sends `supported_pair_methods: {"pairing_psk": {}}`, but the
+client has no `client/pair-init` or `client/pair-auth` handling, no storage trait and no pairing
+PSK. A server that selects the method starts a flow the client cannot answer.
+
+**Why:** the field is part of the hello the extracted client already sends, and pairing is stage 2;
+removing it would change the wire format twice. The advertisement is currently only consistent with
+the guest transport it offers.
+
+**Removing it:** implement the Pairing PSK flow and record storage (stage 2), or stop advertising
+the method until it exists. Test the server's selected method against the fake server either way.
+
+## 12. Scheduled metadata applied immediately
+
+**Spec:** `messaging.md`, `server/state` → `metadata.timestamp`. The field is the server time at
+which the metadata becomes valid; a client that buffers audio ahead of playout should schedule the
+change rather than apply it on arrival.
+
+**What we do:** `handle_state` emits `Event::Track` as soon as the message is decoded, so the
+timestamp is ignored. A title or artwork overlay can be ahead of the audible position by the buffer
+depth (at least the 250 ms the client asks for, more when the sink buffers).
+
+**Why:** scheduling needs a per-role event queue with a timer tied to the clock filter, which the
+session does not have yet; the extracted consumer treated metadata as immediate. Applying it late
+also needs a rule for a change that is superseded before it becomes valid, which belongs with that
+queue.
+
+**Removing it:** give metadata its own scheduled queue, compare `timestamp` with `clock.now_us`,
+and emit at the mapped deadline. Test a future timestamp, a past one, and a change superseded before
+it becomes valid.
+
+## 13. In-place format change flushes buffered audio
+
+**Spec:** `messaging.md`, `stream/start`. The server may send it again with a new format to
+reconfigure a running stream.
+
+**What we do:** `handle_stream_start` flushes the sink and opens the new format, so every frame
+buffered for the old format is dropped. That is safe - no mixed-format audio is played - but not
+gapless: audio already handed to the sink is discarded at the switch.
+
+**Why:** `Sink::open` is the only format-change hook and its contract starts a new stream. A
+gapless switch would need a drain-and-swap step or a second output, neither of which the trait
+offers, and the current consumer's format does not change mid-stream.
+
+**Removing it:** extend the sink contract with a drain-and-switch path (or a second output), wait
+for the old buffer to drain at the switch timestamp, and test a mid-stream change against a sink
+that records the boundary.
+
+## 14. `Sink::underruns()` is not used
+
+**Spec:** none; this is the design's sink contract (`docs/design/syncspin-design.md`, _Playout
+timing_), which expects underrun counts to feed buffer corrections.
+
+**What we do:** `Sink::underruns` has a default of zero and the session never calls it. "The sink
+reports latency and underruns back" is therefore half true: `latency()` fills `output_delay_ms`,
+while `underruns()` is inert. A host can implement it for its own diagnostics, but the crate makes
+no decision from it.
+
+**Why:** adapting `min_buffer_ms` needs the re-sync and state-reporting loop plus a sink whose
+buffers the crate understands; the guest session only reports its initial state. Wiring an unused
+number into playback would be an unverified control loop.
+
+**Removing it:** read `underruns()` at each `client/state` report and after a clock burst, grow
+`min_buffer_ms` (bounded) when the count rises, and test the reported value against a fake sink that
+returns a fixed count.
 
 ## How to update this file
 

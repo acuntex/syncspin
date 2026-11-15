@@ -1,5 +1,6 @@
 //! Connection configuration.
 
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -24,6 +25,56 @@ pub enum AudioMode {
     /// [`AudioFrame::Encoded`](crate::AudioFrame::Encoded). A PCM stream still arrives as
     /// [`AudioFrame::Pcm`](crate::AudioFrame::Pcm), because there is nothing to decode.
     Passthrough,
+}
+
+/// Category of a pre-shared key, as the server announces it in Noise message 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PskCategory {
+    /// Long-term pairing key.
+    LongTerm,
+    /// Key for one pairing attempt.
+    Pairing,
+    /// The published key that authenticates nothing.
+    Sentinel,
+}
+
+impl PskCategory {
+    /// Decodes the two-letter category from the wire.
+    pub(crate) fn from_wire(value: &str) -> Option<PskCategory> {
+        match value {
+            "lt" => Some(PskCategory::LongTerm),
+            "pr" => Some(PskCategory::Pairing),
+            "sn" => Some(PskCategory::Sentinel),
+            _ => None,
+        }
+    }
+}
+
+/// A pre-shared key the host stores for a known server.
+///
+/// Selection after Noise message 1 compares the announced category and key id; a match is only
+/// accepted when `server_id` equals the one in `server/init`. The key itself is never formatted or
+/// logged: `Debug` prints it redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredPsk {
+    /// Category the key belongs to.
+    pub category: PskCategory,
+    /// The 32-byte key.
+    pub psk: [u8; 32],
+    /// Static public key of the server this key belongs to, as announced in `server/init`.
+    pub server_id: String,
+}
+
+impl fmt::Debug for StoredPsk {
+    /// Formats the record with the key material redacted.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredPsk")
+            .field("category", &self.category)
+            .field("psk", &"<redacted>")
+            .field("server_id", &self.server_id)
+            .finish()
+    }
 }
 
 /// Everything the client needs to open a session.

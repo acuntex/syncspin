@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::config::ClientConfig;
+use crate::config::{ClientConfig, StoredPsk};
 use crate::session::{Session, Transport};
 use crate::sink::{AudioFormat, Sink};
 
@@ -16,8 +16,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Something that happened on the connection.
 ///
 /// Events are ordered as the connection produced them, and a session reports at most one
-/// [`Event::Disconnected`], as its last event.
+/// [`Event::Disconnected`], as its last event. The enum is non-exhaustive: a later revision adds
+/// events without breaking a host's match.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// The Noise handshake finished and the session is ready for playback.
     ///
@@ -50,29 +52,43 @@ pub enum Event {
     },
     /// Now-playing metadata changed.
     ///
-    /// Absent fields are reported as empty strings, so a host can clear its display.
+    /// Absent text fields are reported as empty strings, so a host can clear its display; absent
+    /// progress fields are `None`.
     Track {
         /// Track title.
         title: String,
         /// Track artist.
         artist: String,
+        /// Album title.
+        album: String,
+        /// Album artist.
+        album_artist: String,
+        /// URL of the artwork image, empty when the server sent none.
+        artwork_url: String,
+        /// Position within the track in milliseconds, when the server reports one.
+        progress_ms: Option<u64>,
+        /// Track length in milliseconds, when the server reports one.
+        duration_ms: Option<u64>,
     },
     /// The server's view of playback state changed.
     State(PlaybackState),
     /// The server asked this player to change its volume or mute state.
     ///
     /// The session reports the request unchanged; applying platform limits and reporting the
-    /// applied value back to the server is the host's decision.
+    /// applied value back to the server is the host's decision. Exactly one of the two fields is
+    /// present: a volume command carries the requested level, a mute command the requested state.
+    /// A mute command therefore never looks like a request to set the volume to zero.
     Volume {
-        /// Volume in the range 0-100 that was requested, or the last known level.
-        level: u8,
-        /// Mute state that was requested, or the last known state.
-        muted: bool,
+        /// Volume in the range 0-100 that was requested.
+        level: Option<u8>,
+        /// Mute state that was requested.
+        muted: Option<bool>,
     },
 }
 
 /// Playback state as the server describes it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PlaybackState {
     /// Commands the server accepts from clients in the same group.
     pub supported_commands: Vec<String>,
@@ -133,6 +149,17 @@ impl Client {
     ) -> Result<(ClientHandle, EventStream)> {
         connect(config, sink).await
     }
+
+    /// Connects with pairing keys the host stores for known servers.
+    ///
+    /// See [`connect_with_psks`] for the details.
+    pub async fn connect_with_psks(
+        config: ClientConfig,
+        sink: Box<dyn Sink>,
+        psks: Vec<StoredPsk>,
+    ) -> Result<(ClientHandle, EventStream)> {
+        connect_with_psks(config, sink, psks).await
+    }
 }
 
 /// Connects to a server, hands the sink to the session and returns its handle and event stream.
@@ -154,6 +181,25 @@ pub async fn connect(
     config: ClientConfig,
     sink: Box<dyn Sink>,
 ) -> Result<(ClientHandle, EventStream)> {
+    connect_with_psks(config, sink, Vec::new()).await
+}
+
+/// Connects with pairing keys the host stores for known servers.
+///
+/// The server announces a `psk_id` and `psk_category` in Noise message 1. A candidate matches when
+/// its category and derived id both match the announcement; its `server_id` must then equal the one
+/// in `server/init`. On a lookup miss the initial handshake continues with the published Sentinel
+/// key, which is why [`connect`] is the same call with no candidates.
+///
+/// The keys are used for the handshake only; they are not stored or logged.
+///
+/// # Errors
+/// Same as [`connect`], plus a handshake error when a matched record belongs to another server.
+pub async fn connect_with_psks(
+    config: ClientConfig,
+    sink: Box<dyn Sink>,
+    psks: Vec<StoredPsk>,
+) -> Result<(ClientHandle, EventStream)> {
     config.validate()?;
     let endpoint = endpoint(&config.server)?;
     let transport = tokio::time::timeout(CONNECT_TIMEOUT, Transport::connect(&endpoint))
@@ -161,8 +207,16 @@ pub async fn connect(
         .with_context(|| format!("timed out connecting to {endpoint}"))??;
 
     let (events, receiver) = mpsc::unbounded_channel();
-    let task = tokio::spawn(Session::start(transport, config, sink, events));
+    let task = tokio::spawn(Session::start(transport, config, sink, events, psks));
     Ok((ClientHandle { task }, EventStream { events: receiver }))
+}
+
+/// Splits a URL tail into the part before a query or fragment and the marker onward.
+fn split_marker(value: &str) -> (&str, &str) {
+    match value.find(['?', '#']) {
+        Some(index) => value.split_at(index),
+        None => (value, ""),
+    }
 }
 
 /// Builds the WebSocket URL for a configured server address.
@@ -182,16 +236,31 @@ fn endpoint(server: &str) -> Result<String> {
         if rest.is_empty() {
             bail!("the WebSocket address {server:?} names no host");
         }
-        return Ok(match rest.split_once('/') {
-            None => format!("{server}/sendspin"),
-            Some((_, "")) => format!("{server}sendspin"),
-            Some(_) => server.to_owned(),
-        });
+        // A query or fragment belongs after the path, so the default path has to be inserted
+        // before it rather than appended to the whole URL.
+        let (before_marker, after_marker) = split_marker(rest);
+        let Some((authority, path)) = before_marker.split_once('/') else {
+            if before_marker.is_empty() {
+                bail!("the WebSocket address {server:?} names no host");
+            }
+            return Ok(format!("ws://{before_marker}/sendspin{after_marker}"));
+        };
+        if authority.is_empty() {
+            bail!("the WebSocket address {server:?} names no host");
+        }
+        if path.is_empty() {
+            return Ok(format!("ws://{authority}/sendspin{after_marker}"));
+        }
+        return Ok(format!("ws://{before_marker}{after_marker}"));
     }
     if server.contains("://") {
         bail!("unsupported URL scheme in {server:?}; use ws:// or host:port");
     }
-    Ok(format!("ws://{server}/sendspin"))
+    let (before_marker, after_marker) = split_marker(server);
+    if before_marker.is_empty() {
+        bail!("the server address is empty");
+    }
+    Ok(format!("ws://{before_marker}/sendspin{after_marker}"))
 }
 
 #[cfg(test)]
@@ -219,6 +288,30 @@ mod tests {
         assert_eq!(
             endpoint("ws://example.test:1/player").unwrap(),
             "ws://example.test:1/player"
+        );
+    }
+
+    #[test]
+    fn a_query_or_fragment_stays_after_the_default_path() {
+        assert_eq!(
+            endpoint("ws://example.test:1?token=1").unwrap(),
+            "ws://example.test:1/sendspin?token=1"
+        );
+        assert_eq!(
+            endpoint("ws://example.test:1#frag").unwrap(),
+            "ws://example.test:1/sendspin#frag"
+        );
+        assert_eq!(
+            endpoint("ws://example.test:1/?token=1").unwrap(),
+            "ws://example.test:1/sendspin?token=1"
+        );
+        assert_eq!(
+            endpoint("ws://example.test:1/player?token=1").unwrap(),
+            "ws://example.test:1/player?token=1"
+        );
+        assert_eq!(
+            endpoint("example.test:1?token=1").unwrap(),
+            "ws://example.test:1/sendspin?token=1"
         );
     }
 

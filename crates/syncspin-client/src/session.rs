@@ -9,7 +9,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -25,15 +25,15 @@ use syncspin_core::framing::{
 use syncspin_core::messages::{
     AudioChunkHeader, ClientHello, ClientInit, ClientState, ClientTime, Incoming, NoiseHandshake,
     PairingPskMethod, PlayerState, PlayerSupport, ServerActivate, ServerCommand, ServerState,
-    ServerTime, StreamStart, SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID,
-    NOISE_SUITE, PROTOCOL_VERSION,
+    ServerTime, StreamClear, StreamStart, SupportedFormat, SupportedPairMethods, UnpairedAccess,
+    AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
 };
 use syncspin_core::noise::{
     psk_id_for, Responder, TransportState as NoiseTransport, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
 
 use crate::client::{Event, PlaybackState};
-use crate::config::{AudioMode, ClientConfig};
+use crate::config::{AudioMode, ClientConfig, PskCategory, StoredPsk};
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 
 /// How long the Noise handshake may take, from `client/init` to the first `server/activate`.
@@ -53,6 +53,12 @@ const PLAYER_ROLE: &str = "player@v1";
 
 /// Versioned role identifier of the now-playing metadata.
 const METADATA_ROLE: &str = "metadata@v1";
+
+/// Versioned role identifier of the group controller state.
+const CONTROLLER_ROLE: &str = "controller@v1";
+
+/// Largest output delay reported to the server, in milliseconds.
+const MAX_OUTPUT_DELAY_MS: u32 = 5_000;
 
 /// Startup lead time reported to the server, in milliseconds.
 const REQUIRED_LEAD_TIME_MS: u32 = 250;
@@ -167,15 +173,14 @@ pub(crate) struct Session {
     stream: Option<AudioFormat>,
     /// Remaining `client/time` messages of the current burst (0 = no burst running).
     sync_remaining: usize,
-    /// Deadline for the current `client/time` reply, or `None` when not awaiting one.
-    sync_deadline: Option<Instant>,
+    /// Deadline for the current burst, or `None` when no burst is running.
+    burst_deadline: Option<Instant>,
     /// When the current or last burst started, for periodic re-sync spacing.
     burst_started: Option<Instant>,
-    initial_state_sent: bool,
-    /// Last requested volume, kept so a mute command can report a level.
-    volume: u8,
-    /// Last requested mute state, kept so a volume command can report it.
-    muted: bool,
+    /// Samples collected during the current burst; only the best one is pushed.
+    burst_samples: Vec<TimeSample>,
+    /// Whether the player state was reported since the player role last became active.
+    state_sent: bool,
 }
 
 impl Session {
@@ -189,9 +194,10 @@ impl Session {
         config: ClientConfig,
         sink: Box<dyn Sink>,
         events: mpsc::UnboundedSender<Event>,
+        psks: Vec<StoredPsk>,
     ) -> Result<()> {
         let handshake =
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(transport, &config)).await;
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(transport, &config, &psks)).await;
         let ready = match handshake {
             Ok(result) => result,
             Err(_elapsed) => Err(anyhow!("timed out during the Noise handshake")),
@@ -218,11 +224,10 @@ impl Session {
             active_roles: ready.active_roles,
             stream: None,
             sync_remaining: 0,
-            sync_deadline: None,
+            burst_deadline: None,
             burst_started: None,
-            initial_state_sent: false,
-            volume: 0,
-            muted: false,
+            burst_samples: Vec::new(),
+            state_sent: false,
         };
 
         session.emit(Event::Connected {
@@ -254,15 +259,15 @@ impl Session {
 
             self.drive_clock().await?;
 
-            // While a `server/time` reply is outstanding the read has a deadline, so a lost reply
-            // advances the burst instead of stalling it. Any other frame still arrives normally.
-            let incoming = match self.sync_deadline {
+            // While a clock burst is running the read has a deadline, so lost replies end the
+            // burst instead of stalling it. Any other frame still arrives normally.
+            let incoming = match self.burst_deadline {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     match tokio::time::timeout(remaining, self.transport.read()).await {
                         Ok(result) => result?,
                         Err(_elapsed) => {
-                            self.sync_deadline = None;
+                            self.finish_burst().await?;
                             continue;
                         }
                     }
@@ -286,26 +291,39 @@ impl Session {
         }
     }
 
-    /// Starts a fresh burst when the previous one is old enough, and sends its next message.
+    /// Sends the next `client/time` burst when one is due.
+    ///
+    /// A burst is sent as one group and its replies are collected under a single deadline; only
+    /// the measurement with the smallest positive error bound reaches the clock filter.
     async fn drive_clock(&mut self) -> Result<()> {
         if self.sync_remaining == 0
-            && self.sync_deadline.is_none()
+            && self.burst_deadline.is_none()
             && self.player_active()
-            && self.initial_state_sent
-            && self.resync_due()
+            && self.burst_due()
         {
             self.start_burst();
         }
 
-        if self.sync_remaining > 0 && self.sync_deadline.is_none() {
-            let request = Incoming::ClientTime(ClientTime {
-                client_transmitted: now_us(),
-            });
-            self.send_json(&request).await?;
-            self.sync_remaining -= 1;
-            self.sync_deadline = Some(Instant::now() + SYNC_REPLY_TIMEOUT);
+        if self.sync_remaining > 0 {
+            while self.sync_remaining > 0 {
+                let request = Incoming::ClientTime(ClientTime {
+                    client_transmitted: now_us(),
+                });
+                self.send_json(&request).await?;
+                self.sync_remaining -= 1;
+            }
+            self.burst_deadline = Some(Instant::now() + SYNC_REPLY_TIMEOUT);
         }
         Ok(())
+    }
+
+    /// Whether a burst is due.
+    ///
+    /// The clock needs more than one burst to be usable, so the first bursts follow each other
+    /// immediately; afterwards a burst is due when the player state has not been reported yet, and
+    /// then on the re-sync interval.
+    fn burst_due(&self) -> bool {
+        !self.clock.is_ready() || !self.state_sent || self.resync_due()
     }
 
     /// Whether a periodic re-sync burst is due.
@@ -319,8 +337,22 @@ impl Session {
     /// Starts a sync burst of [`SYNC_MESSAGES`] `client/time` round trips.
     fn start_burst(&mut self) {
         self.sync_remaining = SYNC_MESSAGES;
-        self.sync_deadline = None;
+        self.burst_deadline = None;
         self.burst_started = Some(Instant::now());
+        self.burst_samples.clear();
+    }
+
+    /// Ends the current burst: pushes its best measurement and reports the player state once.
+    async fn finish_burst(&mut self) -> Result<()> {
+        self.burst_deadline = None;
+        if let Some(sample) = best_sample(&self.burst_samples) {
+            self.clock.push(sample);
+        }
+        self.burst_samples.clear();
+        if !self.state_sent && self.clock.sample_count() >= 1 && self.player_active() {
+            self.send_client_state().await?;
+        }
+        Ok(())
     }
 
     /// Decrypts one transport message and dispatches the message it carries.
@@ -345,10 +377,7 @@ impl Session {
     async fn handle_json(&mut self, text: &str) -> Result<()> {
         match Incoming::parse(text)? {
             None => Ok(()), // A type this revision does not implement is ignored.
-            Some(Incoming::ServerActivate(activate)) => {
-                self.apply_activate(activate);
-                Ok(())
-            }
+            Some(Incoming::ServerActivate(activate)) => self.apply_activate(activate).await,
             Some(Incoming::ServerTime(time)) => self.handle_server_time(time).await,
             Some(Incoming::ServerState(state)) => {
                 self.handle_state(state);
@@ -359,45 +388,69 @@ impl Session {
                 Ok(())
             }
             Some(Incoming::StreamStart(start)) => self.handle_stream_start(start),
-            // `stream/end` and `stream/clear` have no event in this revision, and every other
-            // message belongs to a role or a direction this client does not act on.
+            Some(Incoming::StreamEnd(_)) => self.stop_stream(),
+            Some(Incoming::StreamClear(clear)) => self.handle_stream_clear(clear),
+            // A message for a role or direction this client does not act on.
             Some(_) => Ok(()),
         }
     }
 
-    /// Applies a `server/activate`: update the roles and start the first sync burst.
-    fn apply_activate(&mut self, activate: ServerActivate) {
+    /// Applies a `server/activate`: role changes, stream teardown and state reporting.
+    async fn apply_activate(&mut self, activate: ServerActivate) -> Result<()> {
+        let had_player = self.player_active();
         if let Some(roles) = activate.active_roles {
             self.active_roles = roles;
         }
-        if self.player_active() && !self.initial_state_sent && self.burst_started.is_none() {
-            self.start_burst();
+        let has_player = self.player_active();
+
+        if had_player && !has_player {
+            // The player role is gone: nothing that is still buffered may become audible.
+            self.state_sent = false;
+            self.sync_remaining = 0;
+            self.burst_deadline = None;
+            self.burst_samples.clear();
+            self.stop_stream()?;
+        } else if !had_player && has_player {
+            // A re-added role reports itself again, from the existing estimate when there is one.
+            if self.clock.sample_count() >= 1 {
+                self.send_client_state().await?;
+            } else {
+                self.start_burst();
+            }
         }
+        Ok(())
     }
 
-    /// Feeds one `server/time` reply into the clock and reports availability once.
+    /// Feeds one `server/time` reply into the current burst.
+    ///
+    /// Only a reply to the burst that is running is used; an unsolicited `server/time` is ignored.
+    /// The burst ends on its last reply or on the deadline in [`Session::serve`].
     async fn handle_server_time(&mut self, time: ServerTime) -> Result<()> {
-        self.clock.push(TimeSample {
+        if self.burst_deadline.is_none() {
+            return Ok(());
+        }
+        self.burst_samples.push(TimeSample {
             client_sent_us: time.client_transmitted,
             server_received_us: time.server_received,
             server_sent_us: time.server_transmitted,
             client_received_us: now_us(),
         });
-        self.sync_deadline = None;
-        if self.clock.is_ready() && !self.initial_state_sent && self.player_active() {
-            self.send_initial_state().await?;
+        if self.burst_samples.len() >= SYNC_MESSAGES {
+            self.finish_burst().await?;
         }
         Ok(())
     }
 
-    /// Sends the initial `client/state` with the sink's output delay and no volume yet.
+    /// Reports the player state, with the sink's output delay and no volume yet.
     ///
-    /// The host owns the output level; until it reports one, the player object carries no volume
+    /// Sent when the player role becomes active and again after it was removed and re-added. The
+    /// host owns the output level; until it reports one, the player object carries no volume
     /// rather than an invented baseline.
-    async fn send_initial_state(&mut self) -> Result<()> {
-        self.initial_state_sent = true;
+    async fn send_client_state(&mut self) -> Result<()> {
+        self.state_sent = true;
         let output_delay_ms = self.sink.latency().map_or(0, |latency| {
-            u32::try_from(latency.as_millis()).unwrap_or(u32::MAX)
+            u32::try_from(latency.as_millis())
+                .map_or(MAX_OUTPUT_DELAY_MS, |delay| delay.min(MAX_OUTPUT_DELAY_MS))
         });
         let state = Incoming::ClientState(ClientState {
             available: true,
@@ -414,17 +467,30 @@ impl Session {
         self.send_json(&state).await
     }
 
-    /// Opens the sink for a newly announced stream.
+    /// Opens the sink for a newly announced player stream.
     fn handle_stream_start(&mut self, start: StreamStart) -> Result<()> {
+        if !self.player_active() {
+            return Ok(());
+        }
         let Some(player) = start.player else {
             // The announcement targets a role this client does not have.
             return Ok(());
         };
+        let codec_header = player
+            .codec_header
+            .as_deref()
+            .map(|encoded| {
+                STANDARD
+                    .decode(encoded)
+                    .context("the stream's codec_header is not standard base64")
+            })
+            .transpose()?;
         let format = AudioFormat {
             codec: Codec::from(player.codec),
             sample_rate: player.sample_rate,
             channels: player.channels,
             bit_depth: player.bit_depth,
+            codec_header,
         };
         if self.config.audio_mode == AudioMode::Decode && format.codec != Codec::Pcm {
             bail!(
@@ -445,17 +511,23 @@ impl Session {
     }
 
     /// Delivers one audio chunk whose 13-byte header the reassembler handed over separately.
+    ///
+    /// The header is protocol syntax even when the frame is not playable: a short or malformed
+    /// chunk closes the connection whether or not a stream is open.
     fn handle_audio(&mut self, body: &[u8]) -> Result<()> {
-        let Some(format) = self.stream.clone() else {
-            // Audio cannot be classified before a stream announced its format.
-            return Ok(());
-        };
-
         // The reassembler removes the message id, which the chunk parser expects.
         let mut message = Vec::with_capacity(1 + body.len());
         message.push(AUDIO_CHUNK_ID);
         message.extend_from_slice(body);
         let (header, data) = AudioChunkHeader::parse(&message)?;
+
+        if !self.player_active() {
+            return Ok(());
+        }
+        let Some(format) = self.stream.clone() else {
+            // Audio cannot be classified before a stream announced its format.
+            return Ok(());
+        };
 
         let frame = match (self.config.audio_mode, &format.codec) {
             (_, Codec::Pcm) => AudioFrame::Pcm(data),
@@ -472,6 +544,24 @@ impl Session {
         self.sink
             .write(frame, due)
             .context("the audio sink rejected a frame")
+    }
+
+    /// Drops buffered audio and forgets the open stream.
+    ///
+    /// A sink that fails to flush ends the session, like any other sink error.
+    fn stop_stream(&mut self) -> Result<()> {
+        self.stream = None;
+        self.sink.flush().context("the audio sink rejected a flush")
+    }
+
+    /// Drops buffered audio without ending the stream.
+    ///
+    /// The client holds no timestamped audio queue of its own - the sink does - so the only
+    /// granularity it can offer is a full flush: a clear with a `from_timestamp` also drops the
+    /// frames after it. The announced format stays open, because the spec lets the stream continue
+    /// and the chunks that follow a seek still belong to it.
+    fn handle_stream_clear(&mut self, _clear: StreamClear) -> Result<()> {
+        self.sink.flush().context("the audio sink rejected a flush")
     }
 
     /// Converts a server timestamp into a local playout deadline.
@@ -494,44 +584,60 @@ impl Session {
             .unwrap_or(now)
     }
 
-    /// Reports one `server/state` message.
+    /// Reports one `server/state` message for the roles this client has active.
     fn handle_state(&mut self, state: ServerState) {
-        if let Some(metadata) = state.metadata {
-            self.emit(Event::Track {
-                title: metadata.title.unwrap_or_default(),
-                artist: metadata.artist.unwrap_or_default(),
-            });
+        if self.role_active(METADATA_ROLE) {
+            if let Some(metadata) = state.metadata {
+                let (progress_ms, duration_ms) = match metadata.progress {
+                    Some(progress) => (progress.track_progress, progress.track_duration),
+                    None => (None, None),
+                };
+                self.emit(Event::Track {
+                    title: metadata.title.unwrap_or_default(),
+                    artist: metadata.artist.unwrap_or_default(),
+                    album: metadata.album.unwrap_or_default(),
+                    album_artist: metadata.album_artist.unwrap_or_default(),
+                    artwork_url: metadata.artwork_url.unwrap_or_default(),
+                    progress_ms,
+                    duration_ms,
+                });
+            }
         }
-        if let Some(controller) = state.controller {
-            self.emit(Event::State(PlaybackState {
-                supported_commands: controller.supported_commands,
-                volume: controller.volume,
-                muted: controller.muted,
-            }));
+        if self.role_active(CONTROLLER_ROLE) {
+            if let Some(controller) = state.controller {
+                self.emit(Event::State(PlaybackState {
+                    supported_commands: controller.supported_commands,
+                    volume: controller.volume,
+                    muted: controller.muted,
+                }));
+            }
         }
     }
 
     /// Reports a player volume or mute request without applying a platform limit.
+    ///
+    /// Exactly one field of the event is present, so a mute request never carries a volume.
     fn handle_command(&mut self, command: ServerCommand) {
+        if !self.player_active() {
+            return;
+        }
         let Some(player) = command.player else {
             return;
         };
         match player.command.as_str() {
             "volume" => {
                 if let Some(level) = player.volume {
-                    self.volume = level;
                     self.emit(Event::Volume {
-                        level,
-                        muted: self.muted,
+                        level: Some(level),
+                        muted: None,
                     });
                 }
             }
             "mute" => {
                 if let Some(muted) = player.mute {
-                    self.muted = muted;
                     self.emit(Event::Volume {
-                        level: self.volume,
-                        muted,
+                        level: None,
+                        muted: Some(muted),
                     });
                 }
             }
@@ -539,9 +645,14 @@ impl Session {
         }
     }
 
+    /// Whether a versioned role is active for this connection.
+    fn role_active(&self, role: &str) -> bool {
+        self.active_roles.iter().any(|active| active == role)
+    }
+
     /// Whether the server activated the player role for this connection.
     fn player_active(&self) -> bool {
-        self.active_roles.iter().any(|role| role == PLAYER_ROLE)
+        self.role_active(PLAYER_ROLE)
     }
 
     /// Queues one event for the caller.
@@ -561,7 +672,11 @@ impl Session {
 /// The Noise metadata in message 1 decides which key seals message 2. A malformed announcement
 /// closes the connection without sending message 2: the peer learns nothing beyond the close, and
 /// the caller reports the reason locally.
-async fn handshake(mut transport: Transport, config: &ClientConfig) -> Result<Ready> {
+async fn handshake(
+    mut transport: Transport,
+    config: &ClientConfig,
+    psks: &[StoredPsk],
+) -> Result<Ready> {
     // 1. client/init. Its exact bytes are the first half of the Noise prologue.
     let client_init = Incoming::ClientInit(ClientInit {
         client_id: config.identity.public_base64(),
@@ -601,9 +716,7 @@ async fn handshake(mut transport: Transport, config: &ClientConfig) -> Result<Re
         .read_message(&message_1)
         .context("failed to read Noise handshake message 1")?;
     let metadata = PskMetadata::parse(&metadata_payload)?;
-    // This revision stores no pairing keys, so a miss leaves only the Sentinel key, which is the
-    // documented unpaired path.
-    let psk = select_psk(&metadata, &[], true)?;
+    let psk = select_psk(&metadata, psks, &server_init.server_id, true)?;
     responder.set_psk(&psk)?;
 
     let message_2 = responder.write_message()?;
@@ -727,29 +840,6 @@ struct PskMetadata {
     category: PskCategory,
 }
 
-/// What a PSK id refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PskCategory {
-    /// Long-term pairing key.
-    LongTerm,
-    /// Key for one pairing attempt.
-    Pairing,
-    /// The published key that authenticates nothing.
-    Sentinel,
-}
-
-impl PskCategory {
-    /// Decodes the two-letter category from the wire.
-    fn from_wire(value: &str) -> Option<PskCategory> {
-        match value {
-            "lt" => Some(PskCategory::LongTerm),
-            "pr" => Some(PskCategory::Pairing),
-            "sn" => Some(PskCategory::Sentinel),
-            _ => None,
-        }
-    }
-}
-
 impl PskMetadata {
     /// Parses and validates the decrypted payload of Noise message 1.
     ///
@@ -787,24 +877,58 @@ fn is_canonical_psk_id(value: &str) -> bool {
 
 /// Chooses the key that seals Noise message 2.
 ///
-/// `stored` holds the pairing keys the host owns; this revision has none, so the published
-/// Sentinel key is the only candidate. A miss is the documented unpaired path during the initial
-/// handshake; during a re-handshake it is an error, because falling back would silently drop a
-/// pairing the previous connection authenticated.
-fn select_psk(metadata: &PskMetadata, stored: &[[u8; 32]], initial: bool) -> Result<[u8; 32]> {
+/// A stored record matches only when both its category and its derived id equal the announcement;
+/// its `server_id` must then equal the one in `server/init`, so a key recorded for a different
+/// server can never seal this handshake. A plain lookup miss is the documented unpaired path during
+/// the initial handshake; during a re-handshake it is an error, because falling back would silently
+/// drop a pairing the previous connection authenticated.
+fn select_psk(
+    metadata: &PskMetadata,
+    stored: &[StoredPsk],
+    server_id: &str,
+    initial: bool,
+) -> Result<[u8; 32]> {
     if metadata.category == PskCategory::Sentinel && metadata.psk_id == SENTINEL_PSK_ID {
         return Ok(SENTINEL_PSK);
     }
-    if let Some(psk) = stored
-        .iter()
-        .find(|psk| psk_id_for(psk.as_slice()) == metadata.psk_id)
-    {
-        return Ok(*psk);
+    let matched = stored.iter().find(|candidate| {
+        candidate.category == metadata.category && psk_id_for(&candidate.psk) == metadata.psk_id
+    });
+    if let Some(candidate) = matched {
+        if candidate.server_id != server_id {
+            bail!("the stored key for the announced PSK id belongs to another server");
+        }
+        return Ok(candidate.psk);
     }
     if initial {
         return Ok(SENTINEL_PSK);
     }
     bail!("no stored key matches the announced PSK id, so a re-handshake cannot continue")
+}
+
+/// Picks the burst measurement with the smallest positive error bound.
+///
+/// The protocol defines `max_error = ((t4 - t1) - (t3 - t2)) / 2`; a sample whose bound is not
+/// positive carries no usable information and is skipped. Ties keep the earlier sample.
+fn best_sample(samples: &[TimeSample]) -> Option<TimeSample> {
+    samples
+        .iter()
+        .copied()
+        .filter_map(|sample| {
+            let error = max_error_us(&sample);
+            (error > 0).then_some((error, sample))
+        })
+        .min_by_key(|(error, _sample)| *error)
+        .map(|(_error, sample)| sample)
+}
+
+/// The error bound of one measurement, in microseconds.
+fn max_error_us(sample: &TimeSample) -> i128 {
+    let t1 = sample.client_sent_us as i128;
+    let t2 = sample.server_received_us as i128;
+    let t3 = sample.server_sent_us as i128;
+    let t4 = sample.client_received_us as i128;
+    ((t4 - t1) - (t3 - t2)) / 2
 }
 
 /// Current wall clock in microseconds since the Unix epoch, the domain of server timestamps.
@@ -824,24 +948,46 @@ mod tests {
         format!(r#"{{"psk_id":"{SENTINEL_PSK_ID}","psk_category":"{category}"}}"#)
     }
 
+    /// The server id used by the selection tests.
+    const SERVER_ID: &str = "B1y4w7z0c3f6i9l2o5r8u1x4a7d0g3j6m9p2s5v8y1b";
+
+    /// Builds a stored record for `psk` in `category`.
+    fn stored(category: PskCategory, psk: [u8; 32], server_id: &str) -> StoredPsk {
+        StoredPsk {
+            category,
+            psk,
+            server_id: server_id.to_owned(),
+        }
+    }
+
     #[test]
     fn a_sentinel_announcement_selects_the_published_key() {
         let metadata = PskMetadata::parse(sentinel_metadata("sn").as_bytes()).unwrap();
         assert_eq!(metadata.category, PskCategory::Sentinel);
-        assert_eq!(select_psk(&metadata, &[], true).unwrap(), SENTINEL_PSK);
-        assert_eq!(select_psk(&metadata, &[], false).unwrap(), SENTINEL_PSK);
+        assert_eq!(
+            select_psk(&metadata, &[], SERVER_ID, true).unwrap(),
+            SENTINEL_PSK
+        );
+        assert_eq!(
+            select_psk(&metadata, &[], SERVER_ID, false).unwrap(),
+            SENTINEL_PSK
+        );
     }
 
     #[test]
     fn a_stored_key_wins_and_a_miss_only_falls_back_on_the_initial_handshake() {
-        let stored: [u8; 32] = std::array::from_fn(|index| index as u8);
-        let announcement = format!(
-            r#"{{"psk_id":"{}","psk_category":"pr"}}"#,
-            psk_id_for(&stored)
-        );
+        let psk: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let announcement = format!(r#"{{"psk_id":"{}","psk_category":"pr"}}"#, psk_id_for(&psk));
         let metadata = PskMetadata::parse(announcement.as_bytes()).unwrap();
-        assert_eq!(select_psk(&metadata, &[stored], true).unwrap(), stored);
-        assert_eq!(select_psk(&metadata, &[stored], false).unwrap(), stored);
+        let candidates = [stored(PskCategory::Pairing, psk, SERVER_ID)];
+        assert_eq!(
+            select_psk(&metadata, &candidates, SERVER_ID, true).unwrap(),
+            psk
+        );
+        assert_eq!(
+            select_psk(&metadata, &candidates, SERVER_ID, false).unwrap(),
+            psk
+        );
 
         let unknown = format!(
             r#"{{"psk_id":"{}","psk_category":"lt"}}"#,
@@ -849,12 +995,76 @@ mod tests {
         );
         let metadata = PskMetadata::parse(unknown.as_bytes()).unwrap();
         assert_eq!(
-            select_psk(&metadata, &[stored], true).unwrap(),
+            select_psk(&metadata, &candidates, SERVER_ID, true).unwrap(),
             SENTINEL_PSK
         );
         assert!(
-            select_psk(&metadata, &[stored], false).is_err(),
+            select_psk(&metadata, &candidates, SERVER_ID, false).is_err(),
             "a re-handshake must not silently drop the established key"
+        );
+    }
+
+    #[test]
+    fn a_stored_key_only_matches_its_own_category_and_server() {
+        let psk: [u8; 32] = std::array::from_fn(|index| index as u8 ^ 0x5a);
+        let announcement = format!(r#"{{"psk_id":"{}","psk_category":"pr"}}"#, psk_id_for(&psk));
+        let metadata = PskMetadata::parse(announcement.as_bytes()).unwrap();
+
+        // The id matches, but the record was filed under another category.
+        let wrong_category = [stored(PskCategory::LongTerm, psk, SERVER_ID)];
+        assert_eq!(
+            select_psk(&metadata, &wrong_category, SERVER_ID, true).unwrap(),
+            SENTINEL_PSK,
+            "a category mismatch is a miss, not a match"
+        );
+        assert!(
+            select_psk(&metadata, &wrong_category, SERVER_ID, false).is_err(),
+            "a category mismatch is an error during a re-handshake"
+        );
+
+        // The category and id match, but the record belongs to another server.
+        let other_server = [stored(PskCategory::Pairing, psk, "wrong-server")];
+        assert!(
+            select_psk(&metadata, &other_server, SERVER_ID, true).is_err(),
+            "a key recorded for another server must never seal this handshake"
+        );
+    }
+
+    #[test]
+    fn the_best_sample_has_the_smallest_positive_error_bound() {
+        assert_eq!(best_sample(&[]), None, "an empty burst has no measurement");
+
+        // t4 - t1 = round trip; t3 - t2 = server processing. Bounds: 1000, 1500 and 100 us.
+        let sample =
+            |client_sent_us, server_received_us, server_sent_us, client_received_us| TimeSample {
+                client_sent_us,
+                server_received_us,
+                server_sent_us,
+                client_received_us,
+            };
+        let broad = sample(1_000, 2_000, 2_000, 3_000);
+        let broadest = sample(4_000, 5_000, 5_000, 7_000);
+        let tight = sample(8_000, 8_100, 8_100, 8_200);
+
+        assert_eq!(
+            best_sample(&[broad, broadest, tight]),
+            Some(tight),
+            "the tightest round trip wins"
+        );
+
+        // A non-positive bound is unusable; the filter would reject it anyway. It claims more
+        // server processing time than the whole round trip.
+        let impossible = sample(10_000, 10_000, 11_000, 10_500);
+        assert!(max_error_us(&impossible) <= 0);
+        assert_eq!(
+            best_sample(&[impossible]),
+            None,
+            "a non-positive error bound carries no information"
+        );
+        assert_eq!(
+            best_sample(&[impossible, broad]),
+            Some(broad),
+            "the unusable sample is skipped"
         );
     }
 

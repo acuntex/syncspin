@@ -11,11 +11,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use syncspin_client::{
-    connect, AudioFormat, AudioFrame, ClientConfig, ClientHandle, Codec, Event, EventStream,
-    PlaybackState, Sink,
+    connect, connect_with_psks, AudioFormat, AudioFrame, ClientConfig, ClientHandle, Codec, Event,
+    EventStream, PskCategory, Sink, StoredPsk,
 };
 use syncspin_core::messages::{
-    ControllerState, Incoming, PlayerCommand, ServerCommand, ServerState,
+    ClientState, ControllerState, Incoming, PlayerCommand, Progress, ServerCommand, ServerState,
 };
 use syncspin_core::noise::{psk_id_for, Identity};
 
@@ -70,6 +70,7 @@ impl Recordings {
 struct RecordingSink {
     recordings: Recordings,
     fail_on_write: Option<usize>,
+    latency: Option<Duration>,
     writes: usize,
 }
 
@@ -78,6 +79,7 @@ impl RecordingSink {
         RecordingSink {
             recordings,
             fail_on_write: None,
+            latency: None,
             writes: 0,
         }
     }
@@ -86,6 +88,16 @@ impl RecordingSink {
         RecordingSink {
             recordings,
             fail_on_write: Some(write),
+            latency: None,
+            writes: 0,
+        }
+    }
+
+    fn with_latency(recordings: Recordings, latency: Duration) -> RecordingSink {
+        RecordingSink {
+            recordings,
+            fail_on_write: None,
+            latency: Some(latency),
             writes: 0,
         }
     }
@@ -129,6 +141,10 @@ impl Sink for RecordingSink {
             .expect("the recordings lock is not poisoned") += 1;
         Ok(())
     }
+
+    fn latency(&self) -> Option<Duration> {
+        self.latency
+    }
 }
 
 /// Creates a recording sink and the shared record it writes to.
@@ -137,20 +153,46 @@ fn recording_sink() -> (Recordings, Box<dyn Sink>) {
     (recordings.clone(), Box::new(RecordingSink::new(recordings)))
 }
 
+/// Creates a recording sink that reports a fixed output delay.
+fn sink_with_latency(latency: Duration) -> (Recordings, Box<dyn Sink>) {
+    let recordings = Recordings::default();
+    (
+        recordings.clone(),
+        Box::new(RecordingSink::with_latency(recordings, latency)),
+    )
+}
+
+/// Builds a configuration for `server`.
+fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientConfig {
+    ClientConfig {
+        server: server.endpoint(),
+        player_name: "Test player".to_owned(),
+        identity: Identity::generate(),
+        audio_mode: mode,
+        max_backoff: Duration::from_secs(1),
+    }
+}
+
 /// Connects to `server` with a fresh identity.
 async fn connect_to(
     server: &FakeServer,
     mode: syncspin_client::AudioMode,
     sink: Box<dyn Sink>,
 ) -> (EventStream, ClientHandle) {
-    let config = ClientConfig {
-        server: server.endpoint(),
-        player_name: "Test player".to_owned(),
-        identity: Identity::generate(),
-        audio_mode: mode,
-        max_backoff: Duration::from_secs(1),
-    };
-    let (handle, events) = connect(config, sink)
+    let (handle, events) = connect(config_for(server, mode), sink)
+        .await
+        .expect("the client must connect to the fake server");
+    (events, handle)
+}
+
+/// Connects with stored pairing keys.
+async fn connect_with_stored_psks(
+    server: &FakeServer,
+    mode: syncspin_client::AudioMode,
+    sink: Box<dyn Sink>,
+    psks: Vec<StoredPsk>,
+) -> (EventStream, ClientHandle) {
+    let (handle, events) = connect_with_psks(config_for(server, mode), sink, psks)
         .await
         .expect("the client must connect to the fake server");
     (events, handle)
@@ -215,6 +257,30 @@ async fn wait_for_open(recordings: &Recordings) -> AudioFormat {
     }
 }
 
+/// Waits until the sink recorded `count` flushes.
+async fn wait_for_flushes(recordings: &Recordings, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if recordings.flushes() >= count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} sink flushes, saw {}",
+            recordings.flushes()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Waits for the client's player state report.
+async fn wait_for_client_state(server: &mut FakeServer) -> ClientState {
+    tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_state())
+        .await
+        .expect("the client must report its state")
+        .expect("the connection must not close before the state report")
+}
+
 /// Current wall clock in microseconds, the domain of server timestamps.
 fn now_us() -> i64 {
     SystemTime::now()
@@ -244,25 +310,37 @@ async fn stream_start_opens_the_sink_with_the_announced_format() {
     server.stream_start("flac", 48_000, 2, 16);
     server.metadata("A title", "An artist");
 
-    let format = AudioFormat {
-        codec: Codec::Flac,
-        sample_rate: 48_000,
-        channels: 2,
-        bit_depth: 16,
+    let format = match next_event(&mut events).await {
+        Event::StreamStart { format } => format,
+        other => panic!("expected StreamStart, got {other:?}"),
     };
-    assert_eq!(
-        next_event(&mut events).await,
-        Event::StreamStart {
-            format: format.clone()
-        }
-    );
-    assert_eq!(
-        next_event(&mut events).await,
+    assert_eq!(format.codec, Codec::Flac);
+    assert_eq!(format.sample_rate, 48_000);
+    assert_eq!(format.channels, 2);
+    assert_eq!(format.bit_depth, 16);
+    assert_eq!(format.codec_header, None);
+
+    match next_event(&mut events).await {
         Event::Track {
-            title: "A title".to_owned(),
-            artist: "An artist".to_owned(),
+            title,
+            artist,
+            album,
+            album_artist,
+            artwork_url,
+            progress_ms,
+            duration_ms,
+        } => {
+            assert_eq!(title, "A title");
+            assert_eq!(artist, "An artist");
+            assert_eq!(album, "");
+            assert_eq!(album_artist, "");
+            assert_eq!(artwork_url, "");
+            assert_eq!(progress_ms, None);
+            assert_eq!(duration_ms, None);
         }
-    );
+        other => panic!("expected Track, got {other:?}"),
+    }
+
     assert_eq!(
         wait_for_open(&recordings).await,
         format,
@@ -272,6 +350,35 @@ async fn stream_start_opens_the_sink_with_the_announced_format() {
         recordings.flushes(),
         1,
         "a new stream must flush the previous output first"
+    );
+}
+
+#[tokio::test]
+async fn a_codec_header_is_delivered_to_the_sink() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // The FLAC marker plus a STREAMINFO-sized body; the exact bytes matter, not their shape.
+    let header: Vec<u8> = (0..42).map(|index| index as u8).collect();
+    server.stream_start_with_header("flac", 48_000, 2, 16, Some(&header));
+
+    let format = match next_event(&mut events).await {
+        Event::StreamStart { format } => format,
+        other => panic!("expected StreamStart, got {other:?}"),
+    };
+    assert_eq!(
+        format.codec_header.as_deref(),
+        Some(header.as_slice()),
+        "the announced codec header must be decoded verbatim"
+    );
+    let opened = wait_for_open(&recordings).await;
+    assert_eq!(
+        opened.codec_header.as_deref(),
+        Some(header.as_slice()),
+        "the sink must receive exactly the announced codec header"
     );
 }
 
@@ -301,6 +408,96 @@ async fn audio_chunks_reach_the_sink_with_the_announced_length() {
         Written::Encoded(_, bytes) => assert_eq!(bytes.len(), data.len()),
         other => panic!("expected an encoded frame, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn stream_end_flushes_the_sink() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    assert_eq!(recordings.flushes(), 1);
+
+    server.stream_end();
+    wait_for_flushes(&recordings, 2).await;
+}
+
+#[tokio::test]
+async fn no_audio_is_written_after_stream_end() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    server.stream_end();
+    // The flush proves the end was processed; the audio below is sent after it.
+    wait_for_flushes(&recordings, 2).await;
+
+    server.audio(now_us(), 0, vec![0x55; 64]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        recordings.written().is_empty(),
+        "a chunk after stream/end must not reach the sink"
+    );
+}
+
+#[tokio::test]
+async fn stream_clear_flushes_the_sink() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    server.stream_clear(Some(now_us() - 1_000_000));
+    wait_for_flushes(&recordings, 2).await;
+
+    // A clear is a seek, not an end: the announced format stays open and later chunks still play.
+    server.audio(now_us(), 0, vec![0x66; 64]);
+    let written = wait_for_writes(&recordings, 1).await;
+    assert_eq!(written[0].frame, Written::Pcm(vec![0x66; 64]));
+}
+
+#[tokio::test]
+async fn removing_the_player_role_flushes_the_sink() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    server.activate(&["metadata@v1"]);
+    wait_for_flushes(&recordings, 2).await;
+
+    server.audio(now_us(), 0, vec![0x77; 64]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        recordings.written().is_empty(),
+        "audio for an inactive player role must not reach the sink"
+    );
 }
 
 #[tokio::test]
@@ -354,14 +551,13 @@ async fn unknown_message_types_are_ignored() {
     server.json(r#"{"type":"future/telemetry","payload":{"value":1}}"#);
     server.metadata("Still here", "An artist");
 
-    assert_eq!(
-        next_event(&mut events).await,
-        Event::Track {
-            title: "Still here".to_owned(),
-            artist: "An artist".to_owned(),
-        },
-        "an unknown type must not close the connection"
-    );
+    match next_event(&mut events).await {
+        Event::Track { title, artist, .. } => {
+            assert_eq!(title, "Still here");
+            assert_eq!(artist, "An artist");
+        }
+        other => panic!("an unknown type must not close the connection, got {other:?}"),
+    }
 
     // The connection is still usable after the unknown message.
     server.stream_start("pcm", 48_000, 2, 16);
@@ -392,6 +588,32 @@ async fn malformed_known_message_closes_the_connection() {
         .await
         .expect("the session must not hang after a protocol error");
     assert!(outcome.is_err(), "a malformed message must end the session");
+}
+
+#[tokio::test]
+async fn a_short_audio_chunk_without_a_stream_is_a_protocol_error() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // Message id 4 with fewer than the 13 header bytes, and no stream announced.
+    server.binary(vec![4, 0, 0]);
+
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => {
+            assert!(
+                reason.contains("truncated"),
+                "the header is validated even without a stream, got: {reason}"
+            );
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(5), handle.finished())
+        .await
+        .expect("the session must not hang after a protocol error");
+    assert!(outcome.is_err());
 }
 
 #[tokio::test]
@@ -454,6 +676,80 @@ async fn a_wrong_psk_id_falls_back_to_the_sentinel_psk() {
 }
 
 #[tokio::test]
+async fn a_stored_key_seals_the_handshake() {
+    // The server announces and uses a private key. Removing `Responder::set_psk` leaves the
+    // responder on the Sentinel key, message 2 fails to authenticate, and this test fails.
+    let psk: [u8; 32] = std::array::from_fn(|index| (index as u8) ^ 0x3c);
+    let options = ServerOptions {
+        psk_id: psk_id_for(&psk),
+        psk_category: "pr".to_owned(),
+        psk,
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let stored = StoredPsk {
+        category: PskCategory::Pairing,
+        psk,
+        server_id: server.server_id().to_owned(),
+    };
+    let (mut events, _handle) = connect_with_stored_psks(
+        &server,
+        syncspin_client::AudioMode::Passthrough,
+        sink,
+        vec![stored],
+    )
+    .await;
+
+    expect_connected(&mut events, &server).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), server.wait_for_message_2())
+            .await
+            .expect("the server must observe message 2"),
+        "message 2 must authenticate with the stored key"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_key_for_another_server_is_refused() {
+    let psk: [u8; 32] = std::array::from_fn(|index| (index as u8) ^ 0x6e);
+    let options = ServerOptions {
+        psk_id: psk_id_for(&psk),
+        psk_category: "lt".to_owned(),
+        psk,
+        ..ServerOptions::default()
+    };
+    let server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let stored = StoredPsk {
+        category: PskCategory::LongTerm,
+        psk,
+        server_id: "a different server".to_owned(),
+    };
+    let (mut events, handle) = connect_with_stored_psks(
+        &server,
+        syncspin_client::AudioMode::Passthrough,
+        sink,
+        vec![stored],
+    )
+    .await;
+
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => {
+            assert!(
+                reason.contains("another server"),
+                "unexpected reason: {reason}"
+            );
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(2), handle.finished())
+        .await
+        .expect("the session must not hang");
+    assert!(outcome.is_err());
+}
+
+#[tokio::test]
 async fn malformed_psk_metadata_closes_without_a_second_handshake_message() {
     let options = ServerOptions {
         metadata: Some(r#"{"psk_id":42,"psk_category":"sn"}"#.to_owned()),
@@ -491,13 +787,15 @@ async fn audio_chunks_carry_a_playout_deadline_once_the_clock_is_ready() {
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
-    // The client reports its state once its clock estimate is ready, which pins the ordering of
-    // the sync replies before the audio below.
+    // The state report follows the first completed burst. The filter needs three measurements,
+    // so the client runs three bursts before the clock is ready; the server counts the replies,
+    // and the 24th is ordered before the audio below.
+    wait_for_client_state(&mut server).await;
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_state())
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_time_replies(24))
             .await
-            .expect("the client must report its state"),
-        "the clock estimate never became ready"
+            .expect("the fake server must answer the initial bursts"),
+        "the connection must stay open while the clock estimate forms"
     );
 
     server.stream_start("pcm", 48_000, 2, 16);
@@ -524,7 +822,7 @@ async fn audio_chunks_carry_a_playout_deadline_once_the_clock_is_ready() {
 #[tokio::test]
 async fn audio_is_delivered_before_the_clock_is_ready() {
     let options = ServerOptions {
-        answer_time: false,
+        answer_time_limit: Some(0),
         ..ServerOptions::default()
     };
     let server = FakeServer::start(options).await.unwrap();
@@ -544,6 +842,58 @@ async fn audio_is_delivered_before_the_clock_is_ready() {
     assert!(
         written[0].due <= Instant::now(),
         "without a clock estimate the deadline must not be scheduled into the future"
+    );
+}
+
+#[tokio::test]
+async fn the_initial_state_is_sent_after_a_single_time_reply() {
+    let options = ServerOptions {
+        answer_time_limit: Some(1),
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // The burst has a single deadline, so the unanswered requests cost one short wait, not seven.
+    let state = wait_for_client_state(&mut server).await;
+    assert!(state.available);
+}
+
+#[tokio::test]
+async fn the_initial_state_is_sent_after_two_time_replies() {
+    let options = ServerOptions {
+        answer_time_limit: Some(2),
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    let state = wait_for_client_state(&mut server).await;
+    assert!(state.available);
+}
+
+#[tokio::test]
+async fn readding_the_player_role_reports_state_again() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    wait_for_client_state(&mut server).await;
+
+    server.activate(&["metadata@v1"]);
+    server.activate(&["player@v1", "metadata@v1"]);
+    let state = wait_for_client_state(&mut server).await;
+    assert!(
+        state.available,
+        "a re-added player role must report itself again"
     );
 }
 
@@ -569,8 +919,36 @@ async fn a_volume_command_is_reported() {
     assert_eq!(
         next_event(&mut events).await,
         Event::Volume {
-            level: 25,
-            muted: false
+            level: Some(25),
+            muted: None
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_mute_command_does_not_report_a_volume() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    let command = serde_json::to_string(&Incoming::ServerCommand(ServerCommand {
+        player: Some(PlayerCommand {
+            command: "mute".to_owned(),
+            volume: None,
+            mute: Some(true),
+            output_delay_ms: None,
+        }),
+    }))
+    .unwrap();
+    server.json(command);
+
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Volume {
+            level: None,
+            muted: Some(true)
         }
     );
 }
@@ -593,6 +971,7 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         ),
     }
 }
+
 #[tokio::test]
 async fn the_client_announces_the_player_role_and_the_requested_format() {
     let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
@@ -651,7 +1030,15 @@ async fn a_decode_client_rejects_an_encoded_stream() {
 
 #[tokio::test]
 async fn controller_state_is_reported() {
-    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let options = ServerOptions {
+        active_roles: vec![
+            "player@v1".to_owned(),
+            "metadata@v1".to_owned(),
+            "controller@v1".to_owned(),
+        ],
+        ..ServerOptions::default()
+    };
+    let server = FakeServer::start(options).await.unwrap();
     let (_recordings, sink) = recording_sink();
     let (mut events, _handle) =
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
@@ -670,15 +1057,81 @@ async fn controller_state_is_reported() {
     .unwrap();
     server.json(state);
 
+    match next_event(&mut events).await {
+        Event::State(state) => {
+            assert_eq!(state.supported_commands, vec!["play".to_owned()]);
+            assert_eq!(state.volume, Some(40));
+            assert_eq!(state.muted, Some(false));
+        }
+        other => panic!("expected State, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn metadata_fields_are_reported() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    let state = serde_json::to_string(&Incoming::ServerState(ServerState {
+        metadata: Some(syncspin_core::messages::Metadata {
+            title: Some("A title".to_owned()),
+            artist: Some("An artist".to_owned()),
+            album: Some("An album".to_owned()),
+            album_artist: Some("An album artist".to_owned()),
+            artwork_url: Some("https://example.test/art.png".to_owned()),
+            progress: Some(Progress {
+                track_progress: Some(1_500),
+                track_duration: Some(240_000),
+                playback_speed: Some(1_000),
+            }),
+            ..Default::default()
+        }),
+        controller: None,
+    }))
+    .unwrap();
+    server.json(state);
+
+    match next_event(&mut events).await {
+        Event::Track {
+            title,
+            artist,
+            album,
+            album_artist,
+            artwork_url,
+            progress_ms,
+            duration_ms,
+        } => {
+            assert_eq!(title, "A title");
+            assert_eq!(artist, "An artist");
+            assert_eq!(album, "An album");
+            assert_eq!(album_artist, "An album artist");
+            assert_eq!(artwork_url, "https://example.test/art.png");
+            assert_eq!(progress_ms, Some(1_500));
+            assert_eq!(duration_ms, Some(240_000));
+        }
+        other => panic!("expected Track, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_short_playout_delay_is_reported() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = sink_with_latency(Duration::from_secs(60));
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    let state = wait_for_client_state(&mut server).await;
+    let player = state.player.expect("the player state follows the role");
     assert_eq!(
-        next_event(&mut events).await,
-        Event::State(PlaybackState {
-            supported_commands: vec!["play".to_owned()],
-            volume: Some(40),
-            muted: Some(false),
-        })
+        player.output_delay_ms, 5_000,
+        "an absurd sink latency is clamped before it reaches the server"
     );
 }
+
 #[tokio::test]
 async fn a_fragmented_audio_chunk_reassembles_before_the_sink_sees_it() {
     let server = FakeServer::start(ServerOptions::default()).await.unwrap();
