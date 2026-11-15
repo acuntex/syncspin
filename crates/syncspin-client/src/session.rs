@@ -123,6 +123,21 @@ const WINDOW_FAILURE_LIMIT: u8 = 5;
 /// Player commands this client accepts from the server.
 const PLAYER_COMMANDS: [&str; 2] = ["volume", "mute"];
 
+/// Control message types that belong to pairing, whose malformed form is a protocol error.
+///
+/// `pairing.md` treats a malformed or missing pairing field as a protocol error: the connection
+/// closes without an application-level message and nothing is persisted. Every other malformed
+/// control message keeps the lenient path, because one bad optional field must not silence
+/// playback. `server/pair-init` belongs to the dynamic flow and is not a known type in this
+/// revision; it is listed so the rule is complete when that flow arrives.
+const PAIRING_MESSAGE_TYPES: [&str; 5] = [
+    "server/pair-init",
+    "server/pair-auth",
+    "server/pair-confirm",
+    "server/pair-finalize",
+    "pair/abort",
+];
+
 /// An established WebSocket connection to a server.
 ///
 /// This is the socket layer only: cleartext JSON during the handshake, one Noise transport
@@ -385,6 +400,13 @@ pub(crate) struct Session<'a> {
     pairing_index: u32,
     /// The pairing attempt in progress, or `None` when this connection is not pairing.
     pairing: Option<PairingAttempt>,
+    /// Whether an attempt ended under the current activation, so its late messages are discarded.
+    ///
+    /// `pairing: None` means one of two things: no attempt was admitted since the last activation
+    /// (a pairing message out of sequence is a protocol error), or an attempt ended and messages
+    /// still in flight must be ignored until the next `server/activate` (the spec's silent-discard
+    /// rule). This flag is what tells them apart. `apply_activate` and a re-handshake clear it.
+    discarding_pairing_messages: bool,
     /// The pairing window the operator opened on this connection, or `None` when it is closed.
     #[cfg(feature = "pairing-code")]
     pairing_window: Option<PairingWindow>,
@@ -475,6 +497,7 @@ pub(crate) async fn attempt(
         candidates,
         pairing_index: 0,
         pairing: None,
+        discarding_pairing_messages: false,
         #[cfg(feature = "pairing-code")]
         pairing_window: None,
         #[cfg(feature = "pairing-code")]
@@ -771,6 +794,11 @@ impl Session<'_> {
             }
             Ok(Some(message)) => self.dispatch(message).await,
             Err(error) => {
+                if names_pairing_message(text) {
+                    // A pairing message that does not decode is a protocol error: the flow cannot
+                    // continue without the field, and ignoring it would leave a half-open attempt.
+                    return Err(error.into());
+                }
                 eprintln!("ignoring a malformed control message: {error}");
                 Ok(())
             }
@@ -844,6 +872,7 @@ impl Session<'_> {
         // The index counts pairing activations since the last handshake, and this is a new one.
         self.pairing_index = 0;
         self.matched = selected.matched;
+        self.discarding_pairing_messages = false;
         // An attempt belongs to the activation and the `h` that admitted it; the new handshake gives
         // both a new value, so the attempt and anything it was holding for are discarded. A server
         // that still wants to pair admits a new attempt under the new keys.
@@ -883,10 +912,15 @@ impl Session<'_> {
     /// cancels the attempt in progress and persists nothing, which is how the spec lets a server
     /// end a pairing without finalizing it.
     async fn apply_activate(&mut self, activate: ServerActivate) -> Result<()> {
+        // Every activation starts a new regime: messages from an attempt that ended before it are
+        // stale, and a new attempt has not started yet.
+        self.discarding_pairing_messages = false;
         let pairing = admits_pairing(&activate)?;
         if pairing.is_none() {
-            // A cancelling activation discards the attempt and anything it already received.
-            self.pairing = None;
+            // A cancelling activation discards the attempt and anything it already received. An
+            // attempt that existed may still have messages on the wire, and those are discarded;
+            // with no attempt at all, a pairing message is a sequence violation.
+            self.discarding_pairing_messages = self.pairing.take().is_some();
             #[cfg(feature = "pairing-code")]
             {
                 self.pending_pairing = None;
@@ -1015,6 +1049,7 @@ impl Session<'_> {
         self.pairing = Some(PairingAttempt::static_code(
             pairing_index,
             self.config.pairing_timeout,
+            self.candidates.pairing(),
         ));
         Ok(())
     }
@@ -1042,7 +1077,11 @@ impl Session<'_> {
 
         match method {
             AdmittedMethod::PairingPsk => {
-                let attempt = PairingAttempt::new(self.pairing_index, self.config.pairing_timeout);
+                let attempt = PairingAttempt::new(
+                    self.pairing_index,
+                    self.config.pairing_timeout,
+                    self.candidates.pairing(),
+                );
                 let init = Incoming::ClientPairInit(ClientPairInit {
                     pairing_index: attempt.pairing_index,
                     commit_b: None,
@@ -1085,7 +1124,7 @@ impl Session<'_> {
     #[cfg(feature = "pairing-code")]
     async fn handle_server_auth(&mut self, auth: ServerPairAuth) -> Result<()> {
         let Some(mut attempt) = self.pairing.take() else {
-            return Ok(());
+            return self.discard_or_reject_pairing_message("server/pair-auth");
         };
         if !attempt.awaiting_server_auth() {
             self.pairing = Some(attempt);
@@ -1121,7 +1160,7 @@ impl Session<'_> {
     #[cfg(feature = "pairing-code")]
     async fn handle_server_confirm(&mut self, confirm: ServerPairConfirm) -> Result<()> {
         let Some(mut attempt) = self.pairing.take() else {
-            return Ok(());
+            return self.discard_or_reject_pairing_message("server/pair-confirm");
         };
         if !attempt.awaiting_server_confirm() {
             self.pairing = Some(attempt);
@@ -1150,12 +1189,28 @@ impl Session<'_> {
         Ok(())
     }
 
+    /// Discards a late pairing message, or rejects one that has no attempt behind it.
+    ///
+    /// The spec's silent-discard rule covers messages a peer sent before it observed the end of an
+    /// attempt; it does not cover a pairing message while no attempt was ever admitted, which is a
+    /// sequence violation and a protocol error. `pairing: None` alone cannot tell the two apart,
+    /// so [`Session::discarding_pairing_messages`] decides.
+    fn discard_or_reject_pairing_message(&self, message: &'static str) -> Result<()> {
+        if self.discarding_pairing_messages {
+            return Ok(());
+        }
+        bail!("the server sent {message} without an active pairing attempt")
+    }
+
     /// Ends the attempt with `reason`: sends `pair/abort` and reports it.
     ///
     /// The connection stays open, as the spec requires for every reason but `concurrent_attempt`:
     /// playback continues in whatever roles the activation left active.
     async fn abort_pairing(&mut self, reason: PairingFailure) -> Result<()> {
         self.pairing = None;
+        // Pairing messages already on their way may still arrive before the next activation; the
+        // spec says to discard them instead of treating them as a sequence violation.
+        self.discarding_pairing_messages = true;
         let abort = Incoming::PairAbort(PairAbort {
             reason: reason.as_str().to_owned(),
         });
@@ -1172,8 +1227,7 @@ impl Session<'_> {
     /// the pairing window.
     fn confirm_pairing(&mut self) -> Result<()> {
         let Some(attempt) = self.pairing.take() else {
-            // A late finalize for an attempt that already ended has no effect.
-            return Ok(());
+            return self.discard_or_reject_pairing_message("server/pair-finalize");
         };
         #[cfg(feature = "pairing-code")]
         if attempt.is_static_code() && !attempt.awaiting_finalize() {
@@ -1195,6 +1249,7 @@ impl Session<'_> {
         // The server rotates this connection to the key it just persisted, and the candidate set
         // was read before that record existed.
         self.candidates.remember(record);
+        self.discarding_pairing_messages = true;
         #[cfg(feature = "pairing-code")]
         {
             self.pairing_window = None;
@@ -1211,6 +1266,7 @@ impl Session<'_> {
     /// saw a cancelling activation - has no effect, so no second event is reported.
     fn handle_pairing_abort(&mut self, abort: PairAbort) -> Result<()> {
         if self.pairing.take().is_some() {
+            self.discarding_pairing_messages = true;
             self.emit(Event::PairingFailed {
                 reason: PairingFailure::from_wire(&abort.reason),
             });
@@ -1988,6 +2044,21 @@ fn decode_pairing_field<const N: usize>(value: &str, name: &str) -> Result<[u8; 
         .map_err(|_| anyhow!("{name} does not decode to {N} bytes"))
 }
 
+/// Returns whether a control frame names a pairing message, even when it does not decode.
+///
+/// The envelope's `type` survives a malformed payload, which is what lets the session tell a
+/// pairing protocol error from a control message this revision may ignore. A frame that is not a
+/// JSON object with a string `type` names nothing and keeps the lenient path.
+fn names_pairing_message(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    value
+        .get("type")
+        .and_then(|message_type| message_type.as_str())
+        .is_some_and(|message_type| PAIRING_MESSAGE_TYPES.contains(&message_type))
+}
+
 /// Whether `value` is the canonical unpadded base64url encoding of a 32-byte key id.
 fn is_canonical_psk_id(value: &str) -> bool {
     if value.len() != PSK_ID_LEN {
@@ -2381,6 +2452,7 @@ mod tests {
             candidates: Candidates::load(None, &[], None).expect("an empty candidate set builds"),
             pairing_index: 0,
             pairing: None,
+            discarding_pairing_messages: false,
             #[cfg(feature = "pairing-code")]
             pairing_window: None,
             #[cfg(feature = "pairing-code")]
@@ -2729,6 +2801,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_pairing_message_types_are_fatal_when_malformed() {
+        for text in [
+            r#"{"type":"server/pair-init"}"#,
+            r#"{"type":"server/pair-auth"}"#,
+            r#"{"type":"server/pair-confirm"}"#,
+            r#"{"type":"server/pair-finalize"}"#,
+            r#"{"type":"pair/abort","payload":{}}"#,
+        ] {
+            assert!(
+                names_pairing_message(text),
+                "{text} names a pairing message"
+            );
+        }
+
+        for text in [
+            r#"{"type":"server/state","payload":{}}"#,
+            r#"{"type":"future/message","payload":{}}"#,
+            "{}",
+            "not json",
+            "",
+        ] {
+            assert!(
+                !names_pairing_message(text),
+                "{text} must stay on the lenient path"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_finalize_without_a_store_is_an_error_instead_of_a_silent_pairing() {
         // The attempt only starts with a store, so this guard is unreachable through the wire; it
@@ -2744,7 +2845,7 @@ mod tests {
             local_noise_transport(),
             None,
         );
-        session.pairing = Some(PairingAttempt::new(1, Duration::from_secs(120)));
+        session.pairing = Some(PairingAttempt::new(1, Duration::from_secs(120), None));
 
         let error = session
             .confirm_pairing()

@@ -36,6 +36,7 @@ use syncspin_core::pairing::wrap::{self, PSK_LABEL};
 
 use crate::config::{PskCategory, StoredPsk};
 use crate::storage::Storage;
+use syncspin_core::noise::SENTINEL_PSK;
 
 /// Method identifier of the Pairing PSK flow, as it is spelled on the wire.
 pub(crate) const METHOD_PAIRING_PSK: &str = "pairing_psk";
@@ -132,6 +133,29 @@ fn draw_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     getrandom::fill(&mut key).expect("the operating system CSPRNG is available");
     key
+}
+
+/// Draws the long-term PSK one attempt delivers, never one the protocol forbids.
+///
+/// `pairing.md` calls a delivered long-term PSK equal to the published Sentinel PSK, or to the
+/// pairing PSK the connection is keyed by, a protocol error. The chance of drawing either is
+/// negligible, but the check is cheap and a conformant client resamples rather than relying on it.
+/// `pairing_psk` is this client's pairing PSK when the connection could be keyed by it.
+fn draw_long_term_psk(pairing_psk: Option<[u8; 32]>) -> [u8; 32] {
+    draw_long_term_psk_with(pairing_psk, draw_key)
+}
+
+/// [`draw_long_term_psk`] with an injectable generator, so a test can force a forbidden draw.
+fn draw_long_term_psk_with(
+    pairing_psk: Option<[u8; 32]>,
+    mut draw: impl FnMut() -> [u8; 32],
+) -> [u8; 32] {
+    loop {
+        let key = draw();
+        if key != SENTINEL_PSK && pairing_psk != Some(key) {
+            return key;
+        }
+    }
 }
 
 /// The keys one connection attempt may seal the Noise handshake with.
@@ -282,11 +306,18 @@ pub(crate) struct PairingAttempt {
 
 impl PairingAttempt {
     /// Starts an attempt, drawing the long-term PSK this pairing will deliver.
-    pub(crate) fn new(pairing_index: u32, timeout: Duration) -> PairingAttempt {
+    ///
+    /// `pairing_psk` is this client's pairing PSK when the connection may be keyed by it; the drawn
+    /// key never equals it or the Sentinel PSK.
+    pub(crate) fn new(
+        pairing_index: u32,
+        timeout: Duration,
+        pairing_psk: Option<[u8; 32]>,
+    ) -> PairingAttempt {
         PairingAttempt {
             pairing_index,
             deadline: Instant::now() + timeout,
-            psk: draw_key(),
+            psk: draw_long_term_psk(pairing_psk),
             #[cfg(feature = "pairing-code")]
             flow: Flow::PairingPsk,
         }
@@ -294,11 +325,15 @@ impl PairingAttempt {
 
     /// Starts a static-code attempt, which waits for the server's CPace share.
     #[cfg(feature = "pairing-code")]
-    pub(crate) fn static_code(pairing_index: u32, timeout: Duration) -> PairingAttempt {
+    pub(crate) fn static_code(
+        pairing_index: u32,
+        timeout: Duration,
+        pairing_psk: Option<[u8; 32]>,
+    ) -> PairingAttempt {
         PairingAttempt {
             pairing_index,
             deadline: Instant::now() + timeout,
-            psk: draw_key(),
+            psk: draw_long_term_psk(pairing_psk),
             flow: Flow::Static(CodePhase::Auth),
         }
     }
@@ -552,7 +587,7 @@ mod tests {
     fn key_material_is_redacted_in_every_debug_format() {
         let encoded = URL_SAFE_NO_PAD.encode(KEY);
         let pairing = PairingPsk(KEY);
-        let attempt = PairingAttempt::new(1, Duration::from_secs(120));
+        let attempt = PairingAttempt::new(1, Duration::from_secs(120), None);
         let candidates = Candidates {
             pairing: Some(pairing),
             records: vec![record("a-server")],
@@ -578,7 +613,7 @@ mod tests {
     #[test]
     fn an_attempt_expires_at_its_configured_timeout() {
         let started = Instant::now();
-        let attempt = PairingAttempt::new(4, Duration::from_secs(120));
+        let attempt = PairingAttempt::new(4, Duration::from_secs(120), None);
         assert_eq!(attempt.pairing_index, 4);
         assert!(attempt.deadline >= started + Duration::from_secs(120));
         assert_ne!(attempt.psk(), [0u8; 32], "the attempt draws its own key");
@@ -586,6 +621,33 @@ mod tests {
             attempt.psk_base64().len(),
             43,
             "the wire carries the key unpadded base64url"
+        );
+    }
+
+    #[test]
+    fn a_drawn_long_term_psk_is_never_a_forbidden_key() {
+        let pairing = [0x11; 32];
+        let allowed = [0x22; 32];
+
+        // The published Sentinel key and the connection's pairing PSK are both refused, in that
+        // order, and the first allowed draw is the one returned.
+        let mut draws = [SENTINEL_PSK, pairing, allowed].into_iter();
+        let key = draw_long_term_psk_with(Some(pairing), || {
+            draws.next().expect("the sequence holds enough draws")
+        });
+        assert_eq!(key, allowed);
+        assert!(
+            draws.next().is_none(),
+            "the loop stops at the first allowed key"
+        );
+
+        // Without a connection pairing PSK the Sentinel key is still refused.
+        let mut draws = [SENTINEL_PSK, allowed].into_iter();
+        assert_eq!(
+            draw_long_term_psk_with(None, || {
+                draws.next().expect("the sequence holds enough draws")
+            }),
+            allowed
         );
     }
 
@@ -612,7 +674,7 @@ mod tests {
         let server_scalar = [0x44; 32];
         let peer_share = pake::public_share(&server_scalar, &generator).expect("a group element");
 
-        let mut attempt = PairingAttempt::static_code(7, Duration::from_secs(120));
+        let mut attempt = PairingAttempt::static_code(7, Duration::from_secs(120), None);
         let share = attempt
             .accept_server_share(CODE, &sid, &peer_share)
             .expect("the server's share is a group element");
@@ -719,7 +781,7 @@ mod tests {
         );
 
         // The state a fresh attempt has is described, not dumped, as well.
-        let fresh = PairingAttempt::static_code(1, Duration::from_secs(120));
+        let fresh = PairingAttempt::static_code(1, Duration::from_secs(120), None);
         let text = format!("{fresh:?}");
         assert!(
             text.contains("static_pairing_code/awaiting_auth"),

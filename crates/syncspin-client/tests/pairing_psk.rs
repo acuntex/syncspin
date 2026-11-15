@@ -779,6 +779,43 @@ async fn a_pairing_activity_without_parameters_ends_the_attempt_with_an_error() 
     assert_still_reconnecting(handle).await;
 }
 
+#[tokio::test]
+async fn a_malformed_pairing_message_is_a_protocol_error() {
+    let pairing_psk = [0x34; 32];
+    let storage = MemoryStorage::holding(pairing_psk);
+    let mut server = FakeServer::start(pairing_options(pairing_psk))
+        .await
+        .unwrap();
+    let (mut events, handle) = connect_to(&server, Some(storage.clone())).await;
+    expect_connected(&mut events, &server).await;
+
+    // `server/pair-confirm` without its tag cannot be acted on, and the spec makes a malformed
+    // pairing field a protocol error: the client closes without an application-level message and
+    // persists nothing.
+    server.json(r#"{"type":"server/pair-confirm","payload":{}}"#.to_owned());
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => {
+            assert!(
+                reason.contains("malformed"),
+                "the reason must name the malformed message, got: {reason}"
+            );
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_pairing_abort())
+            .await
+            .expect("the fake server must notice the close"),
+        None,
+        "a protocol error must not send pair/abort"
+    );
+    assert!(
+        storage.records().is_empty(),
+        "a malformed pairing message must persist nothing"
+    );
+    assert_still_reconnecting(handle).await;
+}
+
 /// Waits for the client's first `client/state`, which follows its first clock measurement.
 async fn wait_for_client_state(server: &mut FakeServer) {
     tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_state())

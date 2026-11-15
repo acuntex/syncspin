@@ -455,6 +455,46 @@ async fn five_failed_confirmations_close_the_window() {
 }
 
 #[tokio::test]
+async fn a_pair_auth_without_an_attempt_is_a_sequence_violation() {
+    let storage = Arc::new(MemoryStorage::default());
+    let mut server = FakeServer::start(static_options(CODE)).await.unwrap();
+    let (mut events, _handle) = connect_to(&server, Some(storage.clone())).await;
+    expect_connected(&mut events, &server).await;
+
+    // The window is closed, so the activation waits as `client/pair-pending`: no attempt exists,
+    // and a `server/pair-auth` now is out of sequence rather than something to discard.
+    let _ = observed(server.wait_for_pair_pending())
+        .await
+        .expect("the client must report the held-back attempt");
+
+    server.json(
+        serde_json::json!({
+            "type": "server/pair-auth",
+            "payload": {"pake_msg_1": "A".repeat(43)},
+        })
+        .to_string(),
+    );
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => assert!(
+            reason.contains("without an active pairing attempt"),
+            "the reason must name the sequence violation, got: {reason}"
+        ),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_pairing_abort())
+            .await
+            .expect("the fake server must notice the close"),
+        None,
+        "a sequence violation must not send pair/abort"
+    );
+    assert!(
+        storage.records().is_empty(),
+        "a rejected pairing message must persist nothing"
+    );
+}
+
+#[tokio::test]
 async fn a_static_activation_without_a_configured_code_is_aborted() {
     let mut server = FakeServer::start(static_options(CODE)).await.unwrap();
     let mut config = config_for(&server.endpoint(), None);
