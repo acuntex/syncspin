@@ -1,0 +1,64 @@
+name: Bug report
+description: Something in the crates does not behave as documented
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: Describe the behaviour you saw and the behaviour you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Smallest reproduction
+      description: The shortest sequence that shows it. A failing test, a few lines of code, or the exact command.
+      render: rust
+    validations:
+      required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: The commit or tag you built against. Nothing is published on crates.io, so there is no version number to quote.
+      placeholder: 6b58210
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target
+    attributes:
+      label: Target
+      description: Where the code was built and run.
+      options:
+        - x86_64 Linux
+        - ARMv7, glibc 2.24
+        - MSRV 1.85
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: peer
+    attributes:
+      label: Server side
+      description: What the client was talking to.
+      options:
+        - Music Assistant
+        - The hermetic fake server
+        - No server involved
+    validations:
+      required: true
+
+  - type: textarea
+    id: player-output
+    attributes:
+      label: Example player output
+      description: The status lines player-pipe writes to stderr, if they are relevant. Redact keys, PSKs and pairing records before pasting.
+      render: text
+    validations:
+      required: false

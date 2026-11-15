@@ -1,0 +1,28 @@
+name: Feature request
+description: A capability the crates should gain
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What do you want to build, and who has that problem?
+      description: Start here. A feature that is described only as a solution is hard to judge.
+    validations:
+      required: true
+
+  - type: textarea
+    id: requested
+    attributes:
+      label: What should the crate do?
+      description: The behaviour, the shape of the API if you have one in mind, and what it replaces today.
+    validations:
+      required: true
+
+  - type: input
+    id: workaround
+    attributes:
+      label: What do you do today instead?
+      placeholder: A downstream implementation, a workaround in the host application, nothing
+    validations:
+      required: false
