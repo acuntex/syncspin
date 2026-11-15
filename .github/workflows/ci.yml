@@ -1,8 +1,8 @@
 # Continuous integration for the syncspin workspace.
 #
-# The job names `lint`, `test`, `msrv`, `arm`, `deny` and `docs` are the gates
-# branch protection refers to; renaming one silently drops it from the required
-# set, so keep the names stable.
+# The job names `lint`, `test`, `msrv`, `arm`, `deny`, `docs` and `secrets` are
+# the gates branch protection refers to; renaming one silently drops it from the
+# required set, so keep the names stable.
 #
 # Actions are pinned by version tag, not by commit SHA. Renovate's
 # `helpers:pinGitHubActionDigests` preset (see `renovate.json5`) rewrites them to
@@ -26,7 +26,9 @@ env:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A pull request is worth abandoning when a newer commit arrives; a push to
+  # `main` is not, because every commit on the default branch must be built.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -41,7 +43,7 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     name: test
@@ -51,7 +53,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   msrv:
     name: msrv
@@ -71,7 +73,7 @@ jobs:
           rustc --version
           cargo --version
       - name: cargo test (MSRV)
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   arm:
     name: arm
@@ -91,13 +93,14 @@ jobs:
       # `cargo-zigbuild` and a `zig` binary) so the glibc 2.24 baseline is
       # actually exercised.
       - name: cargo check (armv7)
-        run: cargo check --workspace --target armv7-unknown-linux-gnueabihf
+        run: cargo check -p syncspin-core -p syncspin-client --target armv7-unknown-linux-gnueabihf --locked
 
   deny:
     name: deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
@@ -119,7 +122,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: `gitleaks git` scans every commit, not just the tip.
+          fetch-depth: 0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: gitleaks
+      # gitleaks needs no token and reads only the local clone, so this works on
+      # fork pull requests without `pull_request_target`. `--redact` keeps a
+      # finding out of the public build log; the exit code still fails the job.
+      - name: gitleaks
+        run: gitleaks git --redact --verbose
 
   # `semver` is deliberately absent. `cargo-semver-checks`
   # (`taiki-e/install-action@v2` with `tool: cargo-semver-checks`) needs a

@@ -34,22 +34,35 @@
       schedule: ["before 06:00 on monday"],
     },
     {
-      // Automerge only where CI is the whole contract: dev-dependencies (test
-      // harnesses) on patch and minor updates. No dev-dependencies exist yet;
-      // the rule is here before the first test harness lands.
+      // Automerge only where CI is the whole contract: test harnesses and the
+      // shared version pins, on patch and minor updates. The cargo manager
+      // reports `depType` as the literal Cargo section name, so these are
+      // `dev-dependencies` and `workspace.dependencies` - never the npm-style
+      // `devDependencies`. Third-party versions live in
+      // `[workspace.dependencies]` here, which is why that section is included;
+      // the crypto crates are pulled back out by the rule below.
       matchManagers: ["cargo"],
-      matchDepTypes: ["devDependencies"],
+      matchDepTypes: ["dev-dependencies", "workspace.dependencies"],
       matchUpdateTypes: ["patch", "minor"],
       automerge: true,
     },
     {
-      // Crypto and the async runtime decide the MSRV (1.85) and, through `snow`
-      // and `x25519-dalek`, the wire protocol. These are never automerged and
-      // their PR is only opened after approval on the Dependency Dashboard, so
-      // a human reads the changelog and the ARMv7 impact first. Listed last so
-      // this rule wins over the grouping and automerge rules above, and with
-      // its own group so approval does not block the weekly cargo PR.
-      matchPackageNames: ["snow", "x25519-dalek", "tokio", "tokio-tungstenite"],
+      // Crypto, hashing and the async runtime decide the MSRV (1.85) and,
+      // through `snow` and `x25519-dalek`, the wire protocol. These are never
+      // automerged and their PR is only opened after approval on the Dependency
+      // Dashboard, so a human reads the changelog and the ARMv7 impact first.
+      // Listed last so this rule wins over the grouping and automerge rules
+      // above (they are declared in `[workspace.dependencies]`, so the
+      // automerge rule would otherwise match them), and with its own group so
+      // approval does not block the weekly cargo PR.
+      matchManagers: ["cargo"],
+      matchPackageNames: [
+        "snow",
+        "x25519-dalek",
+        "sha2",
+        "tokio",
+        "tokio-tungstenite",
+      ],
       groupName: "cargo crypto and runtime (manual review)",
       automerge: false,
       dependencyDashboardApproval: true,

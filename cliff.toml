@@ -1,11 +1,10 @@
 # git-cliff configuration: Conventional Commits -> Keep a Changelog sections.
 #
-# Release step - regenerate the changelog, then normalise the whitespace
-# git-cliff leaves at the end of the file:
+# Release step - regenerate the changelog from the tags:
 #   git cliff --output CHANGELOG.md
-#   npx --yes prettier@3.9.10 --write CHANGELOG.md
-# `git cliff --unreleased --tag v0.1.0 --prepend CHANGELOG.md` also works, but
-# the section it inserts ends without a blank line before the previous release.
+# The result is byte-identical to the committed file apart from the new entries,
+# so no post-processing step is needed.
+# Use --output only; --prepend repeats the header and leaves a stale [Unreleased] block.
 
 [changelog]
 header = """# Changelog
@@ -14,6 +13,7 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 
 """
 body = """
@@ -29,7 +29,6 @@ body = """
 {% endfor %}\
 {% endfor %}
 """
-footer = ""
 trim = true
 
 [git]
