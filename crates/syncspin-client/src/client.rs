@@ -158,6 +158,24 @@ pub enum StreamEndReason {
     RoleRemoved,
 }
 
+/// Why a server needs a pairing this client cannot satisfy with what it holds.
+///
+/// The value is the reason field of [`Event::PairingRequired`]. The enum is non-exhaustive: a later
+/// revision may classify another situation the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PairingRequiredReason {
+    /// The server announced a `psk_id` this client does not hold, so the handshake fell back to
+    /// the Sentinel key.
+    ///
+    /// `connection.md` calls the resulting handshake the server's authenticated
+    /// credential-mismatch signal: the server still holds a record for this client, and the client
+    /// has none it can use for it. The signal alone never removes or replaces a record - not the
+    /// server's and not the client's - so the host decides whether to offer pairing again. A code
+    /// flow or the Pairing PSK flow then replaces the record on both sides.
+    CredentialMismatch,
+}
+
 /// Why a pairing attempt ended without a record.
 ///
 /// Each value is the `reason` field of a `pair/abort`: the client sends the ones it causes and
@@ -329,6 +347,39 @@ pub enum Event {
         /// Static public key of the server the record belongs to, as 43 base64url characters.
         server_id: String,
     },
+    /// The server dropped its pairing record for this client.
+    ///
+    /// Reported when a paired session receives `server/unpair`. The record is gone from
+    /// [`Storage`](crate::storage::Storage) by the time the event arrives, and the client closes
+    /// the connection: the next connection to that server lands in the Sentinel fallback unless the
+    /// host pairs again. The client does not send `client/goodbye` - the crate has no writer for it
+    /// (`docs/spec-deviations.md`, entry 9) - so the server sees the close without a reason.
+    ///
+    /// A record the host passed through
+    /// [`connect_with_psks`](crate::connect_with_psks) is not in a store the client may write, so
+    /// the client reports it and ends the connection without removing it: the host owns that
+    /// record and has to drop it.
+    Unpaired {
+        /// Static public key of the server that dropped the record, as 43 base64url characters.
+        server_id: String,
+    },
+    /// A server needs a pairing this client cannot complete with what it holds.
+    ///
+    /// Reported once per connection, never once per message: the situation is decided by the
+    /// Noise handshake, so the event fires after [`Event::Connected`] and before the session acts
+    /// on its first message, and never again while that connection lasts. A plain guest handshake -
+    /// an unpaired connection whose server announced the Sentinel key - is not a mismatch and
+    /// reports nothing.
+    ///
+    /// Nothing is removed or replaced on either side, and the session continues as an ordinary
+    /// unpaired one. A server that holds a record for this client will keep the connection in
+    /// pairing or idle until the host offers pairing again.
+    PairingRequired {
+        /// Static public key of the server that announced the unknown credential.
+        server_id: String,
+        /// What the server expects and the client cannot provide.
+        reason: PairingRequiredReason,
+    },
     /// A pairing attempt ended without a record.
     ///
     /// Nothing was stored: the host has to offer pairing again, or act on the reason. The
@@ -427,6 +478,15 @@ impl fmt::Debug for Event {
             Self::Paired { server_id } => formatter
                 .debug_struct("Paired")
                 .field("server_id", server_id)
+                .finish(),
+            Self::Unpaired { server_id } => formatter
+                .debug_struct("Unpaired")
+                .field("server_id", server_id)
+                .finish(),
+            Self::PairingRequired { server_id, reason } => formatter
+                .debug_struct("PairingRequired")
+                .field("server_id", server_id)
+                .field("reason", reason)
                 .finish(),
             Self::PairingFailed { reason } => formatter
                 .debug_struct("PairingFailed")
@@ -991,7 +1051,9 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
             // The host has to fix the sink; a retry would only fail the same way.
             return match attempt.ending {
                 session::Ending::Failed(error) => Err(error),
-                session::Ending::Closed => Err(anyhow!("the audio sink failed")),
+                session::Ending::Closed | session::Ending::Unpaired => {
+                    Err(anyhow!("the audio sink failed"))
+                }
             };
         }
         if let Some(error) = flush_error {
@@ -1088,6 +1150,40 @@ mod tests {
             );
             assert!(text.contains("round: 3"), "the round is not secret: {text}");
         }
+    }
+
+    /// The record-lifecycle events name the server, which is not secret, and nothing else.
+    #[test]
+    fn the_record_lifecycle_events_format_their_server_id() {
+        let server_id = "B1y4w7z0c3f6i9l2o5r8u1x4a7d0g3j6m9p2s5v8y1b".to_owned();
+
+        let unpaired = format!(
+            "{:?}",
+            Event::Unpaired {
+                server_id: server_id.clone(),
+            }
+        );
+        assert!(
+            unpaired.contains(&format!("Unpaired {{ server_id: \"{server_id}\" }}")),
+            "got: {unpaired}"
+        );
+
+        let required = format!(
+            "{:?}",
+            Event::PairingRequired {
+                server_id: server_id.clone(),
+                reason: PairingRequiredReason::CredentialMismatch,
+            }
+        );
+        assert!(required.contains(&server_id), "got: {required}");
+        assert!(
+            required.contains("CredentialMismatch"),
+            "the reason is what the host acts on: {required}"
+        );
+        assert!(
+            !required.contains("<redacted>"),
+            "neither event carries a secret, so neither redacts a field: {required}"
+        );
     }
 
     /// Every other event keeps the fields a log line needs.

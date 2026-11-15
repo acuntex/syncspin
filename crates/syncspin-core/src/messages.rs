@@ -278,15 +278,26 @@ pub struct ClientPairInit {
 /// The server sends it in answer to `client/pair-init`, and again after every
 /// [`ClientPairRetry`]. Only the first round carries the server's nonce: the binding values, and
 /// with them the code, are unchanged across the rounds of one attempt.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ServerPairInit {
     /// 32-byte server nonce as 43 unpadded base64url characters; present in the first round only.
     ///
     /// The value is public - it is the server's half of the code binding - and is renamed to the
-    /// `nonce_A` the wire spells.
+    /// `nonce_A` the wire spells. `Debug` redacts it anyway, so that no pairing message can carry
+    /// a nonce into a log line.
     #[serde(rename = "nonce_A", default, skip_serializing_if = "Option::is_none")]
     pub nonce_a: Option<String>,
+}
+
+impl fmt::Debug for ServerPairInit {
+    /// Formats the message with the server nonce redacted.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerPairInit")
+            .field("nonce_A", &redacted(&self.nonce_a))
+            .finish()
+    }
 }
 
 /// `client/pair-retry`: asks for another round of the dynamic flow.
@@ -339,6 +350,16 @@ fn redacted(value: &Option<String>) -> Option<&'static str> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ServerPairFinalize {}
+
+/// `server/unpair`: the server dropped its pairing record for this client.
+///
+/// The payload is the empty object, the same shape as [`ServerPairFinalize`]. The message means the
+/// server no longer holds the long-term PSK that authenticates this client, so the client removes
+/// its own record and closes the connection. It is valid under any activity set, and a client on an
+/// unpaired session - one keyed by the Sentinel key or by its pairing PSK - ignores it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerUnpair {}
 
 /// `client/pair-pending`: the client is holding the admitted attempt back.
 ///
@@ -844,6 +865,9 @@ pub enum Incoming {
     /// `server/pair-finalize`.
     #[serde(rename = "server/pair-finalize")]
     ServerPairFinalize(ServerPairFinalize),
+    /// `server/unpair`.
+    #[serde(rename = "server/unpair")]
+    ServerUnpair(ServerUnpair),
     /// `pair/abort`, in both directions.
     #[serde(rename = "pair/abort")]
     PairAbort(PairAbort),
@@ -945,7 +969,7 @@ struct EnvelopeType {
 ///
 /// A variant added without its entry here would silently read as an unknown type, so the
 /// integration tests parse one instance of every variant.
-const KNOWN_TYPES: [&str; 26] = [
+const KNOWN_TYPES: [&str; 27] = [
     "client/init",
     "server/init",
     "noise/handshake",
@@ -962,6 +986,7 @@ const KNOWN_TYPES: [&str; 26] = [
     "client/pair-confirm",
     "client/pair-finalize",
     "server/pair-finalize",
+    "server/unpair",
     "pair/abort",
     "client/time",
     "server/time",

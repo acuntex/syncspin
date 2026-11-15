@@ -57,6 +57,12 @@
 //! limit the client holds dynamic attempts back - answering them with `client/pair-pending` - until
 //! [`ControlHandle::release_holdback`] is called, the deliberate operator action the spec requires.
 //!
+//! A pairing record can also be dropped from the server's side. `server/unpair` removes it, reports
+//! [`Event::Unpaired`] and closes the connection; a server that announces a `psk_id` the client does
+//! not hold is reported once per connection as [`Event::PairingRequired`] with reason
+//! [`PairingRequiredReason::CredentialMismatch`], so a host can offer pairing again instead of the
+//! lost record going unnoticed.
+//!
 //! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
 //! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
 //! [`Event::StreamClear`] for a seek, plus [`Event::Track`] for the now-playing metadata with its
@@ -76,8 +82,9 @@ pub mod storage;
 
 pub use client::{
     clamp_volume, clamp_volume_with, connect, connect_with_psks, next_backoff, Client,
-    ClientHandle, ControlHandle, Event, EventStream, PairingFailure, PlaybackState,
-    StreamEndReason, DEFAULT_PAIRING_TIMEOUT, INITIAL_BACKOFF, NORMAL_PLAYBACK_SPEED,
+    ClientHandle, ControlHandle, Event, EventStream, PairingFailure, PairingRequiredReason,
+    PlaybackState, StreamEndReason, DEFAULT_PAIRING_TIMEOUT, INITIAL_BACKOFF,
+    NORMAL_PLAYBACK_SPEED,
 };
 pub use config::{
     AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, MAX_PLAYER_NAME_LEN,

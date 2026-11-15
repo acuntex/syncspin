@@ -21,7 +21,7 @@ harmless.
 | 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                           |
 | 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
 | 9   | No `client/goodbye` writer                                      | [`messaging.md` — `client/goodbye`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clientgoodbye)                                                         | Stage 1b                           |
-| 10  | No `server/unpair` and no pairing-required signal               | [`pairing.md` — Pairing Records](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-records)                                                                           | Stage 2                            |
+| 10  | No unpaired-access switch; unpair closes without a goodbye      | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Accepted, `handle_unpair`          |
 | 11  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
 | 12  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
 | 13  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
@@ -229,7 +229,10 @@ it, except that a client leaving one server for another MUST send `another_serve
 **What we do:** the library has no writer for the message and no typed reason. A connection that is
 dropped looks the same to the server whatever the caller intended, so the server cannot tell a
 shutdown from a restart, and the one MUST that can arise — a client leaving one server for another —
-cannot be expressed.
+cannot be expressed. The one place the protocol asks this client for a goodbye today is
+`server/unpair`, where the reason would be `unpaired`: `session::handle_unpair` removes the record,
+reports `Event::Unpaired` and closes the socket without one, so the server learns nothing beyond the
+close (entry 10).
 
 **Why:** the reasons are only actionable once a close path exists and multiple servers or
 displacement exist. The guest session ends by dropping the socket, and a writer without the call
@@ -239,28 +242,48 @@ sites would be an API nobody can reach.
 shutdown, restart, another server), then test on the fake server that the server sees the reason
 before the close.
 
-## 10. No `server/unpair` and no pairing-required signal
+## 10. No unpaired-access switch and no goodbye after `server/unpair`
 
-**Spec:** `pairing.md`, _Pairing Records_ and _Unpaired Access_, and `messaging.md`,
-`server/unpair`. A server that drops a client's record tells it with `server/unpair`, and a client
-that stops admitting unpaired access closes an unpaired connection with `client/goodbye` reason
-`pairing_required`. When a server announces a `psk_id` the client does not hold, the client is
-expected to surface the credential mismatch to its operator.
+**Spec:** `pairing.md`, _Unpaired Access_ and _Pairing Records_, and `messaging.md`, `server/unpair`
+and `client/goodbye`. Whether a client admits unpaired access is a local setting, advertised in
+`client/hello` as `unpaired_access.enabled`; a client that stops admitting it closes an unpaired
+connection with `client/goodbye` reason `pairing_required`. On `server/unpair` the client removes the
+matched pairing record, sends `client/goodbye` reason `unpaired` and closes. A server that announces
+a `psk_id` the client does not hold receives the Sentinel Fallback's authenticated
+credential-mismatch signal, and the client is expected to surface the mismatch to its operator.
 
-**What we do:** a completed pairing stores the record and reports `Event::Paired`, and a server
-that announces a key the client does not hold remains a plain Sentinel fallback on the initial
-handshake (entry 4): no event, no `server/unpair` handling and no `client/goodbye` writer (entry 9).
-The record a server asks to remove therefore stays until the host removes it itself.
+**What we do:** the signal and the record handling are implemented. `session::select_psk` sets its
+`credential_mismatch` flag when the initial handshake falls back to the Sentinel key although the
+server named another credential, and `session::attempt` reports
+`Event::PairingRequired { server_id, reason: CredentialMismatch }` once per connection, after
+`Event::Connected` and before the first activation; a plain Sentinel announcement, a matched record
+and the pairing PSK all report nothing, and `Event::PairingRequired` is never sent twice.
+`Incoming::ServerUnpair` is decoded as `server/unpair`, and `Session::handle_unpair` removes the
+record through `Storage::remove_pairing`, emits `Event::Unpaired { server_id }` and ends the
+connection with the disconnect reason `Ending::Unpaired`. A session that is unpaired - Sentinel-keyed
+or pairing-PSK-keyed - ignores the message, as the spec requires. A record the host passed through
+`connect_with_psks` is not in a store the crate may write, so the event reports it and the host has
+to drop it. `server_unpair_drops_the_record_and_ends_the_connection`,
+`an_unpair_on_an_unpaired_session_is_ignored`,
+`an_unheld_psk_id_is_reported_once_as_a_credential_mismatch` and
+`a_plain_guest_handshake_does_not_ask_for_pairing` pin the observable behaviour, and
+`a_credential_mismatch_is_reported_once_per_connection` pins the once-per-connection rule.
 
-**Why:** removal has to be actionable - a host needs an event to re-offer pairing - and the
-credential-mismatch signal needs a once-per-connection rule so a reconnect loop does not spam the
-UI. Both belong with the pairing control surface (window, operator cancellation, token), which is
-the next step after the PSK flow.
+Two parts are still missing. Unpaired access is always admitted: `client/hello` carries
+`unpaired_access: { enabled: true }` unconditionally, there is no setting that turns it off, and so
+no `pairing_required` close exists. And the close after `server/unpair` carries no `client/goodbye`
+reason `unpaired`, because the crate has no writer for that message (entry 9): the server sees the
+socket close and learns nothing more.
 
-**Removing it:** add `server/unpair` to `Incoming`, remove the record through `Storage`, emit
-`Event::Unpaired { server_id }`; classify a Sentinel fallback that announced a non-Sentinel
-`psk_id` as `Event::PairingRequired { server_id, reason: CredentialMismatch }`, once per connection;
-and test all three against the fake server.
+**Why:** the goodbye reasons are only actionable once a close path with a typed reason exists, and
+the unpaired-access switch is a manufacturer decision the host exposes in its own UI; both belong to
+the pairing control surface rather than to the record handling. Removing the record and reporting the
+mismatch do not depend on either, so they ship first.
+
+**Removing it:** add the `client/goodbye` writer with a typed reason and send `unpaired` in
+`Session::handle_unpair` before the close; expose the unpaired-access setting on `ClientConfig`,
+advertise it in `client/hello`, and close an unpaired connection with `pairing_required` when it is
+turned off. Test both on the fake server by asserting the goodbye reason arrives before the close.
 
 ## 11. Scheduled metadata applied immediately
 

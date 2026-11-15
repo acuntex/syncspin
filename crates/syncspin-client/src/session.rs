@@ -54,7 +54,7 @@ use syncspin_core::pairing::pake::TAG_LEN;
 
 use crate::client::{
     check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, PairingFailure,
-    PlaybackState, StreamEndReason, NORMAL_PLAYBACK_SPEED,
+    PairingRequiredReason, PlaybackState, StreamEndReason, NORMAL_PLAYBACK_SPEED,
 };
 #[cfg(feature = "pairing-code")]
 use crate::config::CodeFormat;
@@ -237,6 +237,9 @@ struct Ready {
     activate: ServerActivate,
     /// Which key sealed the handshake, which decides the pairing methods this connection allows.
     matched: MatchedPsk,
+    /// Whether the handshake fell back to the Sentinel key although the server named another
+    /// credential, which is the server's authenticated credential-mismatch signal.
+    credential_mismatch: bool,
 }
 
 /// A re-handshake whose keys are already in place, waiting for its activation.
@@ -317,9 +320,12 @@ pub(crate) struct Carried {
 }
 
 /// How one connection attempt ended.
+#[derive(Debug)]
 pub(crate) enum Ending {
     /// The server closed the connection.
     Closed,
+    /// The server dropped this client's pairing record, so the client ended the connection.
+    Unpaired,
     /// The attempt failed.
     Failed(anyhow::Error),
 }
@@ -329,6 +335,7 @@ impl Ending {
     pub(crate) fn reason(&self) -> String {
         match self {
             Self::Closed => "the server closed the connection".to_owned(),
+            Self::Unpaired => "the server dropped this client's pairing record".to_owned(),
             Self::Failed(error) => format!("{error:#}"),
         }
     }
@@ -423,6 +430,15 @@ pub(crate) struct Session<'a> {
     server_id: String,
     /// Which key sealed the handshake.
     matched: MatchedPsk,
+    /// A pairing requirement this connection still has to report, or `None` once it has.
+    ///
+    /// The handshake decides it once, but the spec's rule is about the event: a host must see one
+    /// [`Event::PairingRequired`] per connection, not one per frame. Taking the value is what makes
+    /// a second report impossible.
+    pairing_required: Option<PairingRequiredReason>,
+    /// Why this connection has to end after the current wake-up, when a handler ended it instead of
+    /// the peer. `serve` returns it on its next iteration.
+    ending: Option<Ending>,
     /// The keys this connection may seal a re-handshake with, and the records a pairing completed
     /// on this connection adds to them.
     candidates: Candidates,
@@ -528,6 +544,10 @@ pub(crate) async fn attempt(
         controller_commands: None,
         server_id: ready.server_id.clone(),
         matched: ready.matched,
+        pairing_required: ready
+            .credential_mismatch
+            .then_some(PairingRequiredReason::CredentialMismatch),
+        ending: None,
         candidates,
         pairing_index: 0,
         pairing: None,
@@ -546,6 +566,9 @@ pub(crate) async fn attempt(
         server_id: ready.server_id,
         encrypted: true,
     });
+    // The handshake's credential decision reaches the host before anything the session does with
+    // it, and exactly once per connection.
+    session.report_pairing_required();
 
     // The handshake consumed the first activation; it is applied here, now that the session can
     // answer it. A pairing activation in it starts the attempt just as a later one does.
@@ -557,7 +580,7 @@ pub(crate) async fn attempt(
     let ending = match prepared {
         Err(error) => Ending::Failed(error),
         Ok(()) => match session.serve().await {
-            Ok(()) => Ending::Closed,
+            Ok(ending) => ending,
             Err(error) => Ending::Failed(error),
         },
     };
@@ -586,10 +609,15 @@ impl Session<'_> {
     }
 
     /// Reads, dispatches and delivers until the connection ends.
-    async fn serve(&mut self) -> Result<()> {
+    async fn serve(&mut self) -> Result<Ending> {
         loop {
             if self.events.is_closed() {
-                return Ok(());
+                return Ok(Ending::Closed);
+            }
+            // A handler that ends the connection - `server/unpair` is the only one today - set the
+            // reason while the frame was dispatched; the connection is closed here.
+            if let Some(ending) = self.ending.take() {
+                return Ok(ending);
             }
 
             // A re-handshake suspends the clock work: no application message may be sent until the
@@ -643,7 +671,7 @@ impl Session<'_> {
                     }
                     // The caller turns the end into a Disconnected event and schedules the next
                     // attempt, so the sink, the level and the roles survive the drop.
-                    SocketMessage::Closed => return Ok(()),
+                    SocketMessage::Closed => return Ok(Ending::Closed),
                     SocketMessage::Binary(ciphertext) => self.receive(&ciphertext).await?,
                 },
                 Wakeup::Clock => {
@@ -859,6 +887,7 @@ impl Session<'_> {
             Incoming::StreamClear(clear) if !affects_player(clear.roles.as_deref()) => Ok(()),
             Incoming::StreamClear(clear) => self.handle_stream_clear(clear),
             Incoming::ServerPairFinalize(_) => self.confirm_pairing(),
+            Incoming::ServerUnpair(_) => self.handle_unpair(),
             Incoming::PairAbort(abort) => self.handle_pairing_abort(abort),
             #[cfg(feature = "pairing-code")]
             Incoming::ServerPairInit(init) => self.handle_server_init(init).await,
@@ -1511,6 +1540,52 @@ impl Session<'_> {
         Ok(())
     }
 
+    /// Handles `server/unpair`: drops this client's record for the server and ends the connection.
+    ///
+    /// The message is valid under any activity set, but only a paired session - one the handshake
+    /// keyed with a stored long-term record - has a record to drop. A session keyed by the Sentinel
+    /// key or by the pairing PSK is unpaired, and the spec says to ignore the message there: the
+    /// record it could drop would not be the one the server means.
+    ///
+    /// The record is removed through [`Storage`], so the host owns the file and the crate owns the
+    /// rule. A store that refuses the removal leaves the record in place, and the connection ends
+    /// with the store's error: reporting [`Event::Unpaired`] for a record that is still there would
+    /// be a lie. A record the host passed through
+    /// [`connect_with_psks`](crate::connect_with_psks) is not in a store the client may write, so
+    /// the event is reported without removing it - that record belongs to the host.
+    ///
+    /// The client then closes the connection, deliberately and without `client/goodbye`: the crate
+    /// has no writer for it yet (`docs/spec-deviations.md`, entry 9).
+    fn handle_unpair(&mut self) -> Result<()> {
+        if self.matched != MatchedPsk::Stored(PskCategory::LongTerm) {
+            return Ok(());
+        }
+        if let Some(storage) = self.config.storage.as_deref() {
+            storage
+                .remove_pairing(&self.server_id)
+                .context("cannot remove the pairing record")?;
+        }
+        self.emit(Event::Unpaired {
+            server_id: self.server_id.clone(),
+        });
+        self.ending = Some(Ending::Unpaired);
+        Ok(())
+    }
+
+    /// Reports a pairing requirement this connection still owes the host, at most once.
+    ///
+    /// [`Event::Connected`] goes out first, so the host knows which server the requirement belongs
+    /// to. The handshake decides the requirement once per connection; taking the value here is what
+    /// makes a second report impossible, however many messages the session goes on to handle.
+    fn report_pairing_required(&mut self) {
+        if let Some(reason) = self.pairing_required.take() {
+            self.emit(Event::PairingRequired {
+                server_id: self.server_id.clone(),
+                reason,
+            });
+        }
+    }
+
     /// Feeds one `server/time` reply into the current burst.
     ///
     /// Only the reply to the request on the wire is used: its `client_transmitted` has to match
@@ -2077,6 +2152,7 @@ async fn handshake(
         active_roles,
         activate,
         matched: selected.matched,
+        credential_mismatch: selected.credential_mismatch,
     })
 }
 
@@ -2334,6 +2410,9 @@ struct Selected {
     psk: [u8; 32],
     /// Which key it is, which decides the pairing methods this connection allows.
     matched: MatchedPsk,
+    /// Whether the Sentinel key stands in for a credential the server named and this client does
+    /// not hold, which is the server's authenticated credential-mismatch signal.
+    credential_mismatch: bool,
 }
 
 /// Chooses the key that seals Noise message 2.
@@ -2355,6 +2434,7 @@ fn select_psk(
         return Ok(Selected {
             psk: SENTINEL_PSK,
             matched: MatchedPsk::Sentinel,
+            credential_mismatch: false,
         });
     }
     if metadata.category == PskCategory::Pairing {
@@ -2363,6 +2443,7 @@ fn select_psk(
                 return Ok(Selected {
                     psk: pairing,
                     matched: MatchedPsk::PairingPsk,
+                    credential_mismatch: false,
                 });
             }
         }
@@ -2377,12 +2458,17 @@ fn select_psk(
         return Ok(Selected {
             psk: candidate.psk,
             matched: MatchedPsk::Stored(candidate.category),
+            credential_mismatch: false,
         });
     }
     if initial {
+        // The announcement named a credential this client cannot use: either it holds no record
+        // for it, or it holds the key under another category. The fallback is what turns that into
+        // the server's credential-mismatch signal, and the session reports it once per connection.
         return Ok(Selected {
             psk: SENTINEL_PSK,
             matched: MatchedPsk::Sentinel,
+            credential_mismatch: true,
         });
     }
     bail!("no stored key matches the announced PSK id, so a re-handshake cannot continue")
@@ -2459,6 +2545,10 @@ mod tests {
             let selected = select_psk(&metadata, &candidates, SERVER_ID, initial).unwrap();
             assert_eq!(selected.psk, SENTINEL_PSK);
             assert_eq!(selected.matched, MatchedPsk::Sentinel);
+            assert!(
+                !selected.credential_mismatch,
+                "a Sentinel announcement names the key every client holds"
+            );
         }
     }
 
@@ -2486,6 +2576,10 @@ mod tests {
         let selected = select_psk(&metadata, &candidates, SERVER_ID, true).unwrap();
         assert_eq!(selected.psk, SENTINEL_PSK);
         assert!(
+            selected.credential_mismatch,
+            "the fallback stands in for a credential the server named and this client lacks"
+        );
+        assert!(
             select_psk(&metadata, &candidates, SERVER_ID, false).is_err(),
             "a re-handshake must not silently drop the established key"
         );
@@ -2509,6 +2603,7 @@ mod tests {
                 MatchedPsk::PairingPsk,
                 "the pairing PSK is not tied to one server"
             );
+            assert!(!selected.credential_mismatch);
         }
 
         // The same key announced as a long-term key is not the pairing PSK, and there is no record
@@ -2530,6 +2625,10 @@ mod tests {
         let metadata = PskMetadata::parse(foreign.as_bytes()).unwrap();
         let selected = select_psk(&metadata, &candidates, SERVER_ID, true).unwrap();
         assert_eq!(selected.matched, MatchedPsk::Sentinel);
+        assert!(
+            selected.credential_mismatch,
+            "a pairing key that is not this client's is the credential-mismatch signal"
+        );
     }
 
     #[test]
@@ -2546,6 +2645,12 @@ mod tests {
                 .psk,
             SENTINEL_PSK,
             "a category mismatch is a miss, not a match"
+        );
+        assert!(
+            select_psk(&metadata, &wrong_category, SERVER_ID, true)
+                .unwrap()
+                .credential_mismatch,
+            "a key held under another category is exactly what the signal is for"
         );
         assert!(
             select_psk(&metadata, &wrong_category, SERVER_ID, false).is_err(),
@@ -2713,6 +2818,8 @@ mod tests {
             controller_commands: None,
             server_id: SERVER_ID.to_owned(),
             matched: MatchedPsk::Sentinel,
+            pairing_required: None,
+            ending: None,
             candidates: Candidates::load(None, &[], None).expect("an empty candidate set builds"),
             pairing_index: 0,
             pairing: None,
@@ -3235,6 +3342,82 @@ mod tests {
                 "{text} must stay on the lenient path"
             );
         }
+    }
+
+    /// A pairing requirement reaches the host once per connection, not once per frame.
+    #[tokio::test]
+    async fn a_credential_mismatch_is_reported_once_per_connection() {
+        let config = test_config();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+        session.pairing_required = Some(PairingRequiredReason::CredentialMismatch);
+
+        session.report_pairing_required();
+        session.report_pairing_required();
+
+        let mut seen = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            seen.push(event);
+        }
+        assert_eq!(
+            seen,
+            vec![Event::PairingRequired {
+                server_id: SERVER_ID.to_owned(),
+                reason: PairingRequiredReason::CredentialMismatch,
+            }],
+            "one connection, one requirement"
+        );
+        assert!(
+            session.pairing_required.is_none(),
+            "the requirement is consumed, so nothing can report it again"
+        );
+    }
+
+    /// A guest session has no record to drop, so `server/unpair` leaves it untouched.
+    #[tokio::test]
+    async fn an_unpair_on_an_unpaired_session_is_ignored() {
+        let config = test_config();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+        assert_eq!(session.matched, MatchedPsk::Sentinel);
+
+        session
+            .handle_unpair()
+            .expect("an ignored unpair is not an error");
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "the client must not report a record it never held"
+        );
+        assert!(
+            session.ending.is_none(),
+            "the connection stays open, as the spec requires for an unpaired session"
+        );
+
+        // A session keyed by the pairing PSK is unpaired as well: the record it would drop would
+        // be the client's own pairing credential, which no server owns.
+        session.matched = MatchedPsk::PairingPsk;
+        session
+            .handle_unpair()
+            .expect("an ignored unpair is not an error");
+        assert!(receiver.try_recv().is_err());
+        assert!(session.ending.is_none());
     }
 
     #[tokio::test]

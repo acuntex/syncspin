@@ -90,10 +90,14 @@ where `1000` is normal speed.
 
 ## What does not work yet
 
-- **Pairing.** The Pairing PSK flow works when `ClientConfig::storage` is set: the client draws and
-  persists its pairing PSK, offers `pairing_psk`, runs the flow and stores the record, reporting
-  `Event::Paired`. Without a store it offers no pairing method and stays a guest. Still missing: the
-  code methods, `server/unpair`, the pairing window and the operator-facing pairing token.
+- **Pairing.** With `ClientConfig::storage` set, the client draws and persists its pairing PSK,
+  offers `pairing_psk`, runs the flow and stores the record, reporting `Event::Paired`. A record the
+  server drops arrives as `server/unpair` and is reported as `Event::Unpaired`, and a `psk_id` the
+  client does not hold is reported once per connection as `Event::PairingRequired`. With the
+  `pairing-code` feature the client also runs the static and dynamic code flows, gated by a pairing
+  window the host opens or by the process-wide round limit. Without a store it offers no pairing
+  method and stays a guest. Still missing: the operator-facing pairing token and a `client/goodbye`
+  writer.
 - **Server.** `syncspin-server` is a stub; the listener, streams, roles and pairing server arrive in
   0.2.
 - **Discovery.** Clients do not advertise over mDNS and do not accept server-initiated connections.

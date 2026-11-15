@@ -11,9 +11,9 @@ use syncspin_core::messages::{
     ClientTime, ControllerCommand, DecodeError, DeviceInfo, DynamicPairingCodeMethod, Incoming,
     NoiseHandshake, PairAbort, PairingPskMethod, PlayerState, PlayerSupport, ServerActivate,
     ServerCommand, ServerHello, ServerInit, ServerPairAuth, ServerPairConfirm, ServerPairFinalize,
-    ServerPairInit, ServerState, ServerTime, StaticPairingCodeMethod, StreamClear, StreamEnd,
-    StreamStart, StreamStartPlayer, SupportedFormat, SupportedPairMethods, UnpairedAccess,
-    AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
+    ServerPairInit, ServerState, ServerTime, ServerUnpair, StaticPairingCodeMethod, StreamClear,
+    StreamEnd, StreamStart, StreamStartPlayer, SupportedFormat, SupportedPairMethods,
+    UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
 };
 
 /// A payload whose first bytes differ, so a reassembled message is easy to verify.
@@ -317,6 +317,17 @@ fn pairing_messages_roundtrip_on_the_wire() {
     assert_eq!(
         serde_json::from_str::<Incoming>(&json).unwrap(),
         Incoming::ServerPairFinalize(ServerPairFinalize {})
+    );
+
+    // `server/unpair` carries no fields: its payload is the empty object.
+    let json = serde_json::to_string(&Incoming::ServerUnpair(ServerUnpair {})).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({"type": "server/unpair", "payload": {}})
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ServerUnpair(ServerUnpair {})
     );
 
     let abort = PairAbort {
@@ -653,6 +664,135 @@ fn a_pair_confirm_formats_without_its_tags() {
 }
 
 #[test]
+fn no_pairing_message_formats_key_material_a_nonce_or_a_tag() {
+    // Distinctive values, so a leak is unambiguous: a long-term key, a sealed key, both MCF tags,
+    // the sealed opening of the client nonce, and the server's nonce.
+    let long_term = "B1y4w7z0c3f6i9l2o5r8u1x4a7d0g3j6m9p2s5v8y1b".to_owned();
+    let wrapped_psk =
+        "k8Xm3f0Q2p9Lr4Tz7Vc1Nb6Yh5Jd8Gs2Wa0Ke3Ui7Oo4Pa6Sd9Fg1Hj5Kl8Zx2Cv4Bn7Mq0Rt3".to_owned();
+    let server_tag = "E".repeat(86);
+    let client_tag = "C".repeat(86);
+    let sealed_nonce = "D".repeat(64);
+    let server_nonce = "F".repeat(43);
+
+    // Every value is a secret or a binding value: no `Debug` output of a pairing message may
+    // print any of them, whichever message it came from.
+    let secrets = [
+        &long_term,
+        &wrapped_psk,
+        &server_tag,
+        &client_tag,
+        &sealed_nonce,
+        &server_nonce,
+    ];
+
+    // Each entry is the message, plus the marker its format must carry when it holds a secret.
+    // `client/pair-init`'s `commit_B` is a hash and the two `pake_msg` fields are public shares, so
+    // those messages have nothing to redact; `nonce_A` is public on the wire as well, and is
+    // redacted anyway so that no pairing message can print a nonce into a log.
+    let messages: [(&str, Incoming, bool); 12] = [
+        (
+            "client/pair-init",
+            Incoming::ClientPairInit(ClientPairInit {
+                pairing_index: 3,
+                commit_b: None,
+            }),
+            false,
+        ),
+        (
+            "client/pair-finalize",
+            Incoming::ClientPairFinalize(ClientPairFinalize {
+                long_term_psk: Some(long_term.clone()),
+                wrapped_psk: Some(wrapped_psk.clone()),
+            }),
+            true,
+        ),
+        (
+            "server/pair-init",
+            Incoming::ServerPairInit(ServerPairInit {
+                nonce_a: Some(server_nonce.clone()),
+            }),
+            true,
+        ),
+        (
+            "server/pair-auth",
+            Incoming::ServerPairAuth(ServerPairAuth {
+                pake_msg_1: "G".repeat(43),
+            }),
+            false,
+        ),
+        (
+            "client/pair-auth",
+            Incoming::ClientPairAuth(ClientPairAuth {
+                pake_msg_2: "H".repeat(43),
+            }),
+            false,
+        ),
+        (
+            "server/pair-confirm",
+            Incoming::ServerPairConfirm(ServerPairConfirm {
+                server_kc: server_tag.clone(),
+            }),
+            true,
+        ),
+        (
+            "client/pair-confirm",
+            Incoming::ClientPairConfirm(ClientPairConfirm {
+                client_kc: client_tag.clone(),
+                wrapped_nonce_b: Some(sealed_nonce.clone()),
+            }),
+            true,
+        ),
+        (
+            "server/pair-finalize",
+            Incoming::ServerPairFinalize(ServerPairFinalize {}),
+            false,
+        ),
+        (
+            "client/pair-retry",
+            Incoming::ClientPairRetry(ClientPairRetry {}),
+            false,
+        ),
+        (
+            "client/pair-pending",
+            Incoming::ClientPairPending(ClientPairPending {
+                pairing_index: 3,
+                message: Some("Place the device nearby".to_owned()),
+            }),
+            false,
+        ),
+        (
+            "pair/abort",
+            Incoming::PairAbort(PairAbort {
+                reason: "attempt_timeout".to_owned(),
+            }),
+            false,
+        ),
+        (
+            "server/unpair",
+            Incoming::ServerUnpair(ServerUnpair {}),
+            false,
+        ),
+    ];
+
+    for (name, message, redacts) in messages {
+        let text = format!("{message:?}");
+        for secret in secrets {
+            assert!(
+                !text.contains(secret.as_str()),
+                "{name} must not format a key, a nonce or a tag: {text}"
+            );
+        }
+        if redacts {
+            assert!(
+                text.contains("<redacted>"),
+                "{name} must name its redacted field: {text}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_static_pairing_code_descriptor_serializes_as_an_empty_object() {
     let methods = SupportedPairMethods {
         pairing_psk: Some(PairingPskMethod {}),
@@ -926,6 +1066,7 @@ fn parse_accepts_every_message_this_revision_implements() {
         Incoming::ClientPairInit(ClientPairInit::default()),
         Incoming::ClientPairFinalize(ClientPairFinalize::default()),
         Incoming::ServerPairFinalize(ServerPairFinalize {}),
+        Incoming::ServerUnpair(ServerUnpair {}),
         Incoming::PairAbort(PairAbort {
             reason: "attempt_timeout".to_owned(),
         }),
@@ -948,7 +1089,7 @@ fn parse_accepts_every_message_this_revision_implements() {
         Incoming::StreamClear(StreamClear::default()),
         Incoming::StreamEnd(StreamEnd::default()),
     ];
-    assert_eq!(messages.len(), 19, "one instance per message type");
+    assert_eq!(messages.len(), 20, "one instance per message type");
     for message in messages {
         let text = serde_json::to_string(&message).unwrap();
         assert_eq!(
