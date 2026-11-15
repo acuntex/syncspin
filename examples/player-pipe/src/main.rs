@@ -6,7 +6,10 @@
 //! player-pipe --server music-assistant.local:8927 | aplay -f S16_LE -r 48000 -c 2
 //! ```
 //!
-//! The player keeps its identity in a file so the server sees the same player across restarts.
+//! The player keeps its identity in a file so the server sees the same player across restarts. That
+//! file holds the bare 43-character base64url X25519 secret on one line, not JSON: the library has
+//! no storage format of its own, so the example owns this one.
+//!
 //! Status lines are for people; audio is the only thing that reaches stdout.
 
 mod pipe_sink;
@@ -27,7 +30,7 @@ use crate::pipe_sink::PipeSink;
 const DEFAULT_NAME: &str = "syncspin-pipe";
 
 /// Identity file used when `--identity` is absent.
-const DEFAULT_IDENTITY: &str = "./identity.json";
+const DEFAULT_IDENTITY: &str = "./identity.key";
 
 /// First delay between reconnects; doubles up to [`MAX_BACKOFF`].
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -50,13 +53,17 @@ fn main() -> Result<()> {
     play(options)
 }
 
-/// Builds the runtime and runs the player until Ctrl-C.
+/// Builds the runtime, runs the player until Ctrl-C and bounds the shutdown wait.
 fn play(options: Options) -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("failed to start the Tokio runtime")?
-        .block_on(run(options))
+        .context("failed to start the Tokio runtime")?;
+    let result = runtime.block_on(run(options));
+    // A stdout reader that stopped consuming can leave the session task blocked in a write.
+    // Dropping the runtime would wait for that task; bound the wait so Ctrl-C stays responsive.
+    runtime.shutdown_timeout(Duration::from_millis(500));
+    result
 }
 
 /// Connects, reconnects with backoff and returns when the user interrupts.
@@ -73,11 +80,9 @@ async fn run(options: Options) -> Result<()> {
         server: options.server,
         player_name: options.name,
         identity,
-        audio_mode: if options.passthrough {
-            AudioMode::Passthrough
-        } else {
-            AudioMode::Decode
-        },
+        // This example has no decoder, so it asks for raw samples. A host that wants encoded
+        // frames selects `AudioMode::Passthrough` and brings its own decoder.
+        audio_mode: AudioMode::Decode,
         max_backoff: MAX_BACKOFF,
     };
 
@@ -85,9 +90,20 @@ async fn run(options: Options) -> Result<()> {
     loop {
         let (reason, retry_in) = match serve(&config).await {
             Ok(Ending::Interrupted) => return Ok(()),
-            Ok(Ending::Disconnected { reason, retry_in }) => (reason, retry_in),
+            Ok(Ending::Disconnected {
+                reason,
+                retry_in,
+                connected,
+            }) => {
+                if connected {
+                    // The address and the handshake worked, so a later failure is more likely
+                    // transient than a reason to keep waiting longer.
+                    delay = INITIAL_BACKOFF;
+                }
+                (reason, retry_in)
+            }
             Err(error) => (
-                format!("cannot connect to {}: {error:#}", config.server),
+                format!("cannot connect to {}: {error}", config.server),
                 Duration::ZERO,
             ),
         };
@@ -119,6 +135,8 @@ enum Ending {
         reason: String,
         /// Delay the session recommends before the next attempt.
         retry_in: Duration,
+        /// Whether the session reached [`Event::Connected`] before it ended.
+        connected: bool,
     },
     /// The user asked the player to stop.
     Interrupted,
@@ -127,6 +145,7 @@ enum Ending {
 /// Connects once, prints one status line per event and returns how the connection ended.
 async fn serve(config: &ClientConfig) -> Result<Ending> {
     let (_handle, mut events) = Client::connect(config.clone(), Box::new(PipeSink::new())).await?;
+    let mut connected = false;
 
     loop {
         tokio::select! {
@@ -140,10 +159,12 @@ async fn serve(config: &ClientConfig) -> Result<Ending> {
                     return Ok(Ending::Disconnected {
                         reason: "the event stream ended without a disconnect event".to_owned(),
                         retry_in: Duration::ZERO,
+                        connected,
                     });
                 };
                 match event {
                     Event::Connected { server_id, encrypted } => {
+                        connected = true;
                         let security = if encrypted { "encrypted" } else { "not encrypted" };
                         eprintln!("connected: server {server_id}, {security}");
                     }
@@ -182,7 +203,7 @@ async fn serve(config: &ClientConfig) -> Result<Ending> {
                         }
                     }
                     Event::Disconnected { reason, retry_in } => {
-                        return Ok(Ending::Disconnected { reason, retry_in });
+                        return Ok(Ending::Disconnected { reason, retry_in, connected });
                     }
                 }
             }
@@ -192,23 +213,50 @@ async fn serve(config: &ClientConfig) -> Result<Ending> {
 
 /// Loads the identity from `path`, generating and storing one when the file does not exist.
 ///
-/// The secret is never printed; only the derived public key, which is what the server sees.
+/// The file holds the bare 43-character base64url secret on one line; it is not JSON, because the
+/// library has no storage format yet. The secret is never printed, only the derived public key,
+/// which is what the server sees.
 fn load_or_create_identity(path: &Path) -> Result<Identity> {
-    match fs::read_to_string(path) {
-        Ok(text) => Identity::from_secret_base64(text.trim()).with_context(|| {
-            format!(
-                "{} does not hold a 43-character base64url X25519 secret",
-                path.display()
-            )
-        }),
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                bail!("{} is not a regular file", path.display());
+            }
+            tighten_identity_permissions(path, &metadata)?;
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            Identity::from_secret_base64(text.trim()).with_context(|| {
+                format!(
+                    "{} does not hold a bare 43-character base64url X25519 secret on one line",
+                    path.display()
+                )
+            })
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let identity = Identity::generate();
             save_identity(path, &identity)?;
             eprintln!("generated a new identity in {}", path.display());
             Ok(identity)
         }
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
     }
+}
+
+/// Warns about and repairs an identity file that group or others can read.
+///
+/// The file may come from an older build or a careless copy; refusing to start would be worse than
+/// repairing the mode, because the player already knows the keypair behind it.
+fn tighten_identity_permissions(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let mode = metadata.permissions().mode() & 0o777;
+    if (mode & 0o077) == 0 {
+        return Ok(());
+    }
+    eprintln!(
+        "warning: {} is readable by group or others (mode {mode:03o}); setting it to 0600",
+        path.display()
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to restrict the permissions of {}", path.display()))
 }
 
 /// Writes a fresh identity so that only its owner can read it.
@@ -241,8 +289,6 @@ struct Options {
     name: String,
     /// File that holds the X25519 identity.
     identity: PathBuf,
-    /// Whether to ask for encoded frames instead of decoded PCM.
-    passthrough: bool,
 }
 
 /// Result of parsing the command line.
@@ -253,7 +299,7 @@ enum Parse {
     Run(Options),
 }
 
-/// Parses `--flag value`, `--flag=value`, `--passthrough`, `--help` and `-h`.
+/// Parses `--flag value`, `--flag=value`, `--help` and `-h`.
 fn parse_args<I>(args: I) -> Result<Parse>
 where
     I: IntoIterator<Item = String>,
@@ -261,19 +307,12 @@ where
     let mut server = None;
     let mut name = DEFAULT_NAME.to_owned();
     let mut identity = PathBuf::from(DEFAULT_IDENTITY);
-    let mut passthrough = false;
 
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         let (flag, inline) = split_flag(&argument);
         match flag {
             "-h" | "--help" => return Ok(Parse::Help),
-            "--passthrough" => {
-                if inline.is_some() {
-                    bail!("--passthrough takes no value");
-                }
-                passthrough = true;
-            }
             "--server" => server = Some(take_value(flag, inline, &mut args)?),
             "--name" => name = take_value(flag, inline, &mut args)?,
             "--identity" => identity = PathBuf::from(take_value(flag, inline, &mut args)?),
@@ -282,6 +321,7 @@ where
     }
 
     let server = server.ok_or_else(|| anyhow!("--server is required; try --help"))?;
+    check_server(&server)?;
     if name.len() > MAX_PLAYER_NAME_LEN {
         bail!(
             "--name is {} bytes, but the protocol allows at most {MAX_PLAYER_NAME_LEN}",
@@ -293,8 +333,21 @@ where
         server,
         name,
         identity,
-        passthrough,
     }))
+}
+
+/// Rejects an address this build cannot use, before a connection is attempted.
+///
+/// The client validates the address too, but only once it connects. Checking here keeps a TLS URL
+/// from retrying forever, and keeps it from creating an identity file first.
+fn check_server(server: &str) -> Result<()> {
+    if server.starts_with("wss://") {
+        bail!("TLS is not supported by this build; use a ws:// URL or host:port");
+    }
+    if server.contains("://") && !server.starts_with("ws://") {
+        bail!("unsupported URL scheme in {server:?}; use ws:// or host:port");
+    }
+    Ok(())
 }
 
 /// Splits `--flag=value` into its two halves; leaves every other argument unchanged.
@@ -318,6 +371,9 @@ fn take_value(
     if value.trim().is_empty() {
         bail!("{flag} needs a value that is not empty");
     }
+    if value.starts_with('-') {
+        bail!("{flag} needs a value, but {value:?} is another flag");
+    }
     Ok(value)
 }
 
@@ -327,18 +383,18 @@ fn usage() -> String {
         "\
 player-pipe - stream one Sendspin player's audio to standard output
 
-Usage: player-pipe --server <host[:port]> [options]
+Usage: player-pipe --server <host[:port] | ws://url> [options]
 
 Options:
-      --server <host[:port]>  Address of the Sendspin server (required),
-                              for example music-assistant.local:8927
+      --server <host[:port] | ws://url>
+                              Address of the Sendspin server (required), for
+                              example music-assistant.local:8927; TLS (wss://)
+                              is not supported by this build
       --name <player name>    Name this player announces [default: {DEFAULT_NAME}]
-      --identity <path>       File holding the player's X25519 identity; created
-                              with owner-only permissions when missing
+      --identity <path>       File holding the player's X25519 identity: the bare
+                              43-character base64url secret on one line, not JSON;
+                              created with owner-only permissions when missing
                               [default: {DEFAULT_IDENTITY}]
-      --passthrough           Ask for encoded frames instead of decoded PCM; this
-                              example carries no decoder, so such a stream stops
-                              with an error
   -h, --help                  Print this help and exit
 
 Audio goes to standard output as raw samples in the announced format; status
@@ -373,7 +429,6 @@ mod tests {
         assert_eq!(options.server, "music-assistant.local");
         assert_eq!(options.name, DEFAULT_NAME);
         assert_eq!(options.identity, PathBuf::from(DEFAULT_IDENTITY));
-        assert!(!options.passthrough);
     }
 
     #[test]
@@ -381,14 +436,12 @@ mod tests {
         let options = options(&[
             "--server=music-assistant.local:8927",
             "--name=Kitchen",
-            "--identity=/tmp/identity.json",
-            "--passthrough",
+            "--identity=/tmp/identity.key",
         ]);
 
         assert_eq!(options.server, "music-assistant.local:8927");
         assert_eq!(options.name, "Kitchen");
-        assert_eq!(options.identity, PathBuf::from("/tmp/identity.json"));
-        assert!(options.passthrough);
+        assert_eq!(options.identity, PathBuf::from("/tmp/identity.key"));
     }
 
     #[test]
@@ -406,10 +459,30 @@ mod tests {
             &["--server"][..],
             &["--server", ""][..],
             &["--server", "host", "--bogus"][..],
-            &["--server", "host", "--passthrough=yes"][..],
             &["--server", "host", "--name", &too_long][..],
+            &["--server", "--help"][..],
+            &["--server", "host", "--identity", "-x"][..],
         ] {
             assert!(parse(args).is_err(), "{args:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn a_server_this_build_cannot_use_is_rejected_before_connecting() {
+        let Err(error) = parse(&["--server", "wss://example.test"]) else {
+            panic!("a TLS URL must be rejected");
+        };
+        assert!(
+            format!("{error}").contains("TLS"),
+            "the error should name the missing TLS support, got: {error}"
+        );
+
+        let Err(error) = parse(&["--server", "https://example.test"]) else {
+            panic!("a non-ws scheme must be rejected");
+        };
+        assert!(
+            format!("{error}").contains("unsupported URL scheme"),
+            "the error should name the scheme, got: {error}"
+        );
     }
 }

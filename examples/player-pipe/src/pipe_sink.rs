@@ -1,8 +1,9 @@
 //! A [`Sink`] that writes raw samples to standard output.
 //!
-//! The example has no decoder: an encoded stream stops the session with an error that names what
-//! is missing, instead of writing compressed bytes into the pipe. Because stdout is a pipe and not
-//! a scheduled audio device, playout deadlines are ignored and frames are written as they arrive.
+//! The example has no decoder, so it asks the server for PCM; an encoded stream stops the session
+//! with an error that names what is missing, instead of writing compressed bytes into the pipe.
+//! Because stdout is a pipe and not a scheduled audio device, playout deadlines are ignored and
+//! frames are written as they arrive.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -11,6 +12,10 @@ use anyhow::{bail, Context, Result};
 use syncspin_client::{AudioFormat, AudioFrame, Sink};
 
 /// Forwards PCM frames to stdout and reports the format of the stream it was opened for.
+///
+/// This sink only writes raw samples. A host that needs
+/// [`AudioMode::Passthrough`](syncspin_client::AudioMode::Passthrough) must bring its own decoder
+/// and its own sink, because forwarding encoded frames is not something this example can do.
 #[derive(Debug, Default)]
 pub struct PipeSink {
     format: Option<AudioFormat>,
@@ -42,7 +47,7 @@ impl Sink for PipeSink {
                 };
                 bail!(
                     "{stream} delivered a {}-byte `{codec}` frame, but this example carries no \
-                     decoder feature; run it without --passthrough to receive raw PCM",
+                     decoder for encoded streams; it requests PCM from the server",
                     data.len()
                 )
             }

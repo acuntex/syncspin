@@ -1,3 +1,8 @@
 /target
 *.ipk
 .superpowers/
+
+# A player identity generated in the repository root must never be committed. `identity.json` is
+# the name older checkouts used.
+/identity.key
+/identity.json

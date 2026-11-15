@@ -34,6 +34,7 @@ fixed port, a hostname or a device is wrong by construction.
 | `crates/syncspin-core/tests/clock.rs`           | Clock-filter convergence under jitter, the readiness threshold, an outlier not moving the estimate, the local/server timestamp round trip and the reset.                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `crates/syncspin-client/tests/session_guest.rs` | The guest session end to end: connect and report an encrypted connection, `stream/start` opening the sink with the announced format, audio chunks reaching the sink with their length and a playout deadline once the clock is ready, a volume command and controller state, fragmented audio reassembly, a wrong `psk_id` falling back to the Sentinel key, malformed PSK metadata closing without a second handshake message, unknown types ignored while a malformed known type closes the connection, and a server that never starts the handshake being refused. |
 | `crates/syncspin-client/tests/fake_server.rs`   | The harness the session suite runs against: a loopback WebSocket listener that plays the Noise initiator with `snow` and records what the sink received. It carries no tests of its own.                                                                                                                                                                                                                                                                                                                                                                              |
+| `examples/player-pipe` (in-module tests)        | The example's command line: the default name and identity file, `--flag=value` parsing, `--help` without a server, and rejection of incomplete, unknown, empty, dashed and over-long values as well as a TLS or non-`ws` server address.                                                                                                                                                                                                                                                                                                                              |
 | In-module unit tests (`crates/*/src`)           | The per-crate `version()` test, the prologue parsing and identity-redaction tests beside `noise.rs`, and the PSK-selection, endpoint and codec-name tests beside the client code.                                                                                                                                                                                                                                                                                                                                                                                     |
 
 A fake server, not a live Music Assistant, is the reference peer for anything that needs a peer.
@@ -97,10 +98,19 @@ it against the running server.
    has no pairing yet, and the guest session announces `unpaired_access` with `enabled: true`. Without
    the server-side setting the session is kept out of playback, which is a configuration result, not
    a library failure.
-2. The client, pointed at that URL, with a keypair the build owns. `ClientConfig` takes an
-   `Identity`; the build generates one on first run and stores it, because a fresh keypair makes the
-   server treat the player as a new device. The library itself never writes that file.
-3. Keep the server's log and the client's output visible side by side; the interesting failures are
+2. The example player, pointed at that address:
+
+   ```sh
+   cargo run -p player-pipe -- --server <server>:8927 | aplay -f S16_LE -r 48000 -c 2
+   ```
+
+   Replace `aplay` with any consumer of the announced raw format.
+
+3. The first run writes `./identity.key` in 0600 mode and prints the public key the server sees.
+   Later runs reuse that file, because a fresh keypair makes the server treat the player as a new
+   device. The library itself never writes it; the example does. `--identity <path>` stores it
+   elsewhere.
+4. Keep the server's log and the client's output visible side by side; the interesting failures are
    visible in both.
 
 ### What to observe
@@ -113,17 +123,22 @@ it against the running server.
 - **`stream/start`.** The announced format (codec, sample rate, channels, bit depth) matches what
   the sink is opened with. A format change mid-stream closes and reopens the sink instead of
   writing mismatched audio.
-- **Audio at the sink.** Audio actually reaches the output, at the right rate and without gaps: the
-  sink's underrun counter stays at zero after the first buffer, and the first frames are not
-  swallowed. Silence with a healthy connection usually means a playout deadline in the past.
+- **Audio at the sink.** Audio actually reaches the output, at the right rate and without audible
+  gaps, and the first frames are not swallowed. The example's sink does not count underruns
+  (`Sink::underruns` keeps its default of zero), so a zero reading proves nothing there; judge gaps
+  by ear. Silence with a healthy connection usually means a playout deadline in the past.
 - **State.** Title and artist arrive from `server/state.metadata`, and volume, mute and the supported
   commands from `server/state.controller`. The group's `playback_state` and `group_id` travel in
   `group/update`, which the library does not handle yet, so playing/stopped is not observable — see
   [`spec-deviations.md`](spec-deviations.md).
-- **Volume.** A volume command from the server arrives as a volume event; the hosting build applies
-  its platform limit and reports the applied value back — the applied value, not the requested one.
-- **Sync.** With two clients in the same group, both stay audibly aligned; drift over several
-  minutes points at the clock filter or at a sink that does not report latency.
+- **Volume.** A volume command from the server arrives as a volume event, which the player prints to
+  stderr. Applying it and reporting the applied value back is the host's job, and `player-pipe` does
+  neither: with this sink only the event is observable. A build that implements both must report the
+  applied value, not the requested one.
+- **Sync.** With two clients in the same group, both stay audibly aligned; drift over several minutes
+  points at the clock filter or at a sink that does not report latency. `PipeSink::latency` returns
+  `None`, so with the example only the audible check applies; a build that reports latency can also
+  compare it with the playout deadlines.
 - **Recovery.** Stop the server: the session reports a disconnect and leaves the retry to the build
   that hosts it (`ClientConfig::max_backoff` bounds the delay; the crate does not schedule retries in
   this revision). Start the server again and the reconnect plays without a restart — a build that

@@ -12,11 +12,12 @@ from a working player, the server is a stub. Nothing here is stable yet.
 
 ## Layout
 
-| Crate             | Contents                                                                        |
-| ----------------- | ------------------------------------------------------------------------------- |
-| `syncspin-core`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
-| `syncspin-client` | Session loop, `Sink` trait, event stream.                                       |
-| `syncspin-server` | Listener, streams, roles, pairing (planned for 0.2).                            |
+| Path                      | Contents                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------- |
+| `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
+| `crates/syncspin-client/` | Session loop, `Sink` trait, event stream.                                       |
+| `crates/syncspin-server/` | Listener, streams, roles, pairing (planned for 0.2).                            |
+| `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr.               |
 
 `syncspin-core` never depends on `syncspin-client` or `syncspin-server`; every protocol and crypto
 decision lives in one place.
@@ -40,7 +41,10 @@ stderr.
 cargo run -p player-pipe -- --server music-assistant.local:8927 | aplay -f S16_LE -r 48000 -c 2
 ```
 
-Run `cargo run -p player-pipe -- --help` for the player name, identity file and passthrough flags.
+Run `cargo run -p player-pipe -- --help` for the player name and identity file. The first run writes
+`./identity.key` with owner-only permissions and prints the public key the server sees; later runs
+reuse it. The server must allow unpaired access, because this revision has no pairing yet.
+
 The source is small and meant to be read: `src/main.rs` holds the event loop and the identity
 handling, `src/pipe_sink.rs` the `Sink` implementation.
 
