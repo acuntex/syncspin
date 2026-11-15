@@ -10,8 +10,9 @@
 #   rustup component add llvm-tools-preview
 #   cargo install cargo-llvm-cov --locked
 #
-# The floor is 99.1 rather than 100 because eight guard lines cannot be reached by any input; they
-# are listed here so the reason is visible with the gate:
+# The floor is 99.15 rather than 100 because eight guard lines cannot be reached by any input; they
+# are listed here so the reason is visible with the gate. The measured value is 99.17, so a new
+# uncovered line still fails:
 #
 #   syncspin-client/src/client.rs:710        sink_failed + a clean close cannot coexist
 #   syncspin-client/src/session.rs:407-408   deadline combinations the state machine never builds
@@ -22,7 +23,7 @@
 
 set -euo pipefail
 
-FLOOR="${COVERAGE_FLOOR:-99.1}"
+FLOOR="${COVERAGE_FLOOR:-99.15}"
 cd "$(dirname "$0")/.."
 
 args=(--workspace --locked --ignore-filename-regex 'examples/')

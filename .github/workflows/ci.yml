@@ -110,11 +110,11 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Coverage floor
-        # 99.1 is the achieved value: every reachable line is covered. The eight
-        # unexecuted lines are guards no input can reach; scripts/coverage.sh names
-        # them, so a new gap below this floor fails the job.
+        # 99.15 against a measured 99.17: every reachable line is covered and a
+        # new gap still fails. The eight unexecuted lines are guards no input can
+        # reach; scripts/coverage.sh names them.
         env:
-          COVERAGE_FLOOR: "99.1"
+          COVERAGE_FLOOR: "99.15"
         run: |
           cargo llvm-cov --workspace --locked --ignore-filename-regex 'examples/' \
             --lcov --output-path lcov.info --fail-under-lines "${COVERAGE_FLOOR}"
