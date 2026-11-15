@@ -199,3 +199,111 @@ fn reset_clears_the_estimate() {
     assert_eq!(filter.offset_us(), None);
     assert_eq!(filter.last_sample_us(), 0);
 }
+
+#[test]
+fn an_out_of_order_or_impossible_sample_is_discarded() {
+    let mut filter = ClockFilter::new();
+    let sample = jittered_sample(0, START_US);
+    filter.push(sample);
+    assert_eq!(filter.sample_count(), 1);
+    let accepted_at = filter.last_sample_us();
+    let estimate = filter.now_us(accepted_at);
+
+    // The same instant again does not advance the filter; it has to be later.
+    filter.push(sample);
+    assert_eq!(
+        filter.sample_count(),
+        1,
+        "a sample that does not advance the local clock must be discarded"
+    );
+    assert_eq!(filter.last_sample_us(), accepted_at);
+    assert_eq!(
+        filter.now_us(accepted_at),
+        estimate,
+        "a discarded sample must not move the estimate"
+    );
+
+    // A round trip that claims more server processing time than it spent on the wire cannot be
+    // true: its error bound is not positive, so it carries no information.
+    let impossible = TimeSample {
+        client_sent_us: START_US + 10_000,
+        server_received_us: START_US + 10_000,
+        server_sent_us: START_US + 11_000,
+        client_received_us: START_US + 10_500,
+    };
+    assert!(filter.sample_count() >= 1);
+    filter.push(impossible);
+    assert_eq!(
+        filter.sample_count(),
+        1,
+        "a non-positive error bound must not be folded in"
+    );
+}
+
+#[test]
+fn default_starts_from_the_same_empty_state_as_new() {
+    let default = ClockFilter::default();
+    let new = ClockFilter::new();
+    assert_eq!(default.sample_count(), new.sample_count());
+    assert_eq!(default.last_sample_us(), new.last_sample_us());
+    assert_eq!(default.is_ready(), new.is_ready());
+    assert_eq!(default.now_us(START_US), None);
+    assert_eq!(default.client_time_us(START_US), None);
+    assert_eq!(default.offset_us(), None);
+
+    // Both accept the same first sample and derive the same estimate from it.
+    let mut default = default;
+    let mut new = new;
+    let sample = jittered_sample(0, START_US);
+    default.push(sample);
+    new.push(sample);
+    assert_eq!(default.sample_count(), new.sample_count());
+    assert_eq!(
+        default.now_us(sample.client_received_us),
+        new.now_us(sample.client_received_us)
+    );
+}
+
+/// Feeds `prior` offset-zero samples, then `steps` samples whose server clock is one second
+/// ahead, and returns the resulting offset estimate.
+///
+/// Every sample has an error bound of 100 µs and they are spaced [`SPACING_US`] apart.
+fn estimate_after_a_step(prior: usize, steps: usize) -> i64 {
+    let mut filter = ClockFilter::new();
+    let mut local_sent_us = START_US;
+    for _ in 0..prior {
+        filter.push(sample(local_sent_us, 0, 100, 100));
+        local_sent_us += SPACING_US;
+    }
+    assert_eq!(filter.sample_count(), prior);
+    for _ in 0..steps {
+        filter.push(sample(local_sent_us, 1_000_000, 100, 100));
+        local_sent_us += SPACING_US;
+    }
+    filter
+        .offset_us()
+        .unwrap_or_else(|| panic!("{prior} accepted samples must make the filter ready"))
+}
+
+#[test]
+fn adaptive_forgetting_follows_a_step_once_enough_samples_are_in() {
+    // The published cutoff is 100 accepted samples. Below it the filter treats a one-second offset
+    // step as an outlier and barely moves; at the cutoff it inflates its covariance and catches up.
+    // Comparing the two runs proves the branch is what makes the difference, not the step size.
+    let before_cutoff = estimate_after_a_step(99, 3);
+    let at_cutoff = estimate_after_a_step(100, 3);
+
+    assert!(
+        at_cutoff > 700_000,
+        "after the cutoff the estimate must follow the 1 s step, got {at_cutoff} µs"
+    );
+    assert!(
+        before_cutoff < 600_000,
+        "below the cutoff the same step must still be damped, got {before_cutoff} µs"
+    );
+    assert!(
+        at_cutoff > before_cutoff,
+        "adaptive forgetting must move the estimate further than the damped path \
+         ({at_cutoff} vs {before_cutoff})"
+    );
+}

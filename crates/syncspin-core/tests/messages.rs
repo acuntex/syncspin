@@ -812,3 +812,164 @@ fn max_audio_payload_leaves_room_for_the_header() {
         "a limit below the fixed header cannot carry audio"
     );
 }
+
+#[test]
+fn an_audio_chunk_header_rejects_the_wrong_id_and_each_truncation() {
+    use std::error::Error as _;
+
+    let error = AudioChunkHeader::parse(&[]).expect_err("an empty message has no header");
+    assert!(
+        format!("{error:#}").contains("empty binary message"),
+        "unexpected error: {error:#}"
+    );
+
+    let error = AudioChunkHeader::parse(&[7, 0, 0, 0])
+        .expect_err("only an audio chunk id introduces a header");
+    assert!(
+        format!("{error:#}").contains("id 7 is not an audio chunk"),
+        "unexpected error: {error:#}"
+    );
+
+    // Short enough that the timestamp is incomplete, then long enough for the timestamp but not
+    // for `send_ahead`: both are truncations, and the message names the length it saw.
+    for len in 1..AudioChunkHeader::LEN {
+        let mut message = vec![AUDIO_CHUNK_ID; len];
+        if len > 1 {
+            message[1..].fill(0);
+        }
+        let error = AudioChunkHeader::parse(&message)
+            .expect_err("a chunk shorter than the fixed header must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("truncated") && message.contains(&len.to_string()),
+            "the error must name the truncation, got: {message}"
+        );
+    }
+
+    // The two truncation points above are distinct branches: fewer than nine bytes fail at the
+    // timestamp, nine to twelve fail after it.
+    assert!(AudioChunkHeader::parse(&[AUDIO_CHUNK_ID; 8]).is_err());
+    assert!(AudioChunkHeader::parse(&[AUDIO_CHUNK_ID; 9]).is_err());
+    assert!(AudioChunkHeader::parse(&[AUDIO_CHUNK_ID; 12]).is_err());
+
+    let header = AudioChunkHeader {
+        timestamp_us: -1,
+        send_ahead: 0,
+    }
+    .encode(&[1]);
+    assert_eq!(header.len(), AudioChunkHeader::LEN + 1);
+    assert_eq!(
+        AudioChunkHeader::parse(&header).expect("a complete header parses"),
+        (
+            AudioChunkHeader {
+                timestamp_us: -1,
+                send_ahead: 0
+            },
+            &[1u8][..]
+        )
+    );
+
+    let unknown = DecodeError::UnknownType("future/telemetry".to_owned());
+    assert!(
+        unknown.to_string().contains("future/telemetry"),
+        "an unknown type names itself: {unknown}"
+    );
+    assert!(
+        unknown.source().is_none(),
+        "an unknown type wraps no underlying error"
+    );
+
+    let malformed = Incoming::parse("{\"type\":\"client/time\"}").unwrap_err();
+    assert!(
+        malformed.to_string().contains("malformed message"),
+        "a malformed message names the decode failure: {malformed}"
+    );
+    assert!(
+        malformed.source().is_some(),
+        "a malformed message exposes the serde error as its source"
+    );
+}
+
+#[test]
+fn reassembly_rejects_an_empty_sequence_and_more_than_one_message() {
+    let error = reassemble_binary(&[]).expect_err("an empty sequence has no message");
+    assert!(
+        format!("{error:#}").contains("no frame to reassemble"),
+        "unexpected error: {error:#}"
+    );
+
+    let frames = vec![encode_binary(0, b"{}"), encode_binary(4, &[1, 2, 3])];
+    let error = reassemble_binary(&frames).expect_err("two frames are two messages");
+    assert!(
+        format!("{error:#}").contains("more than one message"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("frame 1"),
+        "the error names the frame with the second message: {error:#}"
+    );
+}
+
+#[test]
+fn a_single_fragment_can_carry_both_flags() {
+    // Nothing in the encoding forbids a message that fits one frame from being sent as a
+    // first-and-last fragment; the reassembler has to hand it over as one message.
+    let mut reassembler = Reassembler::new(1024);
+    let frame = vec![
+        BINARY_MESSAGE_ID_FRAGMENT,
+        FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST,
+        9,
+        1,
+        2,
+        3,
+    ];
+    assert_eq!(
+        reassembler.push(&frame).unwrap(),
+        Some((9, vec![1, 2, 3])),
+        "a first-and-last fragment completes in one push"
+    );
+    assert_eq!(
+        reassembler.push(&encode_binary(0, b"{}")).unwrap(),
+        Some((0, b"{}".to_vec())),
+        "the completed message leaves nothing in flight"
+    );
+}
+
+#[test]
+fn a_first_fragment_cannot_exceed_the_message_cap_on_its_own() {
+    let mut reassembler = Reassembler::new(2);
+    let frame = vec![BINARY_MESSAGE_ID_FRAGMENT, FRAGMENT_FLAG_FIRST, 4, 1, 2, 3];
+    let error = reassembler
+        .push(&frame)
+        .expect_err("three payload bytes exceed the two-byte cap");
+    assert!(
+        format!("{error:#}").contains("exceeds 2 bytes"),
+        "unexpected error: {error:#}"
+    );
+
+    // The rejected first fragment left nothing in flight, so a continuation is refused rather
+    // than appended to a message that was never opened.
+    assert!(
+        reassembler
+            .push(&[BINARY_MESSAGE_ID_FRAGMENT, 0, 1])
+            .is_err(),
+        "a continuation after the rejected first fragment has no message to continue"
+    );
+}
+
+#[test]
+fn an_empty_frame_is_rejected() {
+    let mut reassembler = Reassembler::new(1024);
+    let error = reassembler
+        .push(&[])
+        .expect_err("an empty frame has no message id");
+    assert!(
+        format!("{error:#}").contains("empty frame"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        reassembler.push(&encode_binary(0, b"{}")).unwrap(),
+        Some((0, b"{}".to_vec())),
+        "the error leaves the reassembler usable"
+    );
+}

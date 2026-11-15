@@ -441,9 +441,12 @@ mod tests {
         let identity = Identity::generate();
 
         for prologue in [&b""[..], CLIENT_INIT] {
-            let Err(err) = Responder::new(&identity, prologue) else {
-                panic!("a prologue without server/init must be rejected");
-            };
+            let result = Responder::new(&identity, prologue);
+            assert!(
+                result.is_err(),
+                "a prologue without server/init must be rejected"
+            );
+            let err = result.err().expect("the rejection was asserted");
             let message = format!("{err:#}");
             assert!(
                 message.contains("server_id") && message.contains("with_peer"),
@@ -452,9 +455,12 @@ mod tests {
         }
 
         // Malformed JSON is a parse error, not a silently skipped document.
-        let Err(err) = Responder::new(&identity, b"not json at all") else {
-            panic!("a prologue that is not JSON must be rejected");
-        };
+        let result = Responder::new(&identity, b"not json at all");
+        assert!(
+            result.is_err(),
+            "a prologue that is not JSON must be rejected"
+        );
+        let err = result.err().expect("the rejection was asserted");
         assert!(
             format!("{err:#}").contains("prologue is not a sequence of JSON documents"),
             "error should name the malformed prologue, got: {err:#}"
@@ -469,9 +475,9 @@ mod tests {
         let mut prologue = prologue(&first);
         prologue.extend_from_slice(&server_init(&second));
 
-        let Err(err) = Responder::new(&identity, &prologue) else {
-            panic!("two server/init documents are ambiguous");
-        };
+        let result = Responder::new(&identity, &prologue);
+        assert!(result.is_err(), "two server/init documents are ambiguous");
+        let err = result.err().expect("the rejection was asserted");
         assert!(
             format!("{err:#}").contains("more than one `server/init`"),
             "error should name the duplicate, got: {err:#}"
@@ -483,12 +489,70 @@ mod tests {
         let mut identity = Identity::generate();
         identity.public = Identity::generate().public;
         let prologue = prologue(&Identity::generate().public_base64());
-        let Err(err) = Responder::with_peer(&identity, &[0u8; 32], &prologue) else {
-            panic!("a mismatched identity must be rejected");
-        };
+        let result = Responder::with_peer(&identity, &[0u8; 32], &prologue);
+        assert!(result.is_err(), "a mismatched identity must be rejected");
+        let err = result.err().expect("the rejection was asserted");
         assert!(
             format!("{err:#}").contains("does not match"),
             "error should name the mismatch, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_server_init_without_a_usable_server_id_is_rejected() {
+        let identity = Identity::generate();
+
+        let mut missing = CLIENT_INIT.to_vec();
+        missing.extend_from_slice(br#"{"type":"server/init","payload":{"version":1}}"#);
+        let result = Responder::new(&identity, &missing);
+        assert!(result.is_err(), "a server/init without server_id must fail");
+        assert!(
+            format!("{:#}", result.err().expect("the rejection was asserted"))
+                .contains("payload.server_id"),
+            "the error must name the missing field"
+        );
+
+        let mut wrong_type = CLIENT_INIT.to_vec();
+        wrong_type.extend_from_slice(br#"{"type":"server/init","payload":{"server_id":42}}"#);
+        let result = Responder::new(&identity, &wrong_type);
+        assert!(result.is_err(), "a non-string server_id must fail");
+        assert!(
+            format!("{:#}", result.err().expect("the rejection was asserted"))
+                .contains("payload.server_id")
+        );
+    }
+
+    #[test]
+    fn a_server_id_that_is_not_a_canonical_key_is_rejected() {
+        let identity = Identity::generate();
+
+        // Wrong length, an invalid base64url character, and 43 characters whose unused trailing
+        // bits are not zero: only the canonical encoding of exactly 32 bytes may be accepted.
+        for server_id in ["short", &"!".repeat(43), &"a".repeat(43)] {
+            let result = Responder::new(&identity, &prologue(server_id));
+            assert!(
+                result.is_err(),
+                "{server_id:?} must not be accepted as a key"
+            );
+            let message = format!("{:#}", result.err().expect("the rejection was asserted"));
+            assert!(
+                message.contains("canonical 43-character"),
+                "the error must name the encoding, got: {message}"
+            );
+        }
+
+        // The canonical form of the same 32-byte secret is accepted and yields that key.
+        let id = "A".repeat(43);
+        assert_eq!(
+            initiator_key_from_prologue(&prologue(&id)).expect("a canonical key is accepted"),
+            {
+                use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+                use base64::Engine as _;
+                let bytes = URL_SAFE_NO_PAD.decode(&id).expect("the id is base64url");
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&bytes);
+                key
+            }
         );
     }
 
