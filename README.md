@@ -5,6 +5,8 @@ server planned. A server owns the queue and the clock, clients render the audio 
 state back.
 
 [![CI](https://github.com/acuntex/syncspin/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/acuntex/syncspin/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/syncspin-client.svg)](https://crates.io/crates/syncspin-client)
+[![docs.rs](https://docs.rs/syncspin-client/badge.svg)](https://docs.rs/syncspin-client)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#licence)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://github.com/acuntex/syncspin/blob/main/Cargo.toml)
 
@@ -13,8 +15,8 @@ state back.
 **0.1, client first.** The client is implemented and covered by a hermetic test suite, including
 pairing: the Pairing PSK flow, the records it writes, the in-band re-handshake and `server/unpair`,
 plus the static and dynamic code flows behind the `pairing-code` feature. `syncspin-server` is a stub
-with `publish = false`. Nothing is published on crates.io yet: the first upload waits on the account
-side, and `v0.1.0` is a pre-release tag that marks the pinnable state. The API may change before 1.0. The CPace layer behind the code flows has not been reviewed
+with `publish = false`. `syncspin-core` and `syncspin-client` are on crates.io as 0.1.0. The API may
+change before 1.0. The CPace layer behind the code flows has not been reviewed
 externally, so it is unaudited code until it has been.
 
 `syncspin` is not an official Sendspin implementation and is not affiliated with the Sendspin
@@ -34,16 +36,13 @@ decision lives in one place.
 
 ## Getting started
 
-The crates are not on crates.io yet. Pairing landed after the `v0.1.0` tag, so depend on `main`
-until the first registry release exists:
-
 ```toml
 [dependencies]
-syncspin-client = { git = "https://github.com/acuntex/syncspin", branch = "main" }
+syncspin-client = "0.1.0"
 ```
 
-`v0.1.0` predates pairing: a client pinned there is a guest only. Pin a tag instead of `main` once
-one carries the features you need.
+`syncspin-server` is not published; the client is the whole of 0.1. The tag `v0.1.0` marks the
+release.
 
 The example player needs a Sendspin server to talk to:
 
