@@ -61,6 +61,8 @@ const RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Versioned role identifier of the audio player.
 const PLAYER_ROLE: &str = "player@v1";
+/// Bare role name used by `stream/end` and `stream/clear` (see `messaging.md`).
+const PLAYER_STREAM_ROLE: &str = "player";
 
 /// Versioned role identifier of the now-playing metadata.
 const METADATA_ROLE: &str = "metadata@v1";
@@ -1283,11 +1285,16 @@ impl PskMetadata {
 
 /// Whether a `stream/end` or `stream/clear` role list affects the player stream.
 ///
-/// An absent list means every role; otherwise it has to name `player@v1`.
+/// An absent list means every role. Otherwise it has to name the player: `messaging.md` lists the
+/// role names in this message as bare `'player'`, `'artwork'` and `'visualizer'`, while
+/// `server/activate` uses the versioned `player@v1` form. Both spellings are accepted so a server
+/// that reuses the versioned identifier is not silently ignored.
 fn affects_player(roles: Option<&[String]>) -> bool {
     match roles {
         None => true,
-        Some(roles) => roles.iter().any(|role| role == PLAYER_ROLE),
+        Some(roles) => roles
+            .iter()
+            .any(|role| role == PLAYER_STREAM_ROLE || role == PLAYER_ROLE),
     }
 }
 

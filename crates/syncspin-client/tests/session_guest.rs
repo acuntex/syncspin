@@ -550,6 +550,30 @@ async fn a_stream_end_emits_an_event_before_the_flush() {
     wait_for_flushes(&recordings, 2).await;
 }
 
+/// `messaging.md` names the roles in `stream/end` as bare `player`, while `server/activate` uses
+/// `player@v1`. Matching only the versioned form silently ignored every pause from the server.
+#[tokio::test]
+async fn a_bare_player_role_still_ends_the_stream() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+
+    server.stream_end_for(&["player"]);
+    match next_event_within(&mut events, Duration::from_secs(2)).await {
+        Event::StreamEnd { .. } => {}
+        other => panic!("expected StreamEnd for a bare player role, got {other:?}"),
+    }
+    let _ = recordings;
+}
+
 #[tokio::test]
 async fn a_stream_clear_carries_the_timestamp() {
     let server = FakeServer::start(ServerOptions::default()).await.unwrap();
