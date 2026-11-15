@@ -27,8 +27,8 @@ need no issue.
 
 ## Setup
 
-The workspace builds with the toolchain in `rust-toolchain.toml`. Every command below is also a CI
-gate, so a green local run is what a reviewer will see:
+The workspace builds with the toolchain in `rust-toolchain.toml`. `cargo test`, clippy and `fmt` are
+CI gates, so a green local run is what a reviewer will see; prettier is a local hook, not a gate:
 
 ```sh
 cargo test --workspace --locked
@@ -47,22 +47,24 @@ rustup toolchain install 1.85.0
 RUSTUP_TOOLCHAIN=1.85.0 cargo test --workspace --locked
 ```
 
-The ARMv7 compile guard, the pre-commit hooks and the manual run against a real server are
-described in [`docs/testing.md`](docs/testing.md).
+The ARMv7 compile guard and the manual run against a real server are described in
+[`docs/testing.md`](docs/testing.md). The local hooks — gitleaks, `cargo fmt`, clippy and prettier —
+are configured in [`.pre-commit-config.yaml`](.pre-commit-config.yaml); install them with
+`pre-commit install`.
 
 ## The gates
 
 `main` is protected. A pull request merges only when all seven checks are green:
 
-| Check     | What it proves                                                   |
-| --------- | ---------------------------------------------------------------- |
-| `lint`    | `cargo fmt --check` and clippy without warnings.                 |
-| `test`    | The hermetic suite on x86_64.                                    |
-| `msrv`    | The suite still builds and passes on 1.85.                       |
-| `arm`     | The crates still compile for ARMv7 / glibc 2.24.                 |
-| `deny`    | Licences, advisories and sources of every dependency.            |
-| `docs`    | `cargo doc` without warnings, so a broken doc link cannot merge. |
-| `secrets` | No credential in the history, scanned with gitleaks.             |
+| Check     | What it proves                                                                                                                                                |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lint`    | `cargo fmt --check` and clippy without warnings.                                                                                                              |
+| `test`    | The hermetic suite on x86_64.                                                                                                                                 |
+| `msrv`    | The suite still builds and passes on 1.85.                                                                                                                    |
+| `arm`     | The crates still compile for ARMv7. The glibc 2.24 baseline itself needs the `zigbuild` run in [`docs/testing.md`](docs/testing.md); CI does not link it yet. |
+| `deny`    | Licences, advisories and sources of every dependency.                                                                                                         |
+| `docs`    | `cargo doc` without warnings, so a broken doc link cannot merge.                                                                                              |
+| `secrets` | No credential in the history, scanned with gitleaks.                                                                                                          |
 
 ## Hard rules
 

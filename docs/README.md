@@ -1,6 +1,6 @@
 # Documentation
 
-The three documents a reader needs; the README covers usage.
+Usage is in the [README](../README.md). These are the three documents behind it.
 
 | Document                                     | What you get                                                                                    |
 | -------------------------------------------- | ----------------------------------------------------------------------------------------------- |

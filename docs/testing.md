@@ -78,9 +78,8 @@ use the full cross build so the glibc baseline is exercised:
 cargo zigbuild --target armv7-unknown-linux-gnueabihf --no-default-features --features player,controller
 ```
 
-`zigbuild` needs `cargo-zigbuild` and a `zig` binary. The `wss` feature pulls a TLS backend that
-does not build for this target; it is an opt-in feature and stays out of the ARM job and out of
-`--all-features`.
+`zigbuild` needs `cargo-zigbuild` and a `zig` binary. There is no TLS feature in this revision: a
+`wss://` address is rejected when the client is configured, so no TLS backend can reach this target.
 
 ## Manual end-to-end run against a real Music Assistant server
 
