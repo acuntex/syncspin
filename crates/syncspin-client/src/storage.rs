@@ -9,9 +9,9 @@
 //! # Recency is list order
 //!
 //! [`Storage::load_pairings`] returns records oldest first. Using a record stores it again so it
-//! moves to the end, and [`evict`] drops the first record that does not back the live connection.
-//! There is no timestamp in the rule and no extra method: a backend that keeps a list in file order
-//! is a recency-ordered store.
+//! moves to the end, and [`persist_pairing`] drops the first record that does not back the live
+//! connection. There is no timestamp in the rule and no extra method: a backend that keeps a list in
+//! file order is a recency-ordered store.
 //!
 //! # Capacity
 //!
@@ -19,6 +19,11 @@
 //! floor, not a ceiling on what a host may hand back: a store the crate reads but did not write may
 //! hold more, and the client uses it as it is. The client never evicts the record backing the live
 //! connection, because losing it would drop the peer it is talking to.
+//!
+//! The rules are enforced by [`persist_pairing`], not by a backend: a host implements the four
+//! primitive operations of [`Storage`] and the crate does the ordering, the capacity and the
+//! live-record pin on top of them. A pairing therefore never fails for lack of space, whichever
+//! store the host chose.
 //!
 //! # File backend
 //!
@@ -28,7 +33,7 @@
 //! `0600` on Unix; and it refuses a file whose shape it does not recognise instead of rewriting it.
 //! No key, encoded or raw, appears in its `Debug` output or in an error.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::config::StoredPsk;
 
@@ -43,11 +48,10 @@ pub const MAX_PAIRINGS: usize = 5;
 /// and hands it to the client. Every method may be called from the session task, so an
 /// implementation must be `Send + Sync`.
 ///
-/// The record rules belong to [`store_pairing`](Storage::store_pairing): a record for the same
-/// server is replaced and moved to the end, and the oldest record that is not the one being stored
-/// is dropped when the list grows past [`MAX_PAIRINGS`]. [`evict`] is that rule, so a backend that
-/// keeps a list in order can call it instead of stating it again; the file backend this crate ships
-/// does.
+/// The trait is a store, not a policy: [`store_pairing`](Storage::store_pairing) replaces a record
+/// for the same server and appends the new one, and [`persist_pairing`] is what the client calls to
+/// apply the ordering, the capacity of [`MAX_PAIRINGS`] and the live-record pin. A backend therefore
+/// never has to know which connection is live.
 pub trait Storage: Send + Sync + 'static {
     /// The long-lived pairing PSK the host restored, or `None` on a device's first run.
     ///
@@ -70,11 +74,12 @@ pub trait Storage: Send + Sync + 'static {
 
     /// Stores `record` as the newest record for its server.
     ///
-    /// A record the store already holds for the same `server_id` is replaced, so storing it again
-    /// moves it to the end of the list. When the store then holds more than [`MAX_PAIRINGS`]
-    /// records, the oldest record other than the one being stored is dropped - the record being
-    /// stored belongs to the connection that is pairing, and the client never evicts the record
-    /// backing the live connection. An empty `server_id` is rejected.
+    /// This is the primitive [`persist_pairing`] is built on: a record the store already holds for
+    /// the same `server_id` is replaced and the new one is placed at the end, so storing it again
+    /// moves it to the end of the list. A backend does not evict here - capacity and the live-record
+    /// pin belong to [`persist_pairing`], which calls this only after it has made room. An empty
+    /// `server_id` is rejected, so the store cannot be left holding a record that can never be
+    /// selected.
     fn store_pairing(&self, record: StoredPsk) -> Result<()>;
 
     /// Removes the record for `server_id`.
@@ -84,23 +89,63 @@ pub trait Storage: Send + Sync + 'static {
     fn remove_pairing(&self, server_id: &str) -> Result<()>;
 }
 
+/// Stores `record` under the record rules: newest at the end, at most [`MAX_PAIRINGS`], never the
+/// record backing the live connection.
+///
+/// This is the operation the client uses after a completed pairing, and it works for any
+/// [`Storage`]: the rule is the crate's, not a backend's. `record.server_id` is the server being
+/// paired with, which may or may not be `live`; the live server is the one the connection is
+/// currently talking to, and its record is never chosen as a victim.
+///
+/// The store is read first, so room is made before the new record is written: a pairing never fails
+/// for lack of space. The victim is dropped through [`Storage::remove_pairing`], because eviction
+/// writes only through the trait. If a backend call fails, the error is returned; records it
+/// already removed stay removed and `record` is not stored.
+pub fn persist_pairing(storage: &dyn Storage, record: StoredPsk, live: Option<&str>) -> Result<()> {
+    if record.server_id.is_empty() {
+        bail!("a pairing record must name a server");
+    }
+
+    let mut records = storage.load_pairings()?;
+    records.retain(|held| held.server_id != record.server_id);
+    // Make room for the record that is about to be the newest one, then write it. The record being
+    // stored is not in `records`, so it can never be chosen as the victim.
+    while records.len() >= MAX_PAIRINGS {
+        let Some(index) = evictable(&records, live) else {
+            // Every remaining record belongs to the live connection; the live pin wins over the
+            // capacity floor, so the store keeps one more than five rather than drop it.
+            break;
+        };
+        let victim = records.remove(index);
+        storage.remove_pairing(&victim.server_id)?;
+    }
+    storage.store_pairing(record)
+}
+
 /// Drops the oldest record that is not `live` when `records` holds more than [`MAX_PAIRINGS`].
 ///
 /// Returns the index that was removed, or `None` when the list has room or every record belongs to
 /// the live server. The live record wins over the capacity floor: with only live records in the
 /// list nothing is removed.
 ///
-/// This is the rule [`Storage::store_pairing`] documents. It operates on a list in recency order
-/// (oldest first), which is the order [`Storage::load_pairings`] returns.
+/// This is the list form of the rule [`persist_pairing`] applies, for a caller that already holds
+/// the records. It operates on a list in recency order (oldest first), which is the order
+/// [`Storage::load_pairings`] returns. The caller is responsible for a record it is about to store:
+/// [`persist_pairing`] keeps that record out of the list until after eviction.
 pub fn evict(records: &mut Vec<StoredPsk>, live: Option<&str>) -> Option<usize> {
     if records.len() <= MAX_PAIRINGS {
         return None;
     }
-    let index = records
-        .iter()
-        .position(|record| Some(record.server_id.as_str()) != live)?;
+    let index = evictable(records, live)?;
     records.remove(index);
     Some(index)
+}
+
+/// The index of the first record that may be dropped: not the live one, in recency order.
+fn evictable(records: &[StoredPsk], live: Option<&str>) -> Option<usize> {
+    records
+        .iter()
+        .position(|record| Some(record.server_id.as_str()) != live)
 }
 
 #[cfg(feature = "storage-file")]
@@ -318,8 +363,12 @@ mod file {
             let server_id = record.server_id.clone();
             records.retain(|held| held.server_id != server_id);
             records.push(record);
-            // The record just stored is the one the live connection uses, so eviction skips it.
-            while evict(&mut records, Some(&server_id)).is_some() {}
+            // A safety net for a caller that uses the primitive directly: this backend cannot know
+            // which connection is live, so it drops the oldest record rather than pretend to pin
+            // one. `persist_pairing` makes the room before calling this and is what protects the
+            // live record; here the drop only keeps a direct caller from growing the file without
+            // bound.
+            while evict(&mut records, None).is_some() {}
 
             shape.pairings = records.iter().map(encode_record).collect();
             self.write(&shape)

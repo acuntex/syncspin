@@ -1,4 +1,4 @@
-//! Pairing records: the host trait, the eviction rule and the JSON file backend.
+//! Pairing records: the host trait, the record rule and the JSON file backend.
 //!
 //! The trait and the rule need no feature. The file backend is compiled only with
 //! `--features storage-file`, so a default build never links file I/O and its tests are gated the
@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use syncspin_client::storage::{evict, Storage, MAX_PAIRINGS};
+use syncspin_client::storage::{evict, persist_pairing, Storage, MAX_PAIRINGS};
 use syncspin_client::{PskCategory, StoredPsk};
 
 /// Builds a record whose key is derived from `server_id`, so a test can tell records apart.
@@ -36,7 +36,9 @@ fn ids(records: &[StoredPsk]) -> Vec<&str> {
         .collect()
 }
 
-/// A host store that keeps its records in memory and applies the rule the trait documents.
+/// A host store with no rule of its own: it replaces a record for the same server, appends the new
+/// one, and removes on request. Capacity, ordering and the live-record pin are the crate's
+/// [`persist_pairing`], which these tests exercise through the trait.
 #[derive(Default)]
 struct MemoryStorage {
     pairing_psk: Mutex<Option<[u8; 32]>>,
@@ -68,14 +70,12 @@ impl Storage for MemoryStorage {
     }
 
     fn store_pairing(&self, record: StoredPsk) -> Result<()> {
-        let server_id = record.server_id.clone();
         let mut records = self
             .pairings
             .lock()
             .expect("the test store is never poisoned");
-        records.retain(|held| held.server_id != server_id);
+        records.retain(|held| held.server_id != record.server_id);
         records.push(record);
-        while evict(&mut records, Some(&server_id)).is_some() {}
         Ok(())
     }
 
@@ -152,16 +152,17 @@ fn a_store_holding_only_the_live_record_keeps_it() {
 }
 
 #[test]
-fn a_sixth_record_through_the_trait_drops_the_oldest() {
-    let storage = MemoryStorage::default();
+fn a_pairing_never_fails_for_lack_of_space() {
+    // A host store with no eviction logic of its own, behind the trait object the client holds.
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::default());
     for id in ["a", "b", "c", "d", "e"] {
         storage
             .store_pairing(record(id))
             .expect("the store is open");
     }
-    storage
-        .store_pairing(record("f"))
-        .expect("the store makes room");
+    assert_eq!(storage.load_pairings().expect("the store loads").len(), 5);
+
+    persist_pairing(&*storage, record("f"), None).expect("a full store makes room for a pairing");
 
     let loaded = storage.load_pairings().expect("the store loads");
     assert_eq!(loaded.len(), MAX_PAIRINGS);
@@ -169,7 +170,28 @@ fn a_sixth_record_through_the_trait_drops_the_oldest() {
 }
 
 #[test]
-fn storing_a_record_again_moves_it_to_the_end() {
+fn the_live_record_survives_when_it_is_the_oldest() {
+    let storage = MemoryStorage::default();
+    for id in ["live", "b", "c", "d", "e"] {
+        storage
+            .store_pairing(record(id))
+            .expect("the store is open");
+    }
+
+    persist_pairing(&storage, record("f"), Some("live"))
+        .expect("the store makes room for a pairing");
+
+    let loaded = storage.load_pairings().expect("the store loads");
+    assert_eq!(loaded.len(), MAX_PAIRINGS);
+    assert_eq!(
+        ids(&loaded),
+        ["live", "c", "d", "e", "f"],
+        "the live record stays; the second oldest goes"
+    );
+}
+
+#[test]
+fn a_record_stored_again_moves_to_the_end() {
     let storage = MemoryStorage::default();
     for id in ["a", "b", "c", "d", "e"] {
         storage
@@ -181,14 +203,62 @@ fn storing_a_record_again_moves_it_to_the_end() {
         psk: [9; 32],
         ..record("a")
     };
-    storage
-        .store_pairing(renewed.clone())
-        .expect("the store replaces a record");
+    persist_pairing(&storage, renewed.clone(), Some("a")).expect("the store replaces a record");
 
     let loaded = storage.load_pairings().expect("the store loads");
     assert_eq!(ids(&loaded), ["b", "c", "d", "e", "a"]);
     assert_eq!(loaded.len(), MAX_PAIRINGS, "re-storing must not duplicate");
     assert_eq!(loaded[4], renewed, "the newer key replaces the older one");
+}
+
+#[test]
+fn the_record_being_stored_is_never_the_victim() {
+    // Every held record belongs to the live server, so the live pin leaves no victim. The crate
+    // still stores the new record rather than let the pairing fail; the store ends above the floor.
+    let storage = MemoryStorage::default();
+    storage
+        .pairings
+        .lock()
+        .expect("the test store is never poisoned")
+        .extend(named(&["live"; MAX_PAIRINGS]));
+
+    persist_pairing(&storage, record("new"), Some("live")).expect("the new record is stored");
+
+    let loaded = storage.load_pairings().expect("the store loads");
+    assert_eq!(loaded.len(), MAX_PAIRINGS + 1);
+    assert_eq!(
+        loaded
+            .iter()
+            .filter(|held| held.server_id == "live")
+            .count(),
+        MAX_PAIRINGS,
+        "no live record may be evicted"
+    );
+    assert_eq!(loaded[loaded.len() - 1].server_id, "new");
+}
+
+#[test]
+fn a_record_without_a_server_never_reaches_the_store() {
+    let storage = MemoryStorage::default();
+    storage
+        .store_pairing(record("a"))
+        .expect("the store is open");
+    let orphan = StoredPsk {
+        server_id: String::new(),
+        ..record("b")
+    };
+
+    let error =
+        persist_pairing(&storage, orphan, None).expect_err("a record without a server is useless");
+    assert!(
+        format!("{error:#}").contains("server"),
+        "the error must name what is missing, got: {error:#}"
+    );
+    assert_eq!(
+        ids(&storage.load_pairings().expect("the store loads")),
+        ["a"],
+        "a refused record must not touch the store"
+    );
 }
 
 #[test]
@@ -320,7 +390,7 @@ mod files {
     }
 
     #[test]
-    fn the_sixth_record_in_the_file_drops_the_oldest() {
+    fn a_direct_store_on_a_full_file_drops_the_oldest() {
         let dir = TempDir::new();
         let (storage, path) = open(&dir);
         for id in ["a", "b", "c", "d", "e", "f"] {
@@ -338,6 +408,34 @@ mod files {
         assert_eq!(
             ids(&reopened.load_pairings().expect("the file loads")),
             ["b", "c", "d", "e", "f"]
+        );
+    }
+
+    #[test]
+    fn the_crate_rule_drives_the_file_backend_too() {
+        let dir = TempDir::new();
+        let (storage, path) = open(&dir);
+        for id in ["live", "b", "c", "d", "e"] {
+            storage
+                .store_pairing(record(id))
+                .expect("the file is writable");
+        }
+
+        persist_pairing(&storage, record("f"), Some("live")).expect("the file makes room");
+
+        let loaded = storage.load_pairings().expect("the file loads");
+        assert_eq!(loaded.len(), MAX_PAIRINGS);
+        assert_eq!(
+            ids(&loaded),
+            ["live", "c", "d", "e", "f"],
+            "the rule is the crate's, even over a file"
+        );
+
+        drop(storage);
+        let reopened = FileStorage::new(&path).expect("the file is recognised");
+        assert_eq!(
+            ids(&reopened.load_pairings().expect("the file loads")),
+            ["live", "c", "d", "e", "f"]
         );
     }
 
@@ -587,13 +685,11 @@ mod files {
             "reading must not trim a store this build did not limit"
         );
 
-        storage
-            .store_pairing(record("h"))
-            .expect("the file is writable");
+        persist_pairing(&storage, record("h"), None).expect("the file makes room");
         assert_eq!(
             ids(&storage.load_pairings().expect("the file loads")),
             ["d", "e", "f", "g", "h"],
-            "the next write applies the five-record floor and protects the new record"
+            "the next pairing applies the five-record floor and keeps the new record"
         );
     }
 
