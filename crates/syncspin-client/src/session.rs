@@ -6,13 +6,14 @@
 //! A server that does not start the handshake times out; there is no plaintext path to fall back
 //! to.
 
+use std::future::pending;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
@@ -32,7 +33,10 @@ use syncspin_core::noise::{
     psk_id_for, Responder, TransportState as NoiseTransport, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
 
-use crate::client::{Event, PlaybackState};
+use crate::client::{
+    clamp_volume, next_backoff, ControlAction, ControlRequest, Event, PlaybackState,
+    INITIAL_BACKOFF,
+};
 use crate::config::{AudioMode, ClientConfig, PskCategory, StoredPsk};
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 
@@ -85,6 +89,23 @@ const SUPPORTED_BIT_DEPTH: u8 = 16;
 
 /// Length of a canonical unpadded base64url key id.
 const PSK_ID_LEN: usize = 43;
+
+/// Level reported until the host reports its own, in the protocol's 0-100 range.
+///
+/// The player advertises the `volume` command, and the spec requires the matching field whenever
+/// it does. Full scale is the only baseline that neither attenuates nor limits an incoming
+/// request; a host that starts elsewhere reports its level once through
+/// [`ControlHandle::set_volume`](crate::ControlHandle::set_volume).
+const DEFAULT_VOLUME: u8 = 100;
+
+/// Mute state reported until the host reports its own.
+const DEFAULT_MUTED: bool = false;
+
+/// Player commands this client accepts from the server.
+const PLAYER_COMMANDS: [&str; 2] = ["volume", "mute"];
+
+/// Envelope type of a client command.
+const CLIENT_COMMAND_TYPE: &str = "client/command";
 
 /// An established WebSocket connection to a server.
 ///
@@ -165,6 +186,16 @@ struct Ready {
     active_roles: Vec<String>,
 }
 
+/// One wake-up of the session loop.
+enum Wakeup {
+    /// A control handle sent a request, or every handle was dropped.
+    Control(Option<ControlRequest>),
+    /// The socket produced a message, or the read failed.
+    Socket(Result<SocketMessage>),
+    /// The clock deadline elapsed.
+    Clock,
+}
+
 /// A running session.
 pub(crate) struct Session {
     transport: Transport,
@@ -190,6 +221,14 @@ pub(crate) struct Session {
     burst_samples: Vec<TimeSample>,
     /// Whether the player state was reported since the player role last became active.
     state_sent: bool,
+    /// Requests from a [`crate::ControlHandle`], or `None` once every handle was dropped.
+    control: Option<mpsc::UnboundedReceiver<ControlRequest>>,
+    /// Output level in force, in the protocol's 0-100 range.
+    volume: u8,
+    /// Mute state in force.
+    muted: bool,
+    /// Whether [`Event::Connected`] was reported for this session.
+    connected: bool,
 }
 
 impl Session {
@@ -204,6 +243,7 @@ impl Session {
         sink: Box<dyn Sink>,
         events: mpsc::UnboundedSender<Event>,
         psks: Vec<StoredPsk>,
+        control: mpsc::UnboundedReceiver<ControlRequest>,
     ) -> Result<()> {
         let handshake =
             tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(transport, &config, &psks)).await;
@@ -216,7 +256,7 @@ impl Session {
             Err(error) => {
                 let _ = events.send(Event::Disconnected {
                     reason: format!("{error:#}"),
-                    retry_in: Duration::ZERO,
+                    retry_in: next_backoff(INITIAL_BACKOFF, false, config.max_backoff),
                 });
                 return Err(error);
             }
@@ -239,12 +279,17 @@ impl Session {
             burst_started: None,
             burst_samples: Vec::new(),
             state_sent: false,
+            control: Some(control),
+            volume: DEFAULT_VOLUME,
+            muted: DEFAULT_MUTED,
+            connected: false,
         };
 
         session.emit(Event::Connected {
             server_id: ready.server_id,
             encrypted: true,
         });
+        session.connected = true;
         if session.player_active() {
             session.start_burst();
         }
@@ -254,11 +299,20 @@ impl Session {
             Err(error) => {
                 let _ = session.events.send(Event::Disconnected {
                     reason: format!("{error:#}"),
-                    retry_in: Duration::ZERO,
+                    retry_in: session.retry_delay(),
                 });
                 Err(error)
             }
         }
+    }
+
+    /// The delay to recommend before the next connection attempt.
+    ///
+    /// The host owns the sequence, so one session can only report one step of it. A session that
+    /// connected resets the delay; one that failed before [`Event::Connected`] reports the first
+    /// growth step, with [`INITIAL_BACKOFF`] standing in for the delay it cannot see.
+    fn retry_delay(&self) -> Duration {
+        next_backoff(INITIAL_BACKOFF, self.connected, self.config.max_backoff)
     }
 
     /// Reads, dispatches and delivers until the connection ends.
@@ -271,39 +325,52 @@ impl Session {
             self.drive_clock().await?;
 
             // While a request is on the wire the read has its reply deadline; the overall burst
-            // deadline is the backstop. Any other frame still arrives normally.
+            // deadline is the backstop. Any other frame still arrives normally, and a control
+            // request is served between frames.
             let deadline = match (self.reply_deadline, self.burst_deadline) {
                 (Some(reply), Some(burst)) => Some(reply.min(burst)),
                 (Some(reply), None) => Some(reply),
                 (None, Some(burst)) => Some(burst),
                 (None, None) => None,
             };
-            let incoming = match deadline {
-                Some(deadline) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    match tokio::time::timeout(remaining, self.transport.read()).await {
-                        Ok(result) => result?,
-                        Err(_elapsed) => {
-                            self.handle_clock_timeout().await?;
-                            continue;
-                        }
+
+            // The control receiver outlives individual handles: dropping the last one disables the
+            // branch instead of ending the session.
+            let control = &mut self.control;
+            let wakeup = tokio::select! {
+                biased;
+                request = async {
+                    match control {
+                        Some(receiver) => receiver.recv().await,
+                        None => pending().await,
                     }
-                }
-                None => self.transport.read().await?,
+                } => Wakeup::Control(request),
+                message = self.transport.read() => Wakeup::Socket(message),
+                () = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => pending().await,
+                    }
+                } => Wakeup::Clock,
             };
 
-            match incoming {
-                SocketMessage::Text(_) => {
-                    bail!("cleartext text after the Noise transport is a protocol error")
-                }
-                SocketMessage::Closed => {
-                    self.emit(Event::Disconnected {
-                        reason: "the server closed the connection".to_owned(),
-                        retry_in: Duration::ZERO,
-                    });
-                    return Ok(());
-                }
-                SocketMessage::Binary(ciphertext) => self.receive(&ciphertext).await?,
+            match wakeup {
+                Wakeup::Control(Some(request)) => self.handle_control(request).await?,
+                Wakeup::Control(None) => self.control = None,
+                Wakeup::Socket(message) => match message? {
+                    SocketMessage::Text(_) => {
+                        bail!("cleartext text after the Noise transport is a protocol error")
+                    }
+                    SocketMessage::Closed => {
+                        self.emit(Event::Disconnected {
+                            reason: "the server closed the connection".to_owned(),
+                            retry_in: self.retry_delay(),
+                        });
+                        return Ok(());
+                    }
+                    SocketMessage::Binary(ciphertext) => self.receive(&ciphertext).await?,
+                },
+                Wakeup::Clock => self.handle_clock_timeout().await?,
             }
         }
     }
@@ -424,10 +491,7 @@ impl Session {
                 self.handle_state(state);
                 Ok(())
             }
-            Some(Incoming::ServerCommand(command)) => {
-                self.handle_command(command);
-                Ok(())
-            }
+            Some(Incoming::ServerCommand(command)) => self.handle_command(command).await,
             Some(Incoming::StreamStart(start)) => self.handle_stream_start(start),
             Some(Incoming::StreamEnd(end)) if !affects_player(end.roles.as_deref()) => Ok(()),
             Some(Incoming::StreamEnd(_)) => self.stop_stream(),
@@ -498,11 +562,13 @@ impl Session {
         Ok(())
     }
 
-    /// Reports the player state, with the sink's output delay and no volume yet.
+    /// Reports the player state: the level and mute state in force plus the commands this client
+    /// accepts.
     ///
     /// Sent as soon as the first measurement of a burst arrives after the player role became
-    /// active, and again after the role was removed and re-added. The host owns the output level;
-    /// until it reports one, the player object carries no volume rather than an invented baseline.
+    /// active, and again after the role was removed and re-added and on every change to the level
+    /// or mute state. The `supported_commands` list is what makes a conformant server send player
+    /// commands at all.
     async fn send_client_state(&mut self) -> Result<()> {
         self.state_sent = true;
         let output_delay_ms = self.sink.latency().map_or(0, |latency| {
@@ -512,12 +578,15 @@ impl Session {
         let state = Incoming::ClientState(ClientState {
             available: true,
             player: Some(PlayerState {
-                volume: None,
-                muted: None,
+                volume: Some(self.volume),
+                muted: Some(self.muted),
                 output_delay_ms,
                 required_lead_time_ms: REQUIRED_LEAD_TIME_MS,
                 min_buffer_ms: MIN_BUFFER_MS,
-                supported_commands: Vec::new(),
+                supported_commands: PLAYER_COMMANDS
+                    .iter()
+                    .map(|command| (*command).to_owned())
+                    .collect(),
                 format: None,
             }),
         });
@@ -671,34 +740,122 @@ impl Session {
         }
     }
 
-    /// Reports a player volume or mute request without applying a platform limit.
+    /// Applies a volume or mute request from the server and reports the result.
     ///
-    /// Exactly one field of the event is present, so a mute request never carries a volume.
-    fn handle_command(&mut self, command: ServerCommand) {
+    /// The volume is limited by [`clamp_volume`], and the applied value - not the requested one -
+    /// is what [`Event::Volume`] carries and what the following `client/state` reports. A mute
+    /// request changes only the mute field, so it never looks like a request for volume zero.
+    async fn handle_command(&mut self, command: ServerCommand) -> Result<()> {
         if !self.player_active() {
-            return;
+            return Ok(());
         }
         let Some(player) = command.player else {
-            return;
+            return Ok(());
         };
         match player.command.as_str() {
             "volume" => {
-                if let Some(level) = player.volume {
-                    self.emit(Event::Volume {
-                        level: Some(level),
-                        muted: None,
-                    });
-                }
+                let Some(level) = player.volume else {
+                    return Ok(());
+                };
+                self.volume = clamp_volume(self.volume, level);
+                self.emit(Event::Volume {
+                    level: Some(self.volume),
+                    muted: None,
+                });
+                self.report_state().await?;
             }
             "mute" => {
-                if let Some(muted) = player.mute {
-                    self.emit(Event::Volume {
-                        level: None,
-                        muted: Some(muted),
-                    });
-                }
+                let Some(muted) = player.mute else {
+                    return Ok(());
+                };
+                self.muted = muted;
+                self.emit(Event::Volume {
+                    level: None,
+                    muted: Some(muted),
+                });
+                self.report_state().await?;
             }
+            // A command this client does not advertise, such as `set_output_delay`.
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Applies one request from a control handle and answers it.
+    ///
+    /// A command for a role the server did not activate is refused without touching the
+    /// connection. A failure to write it ends the session, because the connection is no longer
+    /// usable.
+    async fn handle_control(&mut self, request: ControlRequest) -> Result<()> {
+        let ControlRequest { action, reply } = request;
+        let allowed = match &action {
+            ControlAction::Transport(_) => self.role_active(CONTROLLER_ROLE),
+            ControlAction::Volume(_) | ControlAction::Mute(_) => self.player_active(),
+        };
+        if !allowed {
+            let role = match action {
+                ControlAction::Transport(_) => CONTROLLER_ROLE,
+                ControlAction::Volume(_) | ControlAction::Mute(_) => PLAYER_ROLE,
+            };
+            let _ = reply.send(Err(anyhow!("the server did not activate {role}")));
+            return Ok(());
+        }
+
+        let result = match action {
+            ControlAction::Transport(command) => self.send_transport_command(command).await,
+            ControlAction::Volume(level) => self.apply_volume(level).await,
+            ControlAction::Mute(muted) => self.apply_mute(muted).await,
+        };
+        match result {
+            Ok(()) => {
+                let _ = reply.send(Ok(()));
+                Ok(())
+            }
+            Err(error) => {
+                let _ = reply.send(Err(anyhow!("{error:#}")));
+                Err(error)
+            }
+        }
+    }
+
+    /// Sends one controller command as a `client/command` envelope.
+    ///
+    /// The shared message set does not model the client-to-server command envelope, so its writer
+    /// lives here; the payload is exactly the controller object the protocol defines for it.
+    async fn send_transport_command(&mut self, command: &'static str) -> Result<()> {
+        let message = ControllerCommandMessage {
+            message_type: CLIENT_COMMAND_TYPE,
+            payload: ControllerCommandPayload {
+                controller: ControllerCommand { command },
+            },
+        };
+        let text = serde_json::to_string(&message).context("failed to encode client/command")?;
+        let ciphertext = encrypt_text(&mut self.noise, &text)?;
+        self.transport.send_binary(ciphertext).await
+    }
+
+    /// Applies a level the host asked for and reports what reached the output.
+    async fn apply_volume(&mut self, level: u8) -> Result<()> {
+        self.volume = clamp_volume(self.volume, level);
+        self.report_state().await
+    }
+
+    /// Applies a mute state the host asked for, leaving the level untouched.
+    async fn apply_mute(&mut self, muted: bool) -> Result<()> {
+        self.muted = muted;
+        self.report_state().await
+    }
+
+    /// Reports a state change the host made, or leaves it to the pending initial report.
+    ///
+    /// The player may not send its initial state before its first clock measurement, so a change
+    /// that arrives earlier is recorded and the burst that is already running carries it; once the
+    /// initial report exists every change goes out immediately.
+    async fn report_state(&mut self) -> Result<()> {
+        if self.state_sent {
+            self.send_client_state().await
+        } else {
+            Ok(())
         }
     }
 
@@ -821,7 +978,11 @@ fn client_hello(config: &ClientConfig) -> Incoming {
     Incoming::ClientHello(ClientHello {
         name: config.player_name.clone(),
         device_info: None,
-        supported_roles: vec![PLAYER_ROLE.to_owned(), METADATA_ROLE.to_owned()],
+        supported_roles: vec![
+            PLAYER_ROLE.to_owned(),
+            CONTROLLER_ROLE.to_owned(),
+            METADATA_ROLE.to_owned(),
+        ],
         player_support: Some(PlayerSupport {
             supported_formats: vec![SupportedFormat {
                 codec: codec.to_owned(),
@@ -878,7 +1039,36 @@ async fn read_encrypted_json(
 /// Encrypts one control message as a Noise transport message.
 fn encrypt_json(noise: &mut NoiseTransport, message: &Incoming) -> Result<Vec<u8>> {
     let text = serde_json::to_string(message).context("failed to encode a control message")?;
+    encrypt_text(noise, &text)
+}
+
+/// Encrypts one JSON body that is already serialized.
+fn encrypt_text(noise: &mut NoiseTransport, text: &str) -> Result<Vec<u8>> {
     noise.encrypt(&encode_binary(BINARY_MESSAGE_ID_JSON, text.as_bytes()))
+}
+
+/// `client/command`: the envelope a client sends commands in.
+#[derive(Debug, Serialize)]
+struct ControllerCommandMessage<'a> {
+    /// Message type of the envelope.
+    #[serde(rename = "type")]
+    message_type: &'a str,
+    /// Role-specific command objects.
+    payload: ControllerCommandPayload<'a>,
+}
+
+/// The `payload` of a [`ControllerCommandMessage`].
+#[derive(Debug, Serialize)]
+struct ControllerCommandPayload<'a> {
+    /// Controller command for the current group.
+    controller: ControllerCommand<'a>,
+}
+
+/// The `controller` object of a client command.
+#[derive(Debug, Serialize)]
+struct ControllerCommand<'a> {
+    /// Command name, one the server advertises in its controller state.
+    command: &'a str,
 }
 
 /// The PSK metadata the server puts into Noise message 1.

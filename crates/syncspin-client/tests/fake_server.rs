@@ -63,7 +63,11 @@ impl Default for ServerOptions {
             psk: SENTINEL_PSK,
             metadata: None,
             start_handshake: true,
-            active_roles: vec!["player@v1".to_owned(), "metadata@v1".to_owned()],
+            active_roles: vec![
+                "player@v1".to_owned(),
+                "controller@v1".to_owned(),
+                "metadata@v1".to_owned(),
+            ],
             answer_time_limit: None,
             manual_time: false,
         }
@@ -119,6 +123,8 @@ pub enum Observation {
     ClientHello(Box<ClientHello>),
     /// The client reported its state.
     ClientState(Box<ClientState>),
+    /// The client sent a `client/command`, carrying its raw JSON body.
+    ClientCommand(String),
     /// The server answered the nth `client/time` request.
     TimeReply(usize),
     /// A `client/time` request arrived and is waiting for a manual answer.
@@ -304,6 +310,17 @@ impl FakeServer {
         loop {
             match self.observation().await {
                 Some(Observation::ClientState(state)) => return Some(*state),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client sends a `client/command` and returns its raw JSON body.
+    pub async fn wait_for_client_command(&mut self) -> Option<String> {
+        loop {
+            match self.observation().await {
+                Some(Observation::ClientCommand(body)) => return Some(body),
                 Some(_) => continue,
                 None => return None,
             }
@@ -639,10 +656,22 @@ async fn handle_client_message(
         Some(Incoming::ClientState(state)) => {
             let _ = observations.send(Observation::ClientState(Box::new(state)));
         }
-        // client/hello, client/time while answers are disabled, and future types.
-        _ => {}
+        // `client/command` is a client message the shared message set does not model yet, so it is
+        // recorded from the raw body; everything else here is `client/hello`, `client/time` while
+        // answers are disabled, and future types.
+        _ => {
+            if let Some(body) = client_command(text) {
+                let _ = observations.send(Observation::ClientCommand(body));
+            }
+        }
     }
     Ok(())
+}
+
+/// Returns the raw body of a `client/command`, or `None` for any other message.
+fn client_command(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    (value.get("type")?.as_str()? == "client/command").then(|| text.to_owned())
 }
 
 /// Builds a `server/time` reply whose two server timestamps read the local clock.

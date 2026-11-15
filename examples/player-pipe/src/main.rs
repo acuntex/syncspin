@@ -108,8 +108,8 @@ async fn run(options: Options) -> Result<()> {
             ),
         };
 
-        // This revision always reports a zero delay, so the player owns the backoff. A server
-        // that asks for longer is honoured, up to the configured cap.
+        // The session recommends a delay and the player keeps its own growing sequence, so the
+        // larger of the two is honoured, up to the configured cap.
         let wait = retry_in.max(delay).min(config.max_backoff);
         eprintln!(
             "disconnected: {reason}; retrying in {}s",

@@ -11,7 +11,10 @@
 //!
 //! [`connect`] validates the configuration and opens the WebSocket; everything after that runs in
 //! a spawned task and reaches the caller through the [`EventStream`]. The [`ClientHandle`] waits
-//! for the task's outcome.
+//! for the task's outcome and hands out a [`ControlHandle`] for transport commands, the volume
+//! level and mute state. The level follows a fixed limit - see [`clamp_volume`] - and the value
+//! the server receives is the applied one. A connection that ends reports a delay from
+//! [`next_backoff`]; the crate schedules no retry, so the host owns the reconnect loop.
 
 mod client;
 mod config;
@@ -19,7 +22,8 @@ mod session;
 mod sink;
 
 pub use client::{
-    connect, connect_with_psks, Client, ClientHandle, Event, EventStream, PlaybackState,
+    clamp_volume, connect, connect_with_psks, next_backoff, Client, ClientHandle, ControlHandle,
+    Event, EventStream, PlaybackState, INITIAL_BACKOFF,
 };
 pub use config::{AudioMode, ClientConfig, PskCategory, StoredPsk, MAX_PLAYER_NAME_LEN};
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};

@@ -100,8 +100,10 @@ pub struct ClientConfig {
     pub audio_mode: AudioMode,
     /// Upper bound for the delay between reconnects.
     ///
-    /// The session does not schedule retries on its own in this revision; a host that reconnects
-    /// applies its own backoff and uses this as the cap.
+    /// The session reports a recommended delay in
+    /// [`Event::Disconnected`](crate::Event::Disconnected) but schedules no retry itself; a host
+    /// that reconnects applies its own backoff, using the value from
+    /// [`next_backoff`](crate::next_backoff) and this as the cap.
     pub max_backoff: Duration,
 }
 
