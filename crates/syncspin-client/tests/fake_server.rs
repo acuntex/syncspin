@@ -9,6 +9,7 @@
 //! helper is used by every binary.
 #![allow(dead_code)]
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -175,7 +176,21 @@ pub enum Command {
     Close,
 }
 
+/// The long-term PSK a pairing delivered, as the harness sees it.
+///
+/// The raw bytes are what a test compares against the client's record; `Debug` prints `<redacted>`
+/// so a failing assertion that formats an [`Observation`] cannot write key material into a log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PairingKey(pub [u8; 32]);
+
+impl fmt::Debug for PairingKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
 /// Something the server observed on the connection.
+#[derive(Debug)]
 pub enum Observation {
     /// Noise message 2 arrived and authenticated with the server's key.
     HandshakeMessage2,
@@ -201,7 +216,7 @@ pub enum Observation {
     /// The client delivered the long-term PSK of a pairing.
     PairFinalize {
         /// The key the client proposed; the server stores it as its record.
-        long_term_psk: [u8; 32],
+        long_term_psk: PairingKey,
     },
     /// The client aborted a pairing attempt, with the reason it reported.
     PairingAborted(String),
@@ -479,7 +494,7 @@ impl FakeServer {
     }
 
     /// Waits until the client delivers a pairing's long-term PSK.
-    pub async fn wait_for_pair_finalize(&mut self) -> Option<[u8; 32]> {
+    pub async fn wait_for_pair_finalize(&mut self) -> Option<PairingKey> {
         loop {
             match self.observation().await {
                 Some(Observation::PairFinalize { long_term_psk }) => return Some(long_term_psk),
@@ -951,7 +966,9 @@ async fn handle_client_message(
             *paired
                 .lock()
                 .expect("the fake server's record lock is not poisoned") = Some(long_term_psk);
-            let _ = observations.send(Observation::PairFinalize { long_term_psk });
+            let _ = observations.send(Observation::PairFinalize {
+                long_term_psk: PairingKey(long_term_psk),
+            });
             if options.acknowledge_pairing {
                 send_encrypted(
                     socket,
@@ -1074,4 +1091,24 @@ fn now_us() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_micros() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_observation_formats_without_the_paired_key() {
+        let key = PairingKey([0x5a; 32]);
+        let text = format!("{:?}", Observation::PairFinalize { long_term_psk: key });
+        assert!(text.contains("<redacted>"), "unexpected format: {text}");
+        assert!(
+            !text.contains("0x5a"),
+            "not even the raw bytes may appear: {text}"
+        );
+        assert!(
+            !text.contains(&format!("{:?}", [0x5a; 32])),
+            "not even the raw bytes may appear: {text}"
+        );
+    }
 }

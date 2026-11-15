@@ -15,7 +15,7 @@ harmless.
 | 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Closes in 0.2                      |
 | 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
 | 3   | No `pairing_token()` export                                     | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Closes with the control surface    |
-| 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Closes with pairing (stage 2)      |
+| 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
 | 5   | No code pairing (PAKE)                                          | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Stage 4                            |
 | 6   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Stage 1b                           |
 | 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                           |
@@ -118,10 +118,16 @@ Sentinel PSK and hands the decrypted message-1 payload back verbatim; the caller
 with `Responder::set_psk` between reading message 1 and writing message 2. The selecting and
 validating is the session layer's job: `PskMetadata::parse` rejects an unknown category and a
 non-canonical id, and `select_psk` applies the matching key and falls back to the Sentinel key only
-on the initial handshake. A host can pass pairing records through `connect_with_psks`
-(`StoredPsk`: category, key and `server_id`); `select_psk` matches category and id, then checks the
-record's `server_id` against `server/init`. `connect` passes no records, so the guest path always
-falls back. `core` itself enforces none of that.
+on the initial handshake. The candidates come from `pairing::Candidates::load`: the records
+`ClientConfig::storage` holds, the records `connect_with_psks` passes (the store wins for a
+`server_id` it already knows), and the client's own pairing PSK. That pairing PSK is drawn once,
+persisted through `Storage::store_pairing_psk` and offered on every connection; it is a client-wide
+credential, so `select_psk` matches it for the announced `pr` id without a `server_id` check, which
+is what lets one token pair any number of servers. A stored record still has to match category and
+id and then name the `server_id` from `server/init`. A pairing that completes is persisted on
+`server/pair-finalize` as a `LongTerm` record, so the next handshake reads it as a stored record.
+`connect` passes no records and configures no store, so the guest path always falls back. `core`
+itself enforces none of that.
 
 **Why:** the Noise module owns no storage and no policy, so it cannot enumerate candidate PSKs or
 decide what a category mismatch means. Splitting it this way keeps `core` free of file I/O and lets
@@ -130,8 +136,8 @@ a host with its own identity store drive selection.
 **Consequence while it stands:** a caller that drives `Responder` directly and ignores the payload
 completes a handshake against any announced `psk_id`/`psk_category` pair, with no fallback decision
 made for it. The client path is covered: the session validates the metadata, checks the category,
-id and server id of a stored record, and falls back to the Sentinel key on the initial handshake
-only. No pairing record is generated or persisted by this crate yet.
+id and server id of a stored record, checks the pairing PSK against the announced id alone, and
+falls back to the Sentinel key on the initial handshake only.
 
 **Removing it:** give `core` a PSK resolver (a trait the session implements over its storage, passed
 into the responder) so the handshake cannot finish without a matched category and id, and enforce
@@ -461,6 +467,12 @@ rule stays strict: a body that is not valid UTF-8, an empty plaintext, a malform
 header, a bad fragment sequence and an oversize reassembly all end the connection.
 `a_malformed_control_message_is_ignored` pins the lenient path; `a_malformed_audio_header_is_a_protocol_error`
 and the fragmentation tests pin the strict ones.
+
+The leniency covers decode failures only: a message that decodes but is unusable is still a protocol
+error. `session::admits_pairing` returns an error for a `server/activate` that declares the
+`pairing` activity without its `pairing` parameters, which closes the connection instead of
+guessing - the alternative would leave the server waiting for a `client/pair-init` the client never
+sends - and `a_pairing_activity_without_parameters_ends_the_attempt_with_an_error` pins it.
 
 **Why:** the extracted consumer depended on the leniency: one bad field from the server should not
 silence playback, and closing turns a single message into a gap plus a reconnect. A message the

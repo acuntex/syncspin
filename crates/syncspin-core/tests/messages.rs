@@ -305,7 +305,6 @@ fn pairing_messages_roundtrip_on_the_wire() {
         serde_json::from_str::<Incoming>(&json).unwrap(),
         Incoming::ClientPairFinalize(finalize)
     );
-
     let json = serde_json::to_string(&Incoming::ServerPairFinalize(ServerPairFinalize {})).unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&json).unwrap(),
@@ -341,6 +340,47 @@ fn pairing_messages_roundtrip_on_the_wire() {
         Incoming::parse(r#"{"type":"pair/abort","payload":{}}"#),
         Err(DecodeError::Malformed(_))
     ));
+}
+
+#[test]
+fn a_pair_finalize_formats_without_its_key_material() {
+    // A real 43-character key and a 64-character wrapping, so the assertions below would catch the
+    // value in either field rather than a short placeholder.
+    let long_term = "B1y4w7z0c3f6i9l2o5r8u1x4a7d0g3j6m9p2s5v8y1b";
+    let wrapped = "k8Xm3f0Q2p9Lr4Tz7Vc1Nb6Yh5Jd8Gs2Wa0Ke3Ui7Oo4Pa6Sd9Fg1Hj5Kl8Zx2Cv4Bn7Mq0Rt3";
+    let finalize = ClientPairFinalize {
+        long_term_psk: Some(long_term.to_owned()),
+        wrapped_psk: Some(wrapped.to_owned()),
+    };
+
+    for text in [
+        format!("{finalize:?}"),
+        format!("{:?}", Incoming::ClientPairFinalize(finalize.clone())),
+    ] {
+        assert!(
+            text.contains("long_term_psk: Some(\"<redacted>\")"),
+            "the field must be present but redacted: {text}"
+        );
+        assert!(
+            text.contains("wrapped_psk: Some(\"<redacted>\")"),
+            "the field must be present but redacted: {text}"
+        );
+        assert!(
+            !text.contains(long_term),
+            "the long-term key must never appear in a debug format: {text}"
+        );
+        assert!(
+            !text.contains(wrapped),
+            "the sealed key must never appear in a debug format: {text}"
+        );
+    }
+
+    // An absent field reads as `None`, not as a redaction of something that is not there.
+    let empty = ClientPairFinalize::default();
+    assert_eq!(
+        format!("{empty:?}"),
+        "ClientPairFinalize { long_term_psk: None, wrapped_psk: None }"
+    );
 }
 
 #[test]

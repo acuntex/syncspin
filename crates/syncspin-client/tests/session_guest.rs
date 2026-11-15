@@ -2148,5 +2148,31 @@ async fn a_control_handle_after_the_connection_ended_is_an_error() {
         format!("{error:#}").contains("the connection has ended"),
         "the error must say the connection is gone, got: {error:#}"
     );
-    assert_eq!(control.volume(), 100, "the level in force is still readable");
+    assert_eq!(
+        control.volume(),
+        100,
+        "the level in force is still readable"
+    );
+}
+
+/// Dropping the event stream ends a live session cleanly, and promptly enough to be usable.
+///
+/// The session notices a dropped stream at the top of its loop, so the test sends one message to
+/// wake it: a host that stops listening stops the connection rather than leaving it running with
+/// nowhere to report to.
+#[tokio::test]
+async fn dropping_the_event_stream_ends_a_live_session() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    drop(events);
+    server.metadata("Wake up", "An artist");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), handle.finished())
+        .await
+        .expect("a dropped event stream must end the connection");
+    outcome.expect("a host that stopped listening is not an error");
 }

@@ -245,8 +245,8 @@ pub struct ClientPairInit {
 ///
 /// Exactly one of the two fields is present: `long_term_psk` in the Pairing PSK flow, where the
 /// key travels inside the authenticated channel, and `wrapped_psk` in the code flows, where it is
-/// sealed under the CPace output.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// sealed under the CPace output. Both fields are key material, so `Debug` redacts them.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ClientPairFinalize {
     /// 32-byte long-term PSK as 43 base64url characters without padding.
@@ -255,6 +255,26 @@ pub struct ClientPairFinalize {
     /// 48-byte sealed long-term PSK as 64 base64url characters without padding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrapped_psk: Option<String>,
+}
+
+impl fmt::Debug for ClientPairFinalize {
+    /// Formats the message with both key fields redacted.
+    ///
+    /// `long_term_psk` and `wrapped_psk` are key material: the first is the new long-term PSK
+    /// itself and the second seals it. A `Debug` log of a decoded message, including one reached
+    /// through [`Incoming`], therefore prints `<redacted>` and never the value.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientPairFinalize")
+            .field("long_term_psk", &redacted(&self.long_term_psk))
+            .field("wrapped_psk", &redacted(&self.wrapped_psk))
+            .finish()
+    }
+}
+
+/// Renders a key field as `Some("<redacted>")`, or `None` when the field is absent.
+fn redacted(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_| "<redacted>")
 }
 
 /// `server/pair-finalize`: the server persisted its pairing record.

@@ -354,7 +354,8 @@ async fn the_psk_flow_stores_one_record_and_pairs_the_next_connection() {
         tokio::time::timeout(Duration::from_secs(5), server.wait_for_pair_finalize())
             .await
             .expect("the client must send client/pair-finalize")
-            .expect("the connection must not close before the finalize");
+            .expect("the connection must not close before the finalize")
+            .0;
 
     match next_event(&mut events).await {
         Event::Paired { server_id } => assert_eq!(server_id, server.server_id()),
