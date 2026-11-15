@@ -12,14 +12,23 @@ from a working player, the server is a stub. Nothing here is stable yet.
 
 ## Layout
 
-| Crate | Contents |
-| --- | --- |
-| `syncspin-core` | Noise handshake, framing, messages, clock filter. No transport, no device code. |
-| `syncspin-client` | Session loop, `Sink` trait, event stream. |
-| `syncspin-server` | Listener, streams, roles, pairing (planned for 0.2). |
+| Crate             | Contents                                                                        |
+| ----------------- | ------------------------------------------------------------------------------- |
+| `syncspin-core`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
+| `syncspin-client` | Session loop, `Sink` trait, event stream.                                       |
+| `syncspin-server` | Listener, streams, roles, pairing (planned for 0.2).                            |
 
 `syncspin-core` never depends on `syncspin-client` or `syncspin-server`; every protocol and crypto
 decision lives in one place.
+
+## Documentation
+
+- [Design](docs/design/syncspin-design.md) - crate split, API sketch, pairing plan and the staged
+  plan towards 0.1.
+- [Spec deviations](docs/spec-deviations.md) - every known departure from the Sendspin
+  specification, why it exists and what closing it takes.
+- [Testing](docs/testing.md) - the hermetic suites, the MSRV and ARMv7 checks, and the manual run
+  against a real Music Assistant server.
 
 ## Example
 

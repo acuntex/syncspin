@@ -8,12 +8,12 @@ This file is for agents and contributors working in this repository.
 
 ## Layout
 
-| Path | Contents |
-| --- | --- |
-| `crates/syncspin-core/` | Noise handshake, framing, messages, clock filter. No transport, no device code. |
-| `crates/syncspin-client/` | Client session loop, `Sink` trait, event stream. |
-| `crates/syncspin-server/` | Server listener, streams, roles, pairing (`0.2`, `publish = false`). |
-| `docs/` | Design notes and `docs/spec-deviations.md` (planned). |
+| Path                      | Contents                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------- |
+| `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
+| `crates/syncspin-client/` | Client session loop, `Sink` trait, event stream.                                |
+| `crates/syncspin-server/` | Server listener, streams, roles, pairing (`0.2`, `publish = false`).            |
+| `docs/`                   | Design, spec deviations and the testing handbook.                               |
 
 An `examples/` directory is planned (a pipe player and a fake server) but does not exist yet.
 
@@ -48,6 +48,9 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
   published crates.
 - **Spec deviations are documented** in `docs/spec-deviations.md` and covered by a test. Where
   Music Assistant and the spec disagree, the spec wins.
+- **This repository is public.** No personal names, home-directory paths, device names or details of
+  downstream or private projects may appear in code, comments, tests, commit messages or docs. When
+  porting code from elsewhere, rewrite the comments instead of copying them.
 - Everything in this repository is English: code, comments, commits, docs. Conventional Commits,
   small verified steps.
 
