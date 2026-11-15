@@ -314,6 +314,8 @@ pub enum Observation {
     RehandshakeMessage2,
     /// The client aborted a pairing attempt, with the reason it reported.
     PairingAborted(String),
+    /// The client said why it is closing the connection.
+    Goodbye(String),
     /// The connection closed.
     Closed,
 }
@@ -739,6 +741,19 @@ impl FakeServer {
                 Some(Observation::PairFinalize { long_term_psk }) => return Some(long_term_psk),
                 Some(_) => continue,
                 None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client says goodbye and returns the reason it sent.
+    pub async fn wait_for_goodbye(&mut self) -> Option<String> {
+        loop {
+            match self.observation().await {
+                Some(Observation::Goodbye(reason)) => return Some(reason),
+                Some(Observation::Closed) | Some(Observation::ClosedBeforeMessage2) | None => {
+                    return None
+                }
+                Some(_) => continue,
             }
         }
     }
@@ -1654,6 +1669,9 @@ async fn handle_client_message(
                 )
                 .await?;
             }
+        }
+        Some(Incoming::ClientGoodbye(goodbye)) => {
+            let _ = observations.send(Observation::Goodbye(goodbye.reason));
         }
         Some(Incoming::PairAbort(abort)) => {
             let _ = observations.send(Observation::PairingAborted(abort.reason));

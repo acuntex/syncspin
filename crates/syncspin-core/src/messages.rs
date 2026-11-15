@@ -732,6 +732,22 @@ pub struct ClientCommand {
 }
 
 // ---------------------------------------------------------------------------
+// Closing
+// ---------------------------------------------------------------------------
+
+/// `client/goodbye`: why the client is closing the connection.
+///
+/// Sent before a graceful close, so the server can tell a restart from a shutdown and whether to
+/// reconnect. `reason` is one of the values `messaging.md` defines; an unknown value is carried
+/// verbatim rather than rejected, so a reason this revision does not name still reaches the peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientGoodbye {
+    /// Why the client is leaving, for example `shutdown`, `restart` or `unpaired`.
+    pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
 // Binary audio
 // ---------------------------------------------------------------------------
 
@@ -868,6 +884,9 @@ pub enum Incoming {
     /// `server/unpair`.
     #[serde(rename = "server/unpair")]
     ServerUnpair(ServerUnpair),
+    /// `client/goodbye`.
+    #[serde(rename = "client/goodbye")]
+    ClientGoodbye(ClientGoodbye),
     /// `pair/abort`, in both directions.
     #[serde(rename = "pair/abort")]
     PairAbort(PairAbort),
@@ -969,7 +988,7 @@ struct EnvelopeType {
 ///
 /// A variant added without its entry here would silently read as an unknown type, so the
 /// integration tests parse one instance of every variant.
-const KNOWN_TYPES: [&str; 27] = [
+const KNOWN_TYPES: [&str; 28] = [
     "client/init",
     "server/init",
     "noise/handshake",
@@ -987,6 +1006,7 @@ const KNOWN_TYPES: [&str; 27] = [
     "client/pair-finalize",
     "server/pair-finalize",
     "server/unpair",
+    "client/goodbye",
     "pair/abort",
     "client/time",
     "server/time",

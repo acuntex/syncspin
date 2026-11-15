@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use syncspin_core::pairing::token::encode_v0;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -231,6 +232,46 @@ impl PairingFailure {
     }
 }
 
+/// Why a client says goodbye to a server.
+///
+/// The value is the `reason` field of `client/goodbye`, which the client sends before a graceful
+/// close so the server knows whether to reconnect. Only the reasons this revision can reach are
+/// named: a reason that needs a state this client cannot detect - `unauthorized`,
+/// `pairing_required`, `concurrent_attempt` - is left out until that state exists. The enum is
+/// non-exhaustive: a later revision may add one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GoodbyeReason {
+    /// The client is switching to another server.
+    ///
+    /// `messaging.md` requires this reason from a client that leaves one server for another; with
+    /// one connection this revision only lets a host express it through
+    /// [`ClientHandle::close`].
+    AnotherServer,
+    /// The client is restarting and will reconnect.
+    Restart,
+    /// The client is shutting down or otherwise going offline.
+    Shutdown,
+    /// The operator asked to disconnect from this server.
+    UserRequest,
+    /// The client processed `server/unpair`.
+    Unpaired,
+}
+
+impl GoodbyeReason {
+    /// Returns the reason as `client/goodbye` spells it.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AnotherServer => "another_server",
+            Self::Restart => "restart",
+            Self::Shutdown => "shutdown",
+            Self::UserRequest => "user_request",
+            Self::Unpaired => "unpaired",
+        }
+    }
+}
+
 /// Something that happened on the connection.
 ///
 /// Events are ordered as the connection produced them. A connection attempt ends with at most one
@@ -350,10 +391,9 @@ pub enum Event {
     /// The server dropped its pairing record for this client.
     ///
     /// Reported when a paired session receives `server/unpair`. The record is gone from
-    /// [`Storage`](crate::storage::Storage) by the time the event arrives, and the client closes
-    /// the connection: the next connection to that server lands in the Sentinel fallback unless the
-    /// host pairs again. The client does not send `client/goodbye` - the crate has no writer for it
-    /// (`docs/spec-deviations.md`, entry 9) - so the server sees the close without a reason.
+    /// [`Storage`](crate::storage::Storage) by the time the event arrives, and the client says
+    /// goodbye with reason `unpaired` and closes the connection: the next connection to that
+    /// server lands in the Sentinel fallback unless the host pairs again.
     ///
     /// A record the host passed through
     /// [`connect_with_psks`](crate::connect_with_psks) is not in a store the client may write, so
@@ -524,7 +564,7 @@ pub struct PlaybackState {
 pub struct ClientHandle {
     task: Option<JoinHandle<Result<()>>>,
     control: ControlHandle,
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: Option<oneshot::Sender<GoodbyeReason>>,
 }
 
 impl ClientHandle {
@@ -536,11 +576,24 @@ impl ClientHandle {
         self.control.clone()
     }
 
+    /// Stops the connection after telling the server why.
+    ///
+    /// The reason is sent as `client/goodbye` on the live connection before it closes; a client
+    /// that is reconnecting has no connection to say it on. The goodbye is best effort: a write
+    /// that fails neither turns the close into an error nor schedules another attempt. Dropping
+    /// the handle does the same with [`GoodbyeReason::Shutdown`].
+    pub fn close(&mut self, reason: GoodbyeReason) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(reason);
+        }
+    }
+
     /// Waits for the connection to end and returns its outcome.
     ///
-    /// The connection ends when the handle or the event stream is dropped, or when the audio sink
-    /// fails; a dropped session is reconnected, not returned. Awaiting this keeps the handle alive,
-    /// so dropping the event stream is the usual way to stop.
+    /// The connection ends when the handle or the event stream is dropped, when
+    /// [`ClientHandle::close`] is called, or when the audio sink fails; a dropped session is
+    /// reconnected, not returned. Awaiting this keeps the handle alive, so dropping the event
+    /// stream is the usual way to stop.
     pub async fn finished(mut self) -> Result<()> {
         let task = self.task.take().expect("the handle owns its task");
         task.await.context("the connection task panicked")?
@@ -550,10 +603,10 @@ impl ClientHandle {
 impl Drop for ClientHandle {
     fn drop(&mut self) {
         // `finished` takes the task, so a handle that is only waiting on the connection does not
-        // stop it; a handle that is dropped asks the connection to end.
+        // stop it; a handle that is dropped asks the connection to end and says why.
         if self.task.is_some() {
             if let Some(shutdown) = self.shutdown.take() {
-                let _ = shutdown.send(());
+                let _ = shutdown.send(GoodbyeReason::Shutdown);
             }
         }
     }
@@ -572,6 +625,20 @@ impl Drop for ClientHandle {
 pub struct ControlHandle {
     commands: mpsc::UnboundedSender<ControlRequest>,
     volume: Arc<AtomicU8>,
+    pairing_token: Option<PairingToken>,
+}
+
+/// The version-0 pairing token, held as the credential it is.
+///
+/// [`Debug`] prints `<redacted>`, so a log line that formats a [`ControlHandle`] never carries the
+/// token, which would let anyone holding that line pair a server with this client.
+#[derive(Clone)]
+struct PairingToken(String);
+
+impl fmt::Debug for PairingToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 impl ControlHandle {
@@ -645,6 +712,19 @@ impl ControlHandle {
     #[must_use]
     pub fn volume(&self) -> u8 {
         self.volume.load(Ordering::Relaxed)
+    }
+
+    /// The version-0 pairing token for this client, or `None` when no
+    /// [`Storage`](crate::storage::Storage) is configured.
+    ///
+    /// The token is `SP:0` plus the base32 body of the identity's public key and the pairing PSK
+    /// that was drawn or restored when the client started, so it is fixed for the client's
+    /// lifetime and survives a reconnect. A token is a credential: anyone holding it can pair a
+    /// server with this client, so a host renders it only while the operator needs it and never
+    /// writes it into a log.
+    #[must_use]
+    pub fn pairing_token(&self) -> Option<String> {
+        self.pairing_token.as_ref().map(|token| token.0.clone())
     }
 
     /// Opens a pairing window on the live connection and starts a waiting static-code attempt.
@@ -837,6 +917,11 @@ pub async fn connect_with_psks(
         Some(storage) => Some(load_or_draw_pairing_psk(storage)?),
         None => None,
     };
+    // The token is fixed once the key is settled: the identity and the pairing PSK do not change
+    // while the client runs, so it is built here and carried by every control handle.
+    let pairing_token = pairing
+        .as_ref()
+        .map(|psk| PairingToken(encode_v0(&config.identity.public, psk.as_bytes())));
 
     let (events, receiver) = mpsc::unbounded_channel();
     let (commands, control) = mpsc::unbounded_channel();
@@ -867,18 +952,14 @@ pub async fn connect_with_psks(
         failed_rounds,
     };
 
-    let task = tokio::spawn(async move {
-        tokio::select! {
-            result = serve_until_dropped(connection, carried) => result,
-            _ = shutdown_rx => Ok(()),
-        }
-    });
+    let task = tokio::spawn(serve_until_dropped(connection, carried, shutdown_rx));
 
     let handle = ClientHandle {
         task: Some(task),
         control: ControlHandle {
             commands,
             volume: reported_volume,
+            pairing_token,
         },
         shutdown: Some(shutdown),
     };
@@ -956,6 +1037,7 @@ async fn wait_before_retry(
     connection: &Connection,
     carried: &mut Carried,
     delay: Duration,
+    shutdown: &mut oneshot::Receiver<GoodbyeReason>,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + delay;
     loop {
@@ -971,6 +1053,11 @@ async fn wait_before_retry(
                     None => std::future::pending().await,
                 }
             } => Wakeup::Control(request),
+            // No connection is open, so there is nothing to say goodbye on; the loop just ends.
+            reason = &mut *shutdown => {
+                let _ = reason;
+                return false;
+            }
             () = tokio::time::sleep_until(deadline) => Wakeup::Deadline,
             () = connection.events.closed() => Wakeup::Closed,
         };
@@ -992,8 +1079,13 @@ async fn wait_before_retry(
 ///
 /// Every attempt, including the first, is opened here. A failed one is followed by the next after
 /// the delay [`next_backoff`] computes, with the sink, the level, the mute state and the roles
-/// carried over.
-async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Result<()> {
+/// carried over. A [`ClientHandle::close`] or a dropped handle stops the loop after the live
+/// session has had its chance to say goodbye.
+async fn serve_until_dropped(
+    connection: Connection,
+    mut carried: Carried,
+    mut shutdown: oneshot::Receiver<GoodbyeReason>,
+) -> Result<()> {
     // The first attempt is not preceded by a wait, but the policy starts at the initial delay, so a
     // failure before any session connected reports two seconds: one growth step from that value.
     let mut delay = INITIAL_BACKOFF;
@@ -1007,7 +1099,7 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
                     reason: format!("cannot connect to {}: {error:#}", connection.endpoint),
                     retry_in: delay,
                 });
-                if !wait_before_retry(&connection, &mut carried, delay).await {
+                if !wait_before_retry(&connection, &mut carried, delay, &mut shutdown).await {
                     return Ok(());
                 }
                 continue;
@@ -1022,6 +1114,7 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
             connection.pairing,
             &connection.reported_volume,
             carried,
+            &mut shutdown,
         )
         .await;
         carried = attempt.carried;
@@ -1032,6 +1125,12 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
         let flush_error = carried.sink.flush().err().map(|error| {
             error.context("the audio sink rejected a flush after the connection ended")
         });
+
+        // A deliberate close is not a drop: nothing is reported and no attempt follows. The
+        // goodbye was best effort, so neither its send nor the flush can turn it into an error.
+        if matches!(&attempt.ending, session::Ending::Shutdown) {
+            return Ok(());
+        }
 
         // A broken output cannot be repaired by reconnecting, and neither can a flush that fails
         // after the session; both end the connection instead of scheduling another attempt.
@@ -1051,7 +1150,7 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
             // The host has to fix the sink; a retry would only fail the same way.
             return match attempt.ending {
                 session::Ending::Failed(error) => Err(error),
-                session::Ending::Closed | session::Ending::Unpaired => {
+                session::Ending::Closed | session::Ending::Unpaired | session::Ending::Shutdown => {
                     Err(anyhow!("the audio sink failed"))
                 }
             };
@@ -1060,7 +1159,7 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
             return Err(error);
         }
 
-        if !wait_before_retry(&connection, &mut carried, delay).await {
+        if !wait_before_retry(&connection, &mut carried, delay, &mut shutdown).await {
             return Ok(());
         }
     }
@@ -1346,6 +1445,13 @@ mod tests {
         }
     }
 
+    /// A shutdown receiver the test never fires; its sender is leaked so the receiver stays open.
+    fn idle_shutdown() -> oneshot::Receiver<GoodbyeReason> {
+        let (sender, receiver) = oneshot::channel();
+        Box::leak(Box::new(sender));
+        receiver
+    }
+
     #[tokio::test]
     async fn a_retry_wait_without_a_control_handle_still_honours_the_delay() {
         let (events, _receiver) = mpsc::unbounded_channel();
@@ -1353,9 +1459,16 @@ mod tests {
         let (commands, control) = mpsc::unbounded_channel();
         drop(commands);
         let mut carried = empty_carried(Some(control));
+        let mut shutdown = idle_shutdown();
 
         let started = std::time::Instant::now();
-        let retry = wait_before_retry(&connection, &mut carried, Duration::from_millis(50)).await;
+        let retry = wait_before_retry(
+            &connection,
+            &mut carried,
+            Duration::from_millis(50),
+            &mut shutdown,
+        )
+        .await;
 
         assert!(retry, "the delay elapsed, so the next attempt must follow");
         assert!(
@@ -1373,8 +1486,14 @@ mod tests {
         let (events, receiver) = mpsc::unbounded_channel();
         let connection = connection_at("127.0.0.1:1", events);
         let mut carried = empty_carried(None);
+        let mut shutdown = idle_shutdown();
 
-        let retry = wait_before_retry(&connection, &mut carried, Duration::from_secs(60));
+        let retry = wait_before_retry(
+            &connection,
+            &mut carried,
+            Duration::from_secs(60),
+            &mut shutdown,
+        );
         tokio::pin!(retry);
         let mut finished = false;
         tokio::select! {
@@ -1401,7 +1520,7 @@ mod tests {
         drop(receiver);
         let connection = connection_at(&address.to_string(), events);
 
-        let outcome = serve_until_dropped(connection, empty_carried(None)).await;
+        let outcome = serve_until_dropped(connection, empty_carried(None), idle_shutdown()).await;
         assert!(
             outcome.is_ok(),
             "a host that dropped the stream ends the connection cleanly"

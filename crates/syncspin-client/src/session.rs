@@ -25,7 +25,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -34,11 +34,12 @@ use syncspin_core::framing::{
     encode_binary, Reassembler, BINARY_MESSAGE_ID_JSON, MAX_REASSEMBLED_LEN,
 };
 use syncspin_core::messages::{
-    AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientPairFinalize, ClientPairInit,
-    ClientState, ClientTime, ControllerCommand, DeviceInfo, Incoming, NoiseHandshake, PairAbort,
-    PairingActivation, PairingPskMethod, PlayerState, PlayerSupport, ServerActivate, ServerCommand,
-    ServerState, ServerTime, StreamClear, StreamStart, SupportedFormat, SupportedPairMethods,
-    UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
+    AudioChunkHeader, ClientCommand, ClientGoodbye, ClientHello, ClientInit, ClientPairFinalize,
+    ClientPairInit, ClientState, ClientTime, ControllerCommand, DeviceInfo, Incoming,
+    NoiseHandshake, PairAbort, PairingActivation, PairingPskMethod, PlayerState, PlayerSupport,
+    ServerActivate, ServerCommand, ServerState, ServerTime, StreamClear, StreamStart,
+    SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
+    PROTOCOL_VERSION,
 };
 #[cfg(feature = "pairing-code")]
 use syncspin_core::messages::{
@@ -53,8 +54,8 @@ use syncspin_core::noise::{
 use syncspin_core::pairing::pake::TAG_LEN;
 
 use crate::client::{
-    check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, PairingFailure,
-    PairingRequiredReason, PlaybackState, StreamEndReason, NORMAL_PLAYBACK_SPEED,
+    check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, GoodbyeReason,
+    PairingFailure, PairingRequiredReason, PlaybackState, StreamEndReason, NORMAL_PLAYBACK_SPEED,
 };
 #[cfg(feature = "pairing-code")]
 use crate::config::CodeFormat;
@@ -326,6 +327,8 @@ pub(crate) enum Ending {
     Closed,
     /// The server dropped this client's pairing record, so the client ended the connection.
     Unpaired,
+    /// The host closed the connection deliberately, after saying why.
+    Shutdown,
     /// The attempt failed.
     Failed(anyhow::Error),
 }
@@ -336,6 +339,7 @@ impl Ending {
         match self {
             Self::Closed => "the server closed the connection".to_owned(),
             Self::Unpaired => "the server dropped this client's pairing record".to_owned(),
+            Self::Shutdown => "the client closed the connection".to_owned(),
             Self::Failed(error) => format!("{error:#}"),
         }
     }
@@ -359,6 +363,8 @@ enum Wakeup {
     Control(Option<ControlRequest>),
     /// The socket produced a message, or the read failed.
     Socket(Result<SocketMessage>),
+    /// The host closed the connection and gave the reason to send.
+    Shutdown(GoodbyeReason),
     /// The clock deadline elapsed.
     Clock,
 }
@@ -417,6 +423,8 @@ pub(crate) struct Session<'a> {
     state_sent: bool,
     /// Requests from a [`crate::ControlHandle`], or `None` once every handle was dropped.
     control: Option<mpsc::UnboundedReceiver<ControlRequest>>,
+    /// The host's deliberate close, with the reason to send before the connection ends.
+    shutdown: &'a mut oneshot::Receiver<GoodbyeReason>,
     /// Output level in force, in the protocol's 0-100 range.
     volume: u8,
     /// Mute state in force.
@@ -473,7 +481,9 @@ pub(crate) struct Session<'a> {
 /// Every failure after the WebSocket is open - handshake, protocol, transport or sink - ends the
 /// attempt and is reported by the caller as one [`Event::Disconnected`]. The state the next
 /// attempt starts from comes back in the result, so the sink, the level, the mute state and the
-/// roles survive the drop.
+/// roles survive the drop. `shutdown` carries the host's deliberate close; it is polled by the
+/// session loop, which says goodbye and ends the attempt without a reconnect.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn attempt(
     transport: Transport,
     config: &ClientConfig,
@@ -482,6 +492,7 @@ pub(crate) async fn attempt(
     pairing_psk: Option<PairingPsk>,
     reported_volume: &AtomicU8,
     carried: Carried,
+    shutdown: &mut oneshot::Receiver<GoodbyeReason>,
 ) -> Attempt {
     // The store's records are read for every attempt, so a record a completed pairing wrote is a
     // candidate for the next connection. A store that cannot be read fails this attempt rather
@@ -538,6 +549,7 @@ pub(crate) async fn attempt(
         burst_samples: Vec::new(),
         state_sent: false,
         control: carried.control,
+        shutdown,
         volume: carried.volume,
         muted: carried.muted,
         sink_failed: false,
@@ -653,6 +665,9 @@ impl Session<'_> {
                         None => pending().await,
                     }
                 } => Wakeup::Control(request),
+                reason = &mut *self.shutdown => {
+                    Wakeup::Shutdown(reason.unwrap_or(GoodbyeReason::Shutdown))
+                }
                 message = self.transport.read() => Wakeup::Socket(message),
                 () = async {
                     match deadline {
@@ -665,6 +680,12 @@ impl Session<'_> {
             match wakeup {
                 Wakeup::Control(Some(request)) => self.handle_control(request).await?,
                 Wakeup::Control(None) => self.control = None,
+                // The host closed the connection: say why, then end the attempt. Neither a failed
+                // goodbye nor a socket that is already gone turns this into a reconnect.
+                Wakeup::Shutdown(reason) => {
+                    self.send_goodbye(reason).await;
+                    return Ok(Ending::Shutdown);
+                }
                 Wakeup::Socket(message) => match message? {
                     SocketMessage::Text(_) => {
                         bail!("cleartext text after the Noise transport is a protocol error")
@@ -847,7 +868,7 @@ impl Session<'_> {
     /// that does not decode is ignored as well, with a line on stderr, instead of ending the
     /// session: one malformed field must not silence playback, and a message the client cannot
     /// decode carries nothing it could act on. The audio path keeps the strict rule - a malformed
-    /// chunk header is a protocol error. See `docs/spec-deviations.md`, entry 19.
+    /// chunk header is a protocol error. See `docs/spec-deviations.md`, entry 17.
     ///
     /// A body that is not valid UTF-8 is a framing error and still closes the connection.
     async fn handle_control_message(&mut self, body: &[u8]) -> Result<()> {
@@ -887,7 +908,7 @@ impl Session<'_> {
             Incoming::StreamClear(clear) if !affects_player(clear.roles.as_deref()) => Ok(()),
             Incoming::StreamClear(clear) => self.handle_stream_clear(clear),
             Incoming::ServerPairFinalize(_) => self.confirm_pairing(),
-            Incoming::ServerUnpair(_) => self.handle_unpair(),
+            Incoming::ServerUnpair(_) => self.handle_unpair().await,
             Incoming::PairAbort(abort) => self.handle_pairing_abort(abort),
             #[cfg(feature = "pairing-code")]
             Incoming::ServerPairInit(init) => self.handle_server_init(init).await,
@@ -1554,9 +1575,9 @@ impl Session<'_> {
     /// [`connect_with_psks`](crate::connect_with_psks) is not in a store the client may write, so
     /// the event is reported without removing it - that record belongs to the host.
     ///
-    /// The client then closes the connection, deliberately and without `client/goodbye`: the crate
-    /// has no writer for it yet (`docs/spec-deviations.md`, entry 9).
-    fn handle_unpair(&mut self) -> Result<()> {
+    /// The client then says goodbye with reason `unpaired` and closes the connection. The goodbye
+    /// is best effort: a write that fails does not turn the deliberate close into a failed attempt.
+    async fn handle_unpair(&mut self) -> Result<()> {
         if self.matched != MatchedPsk::Stored(PskCategory::LongTerm) {
             return Ok(());
         }
@@ -1568,6 +1589,7 @@ impl Session<'_> {
         self.emit(Event::Unpaired {
             server_id: self.server_id.clone(),
         });
+        self.send_goodbye(GoodbyeReason::Unpaired).await;
         self.ending = Some(Ending::Unpaired);
         Ok(())
     }
@@ -2042,6 +2064,19 @@ impl Session<'_> {
     /// Queues one event for the caller.
     fn emit(&self, event: Event) {
         let _ = self.events.send(event);
+    }
+
+    /// Sends `client/goodbye` with `reason`, best effort.
+    ///
+    /// The message belongs to a graceful close. A write that fails is ignored: the connection is
+    /// ending anyway, and reporting the failure would turn a deliberate shutdown into an error or
+    /// a reconnect. A goodbye during a re-handshake is refused by [`Self::send_json`] and ignored
+    /// for the same reason - there is no application-message window to use.
+    async fn send_goodbye(&mut self, reason: GoodbyeReason) {
+        let goodbye = Incoming::ClientGoodbye(ClientGoodbye {
+            reason: reason.as_str().to_owned(),
+        });
+        let _ = self.send_json(&goodbye).await;
     }
 
     /// Encrypts and sends one control message.
@@ -2784,6 +2819,13 @@ mod tests {
         }
     }
 
+    /// A shutdown channel no test closes, leaked so a session can borrow it.
+    fn idle_shutdown() -> &'static mut oneshot::Receiver<GoodbyeReason> {
+        let (sender, receiver) = oneshot::channel();
+        Box::leak(Box::new(sender));
+        Box::leak(Box::new(receiver))
+    }
+
     /// Builds a session around the given transport and control receiver.
     fn test_session<'a>(
         config: &'a ClientConfig,
@@ -2812,6 +2854,7 @@ mod tests {
             burst_samples: Vec::new(),
             state_sent: false,
             control,
+            shutdown: idle_shutdown(),
             volume: 50,
             muted: false,
             sink_failed: false,
@@ -3399,6 +3442,7 @@ mod tests {
 
         session
             .handle_unpair()
+            .await
             .expect("an ignored unpair is not an error");
 
         assert!(
@@ -3415,6 +3459,7 @@ mod tests {
         session.matched = MatchedPsk::PairingPsk;
         session
             .handle_unpair()
+            .await
             .expect("an ignored unpair is not an error");
         assert!(receiver.try_recv().is_err());
         assert!(session.ending.is_none());

@@ -62,10 +62,9 @@ pub trait Storage: Send + Sync + 'static {
     ///
     /// The client draws a key when this is `None`, hands it back through
     /// [`store_pairing_psk`](Storage::store_pairing_psk), and uses it on every connection. The
-    /// operator-facing version-0 token is `client_key || pairing_psk`; the crate has no accessor
-    /// that builds it yet, so a host assembles it from the identity's public key and this value
-    /// with `syncspin_core::pairing::token::encode_v0`. A key the host restored is used as it is, so
-    /// pairing survives a restart.
+    /// operator-facing version-0 token is `client_key || pairing_psk`;
+    /// [`ControlHandle::pairing_token`](crate::ControlHandle::pairing_token) hands it out once the
+    /// client has started. A key the host restored is used as it is, so pairing survives a restart.
     fn pairing_psk(&self) -> Result<Option<[u8; 32]>>;
 
     /// Persists the pairing PSK the client drew on this run.

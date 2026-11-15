@@ -6,14 +6,15 @@ use syncspin_core::framing::{
     FRAGMENT_FLAG_LAST, MAX_PLAINTEXT_LEN, MAX_REASSEMBLED_LEN,
 };
 use syncspin_core::messages::{
-    AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientPairAuth, ClientPairConfirm,
-    ClientPairFinalize, ClientPairInit, ClientPairPending, ClientPairRetry, ClientState,
-    ClientTime, ControllerCommand, DecodeError, DeviceInfo, DynamicPairingCodeMethod, Incoming,
-    NoiseHandshake, PairAbort, PairingPskMethod, PlayerState, PlayerSupport, ServerActivate,
-    ServerCommand, ServerHello, ServerInit, ServerPairAuth, ServerPairConfirm, ServerPairFinalize,
-    ServerPairInit, ServerState, ServerTime, ServerUnpair, StaticPairingCodeMethod, StreamClear,
-    StreamEnd, StreamStart, StreamStartPlayer, SupportedFormat, SupportedPairMethods,
-    UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
+    AudioChunkHeader, ClientCommand, ClientGoodbye, ClientHello, ClientInit, ClientPairAuth,
+    ClientPairConfirm, ClientPairFinalize, ClientPairInit, ClientPairPending, ClientPairRetry,
+    ClientState, ClientTime, ControllerCommand, DecodeError, DeviceInfo, DynamicPairingCodeMethod,
+    Incoming, NoiseHandshake, PairAbort, PairingPskMethod, PlayerState, PlayerSupport,
+    ServerActivate, ServerCommand, ServerHello, ServerInit, ServerPairAuth, ServerPairConfirm,
+    ServerPairFinalize, ServerPairInit, ServerState, ServerTime, ServerUnpair,
+    StaticPairingCodeMethod, StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
+    SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
+    PROTOCOL_VERSION,
 };
 
 /// A payload whose first bytes differ, so a reassembled message is easy to verify.
@@ -353,6 +354,31 @@ fn pairing_messages_roundtrip_on_the_wire() {
     ));
     assert!(matches!(
         Incoming::parse(r#"{"type":"pair/abort","payload":{}}"#),
+        Err(DecodeError::Malformed(_))
+    ));
+}
+
+#[test]
+fn client_goodbye_roundtrips_on_the_wire() {
+    let goodbye = ClientGoodbye {
+        reason: "unpaired".to_owned(),
+    };
+    let json = serde_json::to_string(&Incoming::ClientGoodbye(goodbye.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/goodbye",
+            "payload": {"reason": "unpaired"},
+        })
+    );
+    assert_eq!(
+        Incoming::parse(&json).unwrap(),
+        Some(Incoming::ClientGoodbye(goodbye))
+    );
+
+    // The reason is required: a goodbye without one cannot tell the server anything.
+    assert!(matches!(
+        Incoming::parse(r#"{"type":"client/goodbye","payload":{}}"#),
         Err(DecodeError::Malformed(_))
     ));
 }
@@ -1067,6 +1093,9 @@ fn parse_accepts_every_message_this_revision_implements() {
         Incoming::ClientPairFinalize(ClientPairFinalize::default()),
         Incoming::ServerPairFinalize(ServerPairFinalize {}),
         Incoming::ServerUnpair(ServerUnpair {}),
+        Incoming::ClientGoodbye(ClientGoodbye {
+            reason: "shutdown".to_owned(),
+        }),
         Incoming::PairAbort(PairAbort {
             reason: "attempt_timeout".to_owned(),
         }),
@@ -1089,7 +1118,7 @@ fn parse_accepts_every_message_this_revision_implements() {
         Incoming::StreamClear(StreamClear::default()),
         Incoming::StreamEnd(StreamEnd::default()),
     ];
-    assert_eq!(messages.len(), 20, "one instance per message type");
+    assert_eq!(messages.len(), 21, "one instance per message type");
     for message in messages {
         let text = serde_json::to_string(&message).unwrap();
         assert_eq!(
