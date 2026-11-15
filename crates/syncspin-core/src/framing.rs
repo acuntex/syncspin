@@ -14,12 +14,13 @@
 //!
 //! Bit 0 of the flags byte marks the last fragment, bit 1 the first one, and bits 2-7 must be
 //! zero. Only one fragmented message may be in flight per direction, so the receiver appends every
-//! fragment to one buffer and dispatches the result when the last flag arrives. This module does
-//! no I/O: [`split_binary`] and [`reassemble_binary`] are pure conversions.
+//! fragment to one buffer and dispatches the result when the last flag arrives. [`Reassembler`]
+//! does that for a session reading frame by frame; [`reassemble_binary`] does it for a sequence
+//! already in hand. This module does no I/O.
 
 use anyhow::{bail, Context, Result};
 
-use crate::noise::MAX_MESSAGE_LEN;
+pub use crate::noise::MAX_PLAINTEXT_LEN;
 
 /// Binary message id of a JSON message body.
 pub const BINARY_MESSAGE_ID_JSON: u8 = 0;
@@ -38,20 +39,10 @@ pub const FRAGMENT_FLAG_FIRST: u8 = 0x02;
 /// Fragment flag bits that are reserved and must be zero.
 pub const FRAGMENT_FLAGS_RESERVED: u8 = 0xfc;
 
-/// Largest plaintext that fits in one Noise transport message, including the message id byte.
-///
-/// The Noise specification caps a transport message at [`MAX_MESSAGE_LEN`]; the cipher suites
-/// used by the protocol authenticate the message with a 16-byte tag, which leaves 65 519 bytes of
-/// plaintext.
-pub const MAX_PLAINTEXT_LEN: usize = MAX_MESSAGE_LEN - AEAD_TAG_LEN;
-
 /// Largest reassembled message, bounding the buffer a peer can make the receiver allocate.
 ///
 /// The protocol lets a receiver choose its own limit; a message beyond it is a protocol error.
 pub const MAX_REASSEMBLED_LEN: usize = 64 * 1024 * 1024;
-
-/// Length of the authentication tag every Noise transport message carries.
-const AEAD_TAG_LEN: usize = 16;
 
 /// Header of a first fragment: message id, flags byte and original message id.
 const FIRST_FRAGMENT_HEADER_LEN: usize = 3;
@@ -75,18 +66,20 @@ pub enum Frame<'a> {
 
 /// Decodes one Noise transport plaintext into a [`Frame`].
 ///
-/// The first byte carries the binary message id: id [`BINARY_MESSAGE_ID_JSON`] introduces a
-/// UTF-8 JSON body and every other id introduces a binary body. Cleartext text frames of the
-/// handshake have no id byte and are parsed as JSON directly.
+/// The first byte of a plaintext is its binary message id: id [`BINARY_MESSAGE_ID_JSON`]
+/// introduces a UTF-8 JSON body and every other id introduces a binary body. Cleartext handshake
+/// messages do not travel through Noise, carry no id byte and are JSON text the caller parses
+/// directly; this function never sees them.
 ///
 /// Fragment frames (id [`BINARY_MESSAGE_ID_FRAGMENT`]) are classified like any other binary
-/// message, with the payload starting at the flags byte. To reassemble, pass the plaintexts
-/// themselves to [`reassemble_binary`], because it needs the id byte of each fragment.
+/// message, with the payload starting at the flags byte. A session hands the plaintexts themselves
+/// to a [`Reassembler`], which needs the id byte of each fragment, and decodes only the message the
+/// reassembler completes.
 ///
 /// # Errors
 /// Returns an error for an empty plaintext, which is always a protocol error, and for a JSON body
 /// that is not valid UTF-8.
-pub fn decode_text(bytes: &[u8]) -> Result<Frame<'_>> {
+pub fn decode_frame(bytes: &[u8]) -> Result<Frame<'_>> {
     let Some((&id, payload)) = bytes.split_first() else {
         bail!("empty plaintext: every transport message carries a message id byte");
     };
@@ -154,11 +147,130 @@ pub fn split_binary(id: u8, payload: &[u8], max_plaintext: usize) -> Vec<Vec<u8>
     frames
 }
 
-/// Reassembles frames into the original message.
+/// Incremental reassembler for one direction of a connection.
+///
+/// A session reads one frame at a time and owns a `Reassembler`; [`reassemble_binary`] is the same
+/// validation for a sequence that is already in hand. Both allow only one fragmented message in
+/// flight, as the protocol requires.
+#[derive(Debug)]
+pub struct Reassembler {
+    max_message_len: usize,
+    message: Option<InFlight>,
+}
+
+/// A fragmented message that is still being assembled.
+#[derive(Debug)]
+struct InFlight {
+    /// Original message id, carried by the first fragment.
+    message_id: u8,
+    /// Payload bytes collected so far.
+    body: Vec<u8>,
+}
+
+impl Reassembler {
+    /// Creates a reassembler that rejects a reassembled message longer than `max_message_len`.
+    ///
+    /// A session usually passes [`MAX_REASSEMBLED_LEN`], the bound a receiver may choose for
+    /// itself.
+    pub fn new(max_message_len: usize) -> Self {
+        Self {
+            max_message_len,
+            message: None,
+        }
+    }
+
+    /// Feeds one Noise transport plaintext.
+    ///
+    /// Returns `Some((id, payload))` when the frame completes a message: immediately for a plain
+    /// frame, and on the fragment that carries the last flag for a sequence. Every other fragment
+    /// returns `Ok(None)`.
+    ///
+    /// # Errors
+    /// Returns an error, and drops any message in flight, for the malformed sequences the protocol
+    /// defines: an empty frame, a plain frame while a fragmented message is in flight, a fragment
+    /// without its flags byte, reserved flag bits, a continuation fragment without a first
+    /// fragment, a second first fragment while one is in flight, a first fragment without its
+    /// original message id, an original id of [`BINARY_MESSAGE_ID_FRAGMENT`], and a message larger
+    /// than `max_message_len`.
+    ///
+    /// The framing carries no byte count and no sequence number, so a fragment lost from the middle
+    /// of a message cannot be detected here.
+    pub fn push(&mut self, frame: &[u8]) -> Result<Option<(u8, Vec<u8>)>> {
+        let outcome = self.push_frame(frame);
+        if outcome.is_err() {
+            self.message = None;
+        }
+        outcome
+    }
+
+    /// Validates one frame and advances the reassembly state.
+    fn push_frame(&mut self, frame: &[u8]) -> Result<Option<(u8, Vec<u8>)>> {
+        let Some((&id, body)) = frame.split_first() else {
+            bail!("empty frame");
+        };
+        if id != BINARY_MESSAGE_ID_FRAGMENT {
+            if self.message.is_some() {
+                bail!("non-fragment frame while a fragmented message is in flight");
+            }
+            return Ok(Some((id, body.to_vec())));
+        }
+
+        let Some((&flags, body)) = body.split_first() else {
+            bail!("fragment frame missing its flags byte");
+        };
+        if flags & FRAGMENT_FLAGS_RESERVED != 0 {
+            bail!("fragment flags 0x{flags:02x} set reserved bits");
+        }
+        let first = flags & FRAGMENT_FLAG_FIRST != 0;
+        let last = flags & FRAGMENT_FLAG_LAST != 0;
+
+        if first {
+            if self.message.is_some() {
+                bail!("first fragment while a fragmented message is in flight");
+            }
+            let Some((&message_id, data)) = body.split_first() else {
+                bail!("first fragment missing its original message id");
+            };
+            if message_id == BINARY_MESSAGE_ID_FRAGMENT {
+                bail!("first fragment carries the fragmentation id as its original message id");
+            }
+            if data.len() > self.max_message_len {
+                bail!("fragmented message exceeds {} bytes", self.max_message_len);
+            }
+            let mut message = InFlight {
+                message_id,
+                body: Vec::with_capacity(data.len()),
+            };
+            message.body.extend_from_slice(data);
+            if !last {
+                self.message = Some(message);
+                return Ok(None);
+            }
+            return Ok(Some((message_id, message.body)));
+        }
+
+        let Some(message) = self.message.as_mut() else {
+            bail!("continuation fragment without a first fragment");
+        };
+        if message.body.len() + body.len() > self.max_message_len {
+            bail!("fragmented message exceeds {} bytes", self.max_message_len);
+        }
+        message.body.extend_from_slice(body);
+        if !last {
+            return Ok(None);
+        }
+        let Some(InFlight { message_id, body }) = self.message.take() else {
+            bail!("continuation fragment without a first fragment");
+        };
+        Ok(Some((message_id, body)))
+    }
+}
+
+/// Reassembles a complete sequence of frames into the original message.
 ///
 /// Accepts a single unfragmented frame, returning its id and body unchanged, as well as the
-/// fragment sequence [`split_binary`] produces. The sequence is validated before the body is
-/// returned.
+/// fragment sequence [`split_binary`] produces. A session that reads frame by frame keeps a
+/// [`Reassembler`] instead; this is the batch form for a sequence that is already in hand.
 ///
 /// The framing carries no byte count and no sequence number, so a fragment lost from the middle of
 /// a message cannot be detected here. What is detectable is rejected: a continuation before the
@@ -167,68 +279,29 @@ pub fn split_binary(id: u8, payload: &[u8], max_plaintext: usize) -> Vec<Vec<u8>
 /// larger than [`MAX_REASSEMBLED_LEN`].
 ///
 /// # Errors
-/// Returns an error when the frames are empty or cannot be a complete, well-formed message.
+/// Returns an error when the frames are empty, cannot form exactly one well-formed message, or
+/// exceed [`MAX_REASSEMBLED_LEN`].
 pub fn reassemble_binary(frames: &[Vec<u8>]) -> Result<(u8, Vec<u8>)> {
     if frames.is_empty() {
         bail!("no frame to reassemble");
     }
-    if let [frame] = frames {
-        if let Some((&id, payload)) = frame.split_first() {
-            if id != BINARY_MESSAGE_ID_FRAGMENT {
-                return Ok((id, payload.to_vec()));
-            }
-        }
-    }
-
-    let mut message_id = None;
-    let mut body = Vec::new();
-    let mut complete = false;
+    let mut reassembler = Reassembler::new(MAX_REASSEMBLED_LEN);
+    let mut message = None;
     for (index, frame) in frames.iter().enumerate() {
-        let Some((&id, rest)) = frame.split_first() else {
-            bail!("frame {index}: empty");
-        };
-        if id != BINARY_MESSAGE_ID_FRAGMENT {
-            bail!("frame {index}: message id {id} is not the fragmentation id");
-        }
-        if complete {
-            bail!("frame {index}: follows the last fragment");
-        }
-        let Some((&flags, rest)) = rest.split_first() else {
-            bail!("frame {index}: missing flags byte");
-        };
-        if flags & FRAGMENT_FLAGS_RESERVED != 0 {
-            bail!("frame {index}: reserved flag bits set in 0x{flags:02x}");
-        }
-        let first = flags & FRAGMENT_FLAG_FIRST != 0;
-        let last = flags & FRAGMENT_FLAG_LAST != 0;
-        if first && index != 0 {
-            bail!("frame {index}: first flag set on a continuation fragment");
-        }
-        if !first && index == 0 {
-            bail!("frame 0: continuation fragment without a first fragment");
-        }
-        if first {
-            let Some((&original_id, data)) = rest.split_first() else {
-                bail!("frame 0: first fragment misses the original message id");
-            };
-            if original_id == BINARY_MESSAGE_ID_FRAGMENT {
-                bail!("frame 0: original message id is the fragmentation id");
+        let completed = reassembler
+            .push(frame)
+            .with_context(|| format!("frame {index}"))?;
+        if let Some(completed) = completed {
+            if message.is_some() {
+                bail!("frame {index}: more than one message in one sequence");
             }
-            message_id = Some(original_id);
-            body.extend_from_slice(data);
-        } else {
-            body.extend_from_slice(rest);
+            message = Some(completed);
         }
-        if body.len() > MAX_REASSEMBLED_LEN {
-            bail!("fragmented message exceeds {MAX_REASSEMBLED_LEN} bytes");
-        }
-        complete = last;
     }
-    if !complete {
+    let Some(message) = message else {
         bail!("the last fragment is missing: no fragment carried the last flag");
-    }
-    let id = message_id.expect("a complete sequence starts with a first fragment");
-    Ok((id, body))
+    };
+    Ok(message)
 }
 
 /// Largest encoded-audio payload that fits one frame without fragmentation.

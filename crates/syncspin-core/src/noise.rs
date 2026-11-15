@@ -51,11 +51,12 @@ pub const SENTINEL_PSK_ID: &str = "GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo";
 /// repeated here.
 pub const MAX_MESSAGE_LEN: usize = 65_535;
 
-/// Length of the ChaChaPoly authentication tag appended to every ciphertext.
-const TAG_LEN: usize = 16;
+/// Length of the authentication tag appended to every Noise transport ciphertext.
+pub const TAG_LEN: usize = 16;
 
-/// Largest plaintext that fits into one Noise transport message.
-const MAX_PLAINTEXT_LEN: usize = MAX_MESSAGE_LEN - TAG_LEN;
+/// Largest plaintext that fits into one Noise transport message, including the leading binary
+/// message id byte.
+pub const MAX_PLAINTEXT_LEN: usize = MAX_MESSAGE_LEN - TAG_LEN;
 
 /// Label that Sendspin hashes together with a PSK to derive its id.
 const PSK_ID_LABEL: &[u8] = b"sendspin-psk-id-v1";

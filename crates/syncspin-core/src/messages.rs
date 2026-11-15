@@ -14,6 +14,8 @@
 //! fields the specification allows to be absent default. A `type` this revision does not define
 //! is an error, never a silent default, so the caller decides whether to ignore the message.
 
+use std::fmt;
+
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
@@ -131,9 +133,9 @@ pub struct PairingPskMethod {}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SupportedPairMethods {
-    /// The pairing PSK method, offered by every conformant client.
-    #[serde(default)]
-    pub pairing_psk: PairingPskMethod,
+    /// The pairing PSK method, offered by every conformant client; absent when a peer omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_psk: Option<PairingPskMethod>,
 }
 
 /// The `unpaired_access` object of [`ClientHello`].
@@ -534,8 +536,12 @@ impl AudioChunkHeader {
 /// `{"type": "<group>/<name>", "payload": {..}}`, which is what a session sends.
 ///
 /// The enum is non-exhaustive: a newer revision of the protocol defines messages this one does
-/// not, and a receiver must be able to ignore them without a breaking change. An unrecognized
-/// `type` fails to deserialize.
+/// not, and a receiver must be able to ignore them without a breaking change.
+///
+/// Deserializing this type directly with `serde_json` reports an unknown `type` and a malformed
+/// payload as the same kind of error, so it cannot drive the protocol's rule that the first is
+/// ignored and the second closes the connection. Use [`Incoming::parse`] for received frames,
+/// which tells the two apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 #[non_exhaustive]
@@ -582,4 +588,95 @@ pub enum Incoming {
     /// `stream/end`.
     #[serde(rename = "stream/end")]
     StreamEnd(StreamEnd),
+}
+
+impl Incoming {
+    /// Parses one JSON text frame, telling an unknown message type from a malformed message.
+    ///
+    /// `Ok(None)` means the `type` names a message this revision does not implement. The protocol
+    /// requires ignoring such a message, so it is not an error, and returning the identifier would
+    /// only invite callers to treat the normal case as a failure.
+    ///
+    /// `Err(DecodeError::Malformed(..))` means the message cannot be used: either the frame is not
+    /// a JSON object with a string `type`, or the `type` is known and its payload does not parse.
+    /// The protocol treats that as an error, so the caller must act on it.
+    ///
+    /// Deserializing with `serde_json::from_str::<Incoming>` instead reports both cases through the
+    /// same error type; use this method whenever the difference matters.
+    pub fn parse(text: &str) -> Result<Option<Self>, DecodeError> {
+        let envelope: EnvelopeType = serde_json::from_str(text).map_err(DecodeError::Malformed)?;
+        if !is_known_type(&envelope.message_type) {
+            return Ok(None);
+        }
+        serde_json::from_str(text)
+            .map(Some)
+            .map_err(DecodeError::Malformed)
+    }
+}
+
+/// Why a text frame did not produce an [`Incoming`] message.
+#[derive(Debug)]
+pub enum DecodeError {
+    /// The `type` is not one this revision implements.
+    ///
+    /// [`Incoming::parse`] reports this case as `Ok(None)` rather than as this variant, because the
+    /// protocol requires ignoring an unrecognised type instead of closing the connection. The
+    /// variant stays part of the public error type so a stricter dispatcher can still name the
+    /// case.
+    UnknownType(String),
+    /// The `type` is known, but the message does not deserialize.
+    Malformed(serde_json::Error),
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownType(message_type) => {
+                write!(formatter, "unrecognized message type {message_type:?}")
+            }
+            Self::Malformed(error) => write!(formatter, "malformed message: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Malformed(error) => Some(error),
+            Self::UnknownType(_) => None,
+        }
+    }
+}
+
+/// The `type` field of a message envelope, read before the payload is parsed.
+#[derive(Deserialize)]
+struct EnvelopeType {
+    #[serde(rename = "type")]
+    message_type: String,
+}
+
+/// Message types this revision implements, one per [`Incoming`] variant.
+///
+/// A variant added without its entry here would silently read as an unknown type, so the
+/// integration tests parse one instance of every variant.
+const KNOWN_TYPES: [&str; 14] = [
+    "client/init",
+    "server/init",
+    "noise/handshake",
+    "server/hello",
+    "client/hello",
+    "server/activate",
+    "client/time",
+    "server/time",
+    "client/state",
+    "server/state",
+    "server/command",
+    "stream/start",
+    "stream/clear",
+    "stream/end",
+];
+
+/// Whether this revision implements a message type.
+fn is_known_type(message_type: &str) -> bool {
+    KNOWN_TYPES.contains(&message_type)
 }
