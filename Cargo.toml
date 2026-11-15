@@ -8,6 +8,10 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 authors = ["syncspin contributors"]
+repository = "https://github.com/acuntex/syncspin"
+readme = "README.md"
+keywords = ["sendspin", "music-assistant", "audio", "streaming"]
+categories = ["multimedia::audio", "network-programming"]
 
 # Pinned versions are shared by every crate; a crate opts in with `dep.workspace = true`.
 [workspace.dependencies]

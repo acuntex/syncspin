@@ -26,7 +26,7 @@ never knows a transport. A dependency pointing from core towards a crate is a bu
 cargo test --workspace
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
-cargo zigbuild --target armv7-unknown-linux-gnueabihf   # the ARMv7 baseline, glibc 2.24
+cargo zigbuild --target armv7-unknown-linux-gnueabihf --no-default-features --features player,controller
 cargo deny check                                       # licences, advisories, sources
 ```
 
@@ -43,6 +43,9 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
   and `source` stay off unless a caller opts in.
 - **MSRV 1.85.** A dependency that demands more is pinned or replaced, not silently accepted; the
   `msrv` CI job is the gate.
+- **Names and licence are fixed:** crates `syncspin`, `syncspin-core`, `syncspin-client`,
+  `syncspin-server`; licence `MIT OR Apache-2.0`. Renames break downstream consumers and the
+  published crates.
 - **Spec deviations are documented** in `docs/spec-deviations.md` and covered by a test. Where
   Music Assistant and the spec disagree, the spec wins.
 - Everything in this repository is English: code, comments, commits, docs. Conventional Commits,
