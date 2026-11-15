@@ -8,6 +8,12 @@ deliberately generalised; nothing here describes a particular device, deployment
 The repository is written entirely in English: code, comments, commit messages, README, AGENTS.md,
 CHANGELOG and every file under `docs/`. This document is kept in English for that reason.
 
+**This document describes the target, not the current tree.** It is the design the implementation is
+measured against: the API sketch, the feature flags (`wss`, `flac`, `opus`, `artwork`, `visualizer`,
+`color`, `source`), the pairing flows and the server half are planned work. What exists today is the
+README's "What works today" and "What does not work yet", and
+[`docs/spec-deviations.md`](../spec-deviations.md) for the departures from the specification.
+
 ## Intent
 
 A standalone, public Rust library for Music Assistant's Sendspin protocol: encrypted (Noise),
