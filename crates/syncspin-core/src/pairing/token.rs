@@ -48,10 +48,10 @@ const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 pub struct Token {
     /// The version character the token carried, as a number.
     pub version: u8,
-    /// The decoded payload, at least as long as the version defines.
+    /// The decoded payload, exactly as long as the version defines.
     ///
-    /// Bytes past the version's defined length are reserved for future extension and belong to
-    /// no current meaning: a caller reads `payload[..N]` and ignores the rest.
+    /// Bytes beyond that length that the token carried are dropped here: the spec reserves them
+    /// for future extension and requires a decoder to ignore them.
     pub payload: Vec<u8>,
 }
 
@@ -98,7 +98,9 @@ pub fn encode_v0(client_key: &[u8; 32], psk: &[u8; 32]) -> String {
 /// Lenient about operator formatting: surrounding whitespace is trimmed, ASCII case is folded
 /// and the leading `SP:` is optional. Everything else follows the spec: the first remaining
 /// character is the version, it must be one this crate defines, and the payload must be at least
-/// as long as that version defines. Errors name a rule or a length and never echo the input.
+/// as long as that version defines. Bytes past that length are reserved for future extension and
+/// are dropped, so [`Token::payload`] always has exactly the version's length. Errors name a rule
+/// or a length and never echo the input.
 ///
 /// # Example
 ///
@@ -133,13 +135,16 @@ pub fn decode(token: &str) -> Result<Token> {
         None => bail!("a pairing token needs a version character"),
     };
 
-    let payload = decode_body(&input[1..])?;
+    let mut payload = decode_body(&input[1..])?;
     if payload.len() < required {
         bail!(
             "a version {version} pairing token needs {required} payload bytes, this one has {}",
             payload.len()
         );
     }
+    // Bytes beyond the version's payload are reserved for future extension, and the spec says a
+    // decoder MUST ignore them: ignoring them here means no caller ever has to remember to.
+    payload.truncate(required);
     Ok(Token { version, payload })
 }
 
@@ -207,8 +212,9 @@ fn base32_encode(bytes: &[u8]) -> String {
 
 /// Decodes RFC 4648 §6 base32, ignoring any trailing `=` padding.
 ///
-/// Fails on a character outside the alphabet and on non-zero padding bits, which no conformant
-/// encoder produces and which would otherwise turn one malformed string into a valid token.
+/// Fails on a character outside the alphabet, on a length base32 cannot produce, and on non-zero
+/// padding bits. None of the three is written by a conformant encoder, and accepting any of them
+/// would turn a malformed string into a valid token.
 fn base32_decode(text: &[u8]) -> Result<Vec<u8>> {
     let end = text
         .iter()
@@ -228,6 +234,12 @@ fn base32_decode(text: &[u8]) -> Result<Vec<u8>> {
             bytes.push((buffer >> bits) as u8);
             buffer &= (1 << bits) - 1;
         }
+    }
+    // A final quantum of 1, 3 or 6 characters leaves a whole five-bit symbol that no byte uses;
+    // base32 only produces final quanta of 2, 4, 5, 7 or 8 characters. When those bits are zero
+    // the input would otherwise decode to a shorter payload and pass unnoticed.
+    if bits >= 5 {
+        bail!("a pairing token body has a length base32 cannot encode");
     }
     if buffer != 0 {
         bail!("a pairing token body has non-zero padding bits");
@@ -314,13 +326,34 @@ mod tests {
     }
 
     #[test]
-    fn payload_bytes_beyond_the_version_are_kept_but_do_not_fail_decoding() {
-        // The spec reserves trailing bytes for future extension: a decoder must ignore them, not
-        // reject the token.
-        let payload: Vec<u8> = (0..VERSION_0_PAYLOAD_LEN as u8 + 3).collect();
-        let token = decode(&encode(0, &payload)).expect("a longer version-0 payload decodes");
-        assert_eq!(token.version, 0);
-        assert_eq!(token.payload, payload, "the trailing bytes are kept");
+    fn extension_bytes_beyond_the_version_are_dropped() {
+        // The spec reserves trailing payload bytes for future extension and requires a decoder to
+        // ignore them: the token still decodes, and its payload is exactly the version's length.
+        for (version, len) in [(0, VERSION_0_PAYLOAD_LEN), (1, VERSION_1_PAYLOAD_LEN)] {
+            let payload: Vec<u8> = (0..len as u8 + 3).collect();
+            let token = decode(&encode(version, &payload)).unwrap_or_else(|error| {
+                panic!("a longer version-{version} payload decodes: {error}")
+            });
+            assert_eq!(token.version, version);
+            assert_eq!(
+                token.payload,
+                payload[..len],
+                "version {version} drops the three extension bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_of_a_length_base32_cannot_encode_is_rejected() {
+        // Appending one zero symbol to a 24-byte body gives 41 characters, whose five-bit groups
+        // leave one whole symbol over: 40 characters (25 bytes) is the nearest length base32 can
+        // write. All those bits are zero, so only the quantum check can catch it.
+        let body = format!("{VERSION_1}AA");
+        let message = decode(&body).expect_err("41 body characters are not a base32 length");
+        assert!(
+            message.to_string().contains("length"),
+            "the error names the length: {message}"
+        );
     }
 
     #[test]

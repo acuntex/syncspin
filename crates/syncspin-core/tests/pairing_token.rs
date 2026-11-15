@@ -169,6 +169,50 @@ fn non_zero_padding_bits_are_rejected() {
 }
 
 #[test]
+fn extension_bytes_behind_the_version_payload_are_ignored() {
+    // Appending `A` to a body adds five zero bits. The spec's bodies end in a final character
+    // whose three low bits are padding, so the result is a valid base32 body that carries the
+    // version's payload followed by one zero extension byte: 65 bytes for version 0, 25 for
+    // version 1. The spec reserves those bytes for future extension and requires a decoder to
+    // ignore them, so the token decodes with a payload of exactly the version's length.
+    let token = decode(&format!("{VERSION_0}A")).expect("extension bytes do not fail decoding");
+    assert_eq!(token.version, 0);
+    assert_eq!(
+        token.payload.len(),
+        64,
+        "version 0 drops the extension byte"
+    );
+    assert_eq!(&token.payload[..32], &vector_client_key()[..]);
+    assert_eq!(&token.payload[32..], &vector_pairing_psk()[..]);
+
+    let token = decode(&format!("{VERSION_1}A")).expect("extension bytes do not fail decoding");
+    assert_eq!(token.version, 1);
+    assert_eq!(
+        token.payload,
+        (0xe0..=0xf7).collect::<Vec<u8>>(),
+        "version 1 drops the extension byte and keeps exactly the 24-byte code"
+    );
+}
+
+#[test]
+fn a_body_of_a_length_base32_cannot_encode_is_rejected() {
+    // Base32 writes final quanta of 2, 4, 5, 7 or 8 characters; a body of 41 characters (the
+    // version-1 vector's 39 plus two zero symbols) leaves a whole five-bit symbol over. Every one
+    // of those bits is zero, so only a length check can tell it apart from a valid token.
+    let message = rejection(&format!("{VERSION_1}AA"));
+    assert!(
+        message.contains("length"),
+        "the error names the impossible length: {message}"
+    );
+
+    let message = rejection(&format!("{VERSION_0}AA"));
+    assert!(
+        message.contains("length"),
+        "the error names the impossible length: {message}"
+    );
+}
+
+#[test]
 fn debug_does_not_print_the_payload() {
     let token = decode(VERSION_0).expect("the spec's version-0 vector decodes");
     let debug = format!("{token:?}");
