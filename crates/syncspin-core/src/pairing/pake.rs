@@ -101,10 +101,17 @@ pub fn generator(prs: &[u8], ci: &[u8], sid: &[u8]) -> [u8; 32] {
 /// element. CPace requires the caller to abort the round in that case.
 pub fn scalar_mult_vfy(scalar: &[u8; 32], u: &[u8; 32]) -> Result<[u8; 32]> {
     let point = x25519_dalek::x25519(*scalar, *u);
-    if point == [0u8; 32] {
+    // Fold rather than compare: a slice comparison can stop at the first differing byte, which
+    // would make the timing depend on how many leading bytes of a valid point are zero.
+    if is_all_zero(&point) {
         bail!("the peer's CPace share encodes a low-order point");
     }
     Ok(point)
+}
+
+/// Returns whether every byte is zero, touching the whole slice.
+fn is_all_zero(bytes: &[u8]) -> bool {
+    bytes.iter().fold(0u8, |acc, &byte| acc | byte) == 0
 }
 
 /// Builds `generator_string(DSI, PRS, CI, sid, H.s_in_bytes)` (§8.1, Appendix A.2).
@@ -257,6 +264,20 @@ mod tests {
             &draft_sid(),
         ));
         assert_eq!(hex(&digest[..32]), DRAFT_HASH);
+    }
+
+    #[test]
+    fn is_all_zero_checks_every_byte() {
+        assert!(is_all_zero(&[0u8; 32]), "32 zero bytes are all zero");
+        assert!(is_all_zero(&[]), "an empty slice has no non-zero byte");
+
+        let mut leading = [0u8; 32];
+        leading[0] = 1;
+        assert!(!is_all_zero(&leading), "a non-zero first byte counts");
+
+        let mut trailing = [0u8; 32];
+        trailing[31] = 1;
+        assert!(!is_all_zero(&trailing), "a non-zero last byte counts");
     }
 
     #[test]
