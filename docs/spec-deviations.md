@@ -127,8 +127,8 @@ credential, so `select_psk` matches it for the announced `pr` id without a `serv
 is what lets one token pair any number of servers. A stored record still has to match category and
 id and then name the `server_id` from `server/init`. A pairing that completes is persisted on
 `server/pair-finalize` as a `LongTerm` record, so the next handshake reads it as a stored record.
-`connect` passes no records and configures no store, so the guest path always falls back. `core`
-itself enforces none of that.
+`connect` passes no explicit records; a store on the config still supplies records and the pairing
+PSK, and a host that has neither reaches the guest path. `core` itself enforces none of that.
 
 **Why:** the Noise module owns no storage and no policy, so it cannot enumerate candidate PSKs or
 decide what a category mismatch means. Splitting it this way keeps `core` free of file I/O and lets

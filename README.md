@@ -34,12 +34,16 @@ decision lives in one place.
 
 ## Getting started
 
-The crates are not on crates.io yet, so depend on the tag:
+The crates are not on crates.io yet. Pairing landed after the `v0.1.0` tag, so depend on `main`
+until the next tag exists:
 
 ```toml
 [dependencies]
-syncspin-client = { git = "https://github.com/acuntex/syncspin", tag = "v0.1.0" }
+syncspin-client = { git = "https://github.com/acuntex/syncspin", branch = "main" }
 ```
+
+`v0.1.0` predates pairing: a client pinned there is a guest only. Pin a tag instead of `main` once
+one carries the features you need.
 
 The example player needs a Sendspin server to talk to:
 
@@ -108,7 +112,8 @@ and writes a record after `server/pair-finalize`; `Event::Paired` reports it. A 
 the next connection, and the session survives the server's in-band re-handshake without dropping the
 stream. `server/unpair` removes the record and arrives as `Event::Unpaired`; a server that names a
 `psk_id` the client does not hold produces `Event::PairingRequired` once per connection. Without a
-store the client offers no pairing method and stays a guest.
+store the client offers no pairing method and runs as a guest — unless the host passes records
+through `connect_with_psks`, which needs no store and still authenticates against them.
 
 `FileStorage` is the optional JSON backend behind the `storage-file` feature, and the example uses
 it. The crate writes at most five records into a store it manages, evicting the oldest first and
@@ -151,7 +156,8 @@ every chunk with the playout deadline the client computed, `flush` at each bound
 announces, and optionally `latency` and `underruns` so the client can hold its buffer and report
 timing. The crate owns the connection, the clock and the reconnect loop; the host owns the output
 device, the identity file and everything below the pipe. Pairing needs a
-[`Storage`](crates/syncspin-client/src/storage.rs) as well; without one the client is a guest.
+[`Storage`](crates/syncspin-client/src/storage.rs) as well; without one the client offers no pairing
+method, and a host that already holds records can pass them to `connect_with_psks` instead.
 
 ```rust
 let (handle, mut events) = Client::connect(config, Box::new(my_sink)).await?;
