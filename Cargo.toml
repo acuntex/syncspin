@@ -16,6 +16,7 @@ categories = ["multimedia::audio", "network-programming"]
 # Pinned versions are shared by every crate; a crate opts in with `dep.workspace = true`.
 [workspace.dependencies]
 anyhow = "1.0.104"
+base64 = "0.23.1"
 serde = "1.0.229"
 serde_json = "1.0.154"
 sha2 = "0.10.9"

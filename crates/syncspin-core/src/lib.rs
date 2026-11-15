@@ -5,7 +5,9 @@
 //! It knows no transport and no device integration, and it never depends on the
 //! `syncspin-client` or `syncspin-server` crates.
 //!
-//! This is a `0.1` work in progress: only the crate skeleton exists so far.
+//! This is a `0.1` work in progress: the Noise layer exists so far.
+
+pub mod noise;
 
 /// Returns the version of this crate as recorded in its manifest.
 pub fn version() -> &'static str {

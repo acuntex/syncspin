@@ -1,0 +1,448 @@
+//! Sendspin's Noise layer: `Noise_KKpsk2_25519_ChaChaPoly_SHA256`.
+//!
+//! Every Sendspin connection is wrapped in Noise. The handshake follows the cleartext init
+//! exchange and precedes all application traffic:
+//!
+//! ```text
+//! client -> server  client/init      cleartext JSON, carries the client_id
+//! server -> client  server/init      cleartext JSON, carries the server_id
+//! server -> client  noise/handshake  Noise message 1, payload {"psk_id": .., "psk_category": ..}
+//! client -> server  noise/handshake  Noise message 2, payload {}
+//! ```
+//!
+//! The server is always the Noise initiator and the client the responder, whichever side opened
+//! the WebSocket. Both static public keys are known before the handshake (`KK`), and the
+//! pre-shared key is mixed in at the end of the second message (`psk2`). The Noise prologue is
+//! the exact concatenation of the `client/init` and `server/init` bytes as sent on the wire, so
+//! tampering with the cleartext exchange fails the handshake.
+//!
+//! This module is the responder half plus the transport that follows the handshake. It does not
+//! interpret handshake payloads: the caller validates the `psk_id`/`psk_category` metadata and
+//! selects the PSK. Only the published Sentinel PSK is built in, which is what an unpaired client
+//! uses; it provides no authentication on its own.
+
+use std::fmt;
+
+use anyhow::{anyhow, bail, Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use x25519_dalek::{PublicKey, StaticSecret};
+
+/// Noise protocol parameters used by Sendspin.
+pub const NOISE_PARAMS: &str = "Noise_KKpsk2_25519_ChaChaPoly_SHA256";
+
+/// The published Sentinel PSK, used whenever no paired PSK applies.
+///
+/// Its value is public, so it authenticates nothing. It exists so an unpaired client can
+/// connect before pairing establishes a private PSK.
+pub const SENTINEL_PSK: [u8; 32] = [
+    0x1b, 0x5e, 0x24, 0xdb, 0xc1, 0xae, 0xd9, 0x5f, 0xc2, 0xa5, 0xa3, 0x38, 0xa9, 0x0c, 0x05, 0xdf,
+    0x44, 0xbd, 0x10, 0xf5, 0xec, 0x1f, 0x4c, 0xd6, 0x6c, 0xbf, 0x86, 0x27, 0x27, 0x67, 0xb9, 0xd3,
+];
+
+/// The Sentinel PSK's published id, `psk_id_for(SENTINEL_PSK)`.
+pub const SENTINEL_PSK_ID: &str = "GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo";
+
+/// Maximum size of one Noise message, handshake or transport, including the authentication tag.
+///
+/// This is the Noise specification's limit; `snow` does not re-export the constant, so it is
+/// repeated here.
+pub const MAX_MESSAGE_LEN: usize = 65_535;
+
+/// Length of the ChaChaPoly authentication tag appended to every ciphertext.
+const TAG_LEN: usize = 16;
+
+/// Largest plaintext that fits into one Noise transport message.
+const MAX_PLAINTEXT_LEN: usize = MAX_MESSAGE_LEN - TAG_LEN;
+
+/// Label that Sendspin hashes together with a PSK to derive its id.
+const PSK_ID_LABEL: &[u8] = b"sendspin-psk-id-v1";
+
+/// Payload of Noise handshake message 2: the literal empty JSON object, not zero bytes.
+const HANDSHAKE_MESSAGE_2: &[u8] = b"{}";
+
+/// Unpadded base64url length of a 32-byte key.
+const KEY_CHARS: usize = 43;
+
+/// Derives a PSK id: `base64url(SHA-256("sendspin-psk-id-v1" || psk))`, without padding.
+///
+/// The id is what a server announces in `noise/handshake` message 1 so the client can select
+/// the matching PSK; it is a hash of the key and reveals nothing about its value.
+pub fn psk_id_for(psk: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(PSK_ID_LABEL);
+    hasher.update(psk);
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+/// A long-lived X25519 keypair that identifies one side of a connection.
+///
+/// Sendspin uses the public key as the `client_id` or `server_id` and the secret key as the
+/// static key of the Noise handshake. Both halves must match: [`Identity::generate`] and
+/// [`Identity::from_base64`] derive the public key from the secret, so an identity built through
+/// them always does.
+#[derive(Clone, Copy)]
+pub struct Identity {
+    /// Public X25519 key as 32 raw bytes; 43 base64url characters once encoded.
+    pub public: [u8; 32],
+    /// Secret X25519 key as 32 raw bytes. Never log this value.
+    pub secret: [u8; 32],
+}
+
+impl Identity {
+    /// Generates a fresh keypair from the operating system's CSPRNG.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system's CSPRNG is unavailable. That is not a recoverable
+    /// condition: a silent fallback would be a weak key.
+    pub fn generate() -> Identity {
+        let params = NOISE_PARAMS
+            .parse()
+            .expect("NOISE_PARAMS is a valid Noise protocol name");
+        let keypair = snow::Builder::new(params)
+            .generate_keypair()
+            .expect("the operating system CSPRNG is available");
+        let secret: [u8; 32] = keypair
+            .private
+            .as_slice()
+            .try_into()
+            .expect("an X25519 secret key is 32 bytes");
+        Identity::from_secret(secret)
+    }
+
+    /// Decodes a 32-byte secret key from its 43-character unpadded base64url text.
+    ///
+    /// The public key is derived from the secret; the input is rejected unless it is the
+    /// canonical encoding of a 32-byte key. Anything that is not a canonical secret key - a
+    /// public key, a truncated string, a padded or non-base64url string - is an error.
+    pub fn from_base64(s: &str) -> Result<Identity> {
+        let secret = decode_key(s).ok_or_else(|| {
+            anyhow!("identity secret is not a canonical 43-character unpadded base64url X25519 key")
+        })?;
+        Ok(Identity::from_secret(secret))
+    }
+
+    /// Returns the public key as 43-character unpadded base64url text.
+    ///
+    /// This is the value to send as `client_id` or `server_id`.
+    pub fn public_base64(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.public)
+    }
+
+    /// Returns the secret key as 43-character unpadded base64url text.
+    ///
+    /// The value is key material: hand it to [`Identity::from_base64`] to restore an identity
+    /// and treat the text like a password.
+    pub fn secret_base64(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.secret)
+    }
+
+    /// Builds an identity whose public key is derived from `secret`.
+    fn from_secret(secret: [u8; 32]) -> Identity {
+        Identity {
+            public: public_key_for(&secret),
+            secret,
+        }
+    }
+
+    /// Rejects a hand-built identity whose two halves do not belong together.
+    fn validate(&self) -> Result<()> {
+        if public_key_for(&self.secret) != self.public {
+            bail!("identity public key does not match its secret key");
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Identity {
+    /// Formats the public key and redacts the secret, so `Debug` output is safe to log.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Identity")
+            .field("public", &self.public_base64())
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Noise responder state for one connection.
+pub struct Responder {
+    handshake: snow::HandshakeState,
+}
+
+impl Responder {
+    /// Builds the responder for the client side of a Sendspin handshake.
+    ///
+    /// `prologue` must be the exact concatenation of the `client/init` and `server/init` bytes
+    /// as transmitted, in that order. It is mixed into the handshake verbatim, and the
+    /// initiator's static public key is read from the `server_id` field of the `server/init`
+    /// document it contains. A prologue that carries no such document is rejected; use
+    /// [`Responder::with_peer`] when the key is already known, as during a re-handshake where
+    /// the prologue is the previous handshake hash.
+    pub fn new(identity: &Identity, prologue: &[u8]) -> Result<Responder> {
+        let peer_public = initiator_key_from_prologue(prologue).ok_or_else(|| {
+            anyhow!(
+                "the prologue contains no `server_id` in a `server/init` document, so the \
+                 initiator's static public key is unknown; pass it with `Responder::with_peer`"
+            )
+        })?;
+        Responder::with_peer(identity, &peer_public, prologue)
+    }
+
+    /// Builds the responder with the initiator's static public key supplied explicitly.
+    ///
+    /// Use this when the prologue is not the init exchange, for example on a re-handshake whose
+    /// prologue is the previous handshake hash. `prologue` still reaches Noise unchanged; both
+    /// sides must mix in the same bytes.
+    pub fn with_peer(
+        identity: &Identity,
+        peer_public: &[u8; 32],
+        prologue: &[u8],
+    ) -> Result<Responder> {
+        identity.validate()?;
+
+        // Keep the published constant honest even if someone edits it.
+        debug_assert_eq!(psk_id_for(&SENTINEL_PSK), SENTINEL_PSK_ID);
+
+        let params = NOISE_PARAMS
+            .parse()
+            .context("failed to parse the Noise protocol parameters")?;
+        let handshake = snow::Builder::new(params)
+            .local_private_key(&identity.secret)
+            .remote_public_key(peer_public)
+            .psk(2, &SENTINEL_PSK)
+            .prologue(prologue)
+            .build_responder()
+            .context("failed to build the Noise responder")?;
+        Ok(Responder { handshake })
+    }
+
+    /// Reads one Noise handshake message and returns its decrypted payload.
+    ///
+    /// The payload is returned verbatim. Message 1 carries the PSK metadata
+    /// (`psk_id`, `psk_category`); the caller checks it, because the PSK has already been
+    /// selected when the responder was built.
+    pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
+        ensure_message_len(msg.len(), "handshake message")?;
+        let mut payload = vec![0u8; plaintext_capacity(msg.len(), "handshake message")?];
+        let len = self
+            .handshake
+            .read_message(msg, &mut payload)
+            .context("failed to read the Noise handshake message")?;
+        payload.truncate(len);
+        Ok(payload)
+    }
+
+    /// Writes Noise handshake message 2 and returns it.
+    ///
+    /// The payload is the empty JSON object that Sendspin requires; it is not configurable.
+    pub fn write_message(&mut self) -> Result<Vec<u8>> {
+        let mut message = vec![0u8; MAX_MESSAGE_LEN];
+        let len = self
+            .handshake
+            .write_message(HANDSHAKE_MESSAGE_2, &mut message)
+            .context("failed to write the Noise handshake message")?;
+        message.truncate(len);
+        Ok(message)
+    }
+
+    /// Returns whether both handshake messages have been processed.
+    pub fn handshake_finished(&self) -> bool {
+        self.handshake.is_handshake_finished()
+    }
+
+    /// Finishes the handshake and switches to transport mode.
+    ///
+    /// Fails if a handshake message is still outstanding, which
+    /// [`Responder::handshake_finished`] reports ahead of time.
+    pub fn into_transport(self) -> Result<TransportState> {
+        let state = self
+            .handshake
+            .into_transport_mode()
+            .context("failed to finish the Noise handshake")?;
+        Ok(TransportState { state })
+    }
+}
+
+/// A Noise transport session: one ciphertext per message.
+///
+/// The nonce advances with every message in each direction; a repeated or reordered ciphertext
+/// fails authentication. Payloads are not fragmented at this layer, so a caller that needs to
+/// send more than a single Noise message can carry has to split the data itself.
+pub struct TransportState {
+    state: snow::TransportState,
+}
+
+impl TransportState {
+    /// Encrypts one plaintext into a Noise transport message.
+    ///
+    /// Fails if the plaintext does not fit into a single Noise message, that is if it is larger
+    /// than [`MAX_MESSAGE_LEN`] minus the 16-byte authentication tag.
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        ensure_plaintext_len(plaintext.len())?;
+        let mut message = vec![0u8; plaintext.len() + TAG_LEN];
+        let len = self
+            .state
+            .write_message(plaintext, &mut message)
+            .context("failed to encrypt the Noise transport message")?;
+        message.truncate(len);
+        Ok(message)
+    }
+
+    /// Decrypts one Noise transport message.
+    ///
+    /// Fails if the ciphertext is longer than a Noise message, shorter than the authentication
+    /// tag, or does not authenticate under the current key and nonce.
+    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        ensure_message_len(ciphertext.len(), "transport message")?;
+        let mut plaintext = vec![0u8; plaintext_capacity(ciphertext.len(), "transport message")?];
+        let len = self
+            .state
+            .read_message(ciphertext, &mut plaintext)
+            .context("failed to decrypt the Noise transport message")?;
+        plaintext.truncate(len);
+        Ok(plaintext)
+    }
+}
+
+/// The `{"type": ..., "payload": ...}` envelope of a cleartext init message.
+#[derive(Deserialize)]
+struct PrologueEnvelope {
+    #[serde(rename = "type", default)]
+    message_type: String,
+    #[serde(default)]
+    payload: ProloguePayload,
+}
+
+/// The subset of an init payload that the responder needs.
+#[derive(Default, Deserialize)]
+struct ProloguePayload {
+    #[serde(default)]
+    server_id: String,
+}
+
+/// Reads the initiator's static public key from a prologue of concatenated init messages.
+///
+/// The init messages are parsed as a JSON stream, so a caller can pass the exact two documents
+/// without splitting them. Anything that is not a `server/init` envelope with a canonical
+/// `server_id` is ignored.
+fn initiator_key_from_prologue(prologue: &[u8]) -> Option<[u8; 32]> {
+    serde_json::Deserializer::from_slice(prologue)
+        .into_iter::<PrologueEnvelope>()
+        .filter_map(Result::ok)
+        .filter(|envelope| envelope.message_type == "server/init")
+        .find_map(|envelope| decode_key(&envelope.payload.server_id))
+}
+
+/// Derives the X25519 public key that belongs to `secret`.
+fn public_key_for(secret: &[u8; 32]) -> [u8; 32] {
+    PublicKey::from(&StaticSecret::from(*secret)).to_bytes()
+}
+
+/// Rejects a Noise message that exceeds the protocol maximum.
+fn ensure_message_len(len: usize, what: &str) -> Result<()> {
+    if len > MAX_MESSAGE_LEN {
+        bail!(
+            "Noise {what} is {len} bytes, exceeding the maximum Noise message size of \
+             {MAX_MESSAGE_LEN} bytes"
+        );
+    }
+    Ok(())
+}
+
+/// Rejects plaintext that cannot fit into one Noise message.
+fn ensure_plaintext_len(len: usize) -> Result<()> {
+    if len > MAX_PLAINTEXT_LEN {
+        bail!(
+            "plaintext is {len} bytes, exceeding the maximum Noise plaintext size of \
+             {MAX_PLAINTEXT_LEN} bytes (a {MAX_MESSAGE_LEN}-byte message including the \
+             {TAG_LEN}-byte tag); payloads are not fragmented at this layer"
+        );
+    }
+    Ok(())
+}
+
+/// Returns how much plaintext a message of `len` bytes can carry.
+fn plaintext_capacity(len: usize, what: &str) -> Result<usize> {
+    len.checked_sub(TAG_LEN).ok_or_else(|| {
+        anyhow!("Noise {what} is {len} bytes, shorter than the {TAG_LEN}-byte authentication tag")
+    })
+}
+
+/// Decodes a canonical 32-byte unpadded base64url key.
+fn decode_key(value: &str) -> Option<[u8; 32]> {
+    if value.len() != KEY_CHARS {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
+    if bytes.len() != 32 || URL_SAFE_NO_PAD.encode(&bytes) != value {
+        return None;
+    }
+    bytes.try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLIENT_INIT: &[u8] =
+        br#"{"type":"client/init","payload":{"client_id":"test-client","version":1}}"#;
+
+    fn prologue(server_id: &str) -> Vec<u8> {
+        let server_init = format!(
+            r#"{{"type":"server/init","payload":{{"server_id":"{server_id}","version":1}}}}"#
+        );
+        let mut bytes = Vec::with_capacity(CLIENT_INIT.len() + server_init.len());
+        bytes.extend_from_slice(CLIENT_INIT);
+        bytes.extend_from_slice(server_init.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn the_prologue_carries_the_initiator_static_key() {
+        let identity = Identity::generate();
+        let key = initiator_key_from_prologue(&prologue(&identity.public_base64()))
+            .expect("server/init carries server_id");
+        assert_eq!(key, identity.public);
+    }
+
+    #[test]
+    fn a_prologue_without_a_server_init_is_rejected() {
+        let identity = Identity::generate();
+        for prologue in [&b""[..], CLIENT_INIT, b"not json at all"] {
+            let Err(err) = Responder::new(&identity, prologue) else {
+                panic!("a prologue without server_id must be rejected");
+            };
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("server_id") && message.contains("with_peer"),
+                "error should name the missing key and the way out, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_identity_mismatch_is_rejected_before_the_handshake() {
+        let mut identity = Identity::generate();
+        identity.public = Identity::generate().public;
+        let prologue = prologue(&Identity::generate().public_base64());
+        let Err(err) = Responder::with_peer(&identity, &[0u8; 32], &prologue) else {
+            panic!("a mismatched identity must be rejected");
+        };
+        assert!(
+            format!("{err:#}").contains("does not match"),
+            "error should name the mismatch, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn identity_debug_redacts_the_secret() {
+        let identity = Identity::generate();
+        let text = format!("{identity:?}");
+        assert!(text.contains(&identity.public_base64()));
+        assert!(!text.contains(&identity.secret_base64()));
+        assert!(text.contains("<redacted>"));
+    }
+}
