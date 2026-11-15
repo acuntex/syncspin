@@ -23,6 +23,17 @@ carries. A host passes the values it restored, so the server never sees an inven
 without stored values passes `100` and `false`. `ControlHandle::set_volume` returns the level that
 was applied, and `ControlHandle::volume` reports the level in force without a call.
 
+`ClientConfig::volume_policy` limits a request from the server or from the host. The default policy
+is the rule `clamp_volume` implements: a request to 40 or below is applied as asked, and above 40 one
+request may raise the level by at most 20. `clamp_volume_with` takes a policy, for a device that needs
+a different guard. `Event::Volume` carries both the requested and the applied level, and the
+`client/state` report carries the applied one.
+
+The stream lifecycle is visible on the event stream: `Event::StreamStart` announces a new format,
+`Event::StreamEnd` reports a pause or a removed player role, and `Event::StreamClear` reports a seek
+with its timestamp. The end and clear events arrive before the client flushes the sink, so a host can
+mute, stop or restart its output first; a reconnect flush produces no stream event.
+
 ## Layout
 
 | Path                      | Contents                                                                        |

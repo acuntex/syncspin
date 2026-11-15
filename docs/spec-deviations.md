@@ -28,7 +28,7 @@ harmless.
 | 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                      |
 | 15  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                      |
 | 16  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                    |
-| 17  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume`      |
+| 17  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with` |
 | 18  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`     |
 | 19  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`         |
 
@@ -326,7 +326,9 @@ audio from that server time onward and keep what is earlier; an absent timestamp
 **What we do:** `handle_stream_clear` flushes the sink regardless of `from_timestamp`, so audio
 before the timestamp is dropped too. The announced format stays open for the chunks that follow,
 because a clear does not end the stream. The client keeps no timestamped queue of its own; the sink
-does, and `Sink::flush` has no "drop from a timestamp" mode.
+does, and `Sink::flush` has no "drop from a timestamp" mode. `Event::StreamClear` carries the
+timestamp to the host before the flush, so a host that owns a timestamped queue can discard the
+suffix itself; the client's own flush still drops everything.
 
 **Why:** a partial drop needs the sink to map server timestamps to its own buffer and discard a
 suffix of it; the current trait can only drop everything. The full flush is audible as a short gap
@@ -367,17 +369,18 @@ requests.
 protocol error: the receiver MUST close the connection.
 
 **What we do:** a `server/command` carrying a volume of 101-255 - the wire field is a `u8`, so such
-a value decodes - is applied as 100 and reported as 100. `clamp_volume` limits both the level in
-force and the requested one before it applies the +20 rule, so the client's own `client/state`
-stays inside the range a conformant server accepts, and the connection stays open.
-`a_server_volume_above_the_protocol_range_is_capped` pins the behaviour.
+a value decodes - is applied as 100 and reported as 100. The policy in
+`ClientConfig::volume_policy` (`clamp_volume_with`, with the fixed rule as `clamp_volume` and the
+default) limits both the level in force and the requested one before it applies the step rule, so the
+client's own `client/state` stays inside the range a conformant server accepts, and the connection
+stays open. `a_server_volume_above_the_protocol_range_is_capped` pins the behaviour.
 
 **Why:** closing the connection would silence playback over a value the server got wrong, and the
 right audible outcome - full volume, no mute change - is unambiguous. The alternative, closing,
 belongs with the failure handling that `server/error` and typed protocol errors would introduce
 (entry 7); until then a cap is the failure mode that keeps the player usable.
 
-**Removing it:** give `clamp_volume` and `handle_command` a typed rejection path and close the
+**Removing it:** give `clamp_volume_with` and `handle_command` a typed rejection path and close the
 connection with a protocol-error reason once that path exists, or reject the value at the parser
 with the same effect. Test the closed connection instead of the capped level.
 

@@ -14,10 +14,15 @@
 //! configuration or an address this build cannot use returns an error - an unreachable server is
 //! reported as [`Event::Disconnected`]. The [`ClientHandle`] waits for the connection to end and
 //! hands out a [`ControlHandle`] for transport commands, the volume level and mute state. The level
-//! follows a fixed limit - see [`clamp_volume`] - and the value the server receives is the applied
-//! one. [`ClientConfig::volume`] and [`ClientConfig::muted`] are the level and mute state the first
-//! report carries, so a host passes the values it restored instead of letting the server see a
-//! baseline the output is not at.
+//! follows [`ClientConfig::volume_policy`] - see [`clamp_volume_with`], and [`clamp_volume`] for the
+//! default - and the value the server receives is the applied one. [`ClientConfig::volume`] and
+//! [`ClientConfig::muted`] are the level and mute state the first report carries, so a host passes
+//! the values it restored instead of letting the server see a baseline the output is not at.
+//!
+//! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
+//! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
+//! [`Event::StreamClear`] for a seek. The end and clear events arrive before the sink is flushed,
+//! so the host can mute, stop or restart its output first.
 //!
 //! The connection keeps running until the audio sink fails, which the host has to repair, or until
 //! the handle or the event stream is dropped.
@@ -28,10 +33,13 @@ mod session;
 mod sink;
 
 pub use client::{
-    clamp_volume, connect, connect_with_psks, next_backoff, Client, ClientHandle, ControlHandle,
-    Event, EventStream, PlaybackState, INITIAL_BACKOFF,
+    clamp_volume, clamp_volume_with, connect, connect_with_psks, next_backoff, Client,
+    ClientHandle, ControlHandle, Event, EventStream, PlaybackState, StreamEndReason,
+    INITIAL_BACKOFF,
 };
-pub use config::{AudioMode, ClientConfig, PskCategory, StoredPsk, MAX_PLAYER_NAME_LEN};
+pub use config::{
+    AudioMode, ClientConfig, PskCategory, StoredPsk, VolumePolicy, MAX_PLAYER_NAME_LEN,
+};
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};
 
 // The identity is part of [`ClientConfig`], so a host that builds a configuration needs it. A

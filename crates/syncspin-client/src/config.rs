@@ -52,6 +52,41 @@ impl PskCategory {
     }
 }
 
+/// Limits the session applies to a volume request.
+///
+/// A request at or below [`threshold`](VolumePolicy::threshold) is applied as asked, whether it
+/// raises or lowers the level. Above the threshold, one request may raise the level by at most
+/// [`max_step`](VolumePolicy::max_step); a lower request is still applied as asked, because the
+/// limit bounds raises only. The configuration validation rejects a policy that cannot describe a
+/// valid level before a connection is attempted.
+///
+/// [`VolumePolicy::default`] is the rule [`clamp_volume`](crate::clamp_volume) implements, so a
+/// host that does not configure a policy keeps the behaviour of earlier releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumePolicy {
+    /// At or below this level a request is applied as is, in the protocol's 0-100 range.
+    pub threshold: u8,
+    /// Above the threshold, at most this much may be added per command.
+    pub max_step: u8,
+    /// Whether a request above the threshold may always rise to the threshold itself.
+    ///
+    /// With `false` a low level creeps up by [`max_step`](VolumePolicy::max_step) per command, so
+    /// 1 + a request for 100 yields 21. With `true` the same request yields the threshold, 40,
+    /// because a level below the threshold may always reach it in one step.
+    pub threshold_floor: bool,
+}
+
+impl Default for VolumePolicy {
+    /// Returns the policy [`clamp_volume`](crate::clamp_volume) implements.
+    fn default() -> Self {
+        Self {
+            threshold: 40,
+            max_step: 20,
+            threshold_floor: false,
+        }
+    }
+}
+
 /// A pre-shared key the host stores for a known server.
 ///
 /// Selection after Noise message 1 compares the announced category and key id; a match is only
@@ -110,6 +145,13 @@ pub struct ClientConfig {
     ///
     /// Reported in the first `client/state`; a host without a stored state passes `false`.
     pub muted: bool,
+    /// Limits applied to every volume request.
+    ///
+    /// The session applies the policy to a command from the server and to a level the host sets
+    /// through [`ControlHandle::set_volume`](crate::ControlHandle::set_volume); the value it
+    /// reports back is always the applied one. [`VolumePolicy::default`] keeps the fixed rule of
+    /// earlier releases.
+    pub volume_policy: VolumePolicy,
     /// Upper bound for the delay between reconnects.
     ///
     /// The connection reports a recommended delay in
@@ -138,6 +180,20 @@ impl ClientConfig {
             bail!(
                 "ClientConfig::volume is {}, outside the 0-{MAX_VOLUME} the protocol defines",
                 self.volume
+            );
+        }
+        if self.volume_policy.threshold > MAX_VOLUME {
+            bail!(
+                "ClientConfig::volume_policy.threshold is {}, outside the 0-{MAX_VOLUME} level \
+                 range",
+                self.volume_policy.threshold
+            );
+        }
+        if self.volume_policy.max_step > MAX_VOLUME {
+            bail!(
+                "ClientConfig::volume_policy.max_step is {}, outside the 0-{MAX_VOLUME} step \
+                 range",
+                self.volume_policy.max_step
             );
         }
         if self.max_backoff.is_zero() {

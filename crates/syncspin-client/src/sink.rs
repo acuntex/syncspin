@@ -149,9 +149,12 @@ pub trait Sink: Send + 'static {
     /// Called:
     ///
     /// - on `stream/start`, after the previous stream and before [`Sink::open`] for the new one,
-    /// - on `stream/end`,
-    /// - on `stream/clear`, which seeks or restarts the stream without ending it,
-    /// - when the server removes the `player@v1` role, and
+    /// - on `stream/end`, after [`Event::StreamEnd`](crate::Event::StreamEnd),
+    /// - on `stream/clear`, which seeks or restarts the stream without ending it, after
+    ///   [`Event::StreamClear`](crate::Event::StreamClear),
+    /// - when the server removes the `player@v1` role, after an
+    ///   [`Event::StreamEnd`](crate::Event::StreamEnd) with
+    ///   [`StreamEndReason::RoleRemoved`](crate::StreamEndReason::RoleRemoved), and
     /// - after a connection attempt ends, before the client reconnects, so audio buffered for the
     ///   session that ended cannot become audible on the next one.
     ///

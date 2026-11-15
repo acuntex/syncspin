@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::config::{ClientConfig, StoredPsk};
+use crate::config::{ClientConfig, StoredPsk, VolumePolicy};
 use crate::session::{self, Carried, Transport};
 use crate::sink::{AudioFormat, Sink};
 
@@ -21,18 +21,12 @@ pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Highest level the protocol defines, in its 0-100 volume range.
 pub(crate) const MAX_VOLUME: u8 = 100;
 
-/// Highest level that is always applied as requested.
-const VOLUME_ALWAYS_APPLIED: u8 = 40;
-
-/// Largest increase one request may apply above that level.
-const MAX_VOLUME_STEP: u8 = 20;
-
 /// Returns the volume level to apply for `requested` while `current` is in force.
 ///
-/// Both values are first limited to the protocol's 0-100 range, so the result is always a level
-/// the server accepts. A request to 40 or below is applied as asked, whether it raises or lowers
-/// the level. Above 40, one request may raise the level by at most 20; a lower request is applied
-/// as asked, because the limit bounds raises only.
+/// This is [`clamp_volume_with`] with [`VolumePolicy::default`]: a request to 40 or below is
+/// applied as asked, and above 40 one request may raise the level by at most 20. Both values are
+/// first limited to the protocol's 0-100 range, so the result is always a level the server
+/// accepts.
 ///
 /// ```
 /// # use syncspin_client::clamp_volume;
@@ -43,12 +37,48 @@ const MAX_VOLUME_STEP: u8 = 20;
 /// ```
 #[must_use]
 pub fn clamp_volume(current: u8, requested: u8) -> u8 {
+    clamp_volume_with(VolumePolicy::default(), current, requested)
+}
+
+/// Returns the volume level to apply for `requested` while `current` is in force, using `policy`.
+///
+/// Both values are first limited to the protocol's 0-100 range, so the result is always a level
+/// the server accepts. A request at or below [`VolumePolicy::threshold`] is applied as asked,
+/// whether it raises or lowers the level. Above the threshold, one request may raise the level by
+/// at most [`VolumePolicy::max_step`]; a lower request is applied as asked, because the limit
+/// bounds raises only. When [`VolumePolicy::threshold_floor`] is set, such a request may also rise
+/// to the threshold itself, so a player at 1 reaches 40 in one command instead of 21.
+///
+/// A `policy` whose fields exceed 100 is not rejected here, because the configuration validation
+/// rejects it before a connection exists; the values are limited to 100 so this function still
+/// returns a level the server accepts.
+///
+/// ```
+/// # use syncspin_client::{clamp_volume_with, VolumePolicy};
+/// let policy = VolumePolicy {
+///     threshold: 40,
+///     max_step: 20,
+///     threshold_floor: true,
+/// };
+/// assert_eq!(clamp_volume_with(policy, 1, 100), 40);
+/// assert_eq!(clamp_volume_with(policy, 40, 100), 60);
+/// assert_eq!(clamp_volume_with(policy, 100, 90), 90);
+/// ```
+#[must_use]
+pub fn clamp_volume_with(policy: VolumePolicy, current: u8, requested: u8) -> u8 {
+    let threshold = policy.threshold.min(MAX_VOLUME);
+    let max_step = policy.max_step.min(MAX_VOLUME);
     let current = current.min(MAX_VOLUME);
     let requested = requested.min(MAX_VOLUME);
-    if requested <= VOLUME_ALWAYS_APPLIED {
+    if requested <= threshold {
         return requested;
     }
-    requested.min(current.saturating_add(MAX_VOLUME_STEP))
+    let applied = requested.min(current.saturating_add(max_step));
+    if policy.threshold_floor {
+        applied.max(threshold)
+    } else {
+        applied
+    }
 }
 
 /// Returns the delay to wait before the next connection attempt.
@@ -78,6 +108,19 @@ pub fn next_backoff(previous: Duration, connected: bool, max: Duration) -> Durat
         previous.saturating_mul(2)
     };
     next.min(max)
+}
+
+/// Why a player stream ended.
+///
+/// A seek is not an end: the stream stays open and later chunks still belong to it, so it is
+/// reported as [`Event::StreamClear`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StreamEndReason {
+    /// The server sent `stream/end`, which pauses playback.
+    End,
+    /// The server removed `player@v1` from the active roles.
+    RoleRemoved,
 }
 
 /// Something that happened on the connection.
@@ -121,6 +164,25 @@ pub enum Event {
         /// Format of the new stream.
         format: AudioFormat,
     },
+    /// A player stream ended.
+    ///
+    /// Reported before the sink is flushed, so a host can mute or stop its output first. The
+    /// client flushes the sink itself as well, after this event. A seek does not end the stream;
+    /// it is reported as [`Event::StreamClear`], and chunks after it still belong to the open
+    /// stream.
+    StreamEnd {
+        /// Why the stream ended.
+        reason: StreamEndReason,
+    },
+    /// The server asked to drop buffered audio without ending the stream.
+    ///
+    /// Reported before the sink is flushed, so a host can restart its output or drop the matching
+    /// part of its own queue first. The announced format stays open, and chunks that follow still
+    /// belong to it.
+    StreamClear {
+        /// Server timestamp the audio should resume from, when the server named one.
+        from_timestamp: Option<i64>,
+    },
     /// Now-playing metadata changed.
     ///
     /// Absent text fields are reported as empty strings, so a host can clear its display; absent
@@ -145,16 +207,20 @@ pub enum Event {
     State(PlaybackState),
     /// The server asked this player to change its volume or mute state.
     ///
-    /// The session applies the limits of [`clamp_volume`] and reports the result back to the
-    /// server in `client/state`; the event carries that applied value, not the requested one, so a
-    /// host keeps its output in step with the server without repeating the limit. Exactly one of
-    /// the two fields is present: a volume command carries the applied level, a mute command the
-    /// requested state. A mute command therefore never looks like a request to set the volume to
-    /// zero, and the level in force is unchanged by it.
+    /// The session applies the [`VolumePolicy`] from its configuration and reports the applied
+    /// level back to the server in `client/state`. The event carries both numbers, so a host can
+    /// see what the server asked for and what the policy allowed without repeating the policy.
+    /// `muted` is present for a mute command and absent for a volume command; a mute leaves the
+    /// level unchanged, so both numbers then name the level already in force.
     Volume {
-        /// Applied volume in the range 0-100.
-        level: Option<u8>,
-        /// Mute state that was requested.
+        /// Level the server asked for, as it arrived on the wire.
+        ///
+        /// A non-conformant server can send a value above 100; it is reported unchanged so a host
+        /// can log it, while `applied` always stays inside the protocol's range.
+        requested: u8,
+        /// Level that was applied, always in the range 0-100.
+        applied: u8,
+        /// Mute state that was requested, absent for a volume command.
         muted: Option<bool>,
     },
 }
@@ -251,8 +317,8 @@ impl ControlHandle {
         self.transport("previous").await
     }
 
-    /// Sets the output level, limited by [`clamp_volume`] against the level in force, and returns
-    /// the level that was applied.
+    /// Sets the output level, limited by [`ClientConfig::volume_policy`] against the level in
+    /// force, and returns the level that was applied.
     ///
     /// The level belongs to the connection: the session reports the applied value to the server
     /// with its next state report, which is the initial report when the first clock measurement is

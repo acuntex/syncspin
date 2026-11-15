@@ -130,9 +130,11 @@ pub enum Event {
     Connected { server_id: String, encrypted: bool },
     Disconnected { reason: String, retry_in: Duration },
     StreamStart { format: AudioFormat },
+    StreamEnd { reason: StreamEndReason },     // End | RoleRemoved, before the sink flush
+    StreamClear { from_timestamp: Option<i64> }, // seek, before the sink flush
     Track { title: String, artist: String, album: Option<String>, duration: Option<Duration> },
     State(PlaybackState),
-    Volume { level: u8, muted: bool },
+    Volume { requested: u8, applied: u8, muted: Option<bool> },
     Artwork { mime: String, bytes: Bytes },                  // feature "artwork"
     Visualizer { .. },                                       // feature "visualizer"
     PairingCode { code: PairingCode, format: CodeFormat },   // feature "pairing-code"

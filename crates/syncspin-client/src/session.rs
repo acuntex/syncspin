@@ -35,7 +35,9 @@ use syncspin_core::noise::{
     psk_id_for, Responder, TransportState as NoiseTransport, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
 
-use crate::client::{clamp_volume, ControlAction, ControlRequest, Event, PlaybackState};
+use crate::client::{
+    clamp_volume_with, ControlAction, ControlRequest, Event, PlaybackState, StreamEndReason,
+};
 use crate::config::{AudioMode, ClientConfig, PskCategory, StoredPsk};
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 
@@ -535,7 +537,7 @@ impl Session<'_> {
             Some(Incoming::ServerCommand(command)) => self.handle_command(command).await,
             Some(Incoming::StreamStart(start)) => self.handle_stream_start(start),
             Some(Incoming::StreamEnd(end)) if !affects_player(end.roles.as_deref()) => Ok(()),
-            Some(Incoming::StreamEnd(_)) => self.stop_stream(),
+            Some(Incoming::StreamEnd(_)) => self.stop_stream(StreamEndReason::End),
             Some(Incoming::StreamClear(clear)) if !affects_player(clear.roles.as_deref()) => Ok(()),
             Some(Incoming::StreamClear(clear)) => self.handle_stream_clear(clear),
             // A message for a role or direction this client does not act on.
@@ -559,7 +561,7 @@ impl Session<'_> {
             self.reply_deadline = None;
             self.outstanding_sent_us = None;
             self.burst_samples.clear();
-            self.stop_stream()?;
+            self.stop_stream(StreamEndReason::RoleRemoved)?;
         } else if !had_player && has_player {
             // A re-added role reports itself again, from the existing estimate when there is one.
             if self.clock.sample_count() >= 1 {
@@ -704,9 +706,12 @@ impl Session<'_> {
 
     /// Drops buffered audio and forgets the open stream.
     ///
-    /// A sink that fails to flush ends the session, like any other sink error.
-    fn stop_stream(&mut self) -> Result<()> {
+    /// The event goes out before the flush, so a host can mute or stop its output while the
+    /// client is still dropping the audio it buffered. A sink that fails to flush ends the
+    /// session, like any other sink error.
+    fn stop_stream(&mut self, reason: StreamEndReason) -> Result<()> {
         self.stream = None;
+        self.emit(Event::StreamEnd { reason });
         self.flush_sink()
     }
 
@@ -716,7 +721,13 @@ impl Session<'_> {
     /// granularity it can offer is a full flush: a clear with a `from_timestamp` also drops the
     /// frames after it. The announced format stays open, because the spec lets the stream continue
     /// and the chunks that follow a seek still belong to it.
-    fn handle_stream_clear(&mut self, _clear: StreamClear) -> Result<()> {
+    ///
+    /// The event goes out before the flush, so a host can restart its output and re-prime a
+    /// decoder before the buffered audio is dropped.
+    fn handle_stream_clear(&mut self, clear: StreamClear) -> Result<()> {
+        self.emit(Event::StreamClear {
+            from_timestamp: clear.from_timestamp,
+        });
         self.flush_sink()
     }
 
@@ -806,10 +817,11 @@ impl Session<'_> {
 
     /// Applies a volume or mute request from the server and reports the result.
     ///
-    /// The volume is limited by [`clamp_volume`], which also caps a level the server cannot
-    /// legally send, and the applied value - not the requested one - is what [`Event::Volume`]
-    /// carries and what the following `client/state` reports. A mute request changes only the mute
-    /// field, so it never looks like a request for volume zero.
+    /// The volume is limited by [`ClientConfig::volume_policy`], which also caps a level the
+    /// server cannot legally send. [`Event::Volume`] carries both the requested and the applied
+    /// number, and the following `client/state` reports the applied one. A mute request changes
+    /// only the mute field, so it never looks like a request for volume zero; its event repeats
+    /// the level in force for both numbers.
     async fn handle_command(&mut self, command: ServerCommand) -> Result<()> {
         if !self.player_active() {
             return Ok(());
@@ -822,9 +834,11 @@ impl Session<'_> {
                 let Some(level) = player.volume else {
                     return Ok(());
                 };
-                self.record_volume(clamp_volume(self.volume, level));
+                let applied = clamp_volume_with(self.config.volume_policy, self.volume, level);
+                self.record_volume(applied);
                 self.emit(Event::Volume {
-                    level: Some(self.volume),
+                    requested: level,
+                    applied,
                     muted: None,
                 });
                 self.report_state().await?;
@@ -835,7 +849,8 @@ impl Session<'_> {
                 };
                 self.muted = muted;
                 self.emit(Event::Volume {
-                    level: None,
+                    requested: self.volume,
+                    applied: self.volume,
                     muted: Some(muted),
                 });
                 self.report_state().await?;
@@ -918,7 +933,11 @@ impl Session<'_> {
 
     /// Applies a level the host asked for, reports it and returns what reached the output.
     async fn apply_volume(&mut self, level: u8) -> Result<u8> {
-        self.record_volume(clamp_volume(self.volume, level));
+        self.record_volume(clamp_volume_with(
+            self.config.volume_policy,
+            self.volume,
+            level,
+        ));
         self.report_state().await?;
         Ok(self.volume)
     }

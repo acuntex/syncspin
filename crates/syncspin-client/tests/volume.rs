@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use syncspin_client::{
-    clamp_volume, connect, AudioFormat, AudioFrame, AudioMode, ClientConfig, ClientHandle,
-    ControlHandle, Event, EventStream, Identity, Sink,
+    clamp_volume, clamp_volume_with, connect, AudioFormat, AudioFrame, AudioMode, ClientConfig,
+    ClientHandle, ControlHandle, Event, EventStream, Identity, Sink, VolumePolicy,
 };
 use syncspin_core::messages::{
     ClientState, ControllerCommand, ControllerState, Incoming, PlayerCommand, ServerCommand,
@@ -46,6 +46,7 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         audio_mode: AudioMode::Passthrough,
         volume: 100,
         muted: false,
+        volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(30),
     }
 }
@@ -200,6 +201,62 @@ fn a_level_outside_the_protocol_range_is_capped() {
         10,
         "an impossible current level still allows a request within the range"
     );
+}
+
+#[test]
+fn the_threshold_floor_policy_reaches_the_threshold() {
+    let policy = VolumePolicy {
+        threshold: 40,
+        max_step: 20,
+        threshold_floor: true,
+    };
+
+    assert_eq!(
+        clamp_volume_with(policy, 0, 100),
+        40,
+        "a low level may jump to the threshold in one request"
+    );
+    assert_eq!(clamp_volume_with(policy, 1, 100), 40);
+    assert_eq!(clamp_volume_with(policy, 10, 100), 40);
+    assert_eq!(
+        clamp_volume_with(policy, 40, 100),
+        60,
+        "above the threshold the step rule still applies"
+    );
+    assert_eq!(
+        clamp_volume_with(policy, 100, 90),
+        90,
+        "a lower request is still applied as asked"
+    );
+    assert_eq!(clamp_volume_with(policy, 100, 41), 41);
+}
+
+#[test]
+fn the_default_policy_still_steps_by_twenty() {
+    let policy = VolumePolicy::default();
+    assert_eq!(policy.threshold, 40);
+    assert_eq!(policy.max_step, 20);
+    assert!(!policy.threshold_floor);
+    assert_eq!(
+        clamp_volume_with(policy, 1, 100),
+        21,
+        "the default policy does not lift a low level to the threshold"
+    );
+
+    for (current, requested) in [
+        (0, 41),
+        (10, 100),
+        (40, 100),
+        (50, 80),
+        (100, 90),
+        (255, 255),
+    ] {
+        assert_eq!(
+            clamp_volume_with(policy, current, requested),
+            clamp_volume(current, requested),
+            "the default policy must stay the compatibility rule for ({current}, {requested})"
+        );
+    }
 }
 
 #[tokio::test]
@@ -454,8 +511,9 @@ async fn mute_is_reported_without_changing_the_level() {
     assert_eq!(
         next_event(&mut events).await,
         Event::Volume {
-            level: None,
-            muted: Some(false)
+            requested: 30,
+            applied: 30,
+            muted: Some(false),
         }
     );
     let state = player(next_client_state(&mut server).await);
@@ -564,8 +622,9 @@ async fn a_server_volume_command_reports_the_limited_value() {
     assert_eq!(
         next_event(&mut events).await,
         Event::Volume {
-            level: Some(60),
-            muted: None
+            requested: 100,
+            applied: 60,
+            muted: None,
         },
         "the event carries the level that was applied, not the one requested"
     );
@@ -575,6 +634,76 @@ async fn a_server_volume_command_reports_the_limited_value() {
         "the server sees the level that was applied"
     );
     assert_no_further_state(&mut server).await;
+}
+
+#[tokio::test]
+async fn volume_events_carry_both_requested_and_applied() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (handle, mut events) = connect_to(&server).await;
+    expect_connected(&mut events, &server).await;
+    let control = handle.control();
+
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(100)
+    );
+    control
+        .set_volume(40)
+        .await
+        .expect("the level must be applied");
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(40)
+    );
+
+    server.json(volume_command(100));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Volume {
+            requested: 100,
+            applied: 60,
+            muted: None,
+        },
+        "the event must name what the server asked for and what the policy allowed"
+    );
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(60),
+        "the state report keeps carrying the applied value only"
+    );
+}
+
+#[tokio::test]
+async fn the_configured_policy_applies_to_a_server_command() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let mut config = config_for(&server);
+    config.volume = 1;
+    config.volume_policy = VolumePolicy {
+        threshold: 40,
+        max_step: 20,
+        threshold_floor: true,
+    };
+    let (_handle, mut events) = connect(config, Box::new(NullSink))
+        .await
+        .expect("the client must connect to the fake server");
+    expect_connected(&mut events, &server).await;
+
+    assert_eq!(player(next_client_state(&mut server).await).volume, Some(1));
+    server.json(volume_command(100));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Volume {
+            requested: 100,
+            applied: 40,
+            muted: None,
+        },
+        "the configured threshold floor must reach the session"
+    );
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(40),
+        "the server sees the value the configured policy applied"
+    );
 }
 
 #[tokio::test]
@@ -594,8 +723,9 @@ async fn a_server_volume_above_the_protocol_range_is_capped() {
     assert_eq!(
         next_event(&mut events).await,
         Event::Volume {
-            level: Some(100),
-            muted: None
+            requested: 200,
+            applied: 100,
+            muted: None,
         },
         "a level above the protocol range is capped at 100"
     );

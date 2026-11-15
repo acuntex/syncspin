@@ -13,7 +13,7 @@ use anyhow::Result;
 use fake_server::{FakeServer, ServerOptions};
 use syncspin_client::{
     connect, next_backoff, AudioFormat, AudioFrame, AudioMode, ClientConfig, ClientHandle, Codec,
-    Event, EventStream, Identity, Sink, INITIAL_BACKOFF,
+    Event, EventStream, Identity, Sink, VolumePolicy, INITIAL_BACKOFF,
 };
 use syncspin_core::messages::ClientState;
 
@@ -112,6 +112,7 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         audio_mode: AudioMode::Passthrough,
         volume: 100,
         muted: false,
+        volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
     }
 }
@@ -271,6 +272,7 @@ async fn an_unreachable_server_is_an_event_and_not_an_error() {
         audio_mode: AudioMode::Passthrough,
         volume: 100,
         muted: false,
+        volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(recordings.clone())))
@@ -530,6 +532,7 @@ async fn the_retry_delay_is_awaited_before_the_next_attempt() {
         audio_mode: AudioMode::Passthrough,
         volume: 100,
         muted: false,
+        volume_policy: VolumePolicy::default(),
         max_backoff: retry,
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(Recordings::default())))

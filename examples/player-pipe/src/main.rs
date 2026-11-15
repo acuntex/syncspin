@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use syncspin_client::{AudioMode, Client, ClientConfig, Event, Identity, MAX_PLAYER_NAME_LEN};
+use syncspin_client::{
+    AudioMode, Client, ClientConfig, Event, Identity, VolumePolicy, MAX_PLAYER_NAME_LEN,
+};
 use tokio::signal;
 
 use crate::pipe_sink::PipeSink;
@@ -83,6 +85,7 @@ async fn run(options: Options) -> Result<()> {
         // Nothing is restored across restarts, so the output starts at full scale and unmuted.
         volume: 100,
         muted: false,
+        volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
     };
 
@@ -120,15 +123,23 @@ async fn run(options: Options) -> Result<()> {
                         };
                         eprintln!("track: {label}");
                     }
-                    Event::Volume { level, muted } => {
-                        let mut parts: Vec<String> = Vec::new();
-                        if let Some(level) = level {
-                            parts.push(format!("level {level}"));
-                        }
+                    Event::Volume {
+                        requested,
+                        applied,
+                        muted,
+                    } => {
+                        let mut parts = vec![format!("requested {requested}, applied {applied}")];
                         if let Some(muted) = muted {
                             parts.push(if muted { "muted".to_owned() } else { "unmuted".to_owned() });
                         }
                         eprintln!("volume command: {}", parts.join(", "));
+                    }
+                    Event::StreamEnd { reason } => eprintln!("stream end: {reason:?}"),
+                    Event::StreamClear { from_timestamp } => {
+                        match from_timestamp {
+                            Some(timestamp) => eprintln!("stream clear from {timestamp} us"),
+                            None => eprintln!("stream clear"),
+                        }
                     }
                     Event::State(state) => {
                         let mut parts: Vec<String> = Vec::new();

@@ -6,6 +6,7 @@
 #[path = "fake_server.rs"]
 mod fake_server;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use syncspin_client::{
     connect, connect_with_psks, AudioFormat, AudioFrame, ClientConfig, ClientHandle, Codec, Event,
-    EventStream, PskCategory, Sink, StoredPsk,
+    EventStream, PskCategory, Sink, StoredPsk, StreamEndReason, VolumePolicy,
 };
 use syncspin_core::messages::{
     ClientState, ControllerState, Incoming, PlayerCommand, Progress, ServerCommand, ServerState,
@@ -68,12 +69,43 @@ impl Recordings {
     }
 }
 
+/// A gate that holds one sink flush until the test releases it.
+///
+/// It lets a test prove ordering: the session cannot release the held flush before it emitted the
+/// event, so a test that only releases the gate after it saw the event fails when the order is
+/// reversed (the flush spins and no event arrives).
+#[derive(Clone, Default)]
+struct FlushGate {
+    release: Arc<AtomicBool>,
+}
+
+impl FlushGate {
+    /// Lets the held flush return.
+    fn release(&self) {
+        self.release.store(true, Ordering::SeqCst);
+    }
+
+    /// Spins until the test released the gate, or the bound expires.
+    ///
+    /// The bound keeps a failing test from wedging its worker thread forever; the test itself
+    /// fails earlier, because it is waiting for the event with a shorter timeout.
+    fn wait(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// A sink that records instead of playing, and can fail on a chosen write.
 struct RecordingSink {
     recordings: Recordings,
     fail_on_write: Option<usize>,
     latency: Option<Duration>,
     writes: usize,
+    /// Flush call that holds the session until the gate is released.
+    hold_flush: Option<usize>,
+    gate: Option<FlushGate>,
 }
 
 impl RecordingSink {
@@ -83,6 +115,8 @@ impl RecordingSink {
             fail_on_write: None,
             latency: None,
             writes: 0,
+            hold_flush: None,
+            gate: None,
         }
     }
 
@@ -92,6 +126,8 @@ impl RecordingSink {
             fail_on_write: Some(write),
             latency: None,
             writes: 0,
+            hold_flush: None,
+            gate: None,
         }
     }
 
@@ -101,6 +137,19 @@ impl RecordingSink {
             fail_on_write: None,
             latency: Some(latency),
             writes: 0,
+            hold_flush: None,
+            gate: None,
+        }
+    }
+
+    fn gated(recordings: Recordings, gate: FlushGate, hold_flush: usize) -> RecordingSink {
+        RecordingSink {
+            recordings,
+            fail_on_write: None,
+            latency: None,
+            writes: 0,
+            hold_flush: Some(hold_flush),
+            gate: Some(gate),
         }
     }
 }
@@ -136,11 +185,20 @@ impl Sink for RecordingSink {
     }
 
     fn flush(&mut self) -> Result<()> {
-        *self
-            .recordings
-            .flushes
-            .lock()
-            .expect("the recordings lock is not poisoned") += 1;
+        let count = {
+            let mut flushes = self
+                .recordings
+                .flushes
+                .lock()
+                .expect("the recordings lock is not poisoned");
+            *flushes += 1;
+            *flushes
+        };
+        if self.hold_flush == Some(count) {
+            if let Some(gate) = &self.gate {
+                gate.wait();
+            }
+        }
         Ok(())
     }
 
@@ -164,6 +222,18 @@ fn sink_with_latency(latency: Duration) -> (Recordings, Box<dyn Sink>) {
     )
 }
 
+/// Creates a recording sink that holds the `hold_flush`th flush until the gate is released.
+fn gated_sink(hold_flush: usize) -> (Recordings, FlushGate, Box<dyn Sink>) {
+    let recordings = Recordings::default();
+    let gate = FlushGate::default();
+    let sink = Box::new(RecordingSink::gated(
+        recordings.clone(),
+        gate.clone(),
+        hold_flush,
+    ));
+    (recordings, gate, sink)
+}
+
 /// Builds a configuration for `server`.
 fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientConfig {
     ClientConfig {
@@ -173,6 +243,7 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         audio_mode: mode,
         volume: 100,
         muted: false,
+        volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
     }
 }
@@ -445,6 +516,92 @@ async fn stream_end_flushes_the_sink() {
     assert_eq!(recordings.flushes(), 1);
 
     server.stream_end();
+    wait_for_flushes(&recordings, 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_end_emits_an_event_before_the_flush() {
+    // The second flush - the one `stream/end` causes - holds the session until this test releases
+    // it. The event therefore has to arrive while the sink is still inside that flush; an
+    // implementation that flushed first would never get to the event and this test would time out.
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, gate, sink) = gated_sink(2);
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    assert_eq!(recordings.flushes(), 1);
+
+    server.stream_end();
+    match next_event_within(&mut events, Duration::from_secs(2)).await {
+        Event::StreamEnd { reason } => assert_eq!(reason, StreamEndReason::End),
+        other => panic!("expected StreamEnd, got {other:?}"),
+    }
+    gate.release();
+    wait_for_flushes(&recordings, 2).await;
+}
+
+#[tokio::test]
+async fn a_stream_clear_carries_the_timestamp() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+
+    let seek_position = now_us() - 1_000_000;
+    server.stream_clear(Some(seek_position));
+    match next_event(&mut events).await {
+        Event::StreamClear { from_timestamp } => assert_eq!(
+            from_timestamp,
+            Some(seek_position),
+            "the seek position must reach the host unchanged"
+        ),
+        other => panic!("expected StreamClear, got {other:?}"),
+    }
+    wait_for_flushes(&recordings, 2).await;
+
+    server.stream_clear(None);
+    match next_event(&mut events).await {
+        Event::StreamClear { from_timestamp } => assert_eq!(
+            from_timestamp, None,
+            "a clear without a position must not invent one"
+        ),
+        other => panic!("expected StreamClear, got {other:?}"),
+    }
+    wait_for_flushes(&recordings, 3).await;
+}
+
+#[tokio::test]
+async fn removing_the_player_role_reports_role_removed() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+
+    server.activate(&["metadata@v1"]);
+    match next_event(&mut events).await {
+        Event::StreamEnd { reason } => assert_eq!(reason, StreamEndReason::RoleRemoved),
+        other => panic!("expected StreamEnd, got {other:?}"),
+    }
     wait_for_flushes(&recordings, 2).await;
 }
 
@@ -928,8 +1085,9 @@ async fn a_volume_command_is_reported() {
     assert_eq!(
         next_event(&mut events).await,
         Event::Volume {
-            level: Some(25),
-            muted: None
+            requested: 25,
+            applied: 25,
+            muted: None,
         }
     );
 }
@@ -956,8 +1114,9 @@ async fn a_mute_command_does_not_report_a_volume() {
     assert_eq!(
         next_event(&mut events).await,
         Event::Volume {
-            level: None,
-            muted: Some(true)
+            requested: 100,
+            applied: 100,
+            muted: Some(true),
         }
     );
 }
@@ -971,6 +1130,7 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         audio_mode: syncspin_client::AudioMode::Passthrough,
         volume: 100,
         muted: false,
+        volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
     };
 
@@ -983,6 +1143,28 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
                 ..base("Test player")
             },
             "volume",
+        ),
+        (
+            "a threshold above the range",
+            ClientConfig {
+                volume_policy: VolumePolicy {
+                    threshold: 101,
+                    ..VolumePolicy::default()
+                },
+                ..base("Test player")
+            },
+            "volume_policy",
+        ),
+        (
+            "a step above the range",
+            ClientConfig {
+                volume_policy: VolumePolicy {
+                    max_step: 101,
+                    ..VolumePolicy::default()
+                },
+                ..base("Test player")
+            },
+            "volume_policy",
         ),
         (
             "a zero backoff",
