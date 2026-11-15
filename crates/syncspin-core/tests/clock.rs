@@ -1,6 +1,7 @@
-//! Clock-filter behaviour: convergence, the readiness threshold, outlier weighting and reset.
+//! Clock-filter behaviour: convergence, the readiness threshold, outlier weighting, the
+//! server/local round trip and reset.
 
-use syncspin_core::clock::{ClockFilter, TimeSample, MIN_SAMPLES};
+use syncspin_core::clock::{ClockFilter, TimeSample, READY_AFTER_SAMPLES};
 
 /// Synthetic offset of the server clock relative to the local clock, in microseconds.
 const OFFSET_US: i64 = 250_000;
@@ -78,6 +79,13 @@ fn eight_samples_with_jitter_converge_within_two_milliseconds() {
         last_received_us + OFFSET_US
     );
 
+    // The filter has to beat a single raw sample, whose measurement is off by up to the jitter.
+    let error = (estimate - (last_received_us + OFFSET_US)).abs();
+    assert!(
+        error < JITTER_US,
+        "estimate {estimate} is {error} µs off, no better than one raw sample ({JITTER_US} µs)"
+    );
+
     let offset = filter
         .offset_us()
         .expect("a ready filter reports an offset");
@@ -89,10 +97,13 @@ fn eight_samples_with_jitter_converge_within_two_milliseconds() {
 
 #[test]
 fn fewer_than_the_minimum_yields_no_estimate() {
+    // Pin the constant: a loop that derives its bound from it passes for any value.
+    assert_eq!(READY_AFTER_SAMPLES, 3);
+
     let mut filter = ClockFilter::new();
     let mut local_sent_us = START_US;
 
-    for index in 0..MIN_SAMPLES {
+    for index in 0..READY_AFTER_SAMPLES {
         assert!(!filter.is_ready(), "ready after {index} samples");
         assert_eq!(filter.now_us(local_sent_us), None);
         assert_eq!(filter.offset_us(), None);
@@ -103,9 +114,13 @@ fn fewer_than_the_minimum_yields_no_estimate() {
         assert_eq!(filter.sample_count(), index + 1);
         local_sent_us += SPACING_US;
 
-        if index + 1 == MIN_SAMPLES {
-            assert!(filter.is_ready(), "not ready after {MIN_SAMPLES} samples");
+        if index + 1 == READY_AFTER_SAMPLES {
+            assert!(
+                filter.is_ready(),
+                "not ready after {READY_AFTER_SAMPLES} samples"
+            );
             assert!(filter.now_us(received_us).is_some());
+            assert!(filter.client_time_us(received_us).is_some());
         }
     }
 }
@@ -143,6 +158,34 @@ fn an_outlier_sample_does_not_move_the_estimate_more_than_two_milliseconds() {
 }
 
 #[test]
+fn client_time_is_the_inverse_of_now_us() {
+    let (filter, last_received_us) = converged_filter(8);
+    assert!(filter.is_ready());
+
+    for local_us in [
+        last_received_us - SPACING_US,
+        last_received_us,
+        last_received_us + 1,
+        last_received_us + 1_000_000,
+        last_received_us + 60_000_000,
+    ] {
+        let server_us = filter
+            .now_us(local_us)
+            .expect("a ready filter maps local time to server time");
+        let back = filter
+            .client_time_us(server_us)
+            .expect("a ready filter maps server time to local time");
+        assert!(
+            (back - local_us).abs() <= 1,
+            "round trip of {local_us} µs came back as {back} µs"
+        );
+    }
+
+    let not_ready = ClockFilter::new();
+    assert_eq!(not_ready.client_time_us(0), None);
+}
+
+#[test]
 fn reset_clears_the_estimate() {
     let (mut filter, last_received_us) = converged_filter(8);
     assert!(filter.is_ready());
@@ -152,5 +195,7 @@ fn reset_clears_the_estimate() {
     assert_eq!(filter.sample_count(), 0);
     assert!(!filter.is_ready());
     assert_eq!(filter.now_us(last_received_us), None);
+    assert_eq!(filter.client_time_us(last_received_us), None);
     assert_eq!(filter.offset_us(), None);
+    assert_eq!(filter.last_sample_us(), 0);
 }

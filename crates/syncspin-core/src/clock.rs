@@ -32,6 +32,17 @@
 //!   genuine step instead of treating it as noise;
 //! * drift is applied to a conversion only while it is statistically significant.
 //!
+//! Readiness ([`ClockFilter::is_ready`]) is an availability signal, not an accuracy guarantee: it
+//! says that an estimate exists, not that it is fresh or good. The estimate's error grows with the
+//! distance from [`ClockFilter::last_sample_us`], so a caller that needs a bounded error keeps
+//! feeding samples. The published algorithm has a single 100-sample cutoff, after which adaptive
+//! forgetting may start; this module keeps that cutoff for its own purpose and adds a separate,
+//! much earlier threshold for availability, because the two answer different questions.
+//!
+//! Local timestamps must be positive. The filter starts with `last_sample_us == 0` and discards a
+//! sample that does not advance it, so a local clock that reads zero or less never gets a sample
+//! accepted and never becomes ready.
+//!
 //! The module is pure computation: no I/O, no clock reads, no blocking. The caller owns time.
 
 /// Offset random-walk diffusion, in µs per √µs.
@@ -59,8 +70,9 @@ const ADAPTIVE_FORGETTING_AFTER: usize = 100;
 ///
 /// Three is the smallest count for which every stage of the filter has run: the first sample seeds
 /// the offset, the second seeds the drift, and the third performs the first full predict/correct
-/// cycle. Until then the estimate is withheld rather than reported as if it were measured.
-pub const MIN_SAMPLES: usize = 3;
+/// cycle. This is an availability threshold, not an accuracy one - see
+/// [`ClockFilter::is_ready`].
+pub const READY_AFTER_SAMPLES: usize = 3;
 
 /// The four timestamps of one round trip, in microseconds.
 ///
@@ -81,8 +93,8 @@ pub struct TimeSample {
 /// Two-dimensional Kalman filter over clock offset and drift.
 ///
 /// Feed it every `server/time` reply with [`ClockFilter::push`] and ask it for the matching server
-/// timestamp with [`ClockFilter::now_us`]. Clone it to snapshot an estimate; the clone is
-/// independent.
+/// timestamp with [`ClockFilter::now_us`], or the matching local timestamp with
+/// [`ClockFilter::client_time_us`]. Clone it to snapshot an estimate; the clone is independent.
 #[derive(Debug, Clone)]
 pub struct ClockFilter {
     /// Estimated server clock minus local clock, in microseconds.
@@ -96,7 +108,7 @@ pub struct ClockFilter {
     /// Drift variance.
     p_dd: f64,
     /// `client_received_us` of the last accepted sample.
-    last_sample_us: i64,
+    last_accepted_us: i64,
     /// Accepted samples, saturating at `usize::MAX`.
     count: usize,
     /// Whether `drift` is significant enough to apply during a conversion.
@@ -118,7 +130,7 @@ impl ClockFilter {
             p_oo: f64::INFINITY,
             p_od: 0.0,
             p_dd: 0.0,
-            last_sample_us: 0,
+            last_accepted_us: 0,
             count: 0,
             use_drift: false,
         }
@@ -129,6 +141,10 @@ impl ClockFilter {
     /// A sample is discarded, leaving the estimate and [`ClockFilter::sample_count`] untouched,
     /// when its error bound is not positive or when it would not advance the filter in time -
     /// that is, when `client_received_us` is not later than the last accepted sample's.
+    ///
+    /// Local timestamps must be positive. The filter starts at `last_sample_us == 0` and discards
+    /// any sample that does not advance it, so a local clock reading zero or less never sees a
+    /// sample accepted.
     pub fn push(&mut self, sample: TimeSample) {
         let t1 = sample.client_sent_us as i128;
         let t2 = sample.server_received_us as i128;
@@ -139,14 +155,16 @@ impl ClockFilter {
         let measurement_i = ((t2 - t1) + (t3 - t4)) / 2;
         let max_error_i = ((t4 - t1) - (t3 - t2)) / 2;
 
-        if sample.client_received_us <= self.last_sample_us || max_error_i <= 0 {
+        if sample.client_received_us <= self.last_accepted_us || max_error_i <= 0 {
             return;
         }
 
         let measurement = measurement_i as f64;
         let max_error = max_error_i as f64;
-        let dt = (sample.client_received_us - self.last_sample_us) as f64;
-        self.last_sample_us = sample.client_received_us;
+        let dt = sample
+            .client_received_us
+            .saturating_sub(self.last_accepted_us) as f64;
+        self.last_accepted_us = sample.client_received_us;
 
         // Measurement variance.
         let r = (MAX_ERROR_SCALE * max_error).powi(2);
@@ -198,25 +216,45 @@ impl ClockFilter {
         self.use_drift = self.drift * self.drift > DRIFT_SIGNIFICANCE_THRESHOLD.powi(2) * self.p_dd;
     }
 
-    /// Reports whether the filter has enough samples for an estimate.
+    /// Reports whether an estimate exists.
     ///
-    /// True once [`MIN_SAMPLES`] samples have been accepted; the estimate it guards is
-    /// [`ClockFilter::now_us`] and [`ClockFilter::offset_us`].
+    /// True once [`READY_AFTER_SAMPLES`] samples have been accepted. This is an availability
+    /// signal, not an accuracy guarantee: it says nothing about how fresh or how good the estimate
+    /// is. Its error grows with the distance from [`ClockFilter::last_sample_us`].
+    #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.count >= MIN_SAMPLES
+        self.count >= READY_AFTER_SAMPLES
     }
 
     /// Returns the server clock reading that corresponds to the local reading `local_us`.
     ///
     /// Drift is applied only while it is statistically significant, matching the protocol.
-    /// Returns `None` until the filter is ready.
+    /// Returns `None` until the filter is ready; readiness means an estimate exists, not that it
+    /// is fresh, so the error grows with the distance from [`ClockFilter::last_sample_us`].
+    #[must_use]
     pub fn now_us(&self, local_us: i64) -> Option<i64> {
         if !self.is_ready() {
             return None;
         }
         let d = if self.use_drift { self.drift } else { 0.0 };
         Some(round_away_from_zero(
-            local_us as f64 + self.offset + d * (local_us as f64 - self.last_sample_us as f64),
+            local_us as f64 + self.offset + d * (local_us as f64 - self.last_accepted_us as f64),
+        ))
+    }
+
+    /// Returns the local clock reading that corresponds to the server reading `server_us`.
+    ///
+    /// The inverse of [`ClockFilter::now_us`], up to the final rounding. Drift is applied only
+    /// while it is statistically significant, matching the protocol. Returns `None` until the
+    /// filter is ready, which means an estimate exists rather than that it is fresh.
+    #[must_use]
+    pub fn client_time_us(&self, server_us: i64) -> Option<i64> {
+        if !self.is_ready() {
+            return None;
+        }
+        let d = if self.use_drift { self.drift } else { 0.0 };
+        Some(round_away_from_zero(
+            (server_us as f64 - self.offset + d * self.last_accepted_us as f64) / (1.0 + d),
         ))
     }
 
@@ -224,6 +262,7 @@ impl ClockFilter {
     ///
     /// Rounded to the nearest microsecond, with halves away from zero. Returns `None` until the
     /// filter is ready.
+    #[must_use]
     pub fn offset_us(&self) -> Option<i64> {
         if !self.is_ready() {
             return None;
@@ -231,9 +270,20 @@ impl ClockFilter {
         Some(round_away_from_zero(self.offset))
     }
 
+    /// Returns the local time at which the last accepted sample arrived.
+    ///
+    /// Zero until a sample is accepted, and never later than the local clock now. The estimate's
+    /// error grows with the distance from this instant, so this is the freshness horizon a caller
+    /// can compare against its own clock.
+    #[must_use]
+    pub fn last_sample_us(&self) -> i64 {
+        self.last_accepted_us
+    }
+
     /// Returns the number of accepted samples.
     ///
     /// Discarded samples do not count. The value saturates at `usize::MAX`.
+    #[must_use]
     pub fn sample_count(&self) -> usize {
         self.count
     }
@@ -245,6 +295,9 @@ impl ClockFilter {
 }
 
 /// Rounds to the nearest integer, with halves rounded away from zero (like the protocol).
+///
+/// The `as i64` conversion saturates: an estimate beyond the range becomes `i64::MIN` or
+/// `i64::MAX`, and a NaN becomes zero.
 fn round_away_from_zero(value: f64) -> i64 {
     value.round() as i64
 }
