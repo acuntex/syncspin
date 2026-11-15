@@ -54,6 +54,9 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: tag matches the workspace version
+        # A manual run has no tag: `github.ref_name` is the branch. The check is
+        # for the push path, which is the only one that publishes a version.
+        if: github.ref_type == 'tag'
         run: |
           set -euo pipefail
           version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
