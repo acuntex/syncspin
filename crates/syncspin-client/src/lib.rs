@@ -59,6 +59,58 @@ pub fn version() -> &'static str {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    //! Shared test doubles for the unit tests in this crate.
+
+    use std::time::Instant;
+
+    use crate::sink::{AudioFormat, AudioFrame, Sink};
+
+    /// A sink that accepts every call and keeps the trait's default latency and underrun count.
+    pub(crate) struct NullSink;
+
+    impl Sink for NullSink {
+        fn open(&mut self, _format: AudioFormat) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn write(&mut self, _frame: AudioFrame<'_>, _due: Instant) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_test_sink_reports_the_trait_defaults() {
+        let mut sink = NullSink;
+        sink.open(AudioFormat {
+            codec: crate::Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 16,
+            codec_header: None,
+        })
+        .expect("the test sink accepts a format");
+        sink.write(AudioFrame::Pcm(&[1, 2]), Instant::now())
+            .expect("the test sink accepts a frame");
+        sink.flush().expect("the test sink flushes");
+        assert_eq!(
+            sink.latency(),
+            None,
+            "a sink that does not report a delay adds none"
+        );
+        assert_eq!(
+            sink.underruns(),
+            0,
+            "a sink that does not count underruns reports none"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

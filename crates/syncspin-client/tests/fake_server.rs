@@ -63,6 +63,26 @@ pub struct ServerOptions {
     /// The first connection always announces them, so a test can seed the client with roles and
     /// then reconnect into an activation that carries none.
     pub omit_active_roles_after_the_first: bool,
+    /// Text sent instead of the normal `server/init` document.
+    pub server_init_override: Option<String>,
+    /// Version written into `server/init`; the protocol defines one.
+    pub server_version: u32,
+    /// Text sent instead of the normal `noise/handshake` message 1.
+    pub message_1_override: Option<String>,
+    /// Whether an empty binary frame is sent before `server/init`, which the handshake must skip.
+    pub binary_before_init: bool,
+    /// Whether the connection is closed right after `client/init`, before `server/init`.
+    pub close_before_init: bool,
+    /// Plaintexts sent as encrypted frames after message 2 and before `server/hello`.
+    pub pre_hello_plaintexts: Vec<Vec<u8>>,
+    /// Whether a cleartext text frame is sent after message 2 and before `server/hello`.
+    pub cleartext_after_message_2: bool,
+    /// Whether the connection is closed after message 2 instead of sending `server/hello`.
+    pub close_after_message_2: bool,
+    /// Text sent as the first encrypted message instead of `server/hello`.
+    pub hello_override: Option<String>,
+    /// Text sent as the activation instead of the normal `server/activate`.
+    pub activate_override: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -82,6 +102,16 @@ impl Default for ServerOptions {
             manual_time: false,
             connections: 1,
             omit_active_roles_after_the_first: false,
+            server_init_override: None,
+            server_version: 1,
+            message_1_override: None,
+            binary_before_init: false,
+            close_before_init: false,
+            pre_hello_plaintexts: Vec::new(),
+            cleartext_after_message_2: false,
+            close_after_message_2: false,
+            hello_override: None,
+            activate_override: None,
         }
     }
 }
@@ -117,6 +147,12 @@ pub enum Command {
     },
     /// Sends a raw transport plaintext, for malformed frames a structured command cannot build.
     Binary(Vec<u8>),
+    /// Sends a cleartext WebSocket text frame.
+    Text(String),
+    /// Sends a WebSocket ping.
+    Ping(Vec<u8>),
+    /// Sends an unsolicited WebSocket pong.
+    Pong(Vec<u8>),
     /// Answers the outstanding `client/time` request with this transmit timestamp.
     AnswerTime(i64),
     /// Closes the WebSocket cleanly.
@@ -280,6 +316,21 @@ impl FakeServer {
         });
     }
 
+    /// Sends a WebSocket ping control frame.
+    pub fn ping(&self, payload: Vec<u8>) {
+        let _ = self.commands.send(Command::Ping(payload));
+    }
+
+    /// Sends an unsolicited WebSocket pong control frame.
+    pub fn pong(&self, payload: Vec<u8>) {
+        let _ = self.commands.send(Command::Pong(payload));
+    }
+
+    /// Sends a cleartext text frame after the handshake.
+    pub fn text(&self, text: impl Into<String>) {
+        let _ = self.commands.send(Command::Text(text.into()));
+    }
+
     /// Sends a raw plaintext as one Noise transport message.
     pub fn binary(&self, plaintext: Vec<u8>) {
         let _ = self.commands.send(Command::Binary(plaintext));
@@ -407,12 +458,27 @@ async fn serve_connection(
         .try_into()
         .map_err(|_| anyhow!("client_id does not decode to 32 bytes"))?;
 
+    if options.close_before_init {
+        socket.close(None).await?;
+        let _ = observations.send(Observation::Closed);
+        return Ok(());
+    }
+    if options.binary_before_init {
+        // A binary frame before the Noise transport carries nothing and has to be skipped.
+        socket.send(Message::binary(vec![0, 1, 2])).await?;
+    }
+
     // 2. server/init, whose exact bytes complete the prologue.
-    let server_init_text = serde_json::json!({
-        "type": "server/init",
-        "payload": { "server_id": URL_SAFE_NO_PAD.encode(&keypair.public), "version": 1 },
-    })
-    .to_string();
+    let server_init_text = options.server_init_override.clone().unwrap_or_else(|| {
+        serde_json::json!({
+            "type": "server/init",
+            "payload": {
+                "server_id": URL_SAFE_NO_PAD.encode(&keypair.public),
+                "version": options.server_version,
+            },
+        })
+        .to_string()
+    });
     send_text(&mut socket, &server_init_text).await?;
 
     if !options.start_handshake {
@@ -446,9 +512,12 @@ async fn serve_connection(
         ),
     };
     let message_1 = write_handshake(&mut initiator, metadata.as_bytes())?;
-    let message_1 = serde_json::to_string(&Incoming::NoiseHandshake(NoiseHandshake {
-        data: URL_SAFE_NO_PAD.encode(message_1),
-    }))?;
+    let message_1 = options.message_1_override.clone().unwrap_or_else(|| {
+        serde_json::to_string(&Incoming::NoiseHandshake(NoiseHandshake {
+            data: URL_SAFE_NO_PAD.encode(message_1),
+        }))
+        .expect("a handshake envelope encodes")
+    });
     send_text(&mut socket, &message_1).await?;
 
     // 4. Noise message 2. A client that rejects the metadata closes without sending it.
@@ -480,16 +549,34 @@ async fn serve_connection(
         .into_transport_mode()
         .context("failed to finish the Noise handshake")?;
 
+    if options.close_after_message_2 {
+        socket.close(None).await?;
+        let _ = observations.send(Observation::Closed);
+        return Ok(());
+    }
+    for plaintext in &options.pre_hello_plaintexts {
+        let ciphertext = encrypt(&mut noise, plaintext)?;
+        socket.send(Message::binary(ciphertext)).await?;
+    }
+    if options.cleartext_after_message_2 {
+        send_text(&mut socket, "{}").await?;
+    }
+
     // 5. server/hello.
-    send_encrypted(
-        &mut socket,
-        &mut noise,
-        &Incoming::ServerHello(ServerHello {
-            name: "Test server".to_owned(),
-            languages: None,
-        }),
-    )
-    .await?;
+    match options.hello_override.as_deref() {
+        Some(hello) => send_raw_json(&mut socket, &mut noise, hello).await?,
+        None => {
+            send_encrypted(
+                &mut socket,
+                &mut noise,
+                &Incoming::ServerHello(ServerHello {
+                    name: "Test server".to_owned(),
+                    languages: None,
+                }),
+            )
+            .await?
+        }
+    }
 
     // 6. client/hello.
     let hello = read_encrypted_json(&mut socket, &mut noise).await?;
@@ -501,16 +588,21 @@ async fn serve_connection(
     }
 
     // 7. server/activate with the announced roles.
-    send_encrypted(
-        &mut socket,
-        &mut noise,
-        &Incoming::ServerActivate(ServerActivate {
-            activities: vec!["playback".to_owned()],
-            active_roles: announce_roles.then(|| options.active_roles.clone()),
-            pairing: None,
-        }),
-    )
-    .await?;
+    match options.activate_override.as_deref() {
+        Some(activate) => send_raw_json(&mut socket, &mut noise, activate).await?,
+        None => {
+            send_encrypted(
+                &mut socket,
+                &mut noise,
+                &Incoming::ServerActivate(ServerActivate {
+                    activities: vec!["playback".to_owned()],
+                    active_roles: announce_roles.then(|| options.active_roles.clone()),
+                    pairing: None,
+                }),
+            )
+            .await?
+        }
+    }
 
     // 8. Serve until a close.
     let mut answered_time = 0usize;
@@ -643,6 +735,15 @@ async fn serve_connection(
             LinkEvent::Command(Some(Command::Binary(plaintext))) => {
                 let ciphertext = encrypt(&mut noise, &plaintext)?;
                 socket.send(Message::binary(ciphertext)).await?;
+            }
+            LinkEvent::Command(Some(Command::Text(text))) => {
+                send_text(&mut socket, &text).await?;
+            }
+            LinkEvent::Command(Some(Command::Ping(payload))) => {
+                socket.send(Message::Ping(payload.into())).await?;
+            }
+            LinkEvent::Command(Some(Command::Pong(payload))) => {
+                socket.send(Message::Pong(payload.into())).await?;
             }
             LinkEvent::Command(Some(Command::Close)) | LinkEvent::Command(None) => {
                 socket.close(None).await?;

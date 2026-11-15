@@ -1552,4 +1552,193 @@ mod tests {
         non_canonical.push('p');
         assert!(!is_canonical_psk_id(&non_canonical));
     }
+
+    use crate::test_support::NullSink;
+    use syncspin_core::noise::Identity;
+
+    /// A configuration for a session that is never connected to a real server.
+    fn test_config() -> ClientConfig {
+        ClientConfig {
+            server: "127.0.0.1:1".to_owned(),
+            player_name: "Test player".to_owned(),
+            device_info: None,
+            identity: Identity::generate(),
+            audio_mode: AudioMode::Passthrough,
+            volume: 50,
+            muted: false,
+            volume_policy: crate::config::VolumePolicy::default(),
+            max_backoff: Duration::from_secs(1),
+        }
+    }
+
+    /// Builds a session around the given transport and control receiver.
+    fn test_session<'a>(
+        config: &'a ClientConfig,
+        events: &'a mpsc::UnboundedSender<Event>,
+        reported_volume: &'a AtomicU8,
+        transport: Transport,
+        noise: NoiseTransport,
+        control: Option<mpsc::UnboundedReceiver<ControlRequest>>,
+    ) -> Session<'a> {
+        Session {
+            transport,
+            noise,
+            config,
+            sink: Box::new(NullSink),
+            events,
+            reported_volume,
+            clock: ClockFilter::new(),
+            reassembler: Reassembler::new(MAX_REASSEMBLED_LEN),
+            active_roles: vec![CONTROLLER_ROLE.to_owned()],
+            stream: None,
+            sync_remaining: 0,
+            burst_deadline: None,
+            reply_deadline: None,
+            outstanding_sent_us: None,
+            burst_started: None,
+            burst_samples: Vec::new(),
+            state_sent: false,
+            control,
+            volume: 50,
+            muted: false,
+            sink_failed: false,
+            controller_commands: None,
+        }
+    }
+
+    /// A client WebSocket whose peer was reset, so the next write fails.
+    ///
+    /// `SO_LINGER` with a zero timeout makes the dropped peer send a reset instead of a clean
+    /// close, which is what a server that vanished mid-session looks like. It is the only way to
+    /// exercise the write-failure path; the deprecation note is about a blocking drop, which a
+    /// zero timeout avoids.
+    #[allow(deprecated)]
+    async fn reset_socket() -> Transport {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a loopback listener");
+        let address = listener.local_addr().expect("the bound address");
+        let client = TcpStream::connect(address)
+            .await
+            .expect("a loopback connection");
+        let (server_side, _peer) = listener.accept().await.expect("the accepted connection");
+        let (client_handshake, server_handshake) = tokio::join!(
+            tokio_tungstenite::client_async(
+                format!("ws://{address}/"),
+                tokio_tungstenite::MaybeTlsStream::Plain(client),
+            ),
+            tokio_tungstenite::accept_async(server_side),
+        );
+        let (socket, _response) = client_handshake.expect("the client WebSocket handshake");
+        let server_socket = server_handshake.expect("the server WebSocket upgrade");
+        server_socket
+            .get_ref()
+            .set_linger(Some(Duration::ZERO))
+            .expect("the socket accepts SO_LINGER");
+        drop(server_socket);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Transport { socket }
+    }
+
+    /// Runs a complete Noise handshake locally and returns the responder's transport.
+    fn local_noise_transport() -> NoiseTransport {
+        const PROLOGUE: &[u8] = b"syncspin unit-test prologue";
+        let identity = Identity::generate();
+        let peer = Identity::generate();
+        let mut responder =
+            Responder::with_peer(&identity, &peer.public, PROLOGUE).expect("the responder builds");
+        let mut initiator = snow::Builder::new(
+            syncspin_core::noise::NOISE_PARAMS
+                .parse()
+                .expect("the protocol name parses"),
+        )
+        .local_private_key(&peer.secret)
+        .expect("the initiator key is set")
+        .remote_public_key(&identity.public)
+        .expect("the responder key is set")
+        .psk(2, &SENTINEL_PSK)
+        .expect("the PSK is set")
+        .prologue(PROLOGUE)
+        .expect("the prologue is set")
+        .build_initiator()
+        .expect("the initiator builds");
+
+        let mut buffer = vec![0u8; syncspin_core::noise::MAX_MESSAGE_LEN];
+        let len = initiator
+            .write_message(b"{}", &mut buffer)
+            .expect("message 1 is written");
+        responder
+            .read_message(&buffer[..len])
+            .expect("message 1 is read");
+        let message_2 = responder.write_message().expect("message 2 is written");
+        initiator
+            .read_message(&message_2, &mut buffer)
+            .expect("message 2 is read");
+        responder.into_transport().expect("the handshake finishes")
+    }
+
+    #[tokio::test]
+    async fn a_closed_control_channel_is_disabled_instead_of_polled_forever() {
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let (commands, control) = mpsc::unbounded_channel();
+        drop(commands);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            Some(control),
+        );
+
+        let outcome = session.serve().await;
+        assert!(
+            outcome.is_err(),
+            "the reset socket must end the session: {outcome:?}"
+        );
+        assert!(
+            session.control.is_none(),
+            "a control channel without senders is cleared, not selected forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_request_that_cannot_be_written_ends_the_session() {
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let request = ControlRequest {
+            action: ControlAction::Transport("play"),
+            reply,
+        };
+        let error = session
+            .handle_control(request)
+            .await
+            .expect_err("a failed write must end the session");
+        assert!(
+            format!("{error:#}").contains("WebSocket send failed"),
+            "the error must name the failed write, got: {error:#}"
+        );
+
+        let answer = response
+            .await
+            .expect("the waiting call is answered")
+            .expect_err("the call does not succeed");
+        assert!(
+            format!("{answer:#}").contains("WebSocket send failed"),
+            "the caller sees the write failure, got: {answer:#}"
+        );
+    }
 }

@@ -225,3 +225,98 @@ impl ClientConfig {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A configuration that passes validation, for tests that change one field.
+    fn valid() -> ClientConfig {
+        ClientConfig {
+            server: "127.0.0.1:1".to_owned(),
+            player_name: "Test player".to_owned(),
+            device_info: None,
+            identity: Identity::generate(),
+            audio_mode: AudioMode::Passthrough,
+            volume: 100,
+            muted: false,
+            volume_policy: VolumePolicy::default(),
+            max_backoff: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn a_stored_psk_formats_without_its_key_material() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+
+        let psk = [0xab; 32];
+        let record = StoredPsk {
+            category: PskCategory::Pairing,
+            psk,
+            server_id: "B1y4w7z0c3f6i9l2o5r8u1x4a7d0g3j6m9p2s5v8y1b".to_owned(),
+        };
+        let text = format!("{record:?}");
+        assert!(text.contains("StoredPsk"), "unexpected format: {text}");
+        assert!(text.contains("Pairing"), "the category is not key material");
+        assert!(text.contains("B1y4w7z0c3f6i9l2o5r8u1x4a7d0g3j6m9p2s5v8y1b"));
+        assert!(text.contains("<redacted>"));
+        assert!(
+            !text.contains(&URL_SAFE_NO_PAD.encode(psk)),
+            "the key must never appear in a debug format: {text}"
+        );
+        assert!(
+            !text.contains(&format!("{psk:?}")),
+            "not even the raw bytes may appear: {text}"
+        );
+    }
+
+    #[test]
+    fn an_empty_server_address_is_rejected() {
+        for server in ["", "   "] {
+            let config = ClientConfig {
+                server: server.to_owned(),
+                ..valid()
+            };
+            let error = config.validate().expect_err("an empty address has no host");
+            assert!(
+                format!("{error:#}").contains("server"),
+                "the error must name the address, got: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_player_name_is_bounded_by_the_protocol_length() {
+        let longest = ClientConfig {
+            player_name: "a".repeat(MAX_PLAYER_NAME_LEN),
+            ..valid()
+        };
+        longest
+            .validate()
+            .expect("a name at the limit must be accepted");
+
+        let config = ClientConfig {
+            player_name: "a".repeat(MAX_PLAYER_NAME_LEN + 1),
+            ..valid()
+        };
+        let error = config
+            .validate()
+            .expect_err("a name above the limit must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("player_name")
+                && message.contains(&(MAX_PLAYER_NAME_LEN + 1).to_string()),
+            "the error must name the field and the length, got: {message}"
+        );
+
+        let config = ClientConfig {
+            player_name: " \t ".to_owned(),
+            ..valid()
+        };
+        let error = config
+            .validate()
+            .expect_err("a blank name must be rejected");
+        assert!(format!("{error:#}").contains("player_name"));
+    }
+}

@@ -832,11 +832,130 @@ mod tests {
             "wss://example.test",
             "https://example.test",
             "ws://",
+            "ws://?token=1",
+            "ws://#fragment",
+            "ws:///player",
+            "?token=1",
+            "#fragment",
         ] {
             assert!(
                 endpoint(server).is_err(),
                 "{server:?} must not be turned into a cleartext endpoint"
             );
         }
+    }
+
+    use crate::test_support::NullSink;
+
+    /// Builds the parts of a connection that do not change across attempts.
+    fn connection_at(endpoint: &str, events: mpsc::UnboundedSender<Event>) -> Connection {
+        Connection {
+            endpoint: endpoint.to_owned(),
+            config: ClientConfig {
+                server: endpoint.to_owned(),
+                player_name: "Test player".to_owned(),
+                device_info: None,
+                identity: crate::Identity::generate(),
+                audio_mode: crate::AudioMode::Passthrough,
+                volume: 42,
+                muted: false,
+                volume_policy: VolumePolicy::default(),
+                max_backoff: Duration::from_secs(30),
+            },
+            psks: Vec::new(),
+            events,
+            reported_volume: Arc::new(AtomicU8::new(42)),
+        }
+    }
+
+    fn empty_carried(control: Option<mpsc::UnboundedReceiver<ControlRequest>>) -> Carried {
+        Carried {
+            sink: Box::new(NullSink),
+            control,
+            volume: 42,
+            muted: false,
+            active_roles: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_wait_without_a_control_handle_still_honours_the_delay() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let connection = connection_at("127.0.0.1:1", events);
+        let (commands, control) = mpsc::unbounded_channel();
+        drop(commands);
+        let mut carried = empty_carried(Some(control));
+
+        let started = std::time::Instant::now();
+        let retry = wait_before_retry(&connection, &mut carried, Duration::from_millis(50)).await;
+
+        assert!(retry, "the delay elapsed, so the next attempt must follow");
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "the delay must be waited out, not skipped"
+        );
+        assert!(
+            carried.control.is_none(),
+            "a control channel whose senders are gone is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_event_stream_during_a_retry_ends_the_connection() {
+        let (events, receiver) = mpsc::unbounded_channel();
+        let connection = connection_at("127.0.0.1:1", events);
+        let mut carried = empty_carried(None);
+
+        let retry = wait_before_retry(&connection, &mut carried, Duration::from_secs(60));
+        tokio::pin!(retry);
+        let mut finished = false;
+        tokio::select! {
+            _ = &mut retry => finished = true,
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        assert!(!finished, "the wait must not end while the stream is open");
+
+        drop(receiver);
+        assert!(
+            !retry.await,
+            "a dropped event stream must stop the retry loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_with_no_event_stream_ends_the_connection() {
+        // Bind and release a loopback port, so the open fails immediately rather than timing out.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+        let address = listener.local_addr().expect("the bound address");
+        drop(listener);
+
+        let (events, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let connection = connection_at(&address.to_string(), events);
+
+        let outcome = serve_until_dropped(connection, empty_carried(None)).await;
+        assert!(
+            outcome.is_ok(),
+            "a host that dropped the stream ends the connection cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_namespace_entry_points_wrap_the_free_functions() {
+        // A bad configuration is rejected by both before any socket is opened, which pins the
+        // forwarding: a wrapper that inverted the result would not return this error.
+        let mut config = connection_at("127.0.0.1:1", mpsc::unbounded_channel().0).config;
+        config.player_name.clear();
+        let error = Client::connect(config, Box::new(NullSink))
+            .await
+            .expect_err("an invalid configuration must be rejected");
+        assert!(format!("{error:#}").contains("player_name"));
+
+        let mut config = connection_at("127.0.0.1:1", mpsc::unbounded_channel().0).config;
+        config.server = "wss://example.test".to_owned();
+        let error = Client::connect_with_psks(config, Box::new(NullSink), Vec::new())
+            .await
+            .expect_err("a TLS address must be rejected before connecting");
+        assert!(format!("{error:#}").contains("TLS"));
     }
 }
