@@ -74,9 +74,11 @@ the library crates with their own defaults - the set a consumer that enables not
 
 What the suites do not cover:
 
-- the operator order "open the window first, let the server activate pairing afterwards" - the tests
-  always activate first and open the window in response to `client/pair-pending`, which is the order
-  the protocol allows but not the one `player-pipe --open-window` uses.
+- the operator order "open the window first, let the server activate pairing afterwards" - for a
+  _first_ activation neither the tests nor `player-pipe --open-window` reach it: the connection
+  reports `Connected` and handles the activation before the host's gesture arrives, so both send
+  `client/pair-pending` first. The library supports a window opened before a _later_ activation, and
+  that path is untested.
 - a live server. Everything above runs against the fake server; see the manual pairing run below.
 - external review. The CPace layer has draft vectors and hermetic tests, not a review
   ([`spec-deviations.md`](spec-deviations.md), entry 5).
