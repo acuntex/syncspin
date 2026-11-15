@@ -91,6 +91,13 @@ handling, `src/pipe_sink.rs` the `Sink` implementation.
   `cargo zigbuild --target armv7-unknown-linux-gnueabihf`. `openssl` and `ring` are out: the crypto
   stack is `snow` plus `x25519-dalek`.
 
+## Publishing
+
+`syncspin-core` has to be published before `syncspin-client`: the client's `syncspin-core`
+dependency is a path dependency that `cargo package` rewrites to a registry dependency, so
+`cargo package -p syncspin-client` fails until `syncspin-core` 0.1.0 exists on crates.io.
+`syncspin-server` is `publish = false` and stays out of the release.
+
 ## Licence
 
 MIT OR Apache-2.0, at your option. See [LICENSE-MIT](LICENSE-MIT) and

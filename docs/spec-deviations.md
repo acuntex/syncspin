@@ -75,7 +75,9 @@ is accepted and the session carries on.
 allows four sets — `[]`, `['pairing']`, `['playback']` and `['playback','pairing']` — so this is not
 a single case that a bare parser could settle: the playback-capable rule, the re-evaluation of
 `active_roles` on later activations and the two rejection paths all have to exist first. The client
-stores no PSKs yet, so the other rows are unreachable rather than merely untested.
+stores no PSK of its own, but a host can pass records through `connect_with_psks` (entry 4), so an
+`lt` or `pr` announcement is reachable and the allowed set has to be keyed by the matched record's
+category instead of assuming the Sentinel row.
 
 **Removing it:** add the allowed-set table per PSK category, the playback-capable rule with the
 `active_roles` re-evaluation on later activations, and the two rejection paths (stage 1b). Test each
@@ -88,8 +90,9 @@ the operator as a version-0 token, `SP:0` plus the base32 body of
 `client_key (32 bytes) || pairing_psk (32 bytes)`, transliterating `2` to `9`. The bare PSK is not
 an acceptable interface.
 
-**What we do:** the library has no `pairing_token()` and no pairing PSK at all. The only key the
-client uses today is the published Sentinel PSK, which is not a pairing credential.
+**What we do:** the library has no `pairing_token()` and never generates a pairing PSK. The only key
+it holds by itself is the published Sentinel PSK, which is not a pairing credential; a host can pass
+stored records through `connect_with_psks` (entry 4), but nothing here produces one.
 
 **Why:** a token is a credential: whoever holds it can pair any server with the client. Emitting one
 before the pairing PSK is generated, persisted and covered by the record lifecycle would ship a
@@ -236,8 +239,9 @@ Noise message 1 again to rotate the connection to a paired PSK; the client answe
 over the same transport, without repeating the cleartext init exchange.
 
 **What we do:** `handshake` runs once per WebSocket. `serve` decrypts later messages and
-`handle_json` has no arm for `Incoming::NoiseHandshake`, so a re-handshake arrives as an ignored
-message and the connection keeps its original key. There is no second handshake path at all.
+`handle_control_message` parses them into `Incoming`, where `dispatch` has no arm for
+`Incoming::NoiseHandshake`, so a re-handshake arrives as an ignored message and the connection keeps
+its original key. There is no second handshake path at all.
 
 **Why:** the guest client only ever uses the published Sentinel key, and no pairing PSK exists to
 rotate to (entries 3 and 5). A half-implemented re-handshake that ignored a failed message 2 would

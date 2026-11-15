@@ -45,9 +45,8 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
   and `source` stay off unless a caller opts in.
 - **MSRV 1.85.** A dependency that demands more is pinned or replaced, not silently accepted; the
   `msrv` CI job is the gate.
-- **Names and licence are fixed:** crates `syncspin`, `syncspin-core`, `syncspin-client`,
-  `syncspin-server`; licence `MIT OR Apache-2.0`. Renames break downstream consumers and the
-  published crates.
+- **Names and licence are fixed:** crates `syncspin-core`, `syncspin-client` and `syncspin-server`;
+  licence `MIT OR Apache-2.0`. Renames break downstream consumers and the published crates.
 - **Spec deviations are documented** in `docs/spec-deviations.md` and covered by a test. Where
   Music Assistant and the spec disagree, the spec wins.
 - **This repository is public.** No personal names, home-directory paths, device names, hostnames,
