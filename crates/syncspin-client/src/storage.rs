@@ -25,8 +25,10 @@
 //! The rules are enforced by [`persist_pairing`], not by a backend: a host implements the four
 //! primitive operations of [`Storage`] and the crate does the ordering, the capacity and the
 //! live-record pin on top of them. A pairing therefore never fails for lack of space, whichever
-//! store the host chose. Calling [`Storage::store_pairing`] directly bypasses both rules, so a host
-//! that writes a record itself has to keep the capacity and the live-record pin as well.
+//! store the host chose. Calling [`Storage::store_pairing`] directly skips the live-record pin;
+//! `FileStorage` trims to the floor as a safety net, a host backend may not trim at all, and neither
+//! can know which connection is live. A host that writes a record itself calls [`persist_pairing`]
+//! rather than reimplementing either rule.
 //!
 //! # File backend
 //!
@@ -82,10 +84,11 @@ pub trait Storage: Send + Sync + 'static {
     ///
     /// This is the primitive [`persist_pairing`] is built on: a record the store already holds for
     /// the same `server_id` is replaced and the new one is placed at the end, so storing it again
-    /// moves it to the end of the list. A backend does not evict here - capacity and the live-record
-    /// pin belong to [`persist_pairing`], which calls this only after it has made room. An empty
-    /// `server_id` is rejected, so the store cannot be left holding a record that can never be
-    /// selected.
+    /// moves it to the end of the list. A backend need not evict here - capacity and the live-record
+    /// pin belong to [`persist_pairing`], which calls this only after it has made room. `FileStorage`
+    /// trims to the floor as a safety net for a direct caller, and cannot pin a live record it does
+    /// not know. An empty `server_id` is rejected, so the store cannot be left holding a record that
+    /// can never be selected.
     fn store_pairing(&self, record: StoredPsk) -> Result<()>;
 
     /// Removes the record for `server_id`.
@@ -135,7 +138,7 @@ pub fn persist_pairing(storage: &dyn Storage, record: StoredPsk, live: Option<&s
 /// list nothing is removed.
 ///
 /// This is the list form of the rule [`persist_pairing`] applies, for a caller that already holds
-/// the records. It operates on a list in recency order (oldest first), which is the order
+/// the records. It operates on a list in insertion order (oldest first), which is the order
 /// [`Storage::load_pairings`] returns. The caller is responsible for a record it is about to store:
 /// [`persist_pairing`] keeps that record out of the list until after eviction.
 pub fn evict(records: &mut Vec<StoredPsk>, live: Option<&str>) -> Option<usize> {
@@ -147,7 +150,7 @@ pub fn evict(records: &mut Vec<StoredPsk>, live: Option<&str>) -> Option<usize> 
     Some(index)
 }
 
-/// The index of the first record that may be dropped: not the live one, in recency order.
+/// The index of the first record that may be dropped: not the live one, in insertion order.
 fn evictable(records: &[StoredPsk], live: Option<&str>) -> Option<usize> {
     records
         .iter()

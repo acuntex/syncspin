@@ -482,9 +482,14 @@ not a valid UTF-8 JSON object with a `type` string and a `payload` object is a p
 hands the control kind - id `0` - to `Session::handle_control_message`, which parses it with
 `Incoming::parse`. A body that does not decode is written to stderr and dropped: a truncated
 envelope, JSON that is not an object, and a known `type` whose payload does not deserialize, such as
-`server/command` with `volume: 300`. The session, its clock and its audio continue. Every framing
-rule stays strict: a body that is not valid UTF-8, an empty plaintext, a malformed audio chunk
-header, a bad fragment sequence and an oversize reassembly all end the connection.
+`server/command` with `volume: 300`. The session, its clock and its audio continue. One class is
+exempt: `session::names_pairing_message` reads the envelope's `type` before the payload, and a decode
+failure for one of the five pairing types - `server/pair-init`, `server/pair-auth`,
+`server/pair-confirm`, `server/pair-finalize` and `pair/abort` - closes the connection instead,
+because a half-open pairing attempt must not continue; every other type keeps the lenient path.
+`a_malformed_pairing_message_is_a_protocol_error` pins that exception. Every framing rule stays
+strict: a body that is not valid UTF-8, an empty plaintext, a malformed audio chunk header, a bad
+fragment sequence and an oversize reassembly all end the connection.
 `a_malformed_control_message_is_ignored` pins the lenient path; `a_malformed_audio_header_is_a_protocol_error`
 and the fragmentation tests pin the strict ones.
 

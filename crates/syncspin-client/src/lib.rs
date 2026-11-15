@@ -40,22 +40,22 @@
 //! [`ClientConfig::pairing_timeout`], [`DEFAULT_PAIRING_TIMEOUT`] by default.
 //!
 //! With the `pairing-code` feature and a code in
-//! [`ClientConfig::static_pairing_code`](crate::ClientConfig::static_pairing_code), the client also
-//! offers the Static Pairing Code method. Every attempt is gated by an operator gesture:
-//! [`ControlHandle::open_pairing_window`] opens a window on the live connection, the client answers
-//! a pairing activation with `client/pair-pending` while none is open, and the fifth failed key
-//! confirmation closes the window. The round runs CPace over X25519 with SHA-512 and delivers the
-//! new long-term PSK sealed under its output; that layer has not had an external review.
+//! `ClientConfig::static_pairing_code`, the client also offers the Static Pairing Code method. Every
+//! attempt is gated by an operator gesture: `ControlHandle::open_pairing_window` opens a window on
+//! the live connection, the client answers a pairing activation with `client/pair-pending` while
+//! none is open, and the fifth failed key confirmation closes the window. The round runs CPace over
+//! X25519 with SHA-512 and delivers the new long-term PSK sealed under its output; that layer has
+//! not had an external review.
 //!
-//! With the same feature and at least one entry in each of [`ClientConfig::code_formats`] and
-//! [`ClientConfig::code_out_channels`], the client offers the Dynamic Pairing Code method instead of
+//! With the same feature and at least one entry in each of `ClientConfig::code_formats` and
+//! `ClientConfig::code_out_channels`, the client offers the Dynamic Pairing Code method instead of
 //! relying on a fixed secret. It draws a nonce per attempt, locks it with `commit_B` in
 //! `client/pair-init`, and derives the per-session code once the server's `nonce_A` arrives: six
-//! digits, or a version-1 pairing token for a QR code. [`Event::PairingCode`] carries the code and
+//! digits, or a version-1 pairing token for a QR code. `Event::PairingCode` carries the code and
 //! its round; the code stays the same across the rounds of one attempt. A failed key confirmation
 //! asks the server for another round, and the twentieth failed round ends the attempt. After the
 //! limit the client holds dynamic attempts back - answering them with `client/pair-pending` - until
-//! [`ControlHandle::release_holdback`] is called, the deliberate operator action the spec requires.
+//! `ControlHandle::release_holdback` is called, the deliberate operator action the spec requires.
 //!
 //! A pairing record can also be dropped from the server's side. `server/unpair` removes it, reports
 //! [`Event::Unpaired`] and closes the connection; a server that announces a `psk_id` the client does

@@ -114,9 +114,10 @@ store the client offers no pairing method and stays a guest.
 it. The crate writes at most five records into a store it manages, evicting the oldest first and
 never the record backing the live connection; a store that already holds more is read as it is. That
 order is insertion order, not use order, so a record kept since long ago can be evicted before one
-used recently. Calling `Storage::store_pairing` directly bypasses the capacity and the live-record
-pin: the crate writes through `persist_pairing`, and a host that stores records itself has to apply
-the same rules.
+used recently. `Storage::store_pairing` is the primitive, not the whole rule: calling it directly
+skips the live-record pin, and `FileStorage` trims to five there only as a safety net while a host
+backend may not trim at all. A host that writes a record itself calls the exported `persist_pairing`,
+which applies both rules to any store, instead of reimplementing them.
 
 With the `pairing-code` feature the client also runs the static and dynamic code flows, gated by a
 pairing window the host opens or by the process-wide round limit. The dynamic flow shows the operator
@@ -184,7 +185,8 @@ handbook.
 - **MSRV 1.85**, edition 2021.
 - On the ARMv7 / glibc 2.24 target build with
   `cargo zigbuild --target armv7-unknown-linux-gnueabihf`. `openssl` and `ring` are out: the crypto
-  stack is `snow`, `x25519-dalek` and the RustCrypto primitives the pairing code flows need.
+  stack is `snow`, `x25519-dalek`, `elligator2` and the RustCrypto primitives (`chacha20poly1305`,
+  `sha2`, `hmac`) the pairing code flows need.
 
 ## Licence
 

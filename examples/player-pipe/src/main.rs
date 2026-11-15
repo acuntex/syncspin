@@ -180,6 +180,9 @@ async fn run(options: Options) -> Result<()> {
         pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
         #[cfg(feature = "pairing-code")]
         pairing_pending_text: None,
+        // The example has no display and no speaker, so it offers no dynamic pairing code: an
+        // empty format list advertises nothing. A host with an out-channel sets both lists and
+        // renders `Event::PairingCode`.
         #[cfg(feature = "pairing-code")]
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
@@ -278,14 +281,6 @@ async fn run(options: Options) -> Result<()> {
                     ),
                     Event::PairingFailed { reason } => {
                         eprintln!("pairing failed: {}", reason.as_str())
-                    }
-                    #[cfg(feature = "pairing-code")]
-                    Event::PairingCode { code, format, round } => {
-                        let format = match format {
-                            syncspin_client::CodeFormat::Digits => "digits",
-                            syncspin_client::CodeFormat::QrCode => "QR token",
-                        };
-                        eprintln!("pairing code ({format}, round {round}): {code}");
                     }
                     Event::Disconnected { reason, retry_in } => eprintln!(
                         "disconnected: {reason}; retrying in {}s",

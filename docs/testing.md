@@ -49,12 +49,18 @@ A fake server, not a live Music Assistant, is the reference peer for anything th
 
 ### Pairing
 
-The pairing suites are split by flow; the code flows and the file backend need the features:
+The pairing suites are split by flow. Feature unification decides what a run covers: `storage-file`
+is off in `syncspin-client` but on in `player-pipe`, so a workspace run enables it for the client and
+runs the file backend's tests; `pairing-code` is off everywhere unless requested.
 
 ```sh
 cargo test --workspace --locked
 cargo test --workspace --features pairing-code,storage-file --locked
+cargo test -p syncspin-core -p syncspin-client --locked
 ```
+
+The first runs the PSK, storage and unpair suites, the second adds the code flows, and the third runs
+the library crates with their own defaults - the set a consumer that enables nothing gets.
 
 - `pairing_psk.rs` is the mandatory flow: advertisement, one drawn key, the record, the abort and
   timeout paths, and the re-handshake that carries the stream across a key change.
@@ -215,16 +221,18 @@ against the fake server only; the steps below are the checklist to run, not a re
    `./pairing.json`, and the connection ends. The next start is a guest; a server that still holds
    its half reports `pairing required by ...: CredentialMismatch`.
 
-5. For a server that implements the code flows, rebuild with `--features pairing-code`:
+5. The example offers only the static code flow. It has no display and no speaker, so it advertises
+   neither an emission format nor an out-channel, and a server that activates
+   `dynamic_pairing_code` is answered with `pair/abort`. For a server that implements the static
+   flow, rebuild with `--features pairing-code`:
 
    ```sh
    cargo run -p player-pipe --features pairing-code -- --server <server>:8927 \
      --static-code <8 digits> --open-window
    ```
 
-   The static flow pairs with a code the operator configured on both sides. A dynamic-code
-   activation prints `pairing code (...)` and needs the operator to enter that code in the server.
-   Neither flow has run against a real server either.
+   The operator configures the same eight-digit code on both sides. This flow has not run against a
+   real server either.
 
 If a step fails, the client's stderr names the event or the abort reason and the server log shows
 what it sent. Record both before filing an issue, with the token and all key material removed.
