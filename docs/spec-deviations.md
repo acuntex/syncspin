@@ -26,6 +26,8 @@ harmless.
 | 12  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                   | Stage 1b                      |
 | 13  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                   | Stage 1b                      |
 | 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                     | Stage 1b                      |
+| 15  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                   | Stage 1b                      |
+| 16  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                 | Documented                    |
 
 ## 1. Client-initiated connections only
 
@@ -58,10 +60,12 @@ and is _admissible_ only when those form an allowed set for the matched PSK and 
 playback-capable connection carries `active_roles`. An inadmissible activation must be rejected with
 `client/goodbye` (`pairing_required`, `unauthorized`) or `pair/abort` (`method_not_supported`).
 
-**What we do:** `apply_activate` records `active_roles` and starts the first sync burst; it never
-inspects `activities`, never evaluates the playback-capable rule and never re-evaluates persisted
-roles. There is no `client/goodbye` writer and no `pair/abort` writer, so an inadmissible activation
-is accepted and the session carries on.
+**What we do:** `Session::start` starts the first sync burst once the connection is ready.
+`apply_activate` records `active_roles`, starts a burst only when a re-added `player@v1` has no
+sample yet, and flushes the player stream when the role disappears; it never inspects `activities`,
+never evaluates the playback-capable rule and never re-evaluates persisted roles. There is no
+`client/goodbye` writer and no `pair/abort` writer, so an inadmissible activation is accepted and
+the session carries on.
 
 **Why:** the allowed set depends on the matched PSK and its category. The Sentinel row alone already
 allows four sets — `[]`, `['pairing']`, `['playback']` and `['playback','pairing']` — so this is not
@@ -310,6 +314,47 @@ number into playback would be an unverified control loop.
 **Removing it:** read `underruns()` at each `client/state` report and after a clock burst, grow
 `min_buffer_ms` (bounded) when the count rises, and test the reported value against a fake sink that
 returns a fixed count.
+
+## 15. `stream/clear` with `from_timestamp` flushes everything
+
+**Spec:** `messaging.md`, `stream/clear`. A `from_timestamp` asks the client to discard the buffered
+audio from that server time onward and keep what is earlier; an absent timestamp clears everything.
+
+**What we do:** `handle_stream_clear` flushes the sink regardless of `from_timestamp`, so audio
+before the timestamp is dropped too. The announced format stays open for the chunks that follow,
+because a clear does not end the stream. The client keeps no timestamped queue of its own; the sink
+does, and `Sink::flush` has no "drop from a timestamp" mode.
+
+**Why:** a partial drop needs the sink to map server timestamps to its own buffer and discard a
+suffix of it; the current trait can only drop everything. The full flush is audible as a short gap
+at a seek, but leaving stale audio buffered would be worse.
+
+**Removing it:** add a `Sink::discard_from(&mut self, due: Instant)` (or move the timestamped queue
+into the session) and discard only frames whose deadline is at or after the mapped timestamp; test a
+clear in the middle of a burst of buffered frames.
+
+## 16. Playout deadlines begin after three clock bursts
+
+**Spec:** `messaging.md`, _Clock Synchronization_. The client estimates the server clock from bursts
+of `client/time`/`server/time`, one request at a time, and schedules each frame's playout from that
+estimate.
+
+**What we do:** each burst contributes one measurement, the one with the lowest positive
+`max_error`. `ClockFilter` has an estimate only after three accepted samples
+(`READY_AFTER_SAMPLES`), so the player state is reported as soon as the first reply arrives, but
+audio that arrives before the third burst is handed to the sink with `Instant::now()` instead of a
+scheduled deadline. With a responsive server the three bursts follow each other immediately; with lost
+replies each burst costs its per-message timeouts first.
+
+**Why:** one measurement per burst is the spec's rule, and a readiness threshold below three would
+schedule from a single offset sample with no drift or error estimate. Delivering the audio without a
+deadline is the only honest option while no estimate exists; `Sink::write` documents "now" as "play
+as soon as possible".
+
+**Removing it:** keep bursting until the filter is ready (already done) and, if a deadline is
+required earlier, seed the filter from the first three bursts before reporting the state or relax
+readiness with an explicit accuracy bound; test deadlines with one, two and three answered
+requests.
 
 ## How to update this file
 

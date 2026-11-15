@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use syncspin_client::{
     connect, connect_with_psks, AudioFormat, AudioFrame, ClientConfig, ClientHandle, Codec, Event,
     EventStream, PskCategory, Sink, StoredPsk,
@@ -361,8 +363,13 @@ async fn a_codec_header_is_delivered_to_the_sink() {
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
-    // The FLAC marker plus a STREAMINFO-sized body; the exact bytes matter, not their shape.
-    let header: Vec<u8> = (0..42).map(|index| index as u8).collect();
+    // 40 bytes is not a multiple of three, so its standard base64 carries `==` padding; the
+    // client has to accept the padded form the protocol specifies.
+    let header: Vec<u8> = (0..40).map(|index| index as u8).collect();
+    assert!(
+        STANDARD.encode(&header).ends_with("=="),
+        "the header must exercise base64 padding"
+    );
     server.stream_start_with_header("flac", 48_000, 2, 16, Some(&header));
 
     let format = match next_event(&mut events).await {
@@ -1154,4 +1161,61 @@ async fn a_fragmented_audio_chunk_reassembles_before_the_sink_sees_it() {
     let written = wait_for_writes(&recordings, 1).await;
     assert_eq!(written.len(), 1, "a fragmented chunk is one frame");
     assert_eq!(written[0].frame, Written::Pcm(data));
+}
+#[tokio::test]
+async fn a_second_time_request_waits_for_the_first_reply() {
+    let options = ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    let first = tokio::time::timeout(Duration::from_secs(2), server.next_time_request())
+        .await
+        .expect("the client must send its first clock request")
+        .expect("the connection must stay open");
+
+    // The spec sends one request at a time: no second request may arrive before the reply.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server.next_time_request())
+            .await
+            .is_err(),
+        "a second client/time arrived before the first reply"
+    );
+
+    server.answer_time(first);
+    tokio::time::timeout(Duration::from_secs(2), server.next_time_request())
+        .await
+        .expect("the client must send the next request after the reply")
+        .expect("the connection must stay open");
+}
+
+#[tokio::test]
+async fn a_stream_end_for_another_role_leaves_the_player_alone() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    server.stream_end_for(&["visualizer"]);
+    server.audio(now_us(), 0, vec![0x88; 64]);
+
+    // The player stream is untouched: the chunk still plays and the sink was not flushed again.
+    let written = wait_for_writes(&recordings, 1).await;
+    assert_eq!(written[0].frame, Written::Pcm(vec![0x88; 64]));
+    assert_eq!(
+        recordings.flushes(),
+        1,
+        "a stream end for another role must not flush the player stream"
+    );
 }

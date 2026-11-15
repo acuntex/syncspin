@@ -51,6 +51,8 @@ pub struct ServerOptions {
     pub active_roles: Vec<String>,
     /// How many `client/time` requests to answer; `None` answers all, `Some(0)` none.
     pub answer_time_limit: Option<usize>,
+    /// Whether `client/time` requests are reported but not answered until the test asks.
+    pub manual_time: bool,
 }
 
 impl Default for ServerOptions {
@@ -63,6 +65,7 @@ impl Default for ServerOptions {
             start_handshake: true,
             active_roles: vec!["player@v1".to_owned(), "metadata@v1".to_owned()],
             answer_time_limit: None,
+            manual_time: false,
         }
     }
 }
@@ -79,8 +82,8 @@ pub enum Command {
         bit_depth: u8,
         codec_header: Option<String>,
     },
-    /// Sends `stream/end`.
-    StreamEnd,
+    /// Sends `stream/end` for the given roles (`None` means every role).
+    StreamEnd { roles: Option<Vec<String>> },
     /// Sends `stream/clear`.
     StreamClear { from_timestamp: Option<i64> },
     /// Sends `server/activate` with a new role set.
@@ -98,6 +101,8 @@ pub enum Command {
     },
     /// Sends a raw transport plaintext, for malformed frames a structured command cannot build.
     Binary(Vec<u8>),
+    /// Answers the outstanding `client/time` request with this transmit timestamp.
+    AnswerTime(i64),
     /// Closes the WebSocket cleanly.
     Close,
 }
@@ -116,6 +121,8 @@ pub enum Observation {
     ClientState(Box<ClientState>),
     /// The server answered the nth `client/time` request.
     TimeReply(usize),
+    /// A `client/time` request arrived and is waiting for a manual answer.
+    TimeRequest(i64),
     /// The connection closed.
     Closed,
 }
@@ -199,9 +206,34 @@ impl FakeServer {
         });
     }
 
-    /// Sends `stream/end`.
+    /// Sends `stream/end` for every role.
     pub fn stream_end(&self) {
-        let _ = self.commands.send(Command::StreamEnd);
+        let _ = self.commands.send(Command::StreamEnd { roles: None });
+    }
+
+    /// Sends `stream/end` for the given roles only.
+    pub fn stream_end_for(&self, roles: &[&str]) {
+        let _ = self.commands.send(Command::StreamEnd {
+            roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
+        });
+    }
+
+    /// Answers the outstanding clock request manually.
+    pub fn answer_time(&self, client_transmitted: i64) {
+        let _ = self.commands.send(Command::AnswerTime(client_transmitted));
+    }
+
+    /// Waits until a `client/time` request arrives and returns its transmit timestamp.
+    pub async fn next_time_request(&mut self) -> Option<i64> {
+        loop {
+            match self.observation().await {
+                Some(Observation::TimeRequest(client_transmitted)) => {
+                    return Some(client_transmitted)
+                }
+                Some(_) => continue,
+                None => return None,
+            }
+        }
     }
 
     /// Sends `stream/clear`, optionally from a server timestamp.
@@ -485,13 +517,17 @@ async fn serve(
                 )
                 .await?;
             }
-            LinkEvent::Command(Some(Command::StreamEnd)) => {
+            LinkEvent::Command(Some(Command::StreamEnd { roles })) => {
                 send_encrypted(
                     &mut socket,
                     &mut noise,
-                    &Incoming::StreamEnd(StreamEnd { roles: None }),
+                    &Incoming::StreamEnd(StreamEnd { roles }),
                 )
                 .await?;
+            }
+            LinkEvent::Command(Some(Command::AnswerTime(client_transmitted))) => {
+                let reply = answer_time(ClientTime { client_transmitted });
+                send_encrypted(&mut socket, &mut noise, &reply).await?;
             }
             LinkEvent::Command(Some(Command::StreamClear { from_timestamp })) => {
                 send_encrypted(
@@ -587,15 +623,18 @@ async fn handle_client_message(
     };
     let text = std::str::from_utf8(&plaintext[1..]).context("client JSON is not UTF-8")?;
     match Incoming::parse(text)? {
-        Some(Incoming::ClientTime(request))
-            if options
+        Some(Incoming::ClientTime(request)) => {
+            if options.manual_time {
+                let _ = observations.send(Observation::TimeRequest(request.client_transmitted));
+            } else if options
                 .answer_time_limit
-                .is_none_or(|limit| *answered_time < limit) =>
-        {
-            *answered_time += 1;
-            let reply = answer_time(request);
-            send_encrypted(socket, noise, &reply).await?;
-            let _ = observations.send(Observation::TimeReply(*answered_time));
+                .is_none_or(|limit| *answered_time < limit)
+            {
+                *answered_time += 1;
+                let reply = answer_time(request);
+                send_encrypted(socket, noise, &reply).await?;
+                let _ = observations.send(Observation::TimeReply(*answered_time));
+            }
         }
         Some(Incoming::ClientState(state)) => {
             let _ = observations.send(Observation::ClientState(Box::new(state)));

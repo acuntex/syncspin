@@ -136,8 +136,9 @@ pub trait Sink: Send + 'static {
 
     /// Drops audio that is buffered but not audible yet.
     ///
-    /// The session calls this before opening a new stream. It must succeed when no stream is
-    /// open, so a sink can treat it as "discard everything, keep the output device".
+    /// The session calls this before opening a new stream, when the server ends or clears the
+    /// stream, and when the player role is removed. It must succeed when no stream is open, so a
+    /// sink can treat it as "discard everything, keep the output device".
     fn flush(&mut self) -> anyhow::Result<()>;
 
     /// Reports the output delay the sink adds beyond the audio port.

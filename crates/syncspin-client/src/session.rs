@@ -42,8 +42,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Number of `client/time` round trips in one clock-sync burst.
 const SYNC_MESSAGES: usize = 8;
 
-/// How long to wait for one `server/time` reply before advancing the burst.
-const SYNC_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long to wait for one `server/time` reply before sending the next request.
+///
+/// The spec allows the client to move on without a reply after a timeout of its choosing.
+const SYNC_REPLY_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Overall cap on one burst, so a peer that stalls cannot hold the session loop.
+const SYNC_BURST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Minimum spacing between consecutive sync bursts, so a long stream keeps tracking the clock.
 const RESYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -175,6 +180,10 @@ pub(crate) struct Session {
     sync_remaining: usize,
     /// Deadline for the current burst, or `None` when no burst is running.
     burst_deadline: Option<Instant>,
+    /// Deadline for the reply to the request on the wire, or `None` when no reply is outstanding.
+    reply_deadline: Option<Instant>,
+    /// Transmit timestamp of the request on the wire, used to recognise its reply.
+    outstanding_sent_us: Option<i64>,
     /// When the current or last burst started, for periodic re-sync spacing.
     burst_started: Option<Instant>,
     /// Samples collected during the current burst; only the best one is pushed.
@@ -225,6 +234,8 @@ impl Session {
             stream: None,
             sync_remaining: 0,
             burst_deadline: None,
+            reply_deadline: None,
+            outstanding_sent_us: None,
             burst_started: None,
             burst_samples: Vec::new(),
             state_sent: false,
@@ -259,15 +270,21 @@ impl Session {
 
             self.drive_clock().await?;
 
-            // While a clock burst is running the read has a deadline, so lost replies end the
-            // burst instead of stalling it. Any other frame still arrives normally.
-            let incoming = match self.burst_deadline {
+            // While a request is on the wire the read has its reply deadline; the overall burst
+            // deadline is the backstop. Any other frame still arrives normally.
+            let deadline = match (self.reply_deadline, self.burst_deadline) {
+                (Some(reply), Some(burst)) => Some(reply.min(burst)),
+                (Some(reply), None) => Some(reply),
+                (None, Some(burst)) => Some(burst),
+                (None, None) => None,
+            };
+            let incoming = match deadline {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     match tokio::time::timeout(remaining, self.transport.read()).await {
                         Ok(result) => result?,
                         Err(_elapsed) => {
-                            self.finish_burst().await?;
+                            self.handle_clock_timeout().await?;
                             continue;
                         }
                     }
@@ -291,28 +308,28 @@ impl Session {
         }
     }
 
-    /// Sends the next `client/time` burst when one is due.
+    /// Sends the next `client/time` request of the current burst when one is due.
     ///
-    /// A burst is sent as one group and its replies are collected under a single deadline; only
-    /// the measurement with the smallest positive error bound reaches the clock filter.
+    /// The spec requires one request at a time: the next goes out after the reply arrives or after
+    /// a short per-message timeout, whichever comes first. The burst's measurements are buffered
+    /// and only the one with the smallest positive error bound reaches the clock filter.
     async fn drive_clock(&mut self) -> Result<()> {
         if self.sync_remaining == 0
             && self.burst_deadline.is_none()
+            && self.reply_deadline.is_none()
             && self.player_active()
             && self.burst_due()
         {
             self.start_burst();
         }
 
-        if self.sync_remaining > 0 {
-            while self.sync_remaining > 0 {
-                let request = Incoming::ClientTime(ClientTime {
-                    client_transmitted: now_us(),
-                });
-                self.send_json(&request).await?;
-                self.sync_remaining -= 1;
-            }
-            self.burst_deadline = Some(Instant::now() + SYNC_REPLY_TIMEOUT);
+        if self.sync_remaining > 0 && self.reply_deadline.is_none() {
+            let client_transmitted = now_us();
+            let request = Incoming::ClientTime(ClientTime { client_transmitted });
+            self.send_json(&request).await?;
+            self.outstanding_sent_us = Some(client_transmitted);
+            self.sync_remaining -= 1;
+            self.reply_deadline = Some(Instant::now() + SYNC_REPLY_TIMEOUT);
         }
         Ok(())
     }
@@ -337,14 +354,38 @@ impl Session {
     /// Starts a sync burst of [`SYNC_MESSAGES`] `client/time` round trips.
     fn start_burst(&mut self) {
         self.sync_remaining = SYNC_MESSAGES;
-        self.burst_deadline = None;
+        self.burst_deadline = Some(Instant::now() + SYNC_BURST_TIMEOUT);
+        self.reply_deadline = None;
+        self.outstanding_sent_us = None;
         self.burst_started = Some(Instant::now());
         self.burst_samples.clear();
     }
 
-    /// Ends the current burst: pushes its best measurement and reports the player state once.
+    /// Handles the deadline that fired while waiting for a reply.
+    ///
+    /// A per-message timeout moves the burst on to its next request; when the last request has no
+    /// reply, or the overall burst deadline elapsed, the burst ends with the measurements it has.
+    async fn handle_clock_timeout(&mut self) -> Result<()> {
+        let burst_expired = self
+            .burst_deadline
+            .is_some_and(|deadline| deadline <= Instant::now());
+        if burst_expired {
+            return self.finish_burst().await;
+        }
+        self.reply_deadline = None;
+        self.outstanding_sent_us = None;
+        if self.sync_remaining == 0 {
+            self.finish_burst().await?;
+        }
+        Ok(())
+    }
+
+    /// Ends the current burst: pushes its best measurement and reports the state if it is still
+    /// owed (a burst with no usable reply reports nothing).
     async fn finish_burst(&mut self) -> Result<()> {
         self.burst_deadline = None;
+        self.reply_deadline = None;
+        self.outstanding_sent_us = None;
         if let Some(sample) = best_sample(&self.burst_samples) {
             self.clock.push(sample);
         }
@@ -388,7 +429,9 @@ impl Session {
                 Ok(())
             }
             Some(Incoming::StreamStart(start)) => self.handle_stream_start(start),
+            Some(Incoming::StreamEnd(end)) if !affects_player(end.roles.as_deref()) => Ok(()),
             Some(Incoming::StreamEnd(_)) => self.stop_stream(),
+            Some(Incoming::StreamClear(clear)) if !affects_player(clear.roles.as_deref()) => Ok(()),
             Some(Incoming::StreamClear(clear)) => self.handle_stream_clear(clear),
             // A message for a role or direction this client does not act on.
             Some(_) => Ok(()),
@@ -408,6 +451,8 @@ impl Session {
             self.state_sent = false;
             self.sync_remaining = 0;
             self.burst_deadline = None;
+            self.reply_deadline = None;
+            self.outstanding_sent_us = None;
             self.burst_samples.clear();
             self.stop_stream()?;
         } else if !had_player && has_player {
@@ -423,19 +468,31 @@ impl Session {
 
     /// Feeds one `server/time` reply into the current burst.
     ///
-    /// Only a reply to the burst that is running is used; an unsolicited `server/time` is ignored.
-    /// The burst ends on its last reply or on the deadline in [`Session::serve`].
+    /// Only the reply to the request on the wire is used: its `client_transmitted` has to match
+    /// the request. An unsolicited, late or mis-echoed `server_time` is ignored, because the next
+    /// request may already be on the wire.
     async fn handle_server_time(&mut self, time: ServerTime) -> Result<()> {
-        if self.burst_deadline.is_none() {
+        if self.reply_deadline.is_none()
+            || self.outstanding_sent_us != Some(time.client_transmitted)
+        {
             return Ok(());
         }
+        self.outstanding_sent_us = None;
         self.burst_samples.push(TimeSample {
             client_sent_us: time.client_transmitted,
             server_received_us: time.server_received,
             server_sent_us: time.server_transmitted,
             client_received_us: now_us(),
         });
-        if self.burst_samples.len() >= SYNC_MESSAGES {
+        self.reply_deadline = None;
+
+        // A measurement exists, so the player can report itself without waiting for the rest of
+        // the burst; the burst keeps collecting and pushes its best at the end.
+        if !self.state_sent && self.player_active() {
+            self.send_client_state().await?;
+        }
+
+        if self.sync_remaining == 0 {
             self.finish_burst().await?;
         }
         Ok(())
@@ -443,9 +500,9 @@ impl Session {
 
     /// Reports the player state, with the sink's output delay and no volume yet.
     ///
-    /// Sent when the player role becomes active and again after it was removed and re-added. The
-    /// host owns the output level; until it reports one, the player object carries no volume
-    /// rather than an invented baseline.
+    /// Sent as soon as the first measurement of a burst arrives after the player role became
+    /// active, and again after the role was removed and re-added. The host owns the output level;
+    /// until it reports one, the player object carries no volume rather than an invented baseline.
     async fn send_client_state(&mut self) -> Result<()> {
         self.state_sent = true;
         let output_delay_ms = self.sink.latency().map_or(0, |latency| {
@@ -864,6 +921,16 @@ impl PskMetadata {
     }
 }
 
+/// Whether a `stream/end` or `stream/clear` role list affects the player stream.
+///
+/// An absent list means every role; otherwise it has to name `player@v1`.
+fn affects_player(roles: Option<&[String]>) -> bool {
+    match roles {
+        None => true,
+        Some(roles) => roles.iter().any(|role| role == PLAYER_ROLE),
+    }
+}
+
 /// Whether `value` is the canonical unpadded base64url encoding of a 32-byte key id.
 fn is_canonical_psk_id(value: &str) -> bool {
     if value.len() != PSK_ID_LEN {
@@ -1065,6 +1132,16 @@ mod tests {
             best_sample(&[impossible, broad]),
             Some(broad),
             "the unusable sample is skipped"
+        );
+
+        // Equal bounds keep the earlier measurement.
+        let first_tie = sample(20_000, 20_100, 20_100, 20_300);
+        let second_tie = sample(30_000, 30_100, 30_100, 30_300);
+        assert_eq!(max_error_us(&first_tie), max_error_us(&second_tie));
+        assert_eq!(
+            best_sample(&[first_tie, second_tie]),
+            Some(first_tie),
+            "a tie keeps the earlier sample"
         );
     }
 
