@@ -5,8 +5,11 @@
 //! It knows no transport and no device integration, and it never depends on the
 //! `syncspin-client` or `syncspin-server` crates.
 //!
-//! This is a `0.1` work in progress: the Noise layer exists so far.
+//! This is a `0.1` work in progress: the Noise layer, the message types and the framing layer
+//! exist so far.
 
+pub mod framing;
+pub mod messages;
 pub mod noise;
 
 /// Returns the version of this crate as recorded in its manifest.
