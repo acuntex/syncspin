@@ -47,6 +47,16 @@
 //! confirmation closes the window. The round runs CPace over X25519 with SHA-512 and delivers the
 //! new long-term PSK sealed under its output; that layer has not had an external review.
 //!
+//! With the same feature and at least one entry in each of [`ClientConfig::code_formats`] and
+//! [`ClientConfig::code_out_channels`], the client offers the Dynamic Pairing Code method instead of
+//! relying on a fixed secret. It draws a nonce per attempt, locks it with `commit_B` in
+//! `client/pair-init`, and derives the per-session code once the server's `nonce_A` arrives: six
+//! digits, or a version-1 pairing token for a QR code. [`Event::PairingCode`] carries the code and
+//! its round; the code stays the same across the rounds of one attempt. A failed key confirmation
+//! asks the server for another round, and the twentieth failed round ends the attempt. After the
+//! limit the client holds dynamic attempts back - answering them with `client/pair-pending` - until
+//! [`ControlHandle::release_holdback`] is called, the deliberate operator action the spec requires.
+//!
 //! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
 //! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
 //! [`Event::StreamClear`] for a seek, plus [`Event::Track`] for the now-playing metadata with its
@@ -73,7 +83,10 @@ pub use config::{
     AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, MAX_PLAYER_NAME_LEN,
 };
 #[cfg(feature = "pairing-code")]
-pub use config::{DEFAULT_PAIRING_WINDOW, MAX_PAIRING_PENDING_TEXT_LEN, STATIC_PAIRING_CODE_LEN};
+pub use config::{
+    CodeFormat, CodeOutChannel, DEFAULT_PAIRING_WINDOW, MAX_PAIRING_PENDING_TEXT_LEN,
+    STATIC_PAIRING_CODE_LEN,
+};
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};
 
 // The identity is part of [`ClientConfig`], so a host that builds a configuration needs it. A

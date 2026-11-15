@@ -123,6 +123,10 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
         #[cfg(feature = "pairing-code")]
         pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     }
 }
 
@@ -292,6 +296,10 @@ async fn an_unreachable_server_is_an_event_and_not_an_error() {
         pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
         #[cfg(feature = "pairing-code")]
         pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(recordings.clone())))
         .await
@@ -561,6 +569,10 @@ async fn the_retry_delay_is_awaited_before_the_next_attempt() {
         pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
         #[cfg(feature = "pairing-code")]
         pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(Recordings::default())))
         .await

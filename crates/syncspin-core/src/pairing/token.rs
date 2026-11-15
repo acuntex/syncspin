@@ -19,6 +19,7 @@
 //! - version `0` carries `client_key || pairing_psk`, 64 payload bytes: a raw Curve25519 public
 //!   key followed by the client's pairing PSK. [`encode_v0`] builds it.
 //! - version `1` carries the 24-byte dynamic pairing code of the `qr_code` emission format.
+//!   [`encode_v1`] builds it.
 //!
 //! A token is a credential: anyone holding it can pair a server with the client. Nothing here is
 //! behind a feature gate - a token is text, not a PAKE - and neither [`Debug`] output nor an
@@ -36,7 +37,7 @@ use anyhow::{anyhow, bail, Result};
 const VERSION_0_PAYLOAD_LEN: usize = 64;
 
 /// Version 1's payload length: the dynamic pairing code of the `qr_code` emission format.
-const VERSION_1_PAYLOAD_LEN: usize = 24;
+pub const VERSION_1_PAYLOAD_LEN: usize = 24;
 
 /// The RFC 4648 base32 alphabet, upper case: `A`-`Z` then `2`-`7`.
 const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -91,6 +92,28 @@ pub fn encode_v0(client_key: &[u8; 32], psk: &[u8; 32]) -> String {
     payload.extend_from_slice(client_key);
     payload.extend_from_slice(psk);
     encode(0, &payload)
+}
+
+/// Encodes a version-1 pairing token: the 24-byte dynamic pairing code as base32.
+///
+/// `code` is the `qr_code` emission format of a dynamic pairing code, the first 24 bytes of the
+/// derivation digest. A display renders the returned string as a QR code; the server decodes it
+/// and takes the payload as the entered code.
+///
+/// # Example
+///
+/// ```
+/// use syncspin_core::pairing::token::encode_v1;
+///
+/// // The spec's reference vector: the code 0xe0..=0xf7.
+/// let code: [u8; 24] = std::array::from_fn(|index| 0xe0 + index as u8);
+/// assert_eq!(
+///     encode_v1(&code),
+///     "SP:14DQ6FY7E4XTOP9HJ5LV6Z3PO57YPD4XT6T97N5Y"
+/// );
+/// ```
+pub fn encode_v1(code: &[u8; VERSION_1_PAYLOAD_LEN]) -> String {
+    encode(1, code)
 }
 
 /// Decodes a pairing token, or reports why the input is not one.

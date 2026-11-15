@@ -12,13 +12,23 @@
 //! pairing window the host opens; this module holds the CPace values between the messages, the
 //! session owns the window and the messages.
 //!
+//! The dynamic pairing code flow is offered when the same feature is on,
+//! [`ClientConfig::code_formats`](crate::ClientConfig::code_formats) and
+//! [`ClientConfig::code_out_channels`](crate::ClientConfig::code_out_channels) are set and a store
+//! exists. It draws a nonce per attempt, commits to it in `client/pair-init`, derives the code once
+//! the server's nonce arrives, and runs CPace rounds until the server's key confirmation verifies.
+//! This module holds the binding values and the round state; the session emits the code, sends the
+//! messages and counts the rounds against the limit.
+//!
 //! # Key material
 //!
 //! The pairing PSK and the long-term PSK of an attempt are key material. Both are wrapped in types
 //! whose `Debug` prints `<redacted>`, and neither is ever formatted into an event or an error. The
 //! static code, the CPace intermediate session key and the key-confirmation tags are secrets of
 //! the same kind: they live in types without a formatting implementation, and the tags leave this
-//! module only as base64 on the wire.
+//! module only as base64 on the wire. The dynamic flow's `nonce_B` is secret until it is revealed,
+//! sealed, in `client/pair-confirm`; it is never formatted, and the code it contributes to is only
+//! handed to the session for deliberate emission.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -30,10 +40,16 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
 #[cfg(feature = "pairing-code")]
+use syncspin_core::pairing::code::commitment;
+#[cfg(feature = "pairing-code")]
+use syncspin_core::pairing::code::DynamicCode;
+#[cfg(feature = "pairing-code")]
 use syncspin_core::pairing::pake::{self, SHARE_LEN, TAG_LEN};
 #[cfg(feature = "pairing-code")]
-use syncspin_core::pairing::wrap::{self, PSK_LABEL};
+use syncspin_core::pairing::wrap::{self, NONCE_LABEL, PSK_LABEL};
 
+#[cfg(feature = "pairing-code")]
+use crate::config::CodeFormat;
 use crate::config::{PskCategory, StoredPsk};
 use crate::storage::Storage;
 use syncspin_core::noise::SENTINEL_PSK;
@@ -44,6 +60,10 @@ pub(crate) const METHOD_PAIRING_PSK: &str = "pairing_psk";
 /// Method identifier of the Static Pairing Code flow, as it is spelled on the wire.
 #[cfg(feature = "pairing-code")]
 pub(crate) const METHOD_STATIC_PAIRING_CODE: &str = "static_pairing_code";
+
+/// Method identifier of the Dynamic Pairing Code flow, as it is spelled on the wire.
+#[cfg(feature = "pairing-code")]
+pub(crate) const METHOD_DYNAMIC_PAIRING_CODE: &str = "dynamic_pairing_code";
 
 /// The label that starts every CPace `sid`, as `pairing.md` fixes it.
 #[cfg(feature = "pairing-code")]
@@ -238,52 +258,132 @@ pub(crate) enum MatchedPsk {
     Stored(PskCategory),
 }
 
-/// Which method one attempt runs, and how far a static-code attempt has gone.
+/// Which method one attempt runs, and how far its code flow has gone.
 ///
-/// The Pairing PSK flow sends both of its messages back to back, so it has one state. The static
-/// flow alternates with the server: init, the two CPace shares, the two tags, then the finalize.
+/// The Pairing PSK flow sends both of its messages back to back, so it has one state. The code
+/// flows alternate with the server: init, the two CPace shares, the two tags, then the finalize.
 #[cfg(feature = "pairing-code")]
 enum Flow {
     /// The Pairing PSK flow, which sends `client/pair-init` and `client/pair-finalize` at once.
     PairingPsk,
     /// The Static Pairing Code flow, in the phase its one CPace round is in.
     Static(CodePhase),
+    /// The Dynamic Pairing Code flow, holding the binding values and the current round.
+    Dynamic(DynamicFlow),
 }
 
-/// How far the single CPace round of a static-code attempt has gone.
+/// The values the Dynamic Pairing Code Flow holds between `client/pair-init` and the finalize.
+///
+/// The binding values are fixed per attempt and unchanged across rounds: `nonce_B` is drawn once,
+/// its commitment is what `client/pair-init` locked, and `nonce_A` arrives in the first round's
+/// `server/pair-init`. The derived code lives here as a type without a formatting implementation,
+/// so a host sees it only through the event the session emits.
+#[cfg(feature = "pairing-code")]
+struct DynamicFlow {
+    /// This client's nonce, kept private until it is sealed into `client/pair-confirm`.
+    nonce_b: [u8; 32],
+    /// The server's nonce from the first round, or `None` before that message arrived.
+    nonce_a: Option<[u8; 32]>,
+    /// The derived code, once both nonces are known.
+    code: Option<DynamicCode>,
+    /// The emission format the activation selected.
+    format: CodeFormat,
+    /// The round this attempt is in; `0` before the first `server/pair-init`.
+    round: u32,
+    /// The phase of the round in progress.
+    phase: CodePhase,
+}
+
+/// How far one CPace round of a code flow has gone.
 #[cfg(feature = "pairing-code")]
 enum CodePhase {
+    /// A dynamic round has not begun: the server's `server/pair-init` is awaited.
+    RoundStart,
     /// `client/pair-init` is on the wire; the server's share is awaited.
     Auth,
     /// Both shares crossed; the server's tag is awaited and ours is ready to send.
-    Confirm(StaticCode),
+    Confirm(Box<RoundProof>),
     /// Both tags crossed and the sealed key is on the wire; `server/pair-finalize` is awaited.
     Finalization,
 }
 
-/// The values a static-code attempt holds between `server/pair-auth` and `server/pair-confirm`.
-///
-/// The CPace intermediate session key is not kept: the two tags and the sealed long-term PSK are
-/// everything the following messages need, and they are dropped once the finalize is sent.
 #[cfg(feature = "pairing-code")]
-struct StaticCode {
+impl CodePhase {
+    /// Whether the round has not begun yet.
+    fn is_round_start(&self) -> bool {
+        matches!(self, CodePhase::RoundStart)
+    }
+
+    /// Whether the server's CPace share is awaited.
+    fn is_auth(&self) -> bool {
+        matches!(self, CodePhase::Auth)
+    }
+
+    /// Whether the server's key-confirmation tag is awaited.
+    fn is_confirm(&self) -> bool {
+        matches!(self, CodePhase::Confirm(_))
+    }
+
+    /// Whether `server/pair-finalize` is awaited.
+    fn is_finalization(&self) -> bool {
+        matches!(self, CodePhase::Finalization)
+    }
+}
+
+/// The values one CPace round holds between `server/pair-auth` and `server/pair-confirm`.
+///
+/// The CPace intermediate session key is not kept: the two tags and the seals are everything the
+/// following messages need, and they are dropped once the finalize is sent. The static flow seals
+/// only the long-term PSK; the dynamic flow additionally seals `nonce_B`, the opening of the
+/// commitment `client/pair-init` sent.
+#[cfg(feature = "pairing-code")]
+struct RoundProof {
     /// `Ta`, the server's tag this client expects in `server/pair-confirm`.
     expected_server_tag: [u8; TAG_LEN],
     /// `Tb`, this client's tag for `client/pair-confirm`.
     client_tag: [u8; TAG_LEN],
     /// The long-term PSK sealed under `K_wrap`, for `client/pair-finalize`.
     wrapped_psk: [u8; SEALED_LEN],
+    /// `nonce_B` sealed under the nonce label, for the dynamic flow's `client/pair-confirm`.
+    wrapped_nonce_b: Option<[u8; SEALED_LEN]>,
 }
 
-/// What a verified `server_kc` releases: the two fields of the messages that follow.
+/// What a verified `server_kc` releases: the fields of the messages that follow.
 ///
-/// Both are key material in base64, so the type has no formatting implementation.
+/// All of them are derived from key material, so the type has no formatting implementation.
 #[cfg(feature = "pairing-code")]
 pub(crate) struct Confirmation {
     /// `Tb` as 86 unpadded base64url characters, for `client/pair-confirm`.
     pub(crate) client_kc: String,
     /// The sealed long-term PSK as 64 unpadded base64url characters, for `client/pair-finalize`.
     pub(crate) wrapped_psk: String,
+    /// The sealed `nonce_B` as 64 unpadded base64url characters, in the dynamic flow only.
+    pub(crate) wrapped_nonce_b: Option<String>,
+}
+
+/// The code one round shows the operator.
+///
+/// `code` is the text a host displays or speaks: six digits in the `digits` format, a version-1
+/// token in `qr_code`. It is the protocol's deliberate out-channel emission, not an accidental
+/// format of a secret, and the session carries it into [`Event::PairingCode`](crate::Event).
+#[cfg(feature = "pairing-code")]
+pub(crate) struct CodeEmission {
+    /// The operator-facing code: six digits, or the version-1 token string.
+    pub(crate) code: String,
+    /// The emission format the client was activated with.
+    pub(crate) format: CodeFormat,
+    /// The round this emission belongs to, counting from `1`.
+    pub(crate) round: u32,
+}
+
+/// What verifying `server_kc` decided.
+#[cfg(feature = "pairing-code")]
+pub(crate) enum TagOutcome {
+    /// The tag verified; the two messages that follow may carry these fields.
+    Confirmed(Confirmation),
+    /// The tag did not verify. The dynamic flow rewound to its next round; the static flow leaves
+    /// the decision to its caller.
+    Mismatch,
 }
 
 /// One pairing attempt in progress.
@@ -338,45 +438,208 @@ impl PairingAttempt {
         }
     }
 
+    /// Starts a dynamic-code attempt, which waits for the server's `server/pair-init`.
+    ///
+    /// `nonce_B` is drawn here, once, so the commitment `client/pair-init` carries is fixed for the
+    /// whole attempt - across every round and every retry. `format` is the emission format the
+    /// activation selected and decides how the derived code is presented and what its CPace `PRS`
+    /// are.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) fn dynamic_code(
+        pairing_index: u32,
+        timeout: Duration,
+        pairing_psk: Option<[u8; 32]>,
+        format: CodeFormat,
+    ) -> PairingAttempt {
+        PairingAttempt {
+            pairing_index,
+            deadline: Instant::now() + timeout,
+            psk: draw_long_term_psk(pairing_psk),
+            flow: Flow::Dynamic(DynamicFlow {
+                nonce_b: draw_key(),
+                nonce_a: None,
+                code: None,
+                format,
+                round: 0,
+                phase: CodePhase::RoundStart,
+            }),
+        }
+    }
+
     /// Whether this attempt runs the Static Pairing Code flow.
     #[cfg(feature = "pairing-code")]
     pub(crate) fn is_static_code(&self) -> bool {
         matches!(self.flow, Flow::Static(_))
     }
 
+    /// Whether this attempt runs the Dynamic Pairing Code flow.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) fn is_dynamic_code(&self) -> bool {
+        matches!(self.flow, Flow::Dynamic(_))
+    }
+
+    /// Returns `commit_B` for `client/pair-init`, or `None` outside the dynamic flow.
+    ///
+    /// The commitment is public: it locks `nonce_B` without revealing it, and the server verifies
+    /// the opening it receives in `client/pair-confirm` against it.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) fn commit_b(&self) -> Option<String> {
+        match &self.flow {
+            Flow::Dynamic(state) => Some(URL_SAFE_NO_PAD.encode(commitment(&state.nonce_b))),
+            _ => None,
+        }
+    }
+
+    /// Whether the server's `server/pair-init` is the message this attempt is waiting for.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) fn awaiting_server_init(&self) -> bool {
+        matches!(
+            self.flow,
+            Flow::Dynamic(DynamicFlow {
+                phase: CodePhase::RoundStart,
+                ..
+            })
+        )
+    }
+
     /// Whether the server's CPace share is the message this attempt is waiting for.
     #[cfg(feature = "pairing-code")]
     pub(crate) fn awaiting_server_auth(&self) -> bool {
-        matches!(self.flow, Flow::Static(CodePhase::Auth))
+        self.phase_is(CodePhase::is_auth)
     }
 
     /// Whether the server's key-confirmation tag is the message this attempt is waiting for.
     #[cfg(feature = "pairing-code")]
     pub(crate) fn awaiting_server_confirm(&self) -> bool {
-        matches!(self.flow, Flow::Static(CodePhase::Confirm(_)))
+        self.phase_is(CodePhase::is_confirm)
     }
 
     /// Whether `server/pair-finalize` is the message this attempt is waiting for.
     #[cfg(feature = "pairing-code")]
     pub(crate) fn awaiting_finalize(&self) -> bool {
-        matches!(self.flow, Flow::Static(CodePhase::Finalization))
+        self.phase_is(CodePhase::is_finalization)
     }
 
-    /// Answers `server/pair-auth`: derives the shared point, both tags and the sealed key.
+    /// Returns whether the round's phase satisfies `check`.
+    #[cfg(feature = "pairing-code")]
+    fn phase_is(&self, check: fn(&CodePhase) -> bool) -> bool {
+        match &self.flow {
+            Flow::Static(phase) => check(phase),
+            Flow::Dynamic(state) => check(&state.phase),
+            Flow::PairingPsk => false,
+        }
+    }
+
+    /// Returns the number of the round in progress: `1` for the static flow's only round.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) fn round(&self) -> u32 {
+        match &self.flow {
+            Flow::Dynamic(state) => state.round.max(STATIC_CODE_ROUND),
+            _ => STATIC_CODE_ROUND,
+        }
+    }
+
+    /// Returns the code one round shows the operator, or `None` outside the dynamic flow.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) fn code_emission(&self) -> Option<CodeEmission> {
+        let Flow::Dynamic(state) = &self.flow else {
+            return None;
+        };
+        let code = state.code.as_ref()?;
+        Some(CodeEmission {
+            code: match state.format {
+                CodeFormat::Digits => code.digits_text(),
+                CodeFormat::QrCode => code.qr_token(),
+            },
+            format: state.format,
+            round: state.round,
+        })
+    }
+
+    /// Returns the CPace `PRS` of the derived code, or `None` outside the dynamic flow.
     ///
-    /// `sid` is [`pake_sid`] of this attempt and `code` the configured code, whose digits are
-    /// CPace's `PRS`. The function returns `Yb`, the share `client/pair-auth` carries. The CPace
+    /// The static flow's `PRS` is its configured code, which the caller passes directly; the
+    /// dynamic flow's is derived, so it lives with the attempt.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) fn prs(&self) -> Option<Vec<u8>> {
+        let Flow::Dynamic(state) = &self.flow else {
+            return None;
+        };
+        let code = state.code.as_ref()?;
+        Some(match state.format {
+            CodeFormat::Digits => code.digits().to_vec(),
+            CodeFormat::QrCode => code.qr_payload().to_vec(),
+        })
+    }
+
+    /// Begins a dynamic round from the server's `server/pair-init` and returns its emission.
+    ///
+    /// The first round must carry `nonce_A`, and the code is derived from it, the handshake hash
+    /// and the attempt's own nonce. Later rounds carry no nonce; a server that repeats a different
+    /// one would silently change the code under the operator's fingers, which is a protocol error.
+    /// The round number increases per message, so every round has its own CPace `sid`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the attempt is not a dynamic one, when the message is out of sequence for its
+    /// phase, or when the server's nonce is missing in the first round, repeated differently, or
+    /// contradicts the attempt's own binding.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) fn begin_round(
+        &mut self,
+        nonce_a: Option<[u8; 32]>,
+        handshake_hash: &[u8; 32],
+    ) -> Result<CodeEmission> {
+        let Flow::Dynamic(state) = &mut self.flow else {
+            bail!("the attempt does not run the dynamic pairing code flow");
+        };
+        if !state.phase.is_round_start() {
+            bail!("the attempt is not waiting for server/pair-init");
+        }
+        match (state.nonce_a, nonce_a) {
+            (None, None) => {
+                bail!("the first round's server/pair-init carries no nonce_A")
+            }
+            (None, Some(nonce)) => state.nonce_a = Some(nonce),
+            (Some(expected), Some(received)) if expected != received => {
+                bail!("the server changed nonce_A within one pairing attempt")
+            }
+            // A repeated identical nonce is harmless; an absent one is what a later round sends.
+            _ => {}
+        }
+        state.round = state.round.saturating_add(1);
+        if state.code.is_none() {
+            let nonce_a = state
+                .nonce_a
+                .expect("the first round set the server nonce before the code is derived");
+            state.code = Some(DynamicCode::derive(
+                handshake_hash,
+                &nonce_a,
+                &state.nonce_b,
+            ));
+        }
+        state.phase = CodePhase::Auth;
+        self.code_emission()
+            .ok_or_else(|| anyhow::anyhow!("the pairing code was not derived"))
+    }
+
+    /// Answers `server/pair-auth`: derives the shared point, both tags and the seals.
+    ///
+    /// `sid` is [`pake_sid`] of this attempt and round, and `prs` is the pairing code's CPace `PRS`:
+    /// the configured code's digits for the static flow, or the code this attempt derived for the
+    /// dynamic one. The function returns `Yb`, the share `client/pair-auth` carries. The CPace
     /// intermediate session key stays inside this call; only what the next two messages need is
     /// kept.
     ///
     /// # Errors
     ///
-    /// Fails when the server's share encodes a low-order point, which the draft requires the round
-    /// to abort. The session treats that as a protocol error and closes the connection.
+    /// Fails when the round is not waiting for the server's share, and when the server's share
+    /// encodes a low-order point, which the draft requires the round to abort. The session treats
+    /// that as a protocol error and closes the connection.
     #[cfg(feature = "pairing-code")]
     pub(crate) fn accept_server_share(
         &mut self,
-        code: &str,
+        prs: &[u8],
         sid: &[u8],
         peer_share: &[u8; SHARE_LEN],
     ) -> Result<[u8; SHARE_LEN]> {
@@ -384,9 +647,9 @@ impl PairingAttempt {
             bail!("the attempt is not waiting for the server's CPace share");
         }
 
-        let generator = pake::generator(code.as_bytes(), b"", sid);
-        // A fresh scalar per attempt: reusing one would link attempts, and the draft samples a new
-        // one for every run.
+        let generator = pake::generator(prs, b"", sid);
+        // A fresh scalar per round: reusing one would link rounds, and the draft samples a new one
+        // for every run.
         let scalar = draw_key();
         let share = pake::public_share(&scalar, &generator)
             .context("the CPace generator did not yield a group element")?;
@@ -398,35 +661,66 @@ impl PairingAttempt {
         let expected_server_tag = pake::key_confirmation_tag(sid, &isk, peer_share, AD_SERVER);
         let client_tag = pake::key_confirmation_tag(sid, &isk, &share, AD_CLIENT);
         let wrapped_psk = wrap::wrap(&wrap::k_wrap(PSK_LABEL, sid, &isk), &self.psk);
+        let wrapped_nonce_b = match &self.flow {
+            Flow::Dynamic(state) => Some(wrap::wrap(
+                &wrap::k_wrap(NONCE_LABEL, sid, &isk),
+                &state.nonce_b,
+            )),
+            _ => None,
+        };
 
-        self.flow = Flow::Static(CodePhase::Confirm(StaticCode {
+        let proof = RoundProof {
             expected_server_tag,
             client_tag,
             wrapped_psk,
-        }));
+            wrapped_nonce_b,
+        };
+        match &mut self.flow {
+            Flow::Static(phase) => *phase = CodePhase::Confirm(Box::new(proof)),
+            Flow::Dynamic(state) => state.phase = CodePhase::Confirm(Box::new(proof)),
+            Flow::PairingPsk => bail!("the attempt does not run a code flow"),
+        }
         Ok(share)
     }
 
-    /// Verifies `server_kc` and, when it matches, releases the two fields to send next.
+    /// Verifies `server_kc` and, when it matches, releases the fields to send next.
     ///
-    /// A mismatch is `None`: the static flow has no retry, so the caller aborts the attempt with
-    /// `pairing_code_mismatch` and counts it against the pairing window. The comparison is
-    /// constant-time and the release happens only after it succeeds, so a peer that cannot derive
-    /// the key never sees the sealed long-term PSK.
+    /// A mismatch is [`TagOutcome::Mismatch`]. The dynamic flow rewinds to its next round there and
+    /// leaves the retry decision to the caller, which owns the round limit; the static flow stays
+    /// in its confirmation phase for the caller to abort. The comparison is constant-time and the
+    /// release happens only after it succeeds, so a peer that cannot derive the key never sees the
+    /// sealed nonce or the sealed long-term PSK.
     #[cfg(feature = "pairing-code")]
-    pub(crate) fn verify_server_tag(&mut self, received: &[u8; TAG_LEN]) -> Option<Confirmation> {
-        let Flow::Static(CodePhase::Confirm(state)) = &self.flow else {
-            return None;
+    pub(crate) fn verify_server_tag(&mut self, received: &[u8; TAG_LEN]) -> TagOutcome {
+        let proof = match &mut self.flow {
+            Flow::Static(CodePhase::Confirm(proof)) => proof,
+            Flow::Dynamic(state) => match &mut state.phase {
+                CodePhase::Confirm(proof) => proof,
+                _ => return TagOutcome::Mismatch,
+            },
+            _ => return TagOutcome::Mismatch,
         };
-        if !pake::verify_key_confirmation_tag(&state.expected_server_tag, received) {
-            return None;
+        if !pake::verify_key_confirmation_tag(&proof.expected_server_tag, received) {
+            if let Flow::Dynamic(state) = &mut self.flow {
+                // The round is over; the same code, the same binding values and the same deadline
+                // carry into the next one, which begins with `server/pair-init`.
+                state.phase = CodePhase::RoundStart;
+            }
+            return TagOutcome::Mismatch;
         }
         let confirmation = Confirmation {
-            client_kc: URL_SAFE_NO_PAD.encode(state.client_tag),
-            wrapped_psk: URL_SAFE_NO_PAD.encode(state.wrapped_psk),
+            client_kc: URL_SAFE_NO_PAD.encode(proof.client_tag),
+            wrapped_psk: URL_SAFE_NO_PAD.encode(proof.wrapped_psk),
+            wrapped_nonce_b: proof
+                .wrapped_nonce_b
+                .map(|sealed| URL_SAFE_NO_PAD.encode(sealed)),
         };
-        self.flow = Flow::Static(CodePhase::Finalization);
-        Some(confirmation)
+        match &mut self.flow {
+            Flow::Static(phase) => *phase = CodePhase::Finalization,
+            Flow::Dynamic(state) => state.phase = CodePhase::Finalization,
+            Flow::PairingPsk => unreachable!("only a code flow has a round to confirm"),
+        }
+        TagOutcome::Confirmed(confirmation)
     }
 
     /// Returns the long-term PSK as the 43-character unpadded base64url the wire carries.
@@ -441,7 +735,7 @@ impl PairingAttempt {
 }
 
 impl fmt::Debug for PairingAttempt {
-    /// Formats the attempt without the key it carries or any CPace value.
+    /// Formats the attempt without the key it carries, its nonce or a code it derived.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("PairingAttempt");
         debug
@@ -452,11 +746,27 @@ impl fmt::Debug for PairingAttempt {
         {
             let flow = match &self.flow {
                 Flow::PairingPsk => "pairing_psk",
-                Flow::Static(CodePhase::Auth) => "static_pairing_code/awaiting_auth",
-                Flow::Static(CodePhase::Confirm(_)) => "static_pairing_code/awaiting_confirm",
-                Flow::Static(CodePhase::Finalization) => "static_pairing_code/awaiting_finalize",
+                Flow::Static(phase) => match phase {
+                    CodePhase::RoundStart => "static_pairing_code/round_start",
+                    CodePhase::Auth => "static_pairing_code/awaiting_auth",
+                    CodePhase::Confirm(_) => "static_pairing_code/awaiting_confirm",
+                    CodePhase::Finalization => "static_pairing_code/awaiting_finalize",
+                },
+                Flow::Dynamic(state) => match state.phase {
+                    CodePhase::RoundStart => "dynamic_pairing_code/awaiting_server_init",
+                    CodePhase::Auth => "dynamic_pairing_code/awaiting_auth",
+                    CodePhase::Confirm(_) => "dynamic_pairing_code/awaiting_confirm",
+                    CodePhase::Finalization => "dynamic_pairing_code/awaiting_finalize",
+                },
             };
             debug.field("flow", &flow);
+            if let Flow::Dynamic(state) = &self.flow {
+                // The round number is not secret; the nonce and the code are.
+                debug
+                    .field("round", &state.round)
+                    .field("nonce_b", &"<redacted>")
+                    .field("code", &state.code.as_ref().map(|_| "<redacted>"));
+            }
         }
         debug.finish()
     }
@@ -676,7 +986,7 @@ mod tests {
 
         let mut attempt = PairingAttempt::static_code(7, Duration::from_secs(120), None);
         let share = attempt
-            .accept_server_share(CODE, &sid, &peer_share)
+            .accept_server_share(CODE.as_bytes(), &sid, &peer_share)
             .expect("the server's share is a group element");
 
         let point = pake::scalar_mult_vfy(&server_scalar, &share).expect("a group element");
@@ -724,15 +1034,18 @@ mod tests {
         // and the caller aborts the attempt instead of sending anything.
         let mut tampered = server_tag;
         tampered[0] ^= 0x80;
-        assert!(attempt.verify_server_tag(&tampered).is_none());
+        assert!(matches!(
+            attempt.verify_server_tag(&tampered),
+            TagOutcome::Mismatch
+        ));
         assert!(
             attempt.awaiting_server_confirm(),
             "a mismatch leaves the attempt for the caller to abort"
         );
 
-        let confirmation = attempt
-            .verify_server_tag(&server_tag)
-            .expect("the server's tag verifies");
+        let TagOutcome::Confirmed(confirmation) = attempt.verify_server_tag(&server_tag) else {
+            panic!("the server's tag verifies");
+        };
         assert!(attempt.awaiting_finalize());
 
         // `client_kc` is Tb over the client's own share and associated data.
@@ -790,5 +1103,332 @@ mod tests {
         assert!(fresh.is_static_code());
         assert!(!fresh.awaiting_server_confirm());
         assert!(!fresh.awaiting_finalize());
+    }
+
+    /// The handshake hash the dynamic unit tests derive their codes from.
+    #[cfg(feature = "pairing-code")]
+    const HASH: [u8; 32] = [0x33; 32];
+
+    /// The server nonce the dynamic unit tests use.
+    #[cfg(feature = "pairing-code")]
+    const NONCE_A: [u8; 32] = [0x51; 32];
+
+    /// The client nonce the dynamic unit tests pin, so the derivation can be recomputed.
+    #[cfg(feature = "pairing-code")]
+    const NONCE_B: [u8; 32] = [0x77; 32];
+
+    /// A dynamic attempt between `client/pair-init` and the first `server/pair-init`.
+    ///
+    /// The struct is built here so the client nonce is the pinned one: the production constructor
+    /// draws it, and a test that has to recompute the derivation cannot see it otherwise.
+    #[cfg(feature = "pairing-code")]
+    fn dynamic_attempt(format: CodeFormat) -> PairingAttempt {
+        PairingAttempt {
+            pairing_index: 9,
+            deadline: Instant::now() + Duration::from_secs(120),
+            psk: [0x2a; 32],
+            flow: Flow::Dynamic(DynamicFlow {
+                nonce_b: NONCE_B,
+                nonce_a: None,
+                code: None,
+                format,
+                round: 0,
+                phase: CodePhase::RoundStart,
+            }),
+        }
+    }
+
+    /// The commitment is the digest of the nonce the attempt keeps, and each attempt has its own.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_dynamic_attempt_commits_to_a_fresh_nonce() {
+        let attempt = dynamic_attempt(CodeFormat::Digits);
+        let commitment = attempt.commit_b().expect("the dynamic flow commits");
+        assert_eq!(
+            commitment,
+            URL_SAFE_NO_PAD.encode(syncspin_core::pairing::code::commitment(&NONCE_B)),
+            "the commitment is the digest of the pinned nonce"
+        );
+        assert!(attempt.awaiting_server_init());
+        assert!(!attempt.awaiting_server_auth());
+        assert!(attempt.is_dynamic_code());
+        assert!(!attempt.is_static_code());
+
+        let other =
+            PairingAttempt::dynamic_code(9, Duration::from_secs(120), None, CodeFormat::Digits);
+        assert_ne!(
+            commitment,
+            other.commit_b().expect("the other attempt commits too"),
+            "a second attempt commits to a different nonce"
+        );
+
+        // The static flow has no nonce to commit to.
+        let static_attempt = PairingAttempt::static_code(1, Duration::from_secs(120), None);
+        assert_eq!(static_attempt.commit_b(), None);
+    }
+
+    /// The first round derives the pinned code from `h`, `nonce_A` and the attempt's nonce.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_dynamic_round_derives_the_code_both_sides_repeat() {
+        let mut attempt = dynamic_attempt(CodeFormat::Digits);
+        let first = attempt
+            .begin_round(Some(NONCE_A), &HASH)
+            .expect("the first round carries nonce_A");
+        let expected = DynamicCode::derive(&HASH, &NONCE_A, &NONCE_B);
+
+        assert_eq!(first.round, 1);
+        assert_eq!(first.format, CodeFormat::Digits);
+        assert_eq!(first.code, expected.digits_text());
+        assert_eq!(
+            attempt.prs().as_deref(),
+            Some(expected.digits().as_slice()),
+            "the digits are also CPace's PRS"
+        );
+        assert!(attempt.awaiting_server_auth());
+
+        // The same instant, so the retry comparison below is about the deadline and nothing else.
+        let deadline = attempt.deadline;
+        fail_the_round(&mut attempt);
+        let retried = attempt
+            .begin_round(None, &HASH)
+            .expect("a later round carries no nonce");
+        assert_eq!(retried.round, 2);
+        assert_eq!(retried.code, first.code, "the code does not change");
+        assert_eq!(
+            attempt.deadline, deadline,
+            "a retry keeps the attempt's deadline"
+        );
+
+        assert!(
+            attempt.begin_round(None, &HASH).is_err(),
+            "a third round may not begin while the second is running"
+        );
+    }
+
+    /// A QR attempt presents and feeds CPace with the same 24-byte code.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_qr_attempt_uses_the_24_byte_code() {
+        let mut attempt = dynamic_attempt(CodeFormat::QrCode);
+        let first = attempt
+            .begin_round(Some(NONCE_A), &HASH)
+            .expect("the first round carries nonce_A");
+        let expected = DynamicCode::derive(&HASH, &NONCE_A, &NONCE_B);
+
+        assert_eq!(first.code, expected.qr_token());
+        assert!(first.code.starts_with("SP:1"));
+        assert_eq!(
+            attempt.prs().as_deref(),
+            Some(expected.qr_payload().as_slice()),
+            "the raw 24-byte code is CPace's PRS"
+        );
+    }
+
+    /// A missing or changed server nonce changes the code, so both are protocol errors.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_round_rejects_a_missing_or_changed_server_nonce() {
+        let mut attempt = dynamic_attempt(CodeFormat::Digits);
+        assert!(
+            attempt.begin_round(None, &HASH).is_err(),
+            "the first round has to carry nonce_A"
+        );
+
+        attempt
+            .begin_round(Some(NONCE_A), &HASH)
+            .expect("the first round is accepted");
+
+        // A round has to end before the next one can begin; the retry is where the nonce may
+        // repeat or go missing.
+        fail_the_round(&mut attempt);
+        let mut changed = NONCE_A;
+        changed[0] ^= 0x01;
+        assert!(
+            attempt.begin_round(Some(changed), &HASH).is_err(),
+            "a changed nonce_A would silently change the operator's code"
+        );
+
+        // A repeated identical nonce is harmless, so a server that repeats it is tolerated.
+        let repeated = attempt
+            .begin_round(Some(NONCE_A), &HASH)
+            .expect("a repeated nonce_A does not change the binding");
+        assert_eq!(
+            repeated.code,
+            DynamicCode::derive(&HASH, &NONCE_A, &NONCE_B).digits_text()
+        );
+
+        // A static attempt has no round to begin.
+        let mut static_attempt = PairingAttempt::static_code(1, Duration::from_secs(120), None);
+        assert!(static_attempt.begin_round(Some(NONCE_A), &HASH).is_err());
+    }
+
+    /// Completes the client half of the round in progress against a server half built here.
+    ///
+    /// Returns the round's `sid`, the server's tag and the intermediate session key, so a test can
+    /// verify, unwrap or deliberately trip the server's side.
+    #[cfg(feature = "pairing-code")]
+    fn cross_the_round(attempt: &mut PairingAttempt) -> (Vec<u8>, [u8; 64], [u8; 64]) {
+        let prs = attempt.prs().expect("the code was derived");
+        let sid = pake_sid(&HASH, attempt.pairing_index, attempt.round());
+        let generator = pake::generator(&prs, b"", &sid);
+        let server_scalar = [0x44; 32];
+        let peer_share = pake::public_share(&server_scalar, &generator).expect("a group element");
+        let share = attempt
+            .accept_server_share(&prs, &sid, &peer_share)
+            .expect("the server's share is a group element");
+
+        let point = pake::scalar_mult_vfy(&server_scalar, &share).expect("a group element");
+        let transcript = pake::transcript_ir(&peer_share, b"server", &share, b"client");
+        let isk = pake::intermediate_session_key(&sid, &point, &transcript);
+        let server_tag = pake::key_confirmation_tag(&sid, &isk, &peer_share, b"server");
+        (sid, server_tag, isk)
+    }
+
+    /// Runs the round in progress into a failed `server_kc`, which rewinds it to the next round.
+    #[cfg(feature = "pairing-code")]
+    fn fail_the_round(attempt: &mut PairingAttempt) {
+        let (_sid, server_tag, _isk) = cross_the_round(attempt);
+        let mut tampered = server_tag;
+        tampered[0] ^= 0x80;
+        assert!(matches!(
+            attempt.verify_server_tag(&tampered),
+            TagOutcome::Mismatch
+        ));
+        assert!(
+            attempt.awaiting_server_init(),
+            "a failed round waits for the next server/pair-init"
+        );
+    }
+
+    /// Runs one dynamic round against a server half built here.
+    ///
+    /// Returns the attempt between the two tags, the round's `sid`, the server's tag and the
+    /// intermediate session key.
+    #[cfg(feature = "pairing-code")]
+    fn dynamic_round(format: CodeFormat) -> (PairingAttempt, Vec<u8>, [u8; 64], [u8; 64]) {
+        let mut attempt = dynamic_attempt(format);
+        let emission = attempt
+            .begin_round(Some(NONCE_A), &HASH)
+            .expect("the first round carries nonce_A");
+        let prs = attempt.prs().expect("the code was derived");
+        assert_eq!(
+            prs.len(),
+            match format {
+                CodeFormat::Digits => 6,
+                CodeFormat::QrCode => 24,
+            },
+            "the PRS belongs to the emission format: {}",
+            emission.code.len()
+        );
+
+        let (sid, server_tag, isk) = cross_the_round(&mut attempt);
+        (attempt, sid, server_tag, isk)
+    }
+
+    /// The revealed nonce opens the commitment, and only after the server's tag verifies.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_dynamic_attempt_seals_the_nonce_and_releases_it_only_after_the_server_tag() {
+        let (mut attempt, sid, server_tag, isk) = dynamic_round(CodeFormat::Digits);
+        assert!(attempt.awaiting_server_confirm());
+
+        // A mismatch rewinds the round instead of releasing anything.
+        let mut tampered = server_tag;
+        tampered[0] ^= 0x80;
+        assert!(matches!(
+            attempt.verify_server_tag(&tampered),
+            TagOutcome::Mismatch
+        ));
+        assert!(
+            attempt.awaiting_server_init(),
+            "a failed round waits for the next server/pair-init"
+        );
+        assert!(
+            attempt.code_emission().is_some(),
+            "the code survives the failed round"
+        );
+
+        // The next round has its own sid, so the seal from the failed one is never reused.
+        let emission = attempt
+            .begin_round(None, &HASH)
+            .expect("the retry's round begins without a nonce");
+        assert_eq!(emission.round, 2);
+        let (retry_sid, retry_tag, retry_isk) = cross_the_round(&mut attempt);
+
+        let TagOutcome::Confirmed(confirmation) = attempt.verify_server_tag(&retry_tag) else {
+            panic!("the server's tag verifies");
+        };
+        assert!(attempt.awaiting_finalize());
+
+        // `wrapped_nonce_B` opens under the nonce label of this round to the pinned nonce.
+        let sealed: [u8; 48] = URL_SAFE_NO_PAD
+            .decode(
+                confirmation
+                    .wrapped_nonce_b
+                    .as_deref()
+                    .expect("the dynamic flow seals its nonce"),
+            )
+            .expect("the sealed nonce is base64url")
+            .try_into()
+            .expect("a sealed value is 48 bytes");
+        let nonce_key = wrap::k_wrap(NONCE_LABEL, &retry_sid, &retry_isk);
+        assert_eq!(
+            wrap::unwrap(&nonce_key, &sealed).expect("the seal opens under the server's key"),
+            NONCE_B,
+            "the server recovers exactly the nonce it committed to"
+        );
+
+        // The long-term key is sealed under the PSK label of the same round.
+        let sealed_psk: [u8; 48] = URL_SAFE_NO_PAD
+            .decode(&confirmation.wrapped_psk)
+            .expect("the sealed key is base64url")
+            .try_into()
+            .expect("a sealed value is 48 bytes");
+        let psk_key = wrap::k_wrap(PSK_LABEL, &retry_sid, &retry_isk);
+        assert_eq!(
+            wrap::unwrap(&psk_key, &sealed_psk).expect("the seal opens"),
+            attempt.psk()
+        );
+
+        // The first round's key material is not the retry's: a tripped test above would hide that.
+        assert_ne!(sid, retry_sid, "each round has its own sid");
+        assert_ne!(isk, retry_isk, "each round derives its own session key");
+    }
+
+    /// The nonce and the code never reach a `Debug` format.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_dynamic_attempt_formats_without_its_nonce_or_code() {
+        let mut attempt = dynamic_attempt(CodeFormat::Digits);
+        let text = format!("{attempt:?}");
+        assert!(
+            text.contains("dynamic_pairing_code/awaiting_server_init"),
+            "the phase names itself: {text}"
+        );
+        assert!(
+            !text.contains(&format!("{:?}", NONCE_B)),
+            "the nonce must never appear: {text}"
+        );
+        assert!(text.contains("nonce_b: \"<redacted>\""), "got: {text}");
+        assert!(text.contains("code: None"), "got: {text}");
+
+        let emission = attempt
+            .begin_round(Some(NONCE_A), &HASH)
+            .expect("the first round carries nonce_A");
+        let text = format!("{attempt:?}");
+        assert!(
+            text.contains("dynamic_pairing_code/awaiting_auth"),
+            "got: {text}"
+        );
+        assert!(text.contains("code: Some(\"<redacted>\")"), "got: {text}");
+        assert!(
+            !text.contains(&emission.code),
+            "the code reaches the operator through the event, not a log line: {text}"
+        );
+        assert!(
+            !text.contains(&format!("{:?}", NONCE_A)),
+            "the server nonce stays out of a format as well: {text}"
+        );
     }
 }

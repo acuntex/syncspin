@@ -6,7 +6,7 @@
 //! implementation agree.
 
 use proptest::prelude::*;
-use syncspin_core::pairing::token::{decode, encode_v0};
+use syncspin_core::pairing::token::{decode, encode_v0, encode_v1};
 
 /// The spec's version-0 vector, base32 with `2` transliterated to `9` and padding stripped.
 const VERSION_0: &str = "SP:0AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYP6BYPC4PSOLZXH5DU6V97M5XXO74HR6LZ7J5PW674PT6X37T6757Y";
@@ -62,6 +62,12 @@ fn the_version_1_vector_decodes_to_the_dynamic_pairing_code() {
         (0xe0..=0xf7).collect::<Vec<u8>>(),
         "the payload is the code the spec names for this vector"
     );
+}
+
+#[test]
+fn encode_v1_emits_the_version_1_vector() {
+    let code: [u8; 24] = std::array::from_fn(|index| 0xe0 + index as u8);
+    assert_eq!(encode_v1(&code), VERSION_1);
 }
 
 #[test]

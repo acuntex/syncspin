@@ -99,6 +99,10 @@ async fn run(options: Options) -> Result<()> {
         pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
         #[cfg(feature = "pairing-code")]
         pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     };
 
     // The client owns the reconnect loop: a dropped session is reported on the stream and retried

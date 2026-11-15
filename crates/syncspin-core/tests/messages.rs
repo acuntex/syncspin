@@ -7,13 +7,13 @@ use syncspin_core::framing::{
 };
 use syncspin_core::messages::{
     AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientPairAuth, ClientPairConfirm,
-    ClientPairFinalize, ClientPairInit, ClientPairPending, ClientState, ClientTime,
-    ControllerCommand, DecodeError, DeviceInfo, Incoming, NoiseHandshake, PairAbort,
-    PairingPskMethod, PlayerState, PlayerSupport, ServerActivate, ServerCommand, ServerHello,
-    ServerInit, ServerPairAuth, ServerPairConfirm, ServerPairFinalize, ServerState, ServerTime,
-    StaticPairingCodeMethod, StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
-    SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
-    PROTOCOL_VERSION,
+    ClientPairFinalize, ClientPairInit, ClientPairPending, ClientPairRetry, ClientState,
+    ClientTime, ControllerCommand, DecodeError, DeviceInfo, DynamicPairingCodeMethod, Incoming,
+    NoiseHandshake, PairAbort, PairingPskMethod, PlayerState, PlayerSupport, ServerActivate,
+    ServerCommand, ServerHello, ServerInit, ServerPairAuth, ServerPairConfirm, ServerPairFinalize,
+    ServerPairInit, ServerState, ServerTime, StaticPairingCodeMethod, StreamClear, StreamEnd,
+    StreamStart, StreamStartPlayer, SupportedFormat, SupportedPairMethods, UnpairedAccess,
+    AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
 };
 
 /// A payload whose first bytes differ, so a reassembled message is easy to verify.
@@ -109,6 +109,7 @@ fn client_hello_and_server_hello_roundtrip_on_the_wire() {
         supported_pair_methods: SupportedPairMethods {
             pairing_psk: Some(PairingPskMethod {}),
             static_pairing_code: None,
+            dynamic_pairing_code: None,
         },
         unpaired_access: UnpairedAccess { enabled: true },
     };
@@ -514,6 +515,101 @@ fn code_pairing_messages_roundtrip_on_the_wire() {
 }
 
 #[test]
+fn dynamic_pairing_messages_roundtrip_on_the_wire() {
+    // The first round's `server/pair-init` carries the server's nonce; the later rounds carry none,
+    // and the field must then be absent rather than serialize as null.
+    let first_round = ServerPairInit {
+        nonce_a: Some("A".repeat(43)),
+    };
+    let json = serde_json::to_string(&Incoming::ServerPairInit(first_round.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "server/pair-init",
+            "payload": {"nonce_A": "A".repeat(43)},
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ServerPairInit(first_round)
+    );
+
+    let later_round = ServerPairInit { nonce_a: None };
+    let json = serde_json::to_string(&Incoming::ServerPairInit(later_round.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({"type": "server/pair-init", "payload": {}})
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ServerPairInit(later_round)
+    );
+
+    // `client/pair-retry` is the empty object, like the other payload-less messages.
+    assert_eq!(
+        serde_json::to_value(Incoming::ClientPairRetry(ClientPairRetry {})).unwrap(),
+        serde_json::json!({"type": "client/pair-retry", "payload": {}})
+    );
+    assert_eq!(
+        Incoming::parse(r#"{"type":"client/pair-retry","payload":{}}"#).unwrap(),
+        Some(Incoming::ClientPairRetry(ClientPairRetry {}))
+    );
+
+    // `client/pair-init` carries the commitment of the dynamic flow; the static flow omits it.
+    let with_commitment = ClientPairInit {
+        pairing_index: 4,
+        commit_b: Some("B".repeat(43)),
+    };
+    let json = serde_json::to_string(&Incoming::ClientPairInit(with_commitment.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/pair-init",
+            "payload": {"pairing_index": 4, "commit_B": "B".repeat(43)},
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientPairInit(with_commitment)
+    );
+}
+
+#[test]
+fn the_dynamic_code_descriptor_advertises_channels_and_formats() {
+    let descriptor = DynamicPairingCodeMethod {
+        out_channels: vec!["display".to_owned()],
+        formats: vec!["digits".to_owned(), "qr_code".to_owned()],
+    };
+    assert_eq!(
+        serde_json::to_value(descriptor).unwrap(),
+        serde_json::json!({
+            "out_channels": ["display"],
+            "formats": ["digits", "qr_code"],
+        }),
+        "the descriptor is what `dynamic_pairing_code` advertises"
+    );
+
+    let methods = SupportedPairMethods {
+        pairing_psk: Some(PairingPskMethod {}),
+        static_pairing_code: None,
+        dynamic_pairing_code: Some(DynamicPairingCodeMethod {
+            out_channels: vec!["speaker".to_owned()],
+            formats: vec!["digits".to_owned()],
+        }),
+    };
+    let json = serde_json::to_value(methods).unwrap();
+    assert_eq!(
+        json["dynamic_pairing_code"]["formats"],
+        serde_json::json!(["digits"]),
+        "the method is keyed by its wire identifier"
+    );
+    assert!(
+        json.get("static_pairing_code").is_none(),
+        "a method that is not offered stays absent: {json}"
+    );
+}
+
+#[test]
 fn a_pair_confirm_formats_without_its_tags() {
     let client_tag = "C".repeat(86);
     let sealed_nonce = "D".repeat(64);
@@ -561,6 +657,7 @@ fn a_static_pairing_code_descriptor_serializes_as_an_empty_object() {
     let methods = SupportedPairMethods {
         pairing_psk: Some(PairingPskMethod {}),
         static_pairing_code: Some(StaticPairingCodeMethod::default()),
+        dynamic_pairing_code: None,
     };
     assert_eq!(
         serde_json::to_value(&methods).unwrap(),

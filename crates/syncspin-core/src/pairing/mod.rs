@@ -13,6 +13,9 @@
 pub mod token;
 
 #[cfg(feature = "pairing-code")]
+pub mod code;
+
+#[cfg(feature = "pairing-code")]
 pub mod pake;
 
 #[cfg(feature = "pairing-code")]

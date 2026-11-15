@@ -31,6 +31,67 @@ pub const MAX_PAIRING_PENDING_TEXT_LEN: usize = 200;
 #[cfg(feature = "pairing-code")]
 pub const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(300);
 
+/// Emission format of a dynamic pairing code.
+///
+/// `pairing.md` defines two: `digits`, a six-digit decimal code the operator types into the
+/// server, and `qr_code`, a 24-byte code presented as a version-1 pairing token in a QR code. The
+/// format is chosen per connection by the server's `server/activate`, from the formats the client
+/// advertises; it decides how a host presents the code and what CPace's `PRS` is.
+#[cfg(feature = "pairing-code")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeFormat {
+    /// Six decimal digits.
+    Digits,
+    /// A 24-byte code as a version-1 pairing token.
+    QrCode,
+}
+
+#[cfg(feature = "pairing-code")]
+impl CodeFormat {
+    /// Returns the identifier the wire and `client/hello` use.
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            CodeFormat::Digits => "digits",
+            CodeFormat::QrCode => "qr_code",
+        }
+    }
+
+    /// Decodes an emission format from the wire, or `None` for a value this revision does not know.
+    pub(crate) fn from_wire(value: &str) -> Option<CodeFormat> {
+        match value {
+            "digits" => Some(CodeFormat::Digits),
+            "qr_code" => Some(CodeFormat::QrCode),
+            _ => None,
+        }
+    }
+}
+
+/// Channel a dynamic pairing code reaches the operator through.
+///
+/// The client advertises the channels its host can actually drive. `display` covers a screen, an
+/// e-ink panel or a seven-segment display; `speaker` covers a device that speaks the code from
+/// audio it bundles itself. The crate derives the code and emits it; rendering and speaking belong
+/// to the host.
+#[cfg(feature = "pairing-code")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeOutChannel {
+    /// A display the host renders the code on.
+    Display,
+    /// A speaker the host plays the code through.
+    Speaker,
+}
+
+#[cfg(feature = "pairing-code")]
+impl CodeOutChannel {
+    /// Returns the identifier the wire and `client/hello` use.
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            CodeOutChannel::Display => "display",
+            CodeOutChannel::Speaker => "speaker",
+        }
+    }
+}
+
 /// How the client wants the stream delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioMode {
@@ -253,6 +314,21 @@ pub struct ClientConfig {
     /// sent with no text, because the crate does not invent operator-facing prose.
     #[cfg(feature = "pairing-code")]
     pub pairing_pending_text: Option<String>,
+    /// Emission formats the client offers for a dynamic pairing code.
+    ///
+    /// An empty list offers no dynamic method at all; a non-empty one advertises
+    /// `dynamic_pairing_code` in `client/hello`, together with [`ClientConfig::code_out_channels`].
+    /// Both lists must be set for the method to be offered, because the protocol treats a
+    /// descriptor left without a known format or channel as unrecognized. The code itself is
+    /// derived per attempt, never configured.
+    #[cfg(feature = "pairing-code")]
+    pub code_formats: Vec<CodeFormat>,
+    /// Channels the host can carry a dynamic pairing code through.
+    ///
+    /// The host sets what it can render or speak; the server picks the method's format, and the
+    /// client emits the code through [`Event::PairingCode`](crate::Event::PairingCode).
+    #[cfg(feature = "pairing-code")]
+    pub code_out_channels: Vec<CodeOutChannel>,
 }
 
 impl fmt::Debug for ClientConfig {
@@ -283,7 +359,9 @@ impl fmt::Debug for ClientConfig {
                 &self.static_pairing_code.as_ref().map(|_| "<redacted>"),
             )
             .field("pairing_window", &self.pairing_window)
-            .field("pairing_pending_text", &self.pairing_pending_text);
+            .field("pairing_pending_text", &self.pairing_pending_text)
+            .field("code_formats", &self.code_formats)
+            .field("code_out_channels", &self.code_out_channels);
         debug.finish()
     }
 }
@@ -356,6 +434,14 @@ impl ClientConfig {
                     );
                 }
             }
+            // A descriptor with formats but no channel - or the other way round - is one a server
+            // treats as unrecognized, so the client would advertise a method it cannot complete.
+            if self.code_formats.is_empty() != self.code_out_channels.is_empty() {
+                bail!(
+                    "ClientConfig::code_formats and ClientConfig::code_out_channels must both be \
+                     set or both be empty"
+                );
+            }
         }
         Ok(())
     }
@@ -385,6 +471,10 @@ mod tests {
             pairing_window: DEFAULT_PAIRING_WINDOW,
             #[cfg(feature = "pairing-code")]
             pairing_pending_text: None,
+            #[cfg(feature = "pairing-code")]
+            code_formats: Vec::new(),
+            #[cfg(feature = "pairing-code")]
+            code_out_channels: Vec::new(),
         }
     }
 
@@ -456,6 +546,61 @@ mod tests {
             !text.contains(&format!("{psk:?}")),
             "not even the raw bytes may appear: {text}"
         );
+    }
+
+    /// The dynamic method's descriptor needs a format and a channel; one without the other is
+    /// treated as unrecognized by a server, so the configuration refuses it before a connection.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn the_code_descriptor_lists_are_set_together() {
+        let formats_only = ClientConfig {
+            code_formats: vec![CodeFormat::Digits],
+            ..valid()
+        };
+        let error = formats_only
+            .validate()
+            .expect_err("a format without a channel is not a usable descriptor");
+        assert!(
+            format!("{error:#}").contains("code_out_channels"),
+            "the error names the missing list, got: {error:#}"
+        );
+
+        let channels_only = ClientConfig {
+            code_out_channels: vec![CodeOutChannel::Display],
+            ..valid()
+        };
+        let error = channels_only
+            .validate()
+            .expect_err("a channel without a format is not a usable descriptor");
+        assert!(
+            format!("{error:#}").contains("code_formats"),
+            "the error names the missing list, got: {error:#}"
+        );
+
+        ClientConfig {
+            code_formats: vec![CodeFormat::Digits, CodeFormat::QrCode],
+            code_out_channels: vec![CodeOutChannel::Display],
+            ..valid()
+        }
+        .validate()
+        .expect("both lists make the method offerable");
+    }
+
+    /// The identifiers are the ones `client/hello` and `server/activate` spell.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn the_code_types_round_trip_through_their_wire_names() {
+        assert_eq!(CodeFormat::Digits.as_wire(), "digits");
+        assert_eq!(CodeFormat::QrCode.as_wire(), "qr_code");
+        assert_eq!(CodeFormat::from_wire("digits"), Some(CodeFormat::Digits));
+        assert_eq!(CodeFormat::from_wire("qr_code"), Some(CodeFormat::QrCode));
+        assert_eq!(
+            CodeFormat::from_wire("nfc"),
+            None,
+            "a format this revision does not know selects nothing"
+        );
+        assert_eq!(CodeOutChannel::Display.as_wire(), "display");
+        assert_eq!(CodeOutChannel::Speaker.as_wire(), "speaker");
     }
 
     #[test]

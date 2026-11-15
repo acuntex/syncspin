@@ -1,5 +1,7 @@
 //! Public client surface: events, handles and the connection entry point.
 
+#[cfg(feature = "pairing-code")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +10,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+#[cfg(feature = "pairing-code")]
+use crate::config::CodeFormat;
 use crate::config::{ClientConfig, StoredPsk, VolumePolicy};
 use crate::pairing::{load_or_draw_pairing_psk, PairingPsk};
 use crate::session::{self, Carried, Transport};
@@ -333,6 +337,26 @@ pub enum Event {
         /// Why the attempt ended.
         reason: PairingFailure,
     },
+    /// A dynamic pairing code is ready for the operator.
+    ///
+    /// The code belongs to one attempt and is bound to the Noise handshake and to the two nonces
+    /// of that attempt. A client with a display or a speaker shows or speaks it; the operator then
+    /// types or scans it into the server. The code does not change across the rounds of an attempt,
+    /// so a host that already shows it can ignore a repeat with the same `code`, while `round`
+    /// tells it that another round is running.
+    ///
+    /// The value is deliberate: it is the method's whole point, and the host is expected to render
+    /// it. It is not key material, but it does authorise one pairing, so a host should not keep it
+    /// longer than the attempt.
+    #[cfg(feature = "pairing-code")]
+    PairingCode {
+        /// The code to show: six digits in the `digits` format, a version-1 token in `qr_code`.
+        code: String,
+        /// Emission format the server activated.
+        format: CodeFormat,
+        /// Round this emission belongs to, counting from one.
+        round: u32,
+    },
 }
 
 /// Playback state as the server describes it.
@@ -498,6 +522,23 @@ impl ControlHandle {
             .map(|_level| ())
     }
 
+    /// Releases the dynamic flow's round limit: the deliberate operator action the spec requires.
+    ///
+    /// After twenty rounds without a verified `server_kc`, the client aborts the attempt and holds
+    /// further dynamic attempts back, answering their activations with `client/pair-pending`. The
+    /// counter is not partitioned by server and only this call - or a verified `server_kc` - resets
+    /// it. A host wires it to whatever gesture means "let this device try pairing again".
+    ///
+    /// Unlike a pairing window, the release needs no connection: the count belongs to the process,
+    /// and the next connection starts from a clean one. The call still answers the current level,
+    /// so it observes the same contract as the other control requests.
+    #[cfg(feature = "pairing-code")]
+    pub async fn release_holdback(&self) -> Result<()> {
+        self.send(ControlAction::ReleaseHoldback)
+            .await
+            .map(|_level| ())
+    }
+
     /// Sends one controller command.
     async fn transport(&self, command: &'static str) -> Result<()> {
         self.send(ControlAction::Transport(command))
@@ -531,6 +572,9 @@ pub(crate) enum ControlAction {
     /// Open a pairing window for this connection and start a waiting static-code attempt.
     #[cfg(feature = "pairing-code")]
     OpenPairingWindow,
+    /// Reset the dynamic flow's round counter and start the attempt it held back.
+    #[cfg(feature = "pairing-code")]
+    ReleaseHoldback,
 }
 
 /// One request from a [`ControlHandle`], with the channel its answer travels back on.
@@ -654,6 +698,10 @@ pub async fn connect_with_psks(
     let (commands, control) = mpsc::unbounded_channel();
     let (shutdown, shutdown_rx) = oneshot::channel();
     let reported_volume = Arc::new(AtomicU8::new(config.volume));
+    // The dynamic flow's round counter belongs to the process, not to a connection or a server:
+    // only a verified `server_kc` or a deliberate operator action resets it.
+    #[cfg(feature = "pairing-code")]
+    let failed_rounds = Arc::new(AtomicU32::new(0));
 
     let carried = Carried {
         sink,
@@ -661,6 +709,8 @@ pub async fn connect_with_psks(
         volume: config.volume,
         muted: config.muted,
         active_roles: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        failed_rounds: Arc::clone(&failed_rounds),
     };
     let connection = Connection {
         endpoint,
@@ -669,6 +719,8 @@ pub async fn connect_with_psks(
         pairing,
         events: events.clone(),
         reported_volume: Arc::clone(&reported_volume),
+        #[cfg(feature = "pairing-code")]
+        failed_rounds,
     };
 
     let task = tokio::spawn(async move {
@@ -706,6 +758,10 @@ struct Connection {
     events: mpsc::UnboundedSender<Event>,
     /// Level shared with every [`ControlHandle`].
     reported_volume: Arc<AtomicU8>,
+    /// Failed dynamic rounds since the last verified `server_kc`, shared with every session this
+    /// connection runs and with [`ControlHandle::release_holdback`].
+    #[cfg(feature = "pairing-code")]
+    failed_rounds: Arc<AtomicU32>,
 }
 
 impl Connection {
@@ -726,6 +782,23 @@ enum Wakeup {
 }
 
 /// Answers a request that arrived while no session was established.
+///
+/// A pairing window belongs to a connection and is refused; releasing the round hold-back belongs
+/// to the process and is honoured, so an operator gesture made during a reconnect is not lost.
+#[cfg(feature = "pairing-code")]
+fn refuse(connection: &Connection, carried: &Carried, request: ControlRequest) {
+    if matches!(request.action, ControlAction::ReleaseHoldback) {
+        connection.failed_rounds.store(0, Ordering::SeqCst);
+        let _ = request.reply.send(Ok(carried.volume));
+        return;
+    }
+    let _ = request
+        .reply
+        .send(Err(anyhow!("no connection is established")));
+}
+
+/// Answers a request that arrived while no session was established.
+#[cfg(not(feature = "pairing-code"))]
 fn refuse(request: ControlRequest) {
     let _ = request
         .reply
@@ -758,7 +831,12 @@ async fn wait_before_retry(
             () = connection.events.closed() => Wakeup::Closed,
         };
         match wakeup {
-            Wakeup::Control(Some(request)) => refuse(request),
+            Wakeup::Control(Some(request)) => {
+                #[cfg(feature = "pairing-code")]
+                refuse(connection, carried, request);
+                #[cfg(not(feature = "pairing-code"))]
+                refuse(request);
+            }
             Wakeup::Control(None) => *control = None,
             Wakeup::Deadline => return true,
             Wakeup::Closed => return false,
@@ -1015,11 +1093,17 @@ mod tests {
                 pairing_window: crate::DEFAULT_PAIRING_WINDOW,
                 #[cfg(feature = "pairing-code")]
                 pairing_pending_text: None,
+                #[cfg(feature = "pairing-code")]
+                code_formats: Vec::new(),
+                #[cfg(feature = "pairing-code")]
+                code_out_channels: Vec::new(),
             },
             psks: Vec::new(),
             pairing: None,
             events,
             reported_volume: Arc::new(AtomicU8::new(42)),
+            #[cfg(feature = "pairing-code")]
+            failed_rounds: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -1030,6 +1114,8 @@ mod tests {
             volume: 42,
             muted: false,
             active_roles: Vec::new(),
+            #[cfg(feature = "pairing-code")]
+            failed_rounds: Arc::new(AtomicU32::new(0)),
         }
     }
 

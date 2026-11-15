@@ -33,13 +33,17 @@ use syncspin_core::messages::{
 };
 #[cfg(feature = "pairing-code")]
 use syncspin_core::messages::{
-    ClientPairAuth, ClientPairFinalize, ServerPairAuth, ServerPairConfirm,
+    ClientPairAuth, ClientPairFinalize, ServerPairAuth, ServerPairConfirm, ServerPairInit,
 };
 use syncspin_core::noise::{
     psk_id_for, MAX_MESSAGE_LEN, NOISE_PARAMS, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
 #[cfg(feature = "pairing-code")]
+use syncspin_core::pairing::code::{commitment, DynamicCode};
+#[cfg(feature = "pairing-code")]
 use syncspin_core::pairing::pake;
+#[cfg(feature = "pairing-code")]
+use syncspin_core::pairing::token;
 #[cfg(feature = "pairing-code")]
 use syncspin_core::pairing::wrap;
 
@@ -116,6 +120,24 @@ pub struct ServerOptions {
     /// derive different generators and the client's `server_kc` verification fails.
     #[cfg(feature = "pairing-code")]
     pub static_pairing_code: Option<String>,
+    /// The emission format this server activates, which selects the dynamic flow when set.
+    ///
+    /// The first activation carries `dynamic_pairing_code` with this format. The harness answers
+    /// `client/pair-init` with `server/pair-init`, and begins the CPace round once the test hands
+    /// over the code the client emitted, playing the operator who typed it.
+    #[cfg(feature = "pairing-code")]
+    pub dynamic_format: Option<String>,
+    /// The `nonce_A` the harness sends in the first dynamic round.
+    ///
+    /// Fixed so a test can derive what the server will check; a real server draws it.
+    #[cfg(feature = "pairing-code")]
+    pub nonce_a: [u8; 32],
+    /// How many dynamic rounds the harness fails with a wrong `server_kc`.
+    ///
+    /// A test that plays an operator who keeps mistyping the code sets this above zero: the client
+    /// must retry, keep the code and its deadline, and abort at the twentieth round.
+    #[cfg(feature = "pairing-code")]
+    pub fail_server_kc_rounds: usize,
 }
 
 impl Default for ServerOptions {
@@ -150,6 +172,12 @@ impl Default for ServerOptions {
             stale_message_on_rehandshake: false,
             #[cfg(feature = "pairing-code")]
             static_pairing_code: None,
+            #[cfg(feature = "pairing-code")]
+            dynamic_format: None,
+            #[cfg(feature = "pairing-code")]
+            nonce_a: [0x5a; 32],
+            #[cfg(feature = "pairing-code")]
+            fail_server_kc_rounds: 0,
         }
     }
 }
@@ -202,6 +230,9 @@ pub enum Command {
     Pong(Vec<u8>),
     /// Answers the outstanding `client/time` request with this transmit timestamp.
     AnswerTime(i64),
+    /// Plays the operator entering the pairing code the client emitted.
+    #[cfg(feature = "pairing-code")]
+    EnterPairingCode(String),
     /// Closes the WebSocket cleanly.
     Close,
 }
@@ -242,6 +273,8 @@ pub enum Observation {
     PairInit {
         /// Index the client reported for the activation that admitted the attempt.
         pairing_index: u32,
+        /// `commit_B`, present exactly when the dynamic flow's attempt started.
+        commit_b: Option<String>,
     },
     /// The client reported that it is holding the pairing attempt back.
     PairPending {
@@ -250,6 +283,8 @@ pub enum Observation {
         /// The host's sentence for the operator, when it set one.
         message: Option<String>,
     },
+    /// The client asked for another round of the dynamic flow.
+    PairRetry,
     /// The client sent its CPace share.
     PairAuth {
         /// `pake_msg_2`, the client's share, as base64url.
@@ -259,6 +294,8 @@ pub enum Observation {
     PairConfirm {
         /// `client_kc`, the client's tag, as base64url.
         client_kc: String,
+        /// `wrapped_nonce_B` in the dynamic flow, as base64url.
+        wrapped_nonce_b: Option<String>,
     },
     /// The client delivered the long-term PSK of a pairing.
     PairFinalize {
@@ -431,6 +468,20 @@ impl FakeServer {
             })));
     }
 
+    /// Sends `server/activate` that admits a dynamic pairing attempt in `format`.
+    pub fn activate_dynamic_pairing(&self, format: &str) {
+        let _ = self
+            .commands
+            .send(Command::ActivateMessage(Box::new(ServerActivate {
+                activities: vec!["pairing".to_owned()],
+                active_roles: Some(Vec::new()),
+                pairing: Some(PairingActivation {
+                    method: "dynamic_pairing_code".to_owned(),
+                    format: Some(format.to_owned()),
+                }),
+            })));
+    }
+
     /// Sends `server/activate` that ends the pairing transition without finalizing it.
     pub fn cancel_pairing(&self, roles: &[&str]) {
         let _ = self
@@ -499,6 +550,15 @@ impl FakeServer {
     /// Sends an unsolicited WebSocket pong control frame.
     pub fn pong(&self, payload: Vec<u8>) {
         let _ = self.commands.send(Command::Pong(payload));
+    }
+
+    /// Plays the operator entering the code the client emitted.
+    ///
+    /// The dynamic flow's CPace round starts from this code as `PRS`, exactly as a real server
+    /// starts it once the operator typed or scanned the code.
+    #[cfg(feature = "pairing-code")]
+    pub fn enter_pairing_code(&self, code: impl Into<String>) {
+        let _ = self.commands.send(Command::EnterPairingCode(code.into()));
     }
 
     /// Sends a cleartext text frame after the handshake.
@@ -580,9 +640,36 @@ impl FakeServer {
     pub async fn wait_for_pair_init(&mut self) -> Option<u32> {
         loop {
             match self.observation().await {
-                Some(Observation::PairInit { pairing_index }) => return Some(pairing_index),
+                Some(Observation::PairInit { pairing_index, .. }) => return Some(pairing_index),
                 Some(_) => continue,
                 None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client starts a pairing attempt and returns its index and `commit_B`.
+    pub async fn wait_for_pair_commitment(&mut self) -> Option<(u32, Option<String>)> {
+        loop {
+            match self.observation().await {
+                Some(Observation::PairInit {
+                    pairing_index,
+                    commit_b,
+                }) => return Some((pairing_index, commit_b)),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client asks for another dynamic round.
+    pub async fn wait_for_pair_retry(&mut self) -> bool {
+        loop {
+            match self.observation().await {
+                Some(Observation::PairRetry) => return true,
+                Some(Observation::Closed) | Some(Observation::ClosedBeforeMessage2) | None => {
+                    return false
+                }
+                Some(_) => continue,
             }
         }
     }
@@ -612,11 +699,25 @@ impl FakeServer {
         }
     }
 
+    /// Waits until the client sends its key-confirmation tag and returns the sealed nonce too.
+    pub async fn wait_for_pair_confirm_message(&mut self) -> Option<(String, Option<String>)> {
+        loop {
+            match self.observation().await {
+                Some(Observation::PairConfirm {
+                    client_kc,
+                    wrapped_nonce_b,
+                }) => return Some((client_kc, wrapped_nonce_b)),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     /// Waits until the client sends its key-confirmation tag.
     pub async fn wait_for_pair_confirm(&mut self) -> Option<String> {
         loop {
             match self.observation().await {
-                Some(Observation::PairConfirm { client_kc }) => return Some(client_kc),
+                Some(Observation::PairConfirm { client_kc, .. }) => return Some(client_kc),
                 Some(_) => continue,
                 None => return None,
             }
@@ -985,6 +1086,35 @@ async fn serve_connection(
                 )
                 .await?;
             }
+            #[cfg(feature = "pairing-code")]
+            LinkEvent::Command(Some(Command::EnterPairingCode(code))) => {
+                // The operator typed or scanned the code; the CPace round can begin. `digits` is
+                // fed as its ASCII digits, `qr_code` as the 24 payload bytes of the token.
+                let prs = match options.dynamic_format.as_deref() {
+                    Some("digits") => code.into_bytes(),
+                    Some("qr_code") => {
+                        token::decode(&code)
+                            .context("the entered code is not a pairing token")?
+                            .payload
+                    }
+                    other => bail!("the harness activated no format it can read: {other:?}"),
+                };
+                pake.dynamic.entered = Some(prs);
+                let pairing_index = pake.dynamic.pairing_index;
+                let round_number = pake.dynamic.round;
+                let entered = pake.dynamic.entered.clone().expect("just set");
+                start_round(
+                    &mut socket,
+                    &mut noise,
+                    options,
+                    &handshake_hash,
+                    pairing_index,
+                    round_number,
+                    &entered,
+                    &mut pake,
+                )
+                .await?;
+            }
             LinkEvent::Command(Some(Command::Rehandshake { psk, category })) => {
                 let swapped = rehandshake(
                     &mut socket,
@@ -1085,17 +1215,37 @@ enum LinkEvent {
 
 /// The server-side CPace state of the connection.
 ///
-/// The harness plays the initiator (the server) of the static flow; without the feature it is an
+/// The harness plays the initiator (the server) of both code flows; without the feature it is an
 /// empty value so the call sites do not need two shapes.
 #[derive(Default)]
 struct PairingServer {
     #[cfg(feature = "pairing-code")]
-    round: Option<StaticRound>,
+    round: Option<PakeRound>,
+    #[cfg(feature = "pairing-code")]
+    dynamic: DynamicServer,
 }
 
-/// The server half of one static-code CPace round.
+/// The values the harness holds across the rounds of one dynamic attempt.
 #[cfg(feature = "pairing-code")]
-struct StaticRound {
+#[derive(Default)]
+struct DynamicServer {
+    /// `nonce_A` of the first round, which the harness drew or the test fixed.
+    nonce_a: Option<[u8; 32]>,
+    /// `commit_B` from `client/pair-init`, which the revealed nonce must hash to.
+    commit_b: Option<[u8; 32]>,
+    /// `wrapped_nonce_B` from `client/pair-confirm` of the verified round.
+    wrapped_nonce_b: Option<[u8; 48]>,
+    /// The PRS of the code the operator entered, which the client displayed.
+    entered: Option<Vec<u8>>,
+    /// The pairing index the attempt reported, used in every round's `sid`.
+    pairing_index: u32,
+    /// The round in progress, counting from one.
+    round: u32,
+}
+
+/// The server half of one CPace round.
+#[cfg(feature = "pairing-code")]
+struct PakeRound {
     /// The `sid` both sides derive the generator and the tags from.
     sid: Vec<u8>,
     /// The server's scalar, which only it holds.
@@ -1108,45 +1258,54 @@ struct StaticRound {
     expected_client_tag: Option<[u8; 64]>,
     /// Whether the client's tag verified. Only then is the sealed PSK unwrapped.
     client_verified: bool,
+    /// Whether this round sends a `server_kc` the client must reject.
+    fail_tag: bool,
 }
 
-/// The CPace session id of a static-code attempt: label, `h`, pairing index and round 1.
+/// The CPace session id of one round: label, `h`, pairing index and the round number.
 #[cfg(feature = "pairing-code")]
-fn pake_sid(handshake_hash: &[u8; 32], pairing_index: u32) -> Vec<u8> {
+fn pake_sid(handshake_hash: &[u8; 32], pairing_index: u32, round: u32) -> Vec<u8> {
     let mut sid = Vec::from(b"sendspin-pair-pake-v1".as_slice());
     sid.extend_from_slice(handshake_hash);
     sid.extend_from_slice(&pairing_index.to_be_bytes());
-    sid.extend_from_slice(&1u32.to_be_bytes());
+    sid.extend_from_slice(&round.to_be_bytes());
     sid
 }
 
-/// Starts the harness's CPace round and sends `server/pair-auth`.
+/// Starts one round of the harness's CPace exchange and sends `server/pair-auth`.
+///
+/// `prs` is the code as CPace sees it: the configured static digits, or the six digits / 24 raw
+/// bytes of a dynamic code.
 #[cfg(feature = "pairing-code")]
-async fn start_static_round(
+#[allow(clippy::too_many_arguments)]
+async fn start_round(
     socket: &mut Socket,
     noise: &mut SnowTransport,
     options: &ServerOptions,
     handshake_hash: &[u8; 32],
     pairing_index: u32,
+    round_number: u32,
+    prs: &[u8],
     pake: &mut PairingServer,
 ) -> Result<()> {
-    let code = options
-        .static_pairing_code
-        .as_deref()
-        .expect("the caller checked that the harness plays the static flow");
-    let sid = pake_sid(handshake_hash, pairing_index);
-    let generator = pake::generator(code.as_bytes(), b"", &sid);
+    let sid = pake_sid(handshake_hash, pairing_index, round_number);
+    let generator = pake::generator(prs, b"", &sid);
     let mut scalar = [0u8; 32];
     getrandom::fill(&mut scalar)
         .map_err(|_| anyhow!("the test server cannot draw a CPace scalar"))?;
     let ya = pake::public_share(&scalar, &generator)?;
-    pake.round = Some(StaticRound {
+    // A round the test fails on purpose sends a tag the client cannot accept, as a server whose
+    // operator typed the wrong code would.
+    let fail_tag =
+        options.dynamic_format.is_some() && round_number as usize <= options.fail_server_kc_rounds;
+    pake.round = Some(PakeRound {
         sid,
         scalar,
         ya,
         isk: None,
         expected_client_tag: None,
         client_verified: false,
+        fail_tag,
     });
 
     let reply = Incoming::ServerPairAuth(ServerPairAuth {
@@ -1157,7 +1316,7 @@ async fn start_static_round(
 
 /// Derives the round's key material from the client's share and sends `server/pair-confirm`.
 #[cfg(feature = "pairing-code")]
-async fn complete_static_round(
+async fn complete_round(
     socket: &mut Socket,
     noise: &mut SnowTransport,
     auth: &ClientPairAuth,
@@ -1175,7 +1334,11 @@ async fn complete_static_round(
     let point = pake::scalar_mult_vfy(&round.scalar, &yb)?;
     let transcript = pake::transcript_ir(&round.ya, b"server", &yb, b"client");
     let isk = pake::intermediate_session_key(&round.sid, &point, &transcript);
-    let ta = pake::key_confirmation_tag(&round.sid, &isk, &round.ya, b"server");
+    let mut ta = pake::key_confirmation_tag(&round.sid, &isk, &round.ya, b"server");
+    if round.fail_tag {
+        // One flipped bit is enough: the client compares the whole tag in constant time.
+        ta[0] ^= 0x80;
+    }
     round.expected_client_tag = Some(pake::key_confirmation_tag(&round.sid, &isk, &yb, b"client"));
     round.isk = Some(isk);
 
@@ -1186,14 +1349,23 @@ async fn complete_static_round(
 }
 
 /// Verifies the client's tag and unwraps the long-term PSK it delivered.
+///
+/// In the dynamic flow the harness additionally verifies the opening of the commitment, in the
+/// order the spec prescribes: `wrapped_nonce_B` must unwrap under the nonce label of this round's
+/// `sid`, the recovered nonce must hash to the `commit_B` from `client/pair-init`, and the code the
+/// operator entered must be the one derived from `h`, `nonce_A` and the recovered nonce. Any
+/// failure ends the connection, exactly as a protocol error does.
 #[cfg(feature = "pairing-code")]
-async fn finish_static_pairing(
+#[allow(clippy::too_many_arguments)]
+async fn finish_pairing(
     socket: &mut Socket,
     noise: &mut SnowTransport,
     options: &ServerOptions,
+    handshake_hash: &[u8; 32],
     observations: &UnboundedSender<Observation>,
     paired: &Arc<Mutex<Option<[u8; 32]>>>,
     pake: &mut PairingServer,
+    dynamic: bool,
     finalize: &ClientPairFinalize,
 ) -> Result<()> {
     let Some(round) = pake.round.take() else {
@@ -1203,10 +1375,10 @@ async fn finish_static_pairing(
         bail!("the client finalized before its key-confirmation tag verified");
     }
     if finalize.long_term_psk.is_some() {
-        bail!("the static flow must not carry the long-term PSK in clear");
+        bail!("a code flow must not carry the long-term PSK in clear");
     }
     let Some(encoded) = finalize.wrapped_psk.as_deref() else {
-        bail!("the static flow carries the long-term PSK sealed under the CPace output");
+        bail!("the code flow carries the long-term PSK sealed under the CPace output");
     };
     let sealed: [u8; 48] = URL_SAFE_NO_PAD
         .decode(encoded)
@@ -1216,6 +1388,44 @@ async fn finish_static_pairing(
     let isk = round
         .isk
         .ok_or_else(|| anyhow!("the CPace round never derived a session key"))?;
+
+    if dynamic {
+        let sealed_nonce = pake
+            .dynamic
+            .wrapped_nonce_b
+            .ok_or_else(|| anyhow!("client/pair-confirm carried no wrapped_nonce_B"))?;
+        let nonce_key = wrap::k_wrap(wrap::NONCE_LABEL, &round.sid, &isk);
+        let nonce_b = wrap::unwrap(&nonce_key, &sealed_nonce)
+            .context("wrapped_nonce_B does not open under the round's key")?;
+        let committed = pake
+            .dynamic
+            .commit_b
+            .ok_or_else(|| anyhow!("client/pair-init carried no commit_B"))?;
+        if commitment(&nonce_b) != committed {
+            bail!("the revealed nonce_B does not match the commitment of client/pair-init");
+        }
+        let nonce_a = pake
+            .dynamic
+            .nonce_a
+            .ok_or_else(|| anyhow!("the first round carried no nonce_A"))?;
+        let derived = DynamicCode::derive(handshake_hash, &nonce_a, &nonce_b);
+        let derived_prs = match options.dynamic_format.as_deref() {
+            Some("digits") => derived.digits().to_vec(),
+            Some("qr_code") => derived.qr_payload().to_vec(),
+            other => bail!("the harness activated no emission format it can verify: {other:?}"),
+        };
+        let entered = pake
+            .dynamic
+            .entered
+            .as_ref()
+            .ok_or_else(|| anyhow!("no pairing code was entered"))?;
+        if &derived_prs != entered {
+            bail!("the entered pairing code does not bind to h, nonce_A and nonce_B");
+        }
+    } else if pake.dynamic.wrapped_nonce_b.is_some() {
+        bail!("the static flow's client/pair-confirm carries no wrapped_nonce_B");
+    }
+
     let key = wrap::k_wrap(wrap::PSK_LABEL, &round.sid, &isk);
     let long_term_psk = wrap::unwrap(&key, &sealed)?;
     if long_term_psk == SENTINEL_PSK {
@@ -1281,15 +1491,64 @@ async fn handle_client_message(
         Some(Incoming::ClientPairInit(init)) => {
             let _ = observations.send(Observation::PairInit {
                 pairing_index: init.pairing_index,
+                commit_b: init.commit_b.clone(),
             });
             #[cfg(feature = "pairing-code")]
-            if options.static_pairing_code.is_some() {
-                start_static_round(
+            if options.dynamic_format.is_some() {
+                // The dynamic flow: the commitment must be the 32-byte digest of a nonce the
+                // client keeps, and the first round answers with the server's nonce.
+                let commit_b: [u8; 32] = decode_field(
+                    init.commit_b.as_deref(),
+                    "commit_B",
+                    "a dynamic attempt's client/pair-init carries commit_B",
+                )?;
+                pake.dynamic.nonce_a = Some(options.nonce_a);
+                pake.dynamic.commit_b = Some(commit_b);
+                pake.dynamic.pairing_index = init.pairing_index;
+                pake.dynamic.round = 1;
+                let reply = Incoming::ServerPairInit(ServerPairInit {
+                    nonce_a: Some(URL_SAFE_NO_PAD.encode(options.nonce_a)),
+                });
+                send_encrypted(socket, noise, &reply).await?;
+            } else if options.static_pairing_code.is_some() {
+                let code = options
+                    .static_pairing_code
+                    .as_deref()
+                    .expect("the branch checked the code");
+                start_round(
                     socket,
                     noise,
                     options,
                     handshake_hash,
                     init.pairing_index,
+                    1,
+                    code.as_bytes(),
+                    pake,
+                )
+                .await?;
+            }
+        }
+        Some(Incoming::ClientPairRetry(_)) => {
+            let _ = observations.send(Observation::PairRetry);
+            #[cfg(feature = "pairing-code")]
+            if options.dynamic_format.is_some() {
+                let Some(entered) = pake.dynamic.entered.clone() else {
+                    bail!("client/pair-retry arrived before a pairing code was entered");
+                };
+                pake.dynamic.round += 1;
+                // A later round carries no `nonce_A`; the binding values do not change.
+                let next = Incoming::ServerPairInit(ServerPairInit { nonce_a: None });
+                send_encrypted(socket, noise, &next).await?;
+                let pairing_index = pake.dynamic.pairing_index;
+                let round_number = pake.dynamic.round;
+                start_round(
+                    socket,
+                    noise,
+                    options,
+                    handshake_hash,
+                    pairing_index,
+                    round_number,
+                    &entered,
                     pake,
                 )
                 .await?;
@@ -1303,7 +1562,7 @@ async fn handle_client_message(
         }
         Some(Incoming::ClientPairAuth(auth)) => {
             #[cfg(feature = "pairing-code")]
-            complete_static_round(socket, noise, &auth, pake).await?;
+            complete_round(socket, noise, &auth, pake).await?;
             let _ = observations.send(Observation::PairAuth {
                 pake_msg_2: auth.pake_msg_2,
             });
@@ -1321,20 +1580,33 @@ async fn handle_client_message(
                     .as_ref()
                     .is_some_and(|expected| pake::verify_key_confirmation_tag(expected, &tag));
             }
+            #[cfg(feature = "pairing-code")]
+            if let Some(encoded) = confirm.wrapped_nonce_b.as_deref() {
+                pake.dynamic.wrapped_nonce_b = Some(
+                    URL_SAFE_NO_PAD
+                        .decode(encoded)
+                        .context("wrapped_nonce_B is not base64url")?
+                        .try_into()
+                        .map_err(|_| anyhow!("wrapped_nonce_B is not 48 bytes"))?,
+                );
+            }
             let _ = observations.send(Observation::PairConfirm {
                 client_kc: confirm.client_kc,
+                wrapped_nonce_b: confirm.wrapped_nonce_b,
             });
         }
         Some(Incoming::ClientPairFinalize(finalize)) => {
             #[cfg(feature = "pairing-code")]
-            if options.static_pairing_code.is_some() {
-                finish_static_pairing(
+            if options.static_pairing_code.is_some() || options.dynamic_format.is_some() {
+                finish_pairing(
                     socket,
                     noise,
                     options,
+                    handshake_hash,
                     observations,
                     paired,
                     pake,
+                    options.dynamic_format.is_some(),
                     &finalize,
                 )
                 .await?;
@@ -1380,6 +1652,21 @@ async fn handle_client_message(
         _ => {}
     }
     Ok(())
+}
+
+/// Decodes a base64url field of `N` bytes, naming it in the error.
+#[cfg(feature = "pairing-code")]
+fn decode_field<const N: usize>(
+    value: Option<&str>,
+    name: &str,
+    when_absent: &str,
+) -> Result<[u8; N]> {
+    let value = value.ok_or_else(|| anyhow!("{when_absent}"))?;
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .with_context(|| format!("{name} is not base64url"))?
+        .try_into()
+        .map_err(|_| anyhow!("{name} does not decode to {N} bytes"))
 }
 
 /// Builds a `server/time` reply whose two server timestamps read the local clock.

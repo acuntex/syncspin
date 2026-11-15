@@ -299,6 +299,10 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
         #[cfg(feature = "pairing-code")]
         pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     }
 }
 
@@ -1236,6 +1240,10 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
         #[cfg(feature = "pairing-code")]
         pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     };
 
     for (label, config, field) in [

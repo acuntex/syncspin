@@ -141,6 +141,20 @@ pub struct StaticPairingCodeMethod {
     pub locations: Option<Vec<String>>,
 }
 
+/// The `dynamic_pairing_code` descriptor of [`SupportedPairMethods`].
+///
+/// The protocol requires both lists to be non-empty for a server to recognize the method: a
+/// descriptor left empty is treated as unrecognized, so the client only advertises it when it can
+/// actually emit a code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DynamicPairingCodeMethod {
+    /// Channels that carry the per-session code to the operator: `display` or `speaker`.
+    pub out_channels: Vec<String>,
+    /// Emission formats the client offers: `digits` or `qr_code`.
+    pub formats: Vec<String>,
+}
+
 /// The `supported_pair_methods` object of [`ClientHello`], keyed by method identifier.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,6 +165,9 @@ pub struct SupportedPairMethods {
     /// The static pairing code method, offered when the client has a code configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_pairing_code: Option<StaticPairingCodeMethod>,
+    /// The dynamic pairing code method, offered when the client can derive and emit a code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_pairing_code: Option<DynamicPairingCodeMethod>,
 }
 
 /// The `unpaired_access` object of [`ClientHello`].
@@ -241,9 +258,9 @@ pub struct ServerActivate {
 
 /// `client/pair-init`: starts a pairing attempt.
 ///
-/// Only the Pairing PSK flow is implemented by this revision, so `commit_B` - the commitment of
-/// the dynamic code's client nonce - is absent. The field is modelled because a server validates
-/// the message it expects for the method it picked, and because the code flows build on it.
+/// The Pairing PSK flow leaves `commit_B` absent. The Dynamic Pairing Code Flow requires it: the
+/// commitment locks the client's nonce before any value from the server is known. The Static
+/// Pairing Code Flow has no nonce of its own and leaves it absent as well.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ClientPairInit {
@@ -255,6 +272,30 @@ pub struct ClientPairInit {
     #[serde(rename = "commit_B", default, skip_serializing_if = "Option::is_none")]
     pub commit_b: Option<String>,
 }
+
+/// `server/pair-init`: begins a round of the Dynamic Pairing Code Flow.
+///
+/// The server sends it in answer to `client/pair-init`, and again after every
+/// [`ClientPairRetry`]. Only the first round carries the server's nonce: the binding values, and
+/// with them the code, are unchanged across the rounds of one attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerPairInit {
+    /// 32-byte server nonce as 43 unpadded base64url characters; present in the first round only.
+    ///
+    /// The value is public - it is the server's half of the code binding - and is renamed to the
+    /// `nonce_A` the wire spells.
+    #[serde(rename = "nonce_A", default, skip_serializing_if = "Option::is_none")]
+    pub nonce_a: Option<String>,
+}
+
+/// `client/pair-retry`: asks for another round of the dynamic flow.
+///
+/// Sent in place of [`ClientPairConfirm`] when `server_kc` did not verify and the round limit still
+/// admits another round. The payload is the empty object.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairRetry {}
 
 /// `client/pair-finalize`: the long-term PSK this pairing establishes.
 ///
@@ -779,12 +820,18 @@ pub enum Incoming {
     /// `client/pair-pending`.
     #[serde(rename = "client/pair-pending")]
     ClientPairPending(ClientPairPending),
+    /// `server/pair-init`.
+    #[serde(rename = "server/pair-init")]
+    ServerPairInit(ServerPairInit),
     /// `server/pair-auth`.
     #[serde(rename = "server/pair-auth")]
     ServerPairAuth(ServerPairAuth),
     /// `client/pair-auth`.
     #[serde(rename = "client/pair-auth")]
     ClientPairAuth(ClientPairAuth),
+    /// `client/pair-retry`.
+    #[serde(rename = "client/pair-retry")]
+    ClientPairRetry(ClientPairRetry),
     /// `server/pair-confirm`.
     #[serde(rename = "server/pair-confirm")]
     ServerPairConfirm(ServerPairConfirm),
@@ -898,7 +945,7 @@ struct EnvelopeType {
 ///
 /// A variant added without its entry here would silently read as an unknown type, so the
 /// integration tests parse one instance of every variant.
-const KNOWN_TYPES: [&str; 24] = [
+const KNOWN_TYPES: [&str; 26] = [
     "client/init",
     "server/init",
     "noise/handshake",
@@ -907,8 +954,10 @@ const KNOWN_TYPES: [&str; 24] = [
     "server/activate",
     "client/pair-init",
     "client/pair-pending",
+    "server/pair-init",
     "server/pair-auth",
     "client/pair-auth",
+    "client/pair-retry",
     "server/pair-confirm",
     "client/pair-confirm",
     "client/pair-finalize",

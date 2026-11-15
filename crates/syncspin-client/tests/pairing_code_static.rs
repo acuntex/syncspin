@@ -127,6 +127,10 @@ fn config_for(endpoint: &str, storage: Option<Arc<dyn Storage>>) -> ClientConfig
         static_pairing_code: Some(CODE.to_owned()),
         pairing_window: DEFAULT_PAIRING_WINDOW,
         pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     }
 }
 

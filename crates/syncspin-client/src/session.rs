@@ -12,7 +12,11 @@
 //! `Session::begin_rehandshake`.
 
 use std::future::pending;
+#[cfg(feature = "pairing-code")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(feature = "pairing-code")]
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,7 +42,8 @@ use syncspin_core::messages::{
 };
 #[cfg(feature = "pairing-code")]
 use syncspin_core::messages::{
-    ClientPairAuth, ClientPairConfirm, ClientPairPending, ServerPairAuth, ServerPairConfirm,
+    ClientPairAuth, ClientPairConfirm, ClientPairPending, ClientPairRetry,
+    DynamicPairingCodeMethod, ServerPairAuth, ServerPairConfirm, ServerPairInit,
     StaticPairingCodeMethod,
 };
 use syncspin_core::noise::{
@@ -51,9 +56,13 @@ use crate::client::{
     check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, PairingFailure,
     PlaybackState, StreamEndReason, NORMAL_PLAYBACK_SPEED,
 };
+#[cfg(feature = "pairing-code")]
+use crate::config::CodeFormat;
 use crate::config::{AudioMode, ClientConfig, PskCategory, StoredPsk};
 #[cfg(feature = "pairing-code")]
-use crate::pairing::{pake_sid, METHOD_STATIC_PAIRING_CODE, STATIC_CODE_ROUND};
+use crate::pairing::{
+    pake_sid, TagOutcome, METHOD_DYNAMIC_PAIRING_CODE, METHOD_STATIC_PAIRING_CODE,
+};
 use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_PAIRING_PSK};
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 use crate::storage::persist_pairing;
@@ -120,6 +129,14 @@ const PSK_ID_LEN: usize = 43;
 #[cfg(feature = "pairing-code")]
 const WINDOW_FAILURE_LIMIT: u8 = 5;
 
+/// How many rounds the Dynamic Pairing Code Flow runs without a verified `server_kc`.
+///
+/// `pairing.md`: after twenty rounds since the last verified `server_kc`, the client MUST abort
+/// instead of retrying, and holds further attempts back until a deliberate operator action. The
+/// count is per process, not per server, so it lives beside the connection rather than in it.
+#[cfg(feature = "pairing-code")]
+const ROUND_LIMIT: u32 = 20;
+
 /// Player commands this client accepts from the server.
 const PLAYER_COMMANDS: [&str; 2] = ["volume", "mute"];
 
@@ -128,8 +145,8 @@ const PLAYER_COMMANDS: [&str; 2] = ["volume", "mute"];
 /// `pairing.md` treats a malformed or missing pairing field as a protocol error: the connection
 /// closes without an application-level message and nothing is persisted. Every other malformed
 /// control message keeps the lenient path, because one bad optional field must not silence
-/// playback. `server/pair-init` belongs to the dynamic flow and is not a known type in this
-/// revision; it is listed so the rule is complete when that flow arrives.
+/// playback. `server/pair-init` belongs to the dynamic flow; the client's own `client/pair-retry`
+/// never arrives, so it needs no entry here.
 const PAIRING_MESSAGE_TYPES: [&str; 5] = [
     "server/pair-init",
     "server/pair-auth",
@@ -251,7 +268,7 @@ struct PairingWindow {
     failed_attempts: u8,
 }
 
-/// A static-code activation whose attempt waits for an operator gesture.
+/// A code-flow activation whose attempt waits for an operator gesture or a released hold-back.
 ///
 /// `client/pair-pending` is on the wire and no attempt is running: the timeout starts with
 /// `client/pair-init`, so a server that waits for the gesture is not racing it.
@@ -259,6 +276,10 @@ struct PairingWindow {
 struct PendingPairing {
     /// The pairing index its activation gave `client/pair-init`.
     pairing_index: u32,
+    /// The method whose gesture releases the attempt.
+    method: AdmittedMethod,
+    /// The emission format the dynamic flow was activated with; `None` for the static flow.
+    format: Option<CodeFormat>,
 }
 
 /// The pairing methods an activation can admit on this connection.
@@ -269,6 +290,9 @@ enum AdmittedMethod {
     /// The Static Pairing Code flow.
     #[cfg(feature = "pairing-code")]
     StaticCode,
+    /// The Dynamic Pairing Code flow.
+    #[cfg(feature = "pairing-code")]
+    DynamicCode,
 }
 
 /// State a connection keeps across attempts.
@@ -283,6 +307,13 @@ pub(crate) struct Carried {
     pub(crate) muted: bool,
     /// Roles the last session had active.
     pub(crate) active_roles: Vec<String>,
+    /// Failed dynamic pairing rounds since the last verified `server_kc`.
+    ///
+    /// The count belongs to the process, not to the connection: `pairing.md` does not partition it
+    /// by server, and a reconnect must not reset it. Only a verified `server_kc` or
+    /// [`ControlHandle::release_holdback`](crate::ControlHandle::release_holdback) resets it.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) failed_rounds: Arc<AtomicU32>,
 }
 
 /// How one connection attempt ended.
@@ -410,9 +441,12 @@ pub(crate) struct Session<'a> {
     /// The pairing window the operator opened on this connection, or `None` when it is closed.
     #[cfg(feature = "pairing-code")]
     pairing_window: Option<PairingWindow>,
-    /// A static-code activation whose attempt waits for an operator gesture.
+    /// A code-flow activation whose attempt waits for an operator gesture.
     #[cfg(feature = "pairing-code")]
     pending_pairing: Option<PendingPairing>,
+    /// Failed dynamic pairing rounds since the last verified `server_kc`, shared by the process.
+    #[cfg(feature = "pairing-code")]
+    failed_rounds: Arc<AtomicU32>,
     /// A re-handshake whose new keys are in place, or `None` when the connection is not switching
     /// keys.
     rehandshake: Option<Rehandshake>,
@@ -502,6 +536,8 @@ pub(crate) async fn attempt(
         pairing_window: None,
         #[cfg(feature = "pairing-code")]
         pending_pairing: None,
+        #[cfg(feature = "pairing-code")]
+        failed_rounds: carried.failed_rounds,
         rehandshake: None,
     };
     session.publish_volume();
@@ -544,6 +580,8 @@ impl Session<'_> {
             volume: self.volume,
             muted: self.muted,
             active_roles: self.active_roles,
+            #[cfg(feature = "pairing-code")]
+            failed_rounds: self.failed_rounds,
         }
     }
 
@@ -823,6 +861,8 @@ impl Session<'_> {
             Incoming::ServerPairFinalize(_) => self.confirm_pairing(),
             Incoming::PairAbort(abort) => self.handle_pairing_abort(abort),
             #[cfg(feature = "pairing-code")]
+            Incoming::ServerPairInit(init) => self.handle_server_init(init).await,
+            #[cfg(feature = "pairing-code")]
             Incoming::ServerPairAuth(auth) => self.handle_server_auth(auth).await,
             #[cfg(feature = "pairing-code")]
             Incoming::ServerPairConfirm(confirm) => self.handle_server_confirm(confirm).await,
@@ -964,10 +1004,11 @@ impl Session<'_> {
     /// The method an activation may run on this connection, or `None` when it is inadmissible.
     ///
     /// The Pairing PSK method needs a store and is admissible only on a connection the pairing PSK
-    /// sealed. The static code needs a configured code and a store for the record it produces, is
-    /// admissible only while the connection is *not* keyed by the pairing PSK - the spec's
-    /// invariant, since a code round authenticates a Sentinel-keyed or long-term-keyed channel -
-    /// and takes no emission format, which belongs to the dynamic flow.
+    /// sealed. The static code needs a configured code and a store for the record it produces. The
+    /// dynamic code needs the formats and out-channels the host advertised, the emission format the
+    /// server picked among them, and a store as well. Both code methods are admissible only while
+    /// the connection is *not* keyed by the pairing PSK - the spec's invariant, since a code round
+    /// authenticates a Sentinel-keyed or long-term-keyed channel.
     fn admitted_method(&self, activation: &PairingActivation) -> Option<AdmittedMethod> {
         match activation.method.as_str() {
             METHOD_PAIRING_PSK => (self.config.storage.is_some()
@@ -979,8 +1020,27 @@ impl Session<'_> {
                 && self.matched != MatchedPsk::PairingPsk
                 && activation.format.is_none())
             .then_some(AdmittedMethod::StaticCode),
+            #[cfg(feature = "pairing-code")]
+            METHOD_DYNAMIC_PAIRING_CODE => (self.config.storage.is_some()
+                && self.matched != MatchedPsk::PairingPsk
+                && self.dynamic_format(activation).is_some())
+            .then_some(AdmittedMethod::DynamicCode),
             _ => None,
         }
+    }
+
+    /// The emission format an activation selected, when the client offers it.
+    ///
+    /// A method the client would offer with formats but no channel is refused here too: the
+    /// protocol treats such a descriptor as unrecognized, so no server should have picked it, and
+    /// a client that runs it anyway would emit a code nowhere.
+    #[cfg(feature = "pairing-code")]
+    fn dynamic_format(&self, activation: &PairingActivation) -> Option<CodeFormat> {
+        if self.config.code_out_channels.is_empty() || self.config.code_formats.is_empty() {
+            return None;
+        }
+        let format = CodeFormat::from_wire(activation.format.as_deref()?)?;
+        self.config.code_formats.contains(&format).then_some(format)
     }
 
     /// Whether the pairing window of this connection is open right now.
@@ -1016,6 +1076,18 @@ impl Session<'_> {
         }
     }
 
+    /// Whether the dynamic flow's round limit holds new attempts back.
+    #[cfg(feature = "pairing-code")]
+    fn rounds_are_exhausted(&self) -> bool {
+        self.failed_rounds.load(Ordering::SeqCst) >= ROUND_LIMIT
+    }
+
+    /// Counts one failed dynamic round, returning the count after it.
+    #[cfg(feature = "pairing-code")]
+    fn record_failed_round(&self) -> u32 {
+        self.failed_rounds.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
     /// Opens a pairing window for the connection, and starts the attempt that was waiting for it.
     ///
     /// The gesture belongs to the host; this only records the window and, when a static-code
@@ -1028,39 +1100,86 @@ impl Session<'_> {
             opened: Instant::now(),
             failed_attempts: 0,
         });
+        self.start_pending(AdmittedMethod::StaticCode).await
+    }
+
+    /// Releases the dynamic flow's round limit and starts the attempt it held back.
+    ///
+    /// The count is per process, so the operator action also clears it without a connection; this
+    /// is the session's half, for a gesture that arrives while one is established.
+    #[cfg(feature = "pairing-code")]
+    async fn release_holdback(&mut self) -> Result<()> {
+        self.failed_rounds.store(0, Ordering::SeqCst);
+        self.start_pending(AdmittedMethod::DynamicCode).await
+    }
+
+    /// Starts the held-back activation whose method is `method`, if one is waiting.
+    #[cfg(feature = "pairing-code")]
+    async fn start_pending(&mut self, method: AdmittedMethod) -> Result<()> {
         let Some(pending) = self.pending_pairing.take() else {
             return Ok(());
         };
+        if pending.method != method {
+            // The gesture belongs to the other method: the activation keeps waiting for its own.
+            self.pending_pairing = Some(pending);
+            return Ok(());
+        }
         if self.pairing.is_some() {
             // An activation that superseded the pending one owns the attempt now.
             return Ok(());
         }
-        self.start_static_attempt(pending.pairing_index).await
+        self.start_code_attempt(pending.pairing_index, pending.method, pending.format)
+            .await
     }
 
     /// Sends `client/pair-init` and starts the attempt whose timeout runs from it.
     #[cfg(feature = "pairing-code")]
-    async fn start_static_attempt(&mut self, pairing_index: u32) -> Result<()> {
+    async fn start_code_attempt(
+        &mut self,
+        pairing_index: u32,
+        method: AdmittedMethod,
+        format: Option<CodeFormat>,
+    ) -> Result<()> {
+        let attempt = match method {
+            AdmittedMethod::StaticCode => PairingAttempt::static_code(
+                pairing_index,
+                self.config.pairing_timeout,
+                self.candidates.pairing(),
+            ),
+            AdmittedMethod::DynamicCode => {
+                let Some(format) = format else {
+                    // The activation decided the format; without one no code can be derived, and
+                    // starting an attempt that cannot emit would only waste the operator's time.
+                    return self.abort_pairing(PairingFailure::MethodNotSupported).await;
+                };
+                PairingAttempt::dynamic_code(
+                    pairing_index,
+                    self.config.pairing_timeout,
+                    self.candidates.pairing(),
+                    format,
+                )
+            }
+            AdmittedMethod::PairingPsk => {
+                bail!("the Pairing PSK flow does not start a code attempt")
+            }
+        };
         let init = Incoming::ClientPairInit(ClientPairInit {
             pairing_index,
-            commit_b: None,
+            commit_b: attempt.commit_b(),
         });
         self.send_json(&init).await?;
-        self.pairing = Some(PairingAttempt::static_code(
-            pairing_index,
-            self.config.pairing_timeout,
-            self.candidates.pairing(),
-        ));
+        self.pairing = Some(attempt);
         Ok(())
     }
 
     /// Starts the one attempt a pairing activation admits, or aborts it as unsupported.
     ///
     /// The Pairing PSK flow sends `client/pair-init` and `client/pair-finalize` back to back,
-    /// without waiting for a server response. The static flow sends only `client/pair-init`, and
-    /// only once a pairing window is open: while the window is closed it sends
-    /// `client/pair-pending` instead and the attempt starts with a later gesture. Before either,
-    /// the activation has to be admissible; anything else is a `pair/abort` with reason
+    /// without waiting for a server response. A code flow sends only `client/pair-init`, and only
+    /// once its gate is open: the static flow waits for a pairing window, the dynamic flow for a
+    /// round count below the limit. While the gate is closed the client sends
+    /// `client/pair-pending` instead, and the attempt starts with a later operator action. Before
+    /// either, the activation has to be admissible; anything else is a `pair/abort` with reason
     /// `method_not_supported`, which leaves the connection open.
     async fn start_pairing(&mut self, activation: PairingActivation) -> Result<()> {
         // A second activation supersedes an attempt that is still running; its state is discarded
@@ -1099,28 +1218,100 @@ impl Session<'_> {
             #[cfg(feature = "pairing-code")]
             AdmittedMethod::StaticCode => {
                 if !self.window_is_open() {
-                    let pending = Incoming::ClientPairPending(ClientPairPending {
-                        pairing_index: self.pairing_index,
-                        message: self.config.pairing_pending_text.clone(),
-                    });
-                    self.send_json(&pending).await?;
-                    self.pending_pairing = Some(PendingPairing {
-                        pairing_index: self.pairing_index,
-                    });
-                    return Ok(());
+                    return self
+                        .hold_pairing_back(self.pairing_index, AdmittedMethod::StaticCode, None)
+                        .await;
                 }
-                self.start_static_attempt(self.pairing_index).await
+                self.start_code_attempt(self.pairing_index, AdmittedMethod::StaticCode, None)
+                    .await
+            }
+            #[cfg(feature = "pairing-code")]
+            AdmittedMethod::DynamicCode => {
+                let Some(format) = self.dynamic_format(&activation) else {
+                    // `admitted_method` checked it; nothing can change between the two calls.
+                    return self.abort_pairing(PairingFailure::MethodNotSupported).await;
+                };
+                if self.rounds_are_exhausted() {
+                    return self
+                        .hold_pairing_back(
+                            self.pairing_index,
+                            AdmittedMethod::DynamicCode,
+                            Some(format),
+                        )
+                        .await;
+                }
+                self.start_code_attempt(
+                    self.pairing_index,
+                    AdmittedMethod::DynamicCode,
+                    Some(format),
+                )
+                .await
             }
         }
     }
 
+    /// Sends `client/pair-pending` and remembers the activation until its gate opens.
+    #[cfg(feature = "pairing-code")]
+    async fn hold_pairing_back(
+        &mut self,
+        pairing_index: u32,
+        method: AdmittedMethod,
+        format: Option<CodeFormat>,
+    ) -> Result<()> {
+        let pending = Incoming::ClientPairPending(ClientPairPending {
+            pairing_index,
+            message: self.config.pairing_pending_text.clone(),
+        });
+        self.send_json(&pending).await?;
+        self.pending_pairing = Some(PendingPairing {
+            pairing_index,
+            method,
+            format,
+        });
+        Ok(())
+    }
+
+    /// Handles `server/pair-init`: begins a round of the dynamic flow and emits the code.
+    ///
+    /// The first round carries `nonce_A`; the client derives the code from it, the handshake hash
+    /// and its own nonce, and emits it through [`Event::PairingCode`]. A later round repeats the
+    /// same code with a higher round number: the binding values do not change within an attempt.
+    ///
+    /// A message that arrives when no attempt is running belongs to an attempt the client already
+    /// ended and is discarded silently. A message at the wrong point of a running attempt, a
+    /// missing first-round nonce or a changed one is a protocol error: the connection closes
+    /// without an application-level message, as `pairing.md` requires.
+    #[cfg(feature = "pairing-code")]
+    async fn handle_server_init(&mut self, init: ServerPairInit) -> Result<()> {
+        let Some(mut attempt) = self.pairing.take() else {
+            return self.discard_or_reject_pairing_message("server/pair-init");
+        };
+        if !attempt.awaiting_server_init() {
+            self.pairing = Some(attempt);
+            bail!("the server sent server/pair-init out of sequence");
+        }
+        let nonce_a = match init.nonce_a.as_deref() {
+            Some(value) => Some(decode_pairing_field::<32>(value, "nonce_A")?),
+            None => None,
+        };
+        let emission = attempt.begin_round(nonce_a, self.noise.handshake_hash())?;
+        self.emit(Event::PairingCode {
+            code: emission.code,
+            format: emission.format,
+            round: emission.round,
+        });
+        self.pairing = Some(attempt);
+        Ok(())
+    }
+
     /// Answers `server/pair-auth`: runs the client half of the CPace round.
     ///
-    /// The reply, `client/pair-auth`, carries this client's share `Yb`. A message that arrives when
-    /// no attempt is running belongs to an attempt the client already ended, and is discarded
-    /// silently as the spec requires. A message at the wrong point of a running attempt is a
-    /// sequence violation, and a share that is malformed or encodes a low-order point is a
-    /// protocol error: both close the connection without an application-level message.
+    /// The reply, `client/pair-auth`, carries this client's share `Yb`. The round's `PRS` is the
+    /// configured static code, or the code the dynamic flow derived for this attempt. A message
+    /// that arrives when no attempt is running belongs to an attempt the client already ended, and
+    /// is discarded silently as the spec requires. A message at the wrong point of a running
+    /// attempt is a sequence violation, and a share that is malformed or encodes a low-order point
+    /// is a protocol error: both close the connection without an application-level message.
     #[cfg(feature = "pairing-code")]
     async fn handle_server_auth(&mut self, auth: ServerPairAuth) -> Result<()> {
         let Some(mut attempt) = self.pairing.take() else {
@@ -1130,19 +1321,32 @@ impl Session<'_> {
             self.pairing = Some(attempt);
             bail!("the server sent server/pair-auth out of sequence");
         }
-        let Some(code) = self.config.static_pairing_code.as_deref() else {
-            // The method is only admitted with a code, so this is a configuration changed during
-            // the connection; failing loudly is better than deriving a round from nothing.
-            self.pairing = Some(attempt);
-            bail!("the static pairing code is no longer configured");
+        let prs = if attempt.is_dynamic_code() {
+            match attempt.prs() {
+                Some(prs) => prs,
+                None => {
+                    // The code is derived in `server/pair-init`, so this cannot happen unless the
+                    // attempt was started without one.
+                    self.pairing = Some(attempt);
+                    bail!("the dynamic pairing code was never derived");
+                }
+            }
+        } else {
+            let Some(code) = self.config.static_pairing_code.as_deref() else {
+                // The method is only admitted with a code, so this is a configuration changed
+                // during the connection; failing loudly beats deriving a round from nothing.
+                self.pairing = Some(attempt);
+                bail!("the static pairing code is no longer configured");
+            };
+            code.as_bytes().to_vec()
         };
         let peer_share: [u8; 32] = decode_pairing_field(&auth.pake_msg_1, "pake_msg_1")?;
         let sid = pake_sid(
             self.noise.handshake_hash(),
             attempt.pairing_index,
-            STATIC_CODE_ROUND,
+            attempt.round(),
         );
-        let share = attempt.accept_server_share(code, &sid, &peer_share)?;
+        let share = attempt.accept_server_share(&prs, &sid, &peer_share)?;
         let reply = Incoming::ClientPairAuth(ClientPairAuth {
             pake_msg_2: URL_SAFE_NO_PAD.encode(share),
         });
@@ -1153,10 +1357,12 @@ impl Session<'_> {
 
     /// Handles `server/pair-confirm`: verifies `server_kc` before anything is revealed.
     ///
-    /// A verified tag releases the client's tag and the sealed long-term PSK, which travel back to
-    /// back with no server response awaited. The static flow has no retry: a mismatch ends the
-    /// attempt with `pairing_code_mismatch` and counts it against the pairing window, whose fifth
-    /// failure closes it.
+    /// A verified tag releases the client's tag and the seals, which travel back to back with no
+    /// server response awaited; it also clears the round count, because the spec counts rounds
+    /// since the last verified `server_kc`. A mismatch ends the static flow's attempt with
+    /// `pairing_code_mismatch` - it has no retry - while the dynamic flow answers with
+    /// `client/pair-retry` and keeps the attempt, its code and its deadline. At the twentieth
+    /// failed round the dynamic flow aborts with the same reason instead of retrying.
     #[cfg(feature = "pairing-code")]
     async fn handle_server_confirm(&mut self, confirm: ServerPairConfirm) -> Result<()> {
         let Some(mut attempt) = self.pairing.take() else {
@@ -1167,16 +1373,32 @@ impl Session<'_> {
             bail!("the server sent server/pair-confirm out of sequence");
         }
         let received: [u8; TAG_LEN] = decode_pairing_field(&confirm.server_kc, "server_kc")?;
-        let Some(confirmation) = attempt.verify_server_tag(&received) else {
-            self.record_window_failure();
-            return self
-                .abort_pairing(PairingFailure::PairingCodeMismatch)
-                .await;
+        let confirmation = match attempt.verify_server_tag(&received) {
+            TagOutcome::Confirmed(confirmation) => confirmation,
+            TagOutcome::Mismatch => {
+                if attempt.is_dynamic_code() {
+                    let failed = self.record_failed_round();
+                    if failed < ROUND_LIMIT {
+                        let retry = Incoming::ClientPairRetry(ClientPairRetry {});
+                        self.send_json(&retry).await?;
+                        // The attempt keeps its binding values, its code and its deadline; the
+                        // server begins the next round with `server/pair-init`.
+                        self.pairing = Some(attempt);
+                        return Ok(());
+                    }
+                } else {
+                    self.record_window_failure();
+                }
+                return self
+                    .abort_pairing(PairingFailure::PairingCodeMismatch)
+                    .await;
+            }
         };
+        self.failed_rounds.store(0, Ordering::SeqCst);
 
         let reply = Incoming::ClientPairConfirm(ClientPairConfirm {
             client_kc: confirmation.client_kc,
-            wrapped_nonce_b: None,
+            wrapped_nonce_b: confirmation.wrapped_nonce_b,
         });
         self.send_json(&reply).await?;
         let finalize = Incoming::ClientPairFinalize(ClientPairFinalize {
@@ -1230,9 +1452,9 @@ impl Session<'_> {
             return self.discard_or_reject_pairing_message("server/pair-finalize");
         };
         #[cfg(feature = "pairing-code")]
-        if attempt.is_static_code() && !attempt.awaiting_finalize() {
+        if (attempt.is_static_code() || attempt.is_dynamic_code()) && !attempt.awaiting_finalize() {
             self.pairing = Some(attempt);
-            bail!("the server finalized a static-code attempt before confirming its tag");
+            bail!("the server finalized a code-flow attempt before confirming its tag");
         }
         let Some(storage) = self.config.storage.as_deref() else {
             // An attempt only starts when a store exists, so this is unreachable; failing loudly
@@ -1593,6 +1815,8 @@ impl Session<'_> {
             ControlAction::OpenPairingWindow => {
                 self.open_pairing_window().await.map(|()| self.volume)
             }
+            #[cfg(feature = "pairing-code")]
+            ControlAction::ReleaseHoldback => self.release_holdback().await.map(|()| self.volume),
         };
         match result {
             Ok(level) => {
@@ -1644,10 +1868,10 @@ impl Session<'_> {
                 }
                 Ok(())
             }
-            // The window is a local state: opening it sends nothing itself, and whatever it starts
-            // needs no role.
+            // The window and the hold-back release are local state: neither sends anything itself,
+            // and whatever they start needs no role.
             #[cfg(feature = "pairing-code")]
-            ControlAction::OpenPairingWindow => Ok(()),
+            ControlAction::OpenPairingWindow | ControlAction::ReleaseHoldback => Ok(()),
         }
     }
 
@@ -1879,9 +2103,10 @@ fn client_hello(config: &ClientConfig) -> Incoming {
 /// `pairing_psk` is offered exactly when a store is configured, because the method needs a pairing
 /// PSK that survives restarts and a place to write the record. `static_pairing_code` is offered
 /// exactly when the feature is on, a code is configured and a store exists: the code is the
-/// method's whole credential, and the record it produces has to be persisted, so without either the
-/// client cannot complete an attempt and must not advertise it. The dynamic code arrives with its
-/// own flow; a method the client cannot complete is never offered.
+/// method's whole credential, and the record it produces has to be persisted. `dynamic_pairing_code`
+/// is offered exactly when the feature is on, the host advertised at least one emission format and
+/// one out-channel, and a store exists: the code is derived per attempt and needs somewhere to go.
+/// A method the client cannot complete is never offered.
 fn pair_methods(config: &ClientConfig) -> SupportedPairMethods {
     SupportedPairMethods {
         pairing_psk: config.storage.is_some().then_some(PairingPskMethod {}),
@@ -1893,6 +2118,24 @@ fn pair_methods(config: &ClientConfig) -> SupportedPairMethods {
             .map(|_| StaticPairingCodeMethod::default()),
         #[cfg(not(feature = "pairing-code"))]
         static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        dynamic_pairing_code: (config.storage.is_some()
+            && !config.code_formats.is_empty()
+            && !config.code_out_channels.is_empty())
+        .then(|| DynamicPairingCodeMethod {
+            out_channels: config
+                .code_out_channels
+                .iter()
+                .map(|channel| channel.as_wire().to_owned())
+                .collect(),
+            formats: config
+                .code_formats
+                .iter()
+                .map(|format| format.as_wire().to_owned())
+                .collect(),
+        }),
+        #[cfg(not(feature = "pairing-code"))]
+        dynamic_pairing_code: None,
     }
 }
 
@@ -2166,6 +2409,8 @@ fn now_us() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "pairing-code")]
+    use crate::config::CodeOutChannel;
 
     /// Builds a metadata payload with the Sentinel id and the given category.
     fn sentinel_metadata(category: &str) -> String {
@@ -2412,6 +2657,10 @@ mod tests {
             pairing_window: crate::config::DEFAULT_PAIRING_WINDOW,
             #[cfg(feature = "pairing-code")]
             pairing_pending_text: None,
+            #[cfg(feature = "pairing-code")]
+            code_formats: Vec::new(),
+            #[cfg(feature = "pairing-code")]
+            code_out_channels: Vec::new(),
         }
     }
 
@@ -2457,6 +2706,8 @@ mod tests {
             pairing_window: None,
             #[cfg(feature = "pairing-code")]
             pending_pairing: None,
+            #[cfg(feature = "pairing-code")]
+            failed_rounds: Arc::new(AtomicU32::new(0)),
             rehandshake: None,
         }
     }
@@ -2747,6 +2998,147 @@ mod tests {
             format: Some("digits".to_owned()),
         };
         assert_eq!(session.admitted_method(&formatted), None);
+    }
+
+    /// The dynamic method needs its descriptor, the format the server picked and a store.
+    #[cfg(feature = "pairing-code")]
+    #[tokio::test]
+    async fn the_dynamic_code_needs_formats_channels_and_a_store() {
+        let empty_config = test_config();
+        let formatted_config = ClientConfig {
+            code_formats: vec![CodeFormat::Digits],
+            code_out_channels: vec![CodeOutChannel::Display],
+            ..test_config()
+        };
+        let offered_config = ClientConfig {
+            storage: Some(std::sync::Arc::new(
+                crate::test_support::MemoryStore::holding([7u8; 32]),
+            )),
+            ..formatted_config.clone()
+        };
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &empty_config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+        let activation = PairingActivation {
+            method: "dynamic_pairing_code".to_owned(),
+            format: Some("digits".to_owned()),
+        };
+
+        assert_eq!(
+            session.admitted_method(&activation),
+            None,
+            "without formats and a channel the method is not offered"
+        );
+        assert_eq!(
+            session.dynamic_format(&activation),
+            None,
+            "no descriptor, no emission format"
+        );
+
+        // A descriptor without a store is not offerable: the record could not be persisted.
+        assert!(
+            pair_methods(&formatted_config)
+                .dynamic_pairing_code
+                .is_none(),
+            "the advertisement follows the same rule"
+        );
+        session.config = &formatted_config;
+        assert_eq!(session.admitted_method(&activation), None);
+
+        let descriptor = pair_methods(&offered_config)
+            .dynamic_pairing_code
+            .expect("formats, a channel and a store make the method offerable");
+        assert_eq!(descriptor.formats, vec!["digits"]);
+        assert_eq!(descriptor.out_channels, vec!["display"]);
+
+        session.config = &offered_config;
+        assert_eq!(
+            session.admitted_method(&activation),
+            Some(AdmittedMethod::DynamicCode),
+            "an offered format on a Sentinel-keyed connection is admissible"
+        );
+        assert_eq!(
+            session.dynamic_format(&activation),
+            Some(CodeFormat::Digits),
+            "the activation's format is the one the attempt runs"
+        );
+
+        for format in ["qr_code", "nfc", ""] {
+            let other = PairingActivation {
+                method: "dynamic_pairing_code".to_owned(),
+                format: Some(format.to_owned()),
+            };
+            assert_eq!(
+                session.admitted_method(&other),
+                None,
+                "{format:?} is not an offered format"
+            );
+        }
+        let unformatted = PairingActivation {
+            method: "dynamic_pairing_code".to_owned(),
+            format: None,
+        };
+        assert_eq!(
+            session.admitted_method(&unformatted),
+            None,
+            "the dynamic flow always names its emission format"
+        );
+
+        session.matched = MatchedPsk::PairingPsk;
+        assert_eq!(
+            session.admitted_method(&activation),
+            None,
+            "the method and the matched pairing PSK are an inadmissible combination"
+        );
+    }
+
+    /// The round limit is twenty, and only a release or a verified tag resets it.
+    #[cfg(feature = "pairing-code")]
+    #[tokio::test]
+    async fn the_round_limit_holds_attempts_back_and_a_release_resets_it() {
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        assert!(
+            !session.rounds_are_exhausted(),
+            "a fresh process is below the limit"
+        );
+        for round in 1..20 {
+            assert_eq!(session.record_failed_round(), round);
+            assert!(
+                !session.rounds_are_exhausted(),
+                "round {round} must still admit a retry"
+            );
+        }
+        assert_eq!(session.record_failed_round(), 20);
+        assert!(
+            session.rounds_are_exhausted(),
+            "the twentieth failed round reaches the limit"
+        );
+
+        // The release is the operator action the spec requires, and it clears the count.
+        session
+            .release_holdback()
+            .await
+            .expect("a release needs no connection and no pending attempt");
+        assert!(!session.rounds_are_exhausted());
+        assert_eq!(session.failed_rounds.load(Ordering::SeqCst), 0);
     }
 
     /// The window closes on its fifth failed verification, and expiry closes it as well.
