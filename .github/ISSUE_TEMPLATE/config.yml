@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/acuntex/syncspin/security/advisories/new
-    about: Report it privately. Never paste key material, PSKs or pairing records.
+    url: https://github.com/acuntex/syncspin/blob/main/SECURITY.md
+    about: Read the scope and the redaction rules, then report privately. Never paste key material, PSKs or pairing records.
   - name: Before you open a pull request
     url: https://github.com/acuntex/syncspin/blob/main/CONTRIBUTING.md
     about: The gates, the hard rules and what a change needs to merge.

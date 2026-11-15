@@ -1,7 +1,8 @@
 # syncspin
 
-A Rust library for the Sendspin protocol: a client today, a server planned. A server owns the queue
-and the clock, clients render the audio and report their state back.
+A Rust library for [the Sendspin protocol](https://github.com/Sendspin/spec): a client today, a
+server planned. A server owns the queue and the clock, clients render the audio and report their
+state back.
 
 [![CI](https://github.com/acuntex/syncspin/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/acuntex/syncspin/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#licence)
@@ -11,7 +12,7 @@ and the clock, clients render the audio and report their state back.
 
 **0.1, client first.** The client is implemented and covered by a hermetic test suite;
 `syncspin-server` is a stub with `publish = false`. No crate is published on crates.io — `v0.1.0` is
-a pre-release tag that marks the first pinnable state.
+a pre-release tag that marks the first pinnable state. The API may change before 1.0.
 
 `syncspin` is not an official Sendspin implementation and is not affiliated with the Sendspin
 project; the name describes only the protocol the code speaks.
@@ -22,7 +23,7 @@ project; the name describes only the protocol the code speaks.
 | ------------------------- | ------------------------------------------------------------------------------- |
 | `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
 | `crates/syncspin-client/` | Session loop, `Sink` trait, event stream.                                       |
-| `crates/syncspin-server/` | Listener, streams, roles, pairing (planned for 0.2).                            |
+| `crates/syncspin-server/` | Planned for 0.2: listener, streams, roles, pairing.                             |
 | `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr.               |
 
 `syncspin-core` never depends on `syncspin-client` or `syncspin-server`; every protocol and crypto
@@ -66,17 +67,20 @@ where `1000` is normal speed.
 
 ## What does not work yet
 
-- **Pairing.** No pairing PSK, no code pairing, no pairing records. A client connects as an unpaired
-  guest, which the server must allow.
+- **Pairing.** No pairing flow: no PSK negotiation, no code pairing, no pairing window. A client
+  connects as an unpaired guest, which the server must allow. A host that already holds a pairing
+  record can hand it in through `connect_with_psks`.
 - **Server.** `syncspin-server` is a stub; the listener, streams, roles and pairing server arrive in
   0.2.
 - **Discovery.** Clients do not advertise over mDNS and do not accept server-initiated connections.
 - **Group state.** `group/update`, the spec's authoritative source of the playback state, is not
   handled.
-- **TLS.** `wss://` is an opt-in feature that does not build for ARMv7.
+- **TLS.** No TLS stack: a `wss://` address is rejected when the client is configured, and nothing
+  is downgraded to `ws://`. A TLS backend is out of scope for 0.1.
 
-Every one of these is tracked with its reason and the work that closes it in
-[docs/spec-deviations.md](docs/spec-deviations.md).
+Pairing, discovery, `group/update` and the other departures from the specification are tracked with
+their reasons and the work that closes them in [docs/spec-deviations.md](docs/spec-deviations.md).
+The server half is not a deviation — it is staged work for 0.2.
 
 ## Getting started
 
@@ -102,11 +106,11 @@ handling, `src/pipe_sink.rs` the `Sink` implementation.
 
 ## Integrating a client
 
-A host supplies a [`Sink`]: `open` for a new format, `write` for every chunk with the playout
-deadline the client computed, `flush` at each boundary the crate announces, and optionally `latency`
-and `underruns` so the client can hold its buffer and report timing. The crate owns the connection,
-the clock and the reconnect loop; the host owns the output device, the identity file and everything
-below the pipe.
+A host supplies a [`Sink`](crates/syncspin-client/src/sink.rs): `open` for a new format, `write` for
+every chunk with the playout deadline the client computed, `flush` at each boundary the crate
+announces, and optionally `latency` and `underruns` so the client can hold its buffer and report
+timing. The crate owns the connection, the clock and the reconnect loop; the host owns the output
+device, the identity file and everything below the pipe.
 
 ```rust
 let (handle, mut events) = Client::connect(config, Box::new(my_sink)).await?;
