@@ -183,20 +183,46 @@ fn responder_completes_a_kkpsk2_handshake_with_a_snow_initiator() {
 }
 
 #[test]
+fn a_tampered_prologue_fails_the_handshake() {
+    let server = generate_keypair();
+    let client = Identity::generate();
+    let server_id = URL_SAFE_NO_PAD.encode(&server.public);
+    let prologue = prologue(&client, &server_id);
+
+    // Same server_id, so the responder can still find the initiator's static key, but the bytes
+    // mixed into the handshake differ from the initiator's copy.
+    let mut tampered = prologue.clone();
+    tampered.insert(0, b' ');
+
+    let mut initiator = initiator(&server, &client.public, &prologue);
+    let mut responder = Responder::new(&client, &tampered).expect("server_id still parses");
+
+    let message_1 = write(&mut initiator, handshake_metadata().as_bytes());
+    assert!(
+        responder.read_message(&message_1).is_err(),
+        "a prologue that differs from the initiator's must fail message 1"
+    );
+}
+
+#[test]
+fn into_transport_before_the_handshake_fails() {
+    let server = generate_keypair();
+    let client = Identity::generate();
+    let prologue = prologue(&client, &URL_SAFE_NO_PAD.encode(&server.public));
+
+    let responder = Responder::new(&client, &prologue).expect("build the responder");
+    assert!(
+        responder.into_transport().is_err(),
+        "transport mode must not start before both handshake messages"
+    );
+}
+
+#[test]
 fn transport_rejects_oversized_plaintext() {
     let (mut responder, _initiator) = completed_handshake();
 
-    // One Noise message is at most 65535 bytes including the 16-byte authentication tag.
-    let err = responder
-        .encrypt(&vec![0u8; MAX_MESSAGE_LEN])
-        .expect_err("an oversized plaintext must not be fragmented silently");
-    let message = format!("{err:#}").to_lowercase();
-    assert!(
-        message.contains("noise") && message.contains("maximum"),
-        "error should explain the Noise maximum, got: {message}"
-    );
-
-    // The largest fitting plaintext still produces exactly one full-size message.
+    // A Noise message is at most 65535 bytes including the 16-byte authentication tag, so the
+    // largest plaintext is MAX_MESSAGE_LEN - 16 and filling it produces one full-size message.
     let largest = vec![0u8; MAX_MESSAGE_LEN - 16];
     assert_eq!(
         responder
@@ -205,16 +231,46 @@ fn transport_rejects_oversized_plaintext() {
             .len(),
         MAX_MESSAGE_LEN
     );
+
+    // One byte more must be rejected rather than silently fragmented.
+    let err = responder
+        .encrypt(&vec![0u8; MAX_MESSAGE_LEN - 15])
+        .expect_err("an oversized plaintext must not be fragmented silently");
+    let message = format!("{err:#}").to_lowercase();
+    assert!(
+        message.contains("noise") && message.contains("maximum"),
+        "error should explain the Noise maximum, got: {message}"
+    );
+
+    // Ciphertexts are bounded by the same message size ...
+    let err = responder
+        .decrypt(&vec![0u8; MAX_MESSAGE_LEN + 1])
+        .expect_err("an oversized ciphertext must be rejected");
+    let message = format!("{err:#}").to_lowercase();
+    assert!(
+        message.contains("noise") && message.contains("maximum"),
+        "error should explain the Noise maximum, got: {message}"
+    );
+
+    // ... and must carry at least the authentication tag.
+    let err = responder
+        .decrypt(&[0u8; 15])
+        .expect_err("a ciphertext without a full tag must be rejected");
+    let message = format!("{err:#}").to_lowercase();
+    assert!(
+        message.contains("noise") && message.contains("16-byte") && message.contains("tag"),
+        "error should name the tag length, got: {message}"
+    );
 }
 
 #[test]
-fn identity_base64_roundtrip() {
+fn identity_secret_base64_roundtrip() {
     let identity = Identity::generate();
     let encoded = identity.secret_base64();
     assert_eq!(encoded.len(), 43);
     assert_eq!(identity.public_base64().len(), 43);
 
-    let decoded = Identity::from_base64(&encoded).expect("decode the secret key");
+    let decoded = Identity::from_secret_base64(&encoded).expect("decode the secret key");
     assert_eq!(decoded.public, identity.public);
     assert_eq!(decoded.secret, identity.secret);
     assert_eq!(decoded.public_base64(), identity.public_base64());
@@ -227,7 +283,7 @@ fn identity_base64_roundtrip() {
         &"!".repeat(43),
     ] {
         assert!(
-            Identity::from_base64(invalid).is_err(),
+            Identity::from_secret_base64(invalid).is_err(),
             "non-canonical key {invalid:?} must be rejected"
         );
     }
@@ -242,7 +298,9 @@ fn noise_params_match_the_protocol_suite() {
 #[test]
 fn responder_new_requires_the_initiator_key_in_the_prologue() {
     let identity = Identity::generate();
-    let Err(err) = Responder::new(&identity, b"not the init exchange") else {
+    // A prologue of just the client/init document parses but names no initiator key.
+    let client_only = client_init(&identity);
+    let Err(err) = Responder::new(&identity, client_only.as_bytes()) else {
         panic!("a prologue without server/init must be rejected");
     };
     let message = format!("{err:#}");

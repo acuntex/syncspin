@@ -17,16 +17,16 @@
 //! tampering with the cleartext exchange fails the handshake.
 //!
 //! This module is the responder half plus the transport that follows the handshake. It does not
-//! interpret handshake payloads: the caller validates the `psk_id`/`psk_category` metadata and
-//! selects the PSK. Only the published Sentinel PSK is built in, which is what an unpaired client
-//! uses; it provides no authentication on its own.
+//! interpret handshake payloads; the session layer validates the `psk_id`/`psk_category`
+//! metadata. This milestone uses the published Sentinel PSK, which is what an unpaired client
+//! uses and which provides no authentication on its own; selecting a different PSK from message 1
+//! arrives with the session layer.
 
 use std::fmt;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -81,8 +81,8 @@ pub fn psk_id_for(psk: &[u8]) -> String {
 ///
 /// Sendspin uses the public key as the `client_id` or `server_id` and the secret key as the
 /// static key of the Noise handshake. Both halves must match: [`Identity::generate`] and
-/// [`Identity::from_base64`] derive the public key from the secret, so an identity built through
-/// them always does.
+/// [`Identity::from_secret_base64`] derive the public key from the secret, so an identity built
+/// through them always does.
 #[derive(Clone, Copy)]
 pub struct Identity {
     /// Public X25519 key as 32 raw bytes; 43 base64url characters once encoded.
@@ -113,12 +113,14 @@ impl Identity {
         Identity::from_secret(secret)
     }
 
-    /// Decodes a 32-byte secret key from its 43-character unpadded base64url text.
+    /// Decodes an identity from its 43-character unpadded base64url secret key.
     ///
-    /// The public key is derived from the secret; the input is rejected unless it is the
-    /// canonical encoding of a 32-byte key. Anything that is not a canonical secret key - a
-    /// public key, a truncated string, a padded or non-base64url string - is an error.
-    pub fn from_base64(s: &str) -> Result<Identity> {
+    /// The public key is derived from the secret. The input must be the canonical encoding of
+    /// exactly 32 bytes; a truncated, padded or non-base64url string is an error. Every 32-byte
+    /// value is a valid secret, so this cannot tell a secret key from a public key: passing a
+    /// public key such as [`Identity::public_base64`] succeeds and silently yields a different
+    /// identity.
+    pub fn from_secret_base64(s: &str) -> Result<Identity> {
         let secret = decode_key(s).ok_or_else(|| {
             anyhow!("identity secret is not a canonical 43-character unpadded base64url X25519 key")
         })?;
@@ -134,8 +136,8 @@ impl Identity {
 
     /// Returns the secret key as 43-character unpadded base64url text.
     ///
-    /// The value is key material: hand it to [`Identity::from_base64`] to restore an identity
-    /// and treat the text like a password.
+    /// The value is key material: hand it to [`Identity::from_secret_base64`] to restore an
+    /// identity and treat the text like a password.
     pub fn secret_base64(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.secret)
     }
@@ -178,16 +180,12 @@ impl Responder {
     /// `prologue` must be the exact concatenation of the `client/init` and `server/init` bytes
     /// as transmitted, in that order. It is mixed into the handshake verbatim, and the
     /// initiator's static public key is read from the `server_id` field of the `server/init`
-    /// document it contains. A prologue that carries no such document is rejected; use
-    /// [`Responder::with_peer`] when the key is already known, as during a re-handshake where
-    /// the prologue is the previous handshake hash.
+    /// document it contains. A prologue that is not a sequence of JSON documents, that carries
+    /// no `server/init`, or that carries two of them is rejected; use [`Responder::with_peer`]
+    /// when the key is already known, as during a re-handshake where the prologue is the
+    /// previous handshake hash.
     pub fn new(identity: &Identity, prologue: &[u8]) -> Result<Responder> {
-        let peer_public = initiator_key_from_prologue(prologue).ok_or_else(|| {
-            anyhow!(
-                "the prologue contains no `server_id` in a `server/init` document, so the \
-                 initiator's static public key is unknown; pass it with `Responder::with_peer`"
-            )
-        })?;
+        let peer_public = initiator_key_from_prologue(prologue)?;
         Responder::with_peer(identity, &peer_public, prologue)
     }
 
@@ -222,8 +220,8 @@ impl Responder {
     /// Reads one Noise handshake message and returns its decrypted payload.
     ///
     /// The payload is returned verbatim. Message 1 carries the PSK metadata
-    /// (`psk_id`, `psk_category`); the caller checks it, because the PSK has already been
-    /// selected when the responder was built.
+    /// (`psk_id`, `psk_category`) for the session layer to validate; the handshake itself uses
+    /// the Sentinel PSK in this milestone.
     pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
         ensure_message_len(msg.len(), "handshake message")?;
         let mut payload = vec![0u8; plaintext_capacity(msg.len(), "handshake message")?];
@@ -307,33 +305,41 @@ impl TransportState {
     }
 }
 
-/// The `{"type": ..., "payload": ...}` envelope of a cleartext init message.
-#[derive(Deserialize)]
-struct PrologueEnvelope {
-    #[serde(rename = "type", default)]
-    message_type: String,
-    #[serde(default)]
-    payload: ProloguePayload,
-}
-
-/// The subset of an init payload that the responder needs.
-#[derive(Default, Deserialize)]
-struct ProloguePayload {
-    #[serde(default)]
-    server_id: String,
-}
-
 /// Reads the initiator's static public key from a prologue of concatenated init messages.
 ///
-/// The init messages are parsed as a JSON stream, so a caller can pass the exact two documents
-/// without splitting them. Anything that is not a `server/init` envelope with a canonical
-/// `server_id` is ignored.
-fn initiator_key_from_prologue(prologue: &[u8]) -> Option<[u8; 32]> {
-    serde_json::Deserializer::from_slice(prologue)
-        .into_iter::<PrologueEnvelope>()
-        .filter_map(Result::ok)
-        .filter(|envelope| envelope.message_type == "server/init")
-        .find_map(|envelope| decode_key(&envelope.payload.server_id))
+/// The prologue is the exact `client/init` followed by `server/init` exchange, so it is parsed
+/// as a stream of top-level JSON documents and the caller passes the two documents without
+/// splitting them. Malformed JSON, a missing `server/init`, a non-canonical `server_id` and a
+/// second `server/init` are all errors: guessing a key here would mean handshaking with a static
+/// key the initiator may not hold.
+fn initiator_key_from_prologue(prologue: &[u8]) -> Result<[u8; 32]> {
+    let mut server_id = None;
+    for document in serde_json::Deserializer::from_slice(prologue).into_iter::<serde_json::Value>()
+    {
+        let document = document.context("the prologue is not a sequence of JSON documents")?;
+        if document.get("type").and_then(serde_json::Value::as_str) != Some("server/init") {
+            continue;
+        }
+        if server_id.is_some() {
+            bail!("the prologue contains more than one `server/init` document");
+        }
+        let id = document
+            .pointer("/payload/server_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                anyhow!("the `server/init` document carries no string `payload.server_id`")
+            })?;
+        server_id = Some(decode_key(id).ok_or_else(|| {
+            anyhow!("`server_id` is not a canonical 43-character unpadded base64url X25519 key")
+        })?);
+    }
+
+    server_id.ok_or_else(|| {
+        anyhow!(
+            "the prologue contains no `server/init` document with a `server_id`, so the \
+             initiator's static public key is unknown; pass it with `Responder::with_peer`"
+        )
+    })
 }
 
 /// Derives the X25519 public key that belongs to `secret`.
@@ -390,13 +396,14 @@ mod tests {
     const CLIENT_INIT: &[u8] =
         br#"{"type":"client/init","payload":{"client_id":"test-client","version":1}}"#;
 
+    fn server_init(server_id: &str) -> Vec<u8> {
+        format!(r#"{{"type":"server/init","payload":{{"server_id":"{server_id}","version":1}}}}"#)
+            .into_bytes()
+    }
+
     fn prologue(server_id: &str) -> Vec<u8> {
-        let server_init = format!(
-            r#"{{"type":"server/init","payload":{{"server_id":"{server_id}","version":1}}}}"#
-        );
-        let mut bytes = Vec::with_capacity(CLIENT_INIT.len() + server_init.len());
-        bytes.extend_from_slice(CLIENT_INIT);
-        bytes.extend_from_slice(server_init.as_bytes());
+        let mut bytes = CLIENT_INIT.to_vec();
+        bytes.extend_from_slice(&server_init(server_id));
         bytes
     }
 
@@ -411,9 +418,10 @@ mod tests {
     #[test]
     fn a_prologue_without_a_server_init_is_rejected() {
         let identity = Identity::generate();
-        for prologue in [&b""[..], CLIENT_INIT, b"not json at all"] {
+
+        for prologue in [&b""[..], CLIENT_INIT] {
             let Err(err) = Responder::new(&identity, prologue) else {
-                panic!("a prologue without server_id must be rejected");
+                panic!("a prologue without server/init must be rejected");
             };
             let message = format!("{err:#}");
             assert!(
@@ -421,6 +429,32 @@ mod tests {
                 "error should name the missing key and the way out, got: {message}"
             );
         }
+
+        // Malformed JSON is a parse error, not a silently skipped document.
+        let Err(err) = Responder::new(&identity, b"not json at all") else {
+            panic!("a prologue that is not JSON must be rejected");
+        };
+        assert!(
+            format!("{err:#}").contains("prologue is not a sequence of JSON documents"),
+            "error should name the malformed prologue, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn prologue_with_duplicate_server_id_is_rejected() {
+        let identity = Identity::generate();
+        let first = Identity::generate().public_base64();
+        let second = Identity::generate().public_base64();
+        let mut prologue = prologue(&first);
+        prologue.extend_from_slice(&server_init(&second));
+
+        let Err(err) = Responder::new(&identity, &prologue) else {
+            panic!("two server/init documents are ambiguous");
+        };
+        assert!(
+            format!("{err:#}").contains("more than one `server/init`"),
+            "error should name the duplicate, got: {err:#}"
+        );
     }
 
     #[test]
