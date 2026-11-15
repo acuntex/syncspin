@@ -110,10 +110,11 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --locked
       - name: Coverage floor
-        # Raised to 100 once the gap-closing tests land; keeping the floor at the
-        # measured baseline means a regression fails today without blocking work.
+        # 99.1 is the achieved value: every reachable line is covered. The eight
+        # unexecuted lines are guards no input can reach; scripts/coverage.sh names
+        # them, so a new gap below this floor fails the job.
         env:
-          COVERAGE_FLOOR: "92"
+          COVERAGE_FLOOR: "99.1"
         run: |
           cargo llvm-cov --workspace --locked --ignore-filename-regex 'examples/' \
             --lcov --output-path lcov.info --fail-under-lines "${COVERAGE_FLOOR}"
