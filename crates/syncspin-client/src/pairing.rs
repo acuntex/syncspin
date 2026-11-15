@@ -575,15 +575,14 @@ impl PairingAttempt {
     /// Begins a dynamic round from the server's `server/pair-init` and returns its emission.
     ///
     /// The first round must carry `nonce_A`, and the code is derived from it, the handshake hash
-    /// and the attempt's own nonce. Later rounds carry no nonce; a server that repeats a different
-    /// one would silently change the code under the operator's fingers, which is a protocol error.
-    /// The round number increases per message, so every round has its own CPace `sid`.
+    /// and the attempt's own nonce. Later rounds carry no nonce: `pairing.md` puts it in the first
+    /// round only, so a repeat is a message no conformant server sends and a protocol error either
+    /// way. The round number increases per message, so every round has its own CPace `sid`.
     ///
     /// # Errors
     ///
     /// Fails when the attempt is not a dynamic one, when the message is out of sequence for its
-    /// phase, or when the server's nonce is missing in the first round, repeated differently, or
-    /// contradicts the attempt's own binding.
+    /// phase, when the first round's nonce is missing, or when a later round carries one.
     #[cfg(feature = "pairing-code")]
     pub(crate) fn begin_round(
         &mut self,
@@ -601,11 +600,12 @@ impl PairingAttempt {
                 bail!("the first round's server/pair-init carries no nonce_A")
             }
             (None, Some(nonce)) => state.nonce_a = Some(nonce),
-            (Some(expected), Some(received)) if expected != received => {
-                bail!("the server changed nonce_A within one pairing attempt")
+            (Some(_), Some(_)) => {
+                // Only the first round carries the server's half of the binding; a repeat, equal or
+                // not, is a message no conformant server sends.
+                bail!("the server repeated nonce_A after the first round")
             }
-            // A repeated identical nonce is harmless; an absent one is what a later round sends.
-            _ => {}
+            (Some(_), None) => {}
         }
         state.round = state.round.saturating_add(1);
         if state.code.is_none() {
@@ -1225,10 +1225,10 @@ mod tests {
         );
     }
 
-    /// A missing or changed server nonce changes the code, so both are protocol errors.
+    /// A missing first-round nonce, a repeated one and a changed later one are protocol errors.
     #[cfg(feature = "pairing-code")]
     #[test]
-    fn a_round_rejects_a_missing_or_changed_server_nonce() {
+    fn a_round_rejects_a_missing_or_repeated_server_nonce() {
         let mut attempt = dynamic_attempt(CodeFormat::Digits);
         assert!(
             attempt.begin_round(None, &HASH).is_err(),
@@ -1239,9 +1239,13 @@ mod tests {
             .begin_round(Some(NONCE_A), &HASH)
             .expect("the first round is accepted");
 
-        // A round has to end before the next one can begin; the retry is where the nonce may
-        // repeat or go missing.
+        // A round has to end before the next one can begin; the retry is where the nonce must be
+        // absent again.
         fail_the_round(&mut attempt);
+        assert!(
+            attempt.begin_round(Some(NONCE_A), &HASH).is_err(),
+            "a repeated nonce_A in a later round is a message no conformant server sends"
+        );
         let mut changed = NONCE_A;
         changed[0] ^= 0x01;
         assert!(
@@ -1249,13 +1253,14 @@ mod tests {
             "a changed nonce_A would silently change the operator's code"
         );
 
-        // A repeated identical nonce is harmless, so a server that repeats it is tolerated.
-        let repeated = attempt
-            .begin_round(Some(NONCE_A), &HASH)
-            .expect("a repeated nonce_A does not change the binding");
+        // The retry that carries no nonce is the one the spec describes.
+        let retried = attempt
+            .begin_round(None, &HASH)
+            .expect("a later round carries no nonce_A");
         assert_eq!(
-            repeated.code,
-            DynamicCode::derive(&HASH, &NONCE_A, &NONCE_B).digits_text()
+            retried.code,
+            DynamicCode::derive(&HASH, &NONCE_A, &NONCE_B).digits_text(),
+            "the binding values, and so the code, stay the same"
         );
 
         // A static attempt has no round to begin.

@@ -1082,9 +1082,19 @@ impl Session<'_> {
         self.failed_rounds.load(Ordering::SeqCst) >= ROUND_LIMIT
     }
 
-    /// Counts one failed dynamic round, returning the count after it.
+    /// The rounds counted since the last verified `server_kc`.
     #[cfg(feature = "pairing-code")]
-    fn record_failed_round(&self) -> u32 {
+    fn failed_rounds(&self) -> u32 {
+        self.failed_rounds.load(Ordering::SeqCst)
+    }
+
+    /// Counts one dynamic round that began, returning the count after it.
+    ///
+    /// A round counts from the moment the code is emitted, so an attempt that ends later - by a
+    /// cancelling activation, a timeout or a failed key confirmation - leaves its round counted.
+    /// That is what stops a peer from starting rounds forever without ever confirming one.
+    #[cfg(feature = "pairing-code")]
+    fn record_round(&self) -> u32 {
         self.failed_rounds.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -1300,6 +1310,9 @@ impl Session<'_> {
             format: emission.format,
             round: emission.round,
         });
+        // The round counts from here: the code is emitted, so the operator and the server have
+        // everything one round needs. An attempt that ends later leaves this round counted.
+        self.record_round();
         self.pairing = Some(attempt);
         Ok(())
     }
@@ -1377,8 +1390,9 @@ impl Session<'_> {
             TagOutcome::Confirmed(confirmation) => confirmation,
             TagOutcome::Mismatch => {
                 if attempt.is_dynamic_code() {
-                    let failed = self.record_failed_round();
-                    if failed < ROUND_LIMIT {
+                    // The round was counted when it began. Below the limit the client retries;
+                    // at the limit it aborts, as `pairing.md` requires.
+                    if self.failed_rounds() < ROUND_LIMIT {
                         let retry = Incoming::ClientPairRetry(ClientPairRetry {});
                         self.send_json(&retry).await?;
                         // The attempt keeps its binding values, its code and its deadline; the
@@ -1394,6 +1408,7 @@ impl Session<'_> {
                     .await;
             }
         };
+        // A verified tag is the one thing besides an operator action that clears the round count.
         self.failed_rounds.store(0, Ordering::SeqCst);
 
         let reply = Incoming::ClientPairConfirm(ClientPairConfirm {
@@ -3120,16 +3135,16 @@ mod tests {
             "a fresh process is below the limit"
         );
         for round in 1..20 {
-            assert_eq!(session.record_failed_round(), round);
+            assert_eq!(session.record_round(), round);
             assert!(
                 !session.rounds_are_exhausted(),
-                "round {round} must still admit a retry"
+                "round {round} must still admit another one"
             );
         }
-        assert_eq!(session.record_failed_round(), 20);
+        assert_eq!(session.record_round(), 20);
         assert!(
             session.rounds_are_exhausted(),
-            "the twentieth failed round reaches the limit"
+            "the twentieth begun round reaches the limit"
         );
 
         // The release is the operator action the spec requires, and it clears the count.

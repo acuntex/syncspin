@@ -127,6 +127,12 @@ pub struct ServerOptions {
     /// over the code the client emitted, playing the operator who typed it.
     #[cfg(feature = "pairing-code")]
     pub dynamic_format: Option<String>,
+    /// Whether a dynamic `client/pair-init` is answered with `server/pair-init`.
+    ///
+    /// With `false` the harness records the commitment and stays silent, which is what an attempt
+    /// that ends before its first round looks like: no code is ever emitted, so no round counts.
+    #[cfg(feature = "pairing-code")]
+    pub dynamic_pair_init: bool,
     /// The `nonce_A` the harness sends in the first dynamic round.
     ///
     /// Fixed so a test can derive what the server will check; a real server draws it.
@@ -174,6 +180,8 @@ impl Default for ServerOptions {
             static_pairing_code: None,
             #[cfg(feature = "pairing-code")]
             dynamic_format: None,
+            #[cfg(feature = "pairing-code")]
+            dynamic_pair_init: true,
             #[cfg(feature = "pairing-code")]
             nonce_a: [0x5a; 32],
             #[cfg(feature = "pairing-code")]
@@ -1506,10 +1514,12 @@ async fn handle_client_message(
                 pake.dynamic.commit_b = Some(commit_b);
                 pake.dynamic.pairing_index = init.pairing_index;
                 pake.dynamic.round = 1;
-                let reply = Incoming::ServerPairInit(ServerPairInit {
-                    nonce_a: Some(URL_SAFE_NO_PAD.encode(options.nonce_a)),
-                });
-                send_encrypted(socket, noise, &reply).await?;
+                if options.dynamic_pair_init {
+                    let reply = Incoming::ServerPairInit(ServerPairInit {
+                        nonce_a: Some(URL_SAFE_NO_PAD.encode(options.nonce_a)),
+                    });
+                    send_encrypted(socket, noise, &reply).await?;
+                }
             } else if options.static_pairing_code.is_some() {
                 let code = options
                     .static_pairing_code

@@ -1,5 +1,6 @@
 //! Public client surface: events, handles and the connection entry point.
 
+use std::fmt;
 #[cfg(feature = "pairing-code")]
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -218,7 +219,7 @@ impl PairingFailure {
 /// [`Event::Disconnected`], and the crate then reconnects on its own, so a later event belongs to
 /// the next attempt. The enum is non-exhaustive: a later revision adds events without breaking a
 /// host's match.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
     /// The Noise handshake finished and the session is ready for playback.
@@ -357,6 +358,89 @@ pub enum Event {
         /// Round this emission belongs to, counting from one.
         round: u32,
     },
+}
+
+impl fmt::Debug for Event {
+    /// Formats an event, redacting the dynamic pairing code it may carry.
+    ///
+    /// A host renders that code deliberately, through the event itself; a `Debug` format is what a
+    /// panic, an assertion or a logging facade writes, and the code authorises one pairing, so it
+    /// must not appear there. Every other field is what a log line needs.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connected {
+                server_id,
+                encrypted,
+            } => formatter
+                .debug_struct("Connected")
+                .field("server_id", server_id)
+                .field("encrypted", encrypted)
+                .finish(),
+            Self::Disconnected { reason, retry_in } => formatter
+                .debug_struct("Disconnected")
+                .field("reason", reason)
+                .field("retry_in", retry_in)
+                .finish(),
+            Self::StreamStart { format } => formatter
+                .debug_struct("StreamStart")
+                .field("format", format)
+                .finish(),
+            Self::StreamEnd { reason } => formatter
+                .debug_struct("StreamEnd")
+                .field("reason", reason)
+                .finish(),
+            Self::StreamClear { from_timestamp } => formatter
+                .debug_struct("StreamClear")
+                .field("from_timestamp", from_timestamp)
+                .finish(),
+            Self::Track {
+                title,
+                artist,
+                album,
+                album_artist,
+                artwork_url,
+                progress_ms,
+                duration_ms,
+                playback_speed,
+            } => formatter
+                .debug_struct("Track")
+                .field("title", title)
+                .field("artist", artist)
+                .field("album", album)
+                .field("album_artist", album_artist)
+                .field("artwork_url", artwork_url)
+                .field("progress_ms", progress_ms)
+                .field("duration_ms", duration_ms)
+                .field("playback_speed", playback_speed)
+                .finish(),
+            Self::State(state) => formatter.debug_tuple("State").field(state).finish(),
+            Self::Volume {
+                requested,
+                applied,
+                muted,
+            } => formatter
+                .debug_struct("Volume")
+                .field("requested", requested)
+                .field("applied", applied)
+                .field("muted", muted)
+                .finish(),
+            Self::Paired { server_id } => formatter
+                .debug_struct("Paired")
+                .field("server_id", server_id)
+                .finish(),
+            Self::PairingFailed { reason } => formatter
+                .debug_struct("PairingFailed")
+                .field("reason", reason)
+                .finish(),
+            #[cfg(feature = "pairing-code")]
+            Self::PairingCode { format, round, .. } => formatter
+                .debug_struct("PairingCode")
+                .field("code", &"<redacted>")
+                .field("format", format)
+                .field("round", round)
+                .finish(),
+        }
+    }
 }
 
 /// Playback state as the server describes it.
@@ -975,6 +1059,53 @@ fn endpoint(server: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pairing code is a credential for one attempt: `Debug` names it but never prints it.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn the_pairing_code_event_formats_without_its_code() {
+        for (code, format) in [
+            ("482913".to_owned(), CodeFormat::Digits),
+            (
+                "SP:1QJOHGMGBXP55Y6KMJD3KOYR9F6OWYD6QQPIKEFY".to_owned(),
+                CodeFormat::QrCode,
+            ),
+        ] {
+            let event = Event::PairingCode {
+                code: code.clone(),
+                format,
+                round: 3,
+            };
+            let text = format!("{event:?}");
+            assert!(text.contains("code: \"<redacted>\""), "got: {text}");
+            assert!(
+                !text.contains(&code),
+                "the code must never reach a log line: {text}"
+            );
+            assert!(
+                text.contains(&format!("format: {format:?}")),
+                "the format is not secret: {text}"
+            );
+            assert!(text.contains("round: 3"), "the round is not secret: {text}");
+        }
+    }
+
+    /// Every other event keeps the fields a log line needs.
+    #[test]
+    fn an_event_still_formats_its_readable_fields() {
+        let text = format!(
+            "{:?}",
+            Event::Disconnected {
+                reason: "the server closed the connection".to_owned(),
+                retry_in: Duration::from_secs(2),
+            }
+        );
+        assert!(
+            text.contains("Disconnected { reason: \"the server closed the connection\""),
+            "got: {text}"
+        );
+        assert!(text.contains("retry_in: 2s"), "got: {text}");
+    }
 
     #[test]
     fn every_abort_reason_round_trips_through_the_wire_spelling() {

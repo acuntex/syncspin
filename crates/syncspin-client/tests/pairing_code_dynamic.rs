@@ -533,6 +533,107 @@ async fn the_round_limit_holds_the_next_attempt_back_until_released() {
     );
 }
 
+#[tokio::test]
+async fn rounds_that_end_before_a_confirmation_still_count_toward_the_limit() {
+    let mut server = FakeServer::start(dynamic_options("digits", 0))
+        .await
+        .unwrap();
+    let (mut events, handle) = connect_to(config_for(
+        &server.endpoint(),
+        Some(Arc::new(MemoryStorage::default())),
+        vec![CodeFormat::Digits],
+    ))
+    .await;
+    expect_connected(&mut events, &server).await;
+
+    // Twenty attempts, each ending right after its code was emitted. No `server_kc` ever arrives,
+    // so nothing but the emission of a code can make a round count.
+    for index in 1..=20u32 {
+        if index > 1 {
+            server.activate_dynamic_pairing("digits");
+        }
+        let (reported, commitment) = observed(server.wait_for_pair_commitment())
+            .await
+            .expect("the client must start each attempt")
+            .expect("the connection must not close");
+        assert_eq!(reported, index, "activation {index} of this connection");
+        assert!(
+            commitment.is_some(),
+            "each attempt commits to its own nonce, even one that never completes"
+        );
+        // The attempt ends under the cancelling activation, after its round began.
+        server.cancel_pairing(&["metadata@v1"]);
+    }
+
+    // The twenty-first activation is held back even though no key confirmation ever failed.
+    server.activate_dynamic_pairing("digits");
+    let (index, _) = observed(server.wait_for_pair_pending())
+        .await
+        .expect("the client must report the held-back attempt")
+        .expect("the connection must not close");
+    assert_eq!(index, 21, "the activation after twenty emitted rounds");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), server.wait_for_pair_init())
+            .await
+            .is_err(),
+        "twenty emitted rounds hold the next attempt back"
+    );
+
+    // The operator action the spec requires admits it again.
+    handle
+        .control()
+        .release_holdback()
+        .await
+        .expect("the release belongs to the process");
+    let (index, _) = observed(server.wait_for_pair_commitment())
+        .await
+        .expect("the release starts the held-back attempt")
+        .expect("the connection must not close");
+    assert_eq!(index, 21, "the held-back activation keeps its index");
+}
+
+#[tokio::test]
+async fn attempts_that_end_before_their_first_round_do_not_count() {
+    let mut server = FakeServer::start(ServerOptions {
+        first_activate: Some(dynamic_activation("digits")),
+        dynamic_format: Some("digits".to_owned()),
+        // The harness records the commitment and never begins a round, so no code is emitted.
+        dynamic_pair_init: false,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (mut events, _handle) = connect_to(config_for(
+        &server.endpoint(),
+        Some(Arc::new(MemoryStorage::default())),
+        vec![CodeFormat::Digits],
+    ))
+    .await;
+    expect_connected(&mut events, &server).await;
+
+    for index in 1..=21u32 {
+        if index > 1 {
+            server.activate_dynamic_pairing("digits");
+        }
+        let (reported, _) = observed(server.wait_for_pair_commitment())
+            .await
+            .expect("each attempt is admitted")
+            .expect("the connection must not close");
+        assert_eq!(reported, index, "activation {index} of this connection");
+        server.cancel_pairing(&["metadata@v1"]);
+    }
+
+    // Twenty-one attempts ended before their first round, so nothing was counted and the next
+    // activation is admitted rather than held back.
+    server.activate_dynamic_pairing("digits");
+    let (index, commitment) = observed(server.wait_for_pair_commitment())
+        .await
+        .expect("an attempt that never emitted a code is not counted")
+        .expect("the connection must not close");
+    assert_eq!(index, 22);
+    assert!(commitment.is_some());
+}
+
 /// Decodes an unpadded base64url string, failing the assertion when it is malformed.
 fn base64_url(value: &str) -> Vec<u8> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
