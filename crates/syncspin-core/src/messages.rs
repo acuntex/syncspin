@@ -129,6 +129,18 @@ pub struct PlayerSupport {
 #[serde(rename_all = "snake_case")]
 pub struct PairingPskMethod {}
 
+/// The `static_pairing_code` descriptor of [`SupportedPairMethods`].
+///
+/// The only field is an informational hint: where the operator finds the configured code. A client
+/// that does not know leaves it absent, and the descriptor serializes as the empty object.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StaticPairingCodeMethod {
+    /// Where the code is available: `device`, `leaflet` or `operator`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locations: Option<Vec<String>>,
+}
+
 /// The `supported_pair_methods` object of [`ClientHello`], keyed by method identifier.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,6 +148,9 @@ pub struct SupportedPairMethods {
     /// The pairing PSK method, offered by every conformant client; absent when a peer omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_psk: Option<PairingPskMethod>,
+    /// The static pairing code method, offered when the client has a code configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_pairing_code: Option<StaticPairingCodeMethod>,
 }
 
 /// The `unpaired_access` object of [`ClientHello`].
@@ -283,6 +298,90 @@ fn redacted(value: &Option<String>) -> Option<&'static str> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ServerPairFinalize {}
+
+/// `client/pair-pending`: the client is holding the admitted attempt back.
+///
+/// Sent instead of [`ClientPairInit`] while the static flow's pairing window is closed, or while
+/// the dynamic flow's round limit holds attempts back. It neither starts the attempt nor its
+/// timeout, so a `pairing_index` here may be followed by an init carrying the same value later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairPending {
+    /// Number of pairing `server/activate` messages received since the last Noise handshake.
+    pub pairing_index: u32,
+    /// Short sentence for the operator, supplied by the host.
+    ///
+    /// The spec allows at most 200 bytes of UTF-8; the client sends what its configuration holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `server/pair-auth`: the server's CPace public share `Ya`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerPairAuth {
+    /// 32-byte share as 43 base64url characters without padding.
+    pub pake_msg_1: String,
+}
+
+/// `client/pair-auth`: the client's CPace public share `Yb`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairAuth {
+    /// 32-byte share as 43 base64url characters without padding.
+    pub pake_msg_2: String,
+}
+
+/// `server/pair-confirm`: the server's MCF tag `Ta`.
+///
+/// The tag is derived from the CPace session key, so `Debug` redacts it: no log line or failed
+/// assertion prints it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerPairConfirm {
+    /// 64-byte HMAC-SHA-512 tag as 86 base64url characters without padding.
+    pub server_kc: String,
+}
+
+impl fmt::Debug for ServerPairConfirm {
+    /// Formats the message with the key-confirmation tag redacted.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerPairConfirm")
+            .field("server_kc", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `client/pair-confirm`: the client's MCF tag `Tb`, plus the dynamic flow's sealed opening.
+///
+/// Both fields are derived from the CPace session key, so `Debug` redacts them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairConfirm {
+    /// 64-byte HMAC-SHA-512 tag as 86 base64url characters without padding.
+    pub client_kc: String,
+    /// 48-byte sealing of `nonce_B`, present only in the Dynamic Pairing Code Flow.
+    ///
+    /// The wire spells the field `wrapped_nonce_B`, so the rename is explicit.
+    #[serde(
+        rename = "wrapped_nonce_B",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wrapped_nonce_b: Option<String>,
+}
+
+impl fmt::Debug for ClientPairConfirm {
+    /// Formats the message with the tag and the sealed nonce redacted.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientPairConfirm")
+            .field("client_kc", &"<redacted>")
+            .field("wrapped_nonce_B", &redacted(&self.wrapped_nonce_b))
+            .finish()
+    }
+}
 
 /// `pair/abort`: ends a pairing attempt, whether or not it started.
 ///
@@ -677,6 +776,21 @@ pub enum Incoming {
     /// `client/pair-init`.
     #[serde(rename = "client/pair-init")]
     ClientPairInit(ClientPairInit),
+    /// `client/pair-pending`.
+    #[serde(rename = "client/pair-pending")]
+    ClientPairPending(ClientPairPending),
+    /// `server/pair-auth`.
+    #[serde(rename = "server/pair-auth")]
+    ServerPairAuth(ServerPairAuth),
+    /// `client/pair-auth`.
+    #[serde(rename = "client/pair-auth")]
+    ClientPairAuth(ClientPairAuth),
+    /// `server/pair-confirm`.
+    #[serde(rename = "server/pair-confirm")]
+    ServerPairConfirm(ServerPairConfirm),
+    /// `client/pair-confirm`.
+    #[serde(rename = "client/pair-confirm")]
+    ClientPairConfirm(ClientPairConfirm),
     /// `client/pair-finalize`.
     #[serde(rename = "client/pair-finalize")]
     ClientPairFinalize(ClientPairFinalize),
@@ -784,7 +898,7 @@ struct EnvelopeType {
 ///
 /// A variant added without its entry here would silently read as an unknown type, so the
 /// integration tests parse one instance of every variant.
-const KNOWN_TYPES: [&str; 19] = [
+const KNOWN_TYPES: [&str; 24] = [
     "client/init",
     "server/init",
     "noise/handshake",
@@ -792,6 +906,11 @@ const KNOWN_TYPES: [&str; 19] = [
     "client/hello",
     "server/activate",
     "client/pair-init",
+    "client/pair-pending",
+    "server/pair-auth",
+    "client/pair-auth",
+    "server/pair-confirm",
+    "client/pair-confirm",
     "client/pair-finalize",
     "server/pair-finalize",
     "pair/abort",

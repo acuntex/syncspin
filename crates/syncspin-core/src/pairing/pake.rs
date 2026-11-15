@@ -2,11 +2,11 @@
 //!
 //! The suite is `CPACE-X25519-SHA512` from
 //! [draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/draft-irtf-cfrg-cpace/21/):
-//! group `G_X25519`, hash SHA-512, mutual confirmation flow. This module implements the two
-//! primitives the protocol is built on - the generator and the verified scalar multiplication -
-//! and pins them to the draft's Appendix B.1 vectors in `tests/pake_vectors.rs`. It does not
-//! implement the message flow, the confirmation tags or the transcript; those belong to the
-//! session layer.
+//! group `G_X25519`, hash SHA-512, mutual confirmation flow. This module implements the
+//! primitives that flow is built from - the generator, the verified scalar multiplication, the
+//! transcript hashing, the intermediate session key and the key-confirmation tags - and pins them
+//! to the draft's vectors in `tests/pake_vectors.rs`. The message flow itself belongs to the
+//! session layer, which knows when a share or a tag crosses the wire.
 //!
 //! # What the generator is
 //!
@@ -17,7 +17,17 @@
 //! data `ADa`/`ADb` is *not* an input: it enters the transcript that the confirmation flow
 //! hashes, not the generator.
 //!
-//! # The representative convention
+//! # The transcript and the key confirmation
+//!
+//! Sendspin fixes CPace's initiator-responder mode, so the transcript is
+//! [`transcript_ir`]: `lv_cat(Ya, ADa) || lv_cat(Yb, ADb)`. [`intermediate_session_key`] hashes
+//! `lv_cat(G.DSI_ISK, sid, K)` followed by that transcript. The explicit key confirmation of
+//! §10.4 derives `mac_key = H(b"CPaceMac" || sid || ISK)` and authenticates the sender's own
+//! `lv_cat(share, associated data)` with HMAC-SHA-512, which is [`key_confirmation_tag`].
+//! [`transcript_oc`] is the parallel-execution form: Sendspin does not use it, but the draft's
+//! vectors cover it and keeping it proves the two forms differ only in the ordering step.
+//!
+//! # Representative convention
 //!
 //! CPace hands the map an arbitrary field element. `elligator2::from_representative` instead
 //! expects a representative, a value below `(p-1)/2`, and masks bits 254 and 255 of its input.
@@ -27,19 +37,42 @@
 //! only `r^2`, so `r` and `-r` map to the same point, and negating a value with bit 254 set
 //! yields one the crate accepts. The §B.1.1 generator matches only with that normalisation.
 //!
+//! # Secret handling
+//!
+//! `PRS`, the scalar, the shared point, `ISK` and the tags derive from the pairing code or from a
+//! scalar. This module returns them as bytes, exactly as [`mod@super::wrap`] does, and never
+//! formats them: no `Debug`, no `Display`, no error string carries a value. [`key_confirmation_tag`]
+//! and [`verify_key_confirmation_tag`] are branch-free over the secret-derived tag.
+//!
 //! # Not reviewed
 //!
 //! Neither this module nor `elligator2` 0.1 has had an external cryptographic review. The
 //! draft vectors pin the arithmetic, not the review.
 
 use anyhow::{bail, Result};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha512};
 
 /// `G_X25519.DSI`, the group's domain-separation identifier (§8.2).
 const DSI: &[u8] = b"CPace255";
 
+/// `G.DSI_ISK`, the domain-separation identifier of the ISK (§7.2).
+const DSI_ISK: &[u8] = b"CPace255_ISK";
+
+/// The label that prefixes the MCF MAC key (§10.4).
+const MAC_LABEL: &[u8] = b"CPaceMac";
+
 /// The input block size of SHA-512 in bytes (`H.s_in_bytes`), which `generator_string` pads to.
 const SHA512_BLOCK_LEN: usize = 128;
+
+/// Length of a CPace public share in bytes.
+pub const SHARE_LEN: usize = 32;
+
+/// Length of the intermediate session key in bytes: one SHA-512 output.
+pub const ISK_LEN: usize = 64;
+
+/// Length of a key-confirmation tag in bytes: one HMAC-SHA-512 output.
+pub const TAG_LEN: usize = 64;
 
 /// The field modulus `p = 2^255 - 19`, little-endian.
 const FIELD_MODULUS: [u8; 32] = [
@@ -112,6 +145,146 @@ pub fn scalar_mult_vfy(scalar: &[u8; 32], u: &[u8; 32]) -> Result<[u8; 32]> {
 /// Returns whether every byte is zero, touching the whole slice.
 fn is_all_zero(bytes: &[u8]) -> bool {
     bytes.iter().fold(0u8, |acc, &byte| acc | byte) == 0
+}
+
+/// Computes a public share `Y = G.scalar_mult(scalar, generator)`.
+///
+/// X25519 clamps the scalar, exactly as `G_X25519.sample_scalar` does, so a scalar drawn from the
+/// CSPRNG is used here unchanged. The generator is public, so the low-order check costs nothing
+/// secret and rejects a degenerate generator instead of returning the neutral element.
+///
+/// # Errors
+///
+/// Fails when the group operation yields the neutral element, which only a low-order `generator`
+/// can cause.
+pub fn public_share(scalar: &[u8; 32], generator: &[u8; 32]) -> Result<[u8; 32]> {
+    scalar_mult_vfy(scalar, generator)
+}
+
+/// Concatenates each part with its LEB128 length prepended (`lv_cat` from §6.3).
+///
+/// The length makes the encoding prefix-free, which is what lets the transcript be hashed without
+/// an ambiguity between a share and the associated data that follows it.
+///
+/// # Example
+///
+/// ```
+/// use syncspin_core::pairing::pake::lv_cat;
+///
+/// // Draft §A.1.4.
+/// assert_eq!(
+///     lv_cat(&[b"1234".as_slice(), b"5", b"", b"678"]),
+///     [
+///         0x04, b'1', b'2', b'3', b'4', 0x01, b'5', 0x00, 0x03, b'6', b'7', b'8',
+///     ]
+/// );
+/// ```
+pub fn lv_cat(parts: &[&[u8]]) -> Vec<u8> {
+    let mut joined = Vec::new();
+    for part in parts {
+        push_lv(&mut joined, part);
+    }
+    joined
+}
+
+/// Builds the initiator-responder transcript `lv_cat(Ya, ADa) || lv_cat(Yb, ADb)` (§6.3).
+///
+/// Both sides hash the same ordering: the initiator's share and associated data first, then the
+/// responder's, whichever party computes it. Sendspin's `ADa` is `b"server"` and its `ADb` is
+/// `b"client"`.
+pub fn transcript_ir(ya: &[u8], ad_a: &[u8], yb: &[u8], ad_b: &[u8]) -> Vec<u8> {
+    let mut transcript = lv_cat(&[ya, ad_a]);
+    transcript.extend_from_slice(&lv_cat(&[yb, ad_b]));
+    transcript
+}
+
+/// Builds the parallel-execution transcript `o_cat(lv_cat(Ya, ADa), lv_cat(Yb, ADb))` (§6.3).
+///
+/// The two messages are ordered lexicographically and prefixed with `b"oc"`, so neither party has
+/// to know who spoke first. Sendspin fixes an initiator and a responder, so it uses
+/// [`transcript_ir`]; this form exists because the draft's vectors cover it.
+pub fn transcript_oc(ya: &[u8], ad_a: &[u8], yb: &[u8], ad_b: &[u8]) -> Vec<u8> {
+    let initiator = lv_cat(&[ya, ad_a]);
+    let responder = lv_cat(&[yb, ad_b]);
+    let mut transcript = Vec::from(b"oc".as_slice());
+    if lexicographically_larger(&initiator, &responder) {
+        transcript.extend_from_slice(&initiator);
+        transcript.extend_from_slice(&responder);
+    } else {
+        transcript.extend_from_slice(&responder);
+        transcript.extend_from_slice(&initiator);
+    }
+    transcript
+}
+
+/// Derives `ISK = H(lv_cat(G.DSI_ISK, sid, K) || transcript)` (§7.2).
+///
+/// `shared_point` is the secret point `K = scalar_mult_vfy(scalar, peer_share)`, and `transcript`
+/// is [`transcript_ir`] or [`transcript_oc`]. The result is the 64-byte intermediate session key,
+/// which the higher-level protocol processes before use: Sendspin derives `K_wrap` from it with
+/// [`super::wrap::k_wrap`].
+///
+/// The value is secret. It is returned as bytes and never formatted.
+pub fn intermediate_session_key(
+    sid: &[u8],
+    shared_point: &[u8],
+    transcript: &[u8],
+) -> [u8; ISK_LEN] {
+    let mut input = lv_cat(&[DSI_ISK, sid, shared_point]);
+    input.extend_from_slice(transcript);
+    Sha512::digest(input).into()
+}
+
+/// Computes the explicit key-confirmation tag of the sender's own message (§10.4).
+///
+/// `mac_key = H(b"CPaceMac" || sid || ISK)`, raw and without length prefixes, then
+/// `T = HMAC-SHA-512(mac_key, lv_cat(share, associated data))`. Passing the initiator's `Ya` and
+/// `ADa` yields `Ta` (`server_kc`); the responder's `Yb` and `ADb` yield `Tb` (`client_kc`).
+///
+/// The tag is secret-derived. It is returned as bytes and never formatted.
+pub fn key_confirmation_tag(
+    sid: &[u8],
+    isk: &[u8; ISK_LEN],
+    share: &[u8],
+    ad: &[u8],
+) -> [u8; TAG_LEN] {
+    let mut key_input = Vec::from(MAC_LABEL);
+    key_input.extend_from_slice(sid);
+    key_input.extend_from_slice(isk);
+    let mac_key = Sha512::digest(key_input);
+
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&mac_key)
+        .expect("HMAC-SHA-512 accepts a key of any length");
+    mac.update(&lv_cat(&[share, ad]));
+    mac.finalize().into_bytes().into()
+}
+
+/// Returns whether a received tag equals the one this side derived.
+///
+/// The comparison touches every byte of both tags and folds the differences into one value, so it
+/// does not stop at the first mismatch: the tags are derived from `ISK`, and an early exit would
+/// leak how many leading bytes an attacker guessed. Only the single final result depends on the
+/// data, and that result is public - it decides whether the round continues.
+#[must_use]
+pub fn verify_key_confirmation_tag(expected: &[u8; TAG_LEN], received: &[u8; TAG_LEN]) -> bool {
+    let difference = expected
+        .iter()
+        .zip(received)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    difference == 0
+}
+
+/// Returns whether `left` is greater than `right` in the draft's lexicographical order (§A.3.1).
+fn lexicographically_larger(left: &[u8], right: &[u8]) -> bool {
+    for (a, b) in left.iter().zip(right) {
+        if a > b {
+            return true;
+        }
+        if a < b {
+            return false;
+        }
+    }
+    left.len() > right.len()
 }
 
 /// Builds `generator_string(DSI, PRS, CI, sid, H.s_in_bytes)` (§8.1, Appendix A.2).

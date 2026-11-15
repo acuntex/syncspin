@@ -293,6 +293,12 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
+        #[cfg(feature = "pairing-code")]
+        pairing_pending_text: None,
     }
 }
 
@@ -1224,6 +1230,12 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
+        #[cfg(feature = "pairing-code")]
+        pairing_pending_text: None,
     };
 
     for (label, config, field) in [

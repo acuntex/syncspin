@@ -13,6 +13,24 @@ use crate::storage::Storage;
 /// Longest player name the protocol allows, in bytes of UTF-8.
 pub const MAX_PLAYER_NAME_LEN: usize = 64;
 
+/// Number of digits in a static pairing code.
+///
+/// The protocol fixes the length at eight decimal digits, so a configured code is exactly this
+/// many ASCII characters.
+#[cfg(feature = "pairing-code")]
+pub const STATIC_PAIRING_CODE_LEN: usize = 8;
+
+/// Longest `client/pair-pending` message the protocol allows, in bytes of UTF-8.
+#[cfg(feature = "pairing-code")]
+pub const MAX_PAIRING_PENDING_TEXT_LEN: usize = 200;
+
+/// How long an operator-opened pairing window admits attempts.
+///
+/// `pairing.md` recommends five minutes and starts the clock at the gesture, not at the first
+/// attempt.
+#[cfg(feature = "pairing-code")]
+pub const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(300);
+
 /// How the client wants the stream delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioMode {
@@ -211,6 +229,30 @@ pub struct ClientConfig {
     /// which is [`DEFAULT_PAIRING_TIMEOUT`](crate::DEFAULT_PAIRING_TIMEOUT); a host shortens it
     /// only for tests or for a deployment that wants a tighter bound.
     pub pairing_timeout: Duration,
+    /// The operator-facing static pairing code, exactly eight decimal digits.
+    ///
+    /// The code is configuration, never generated: a manufacturer provisions one per device, and
+    /// the operator reads it off the device or its leaflet. Offering the static code method in
+    /// `client/hello` depends on this field being set, so a client without a code never advertises
+    /// a method it cannot complete.
+    ///
+    /// The code is a credential: anyone who knows it and can reach the server may pair. It is
+    /// never formatted - [`ClientConfig`]'s `Debug` prints it redacted - and never logged.
+    #[cfg(feature = "pairing-code")]
+    pub static_pairing_code: Option<String>,
+    /// How long an operator-opened pairing window admits attempts, recommended five minutes.
+    ///
+    /// The window runs from [`ControlHandle::open_pairing_window`](crate::ControlHandle::open_pairing_window)
+    /// and does not pause during an attempt. On expiry it closes silently; an attempt already in
+    /// progress runs to its own end.
+    #[cfg(feature = "pairing-code")]
+    pub pairing_window: Duration,
+    /// Sentence sent in `client/pair-pending`, in the host's language.
+    ///
+    /// A host that wants to tell the operator what to do sets it here; without one the message is
+    /// sent with no text, because the crate does not invent operator-facing prose.
+    #[cfg(feature = "pairing-code")]
+    pub pairing_pending_text: Option<String>,
 }
 
 impl fmt::Debug for ClientConfig {
@@ -220,8 +262,8 @@ impl fmt::Debug for ClientConfig {
     /// identity redacts its secret. Neither is delegated to here, so a `Debug` log of a
     /// configuration cannot leak a key.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ClientConfig")
+        let mut debug = formatter.debug_struct("ClientConfig");
+        debug
             .field("server", &self.server)
             .field("player_name", &self.player_name)
             .field("device_info", &self.device_info)
@@ -232,8 +274,17 @@ impl fmt::Debug for ClientConfig {
             .field("muted", &self.muted)
             .field("volume_policy", &self.volume_policy)
             .field("max_backoff", &self.max_backoff)
-            .field("pairing_timeout", &self.pairing_timeout)
-            .finish()
+            .field("pairing_timeout", &self.pairing_timeout);
+        // The static code is a credential, so it is named but never printed.
+        #[cfg(feature = "pairing-code")]
+        debug
+            .field(
+                "static_pairing_code",
+                &self.static_pairing_code.as_ref().map(|_| "<redacted>"),
+            )
+            .field("pairing_window", &self.pairing_window)
+            .field("pairing_pending_text", &self.pairing_pending_text);
+        debug.finish()
     }
 }
 
@@ -279,6 +330,33 @@ impl ClientConfig {
         if self.pairing_timeout.is_zero() {
             bail!("ClientConfig::pairing_timeout must not be zero");
         }
+        #[cfg(feature = "pairing-code")]
+        {
+            if let Some(code) = &self.static_pairing_code {
+                if code.len() != STATIC_PAIRING_CODE_LEN
+                    || !code.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    // The code itself is a credential, so the error names the shape, never the
+                    // value the host passed.
+                    bail!(
+                        "ClientConfig::static_pairing_code must be {STATIC_PAIRING_CODE_LEN} \
+                         ASCII digits"
+                    );
+                }
+            }
+            if self.pairing_window.is_zero() {
+                bail!("ClientConfig::pairing_window must not be zero");
+            }
+            if let Some(text) = &self.pairing_pending_text {
+                if text.len() > MAX_PAIRING_PENDING_TEXT_LEN {
+                    bail!(
+                        "ClientConfig::pairing_pending_text is {} bytes, more than the \
+                         {MAX_PAIRING_PENDING_TEXT_LEN} the protocol allows",
+                        text.len()
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -301,6 +379,12 @@ mod tests {
             volume_policy: VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
+            #[cfg(feature = "pairing-code")]
+            static_pairing_code: None,
+            #[cfg(feature = "pairing-code")]
+            pairing_window: DEFAULT_PAIRING_WINDOW,
+            #[cfg(feature = "pairing-code")]
+            pairing_pending_text: None,
         }
     }
 
@@ -421,5 +505,103 @@ mod tests {
             .validate()
             .expect_err("a blank name must be rejected");
         assert!(format!("{error:#}").contains("player_name"));
+    }
+
+    /// The protocol fixes the code at eight decimal digits; anything else cannot be entered.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_static_pairing_code_is_exactly_eight_digits() {
+        for code in ["12345678", "00000000", "99999999"] {
+            let config = ClientConfig {
+                static_pairing_code: Some(code.to_owned()),
+                ..valid()
+            };
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{code:?} must be accepted: {error:#}"));
+        }
+
+        for code in [
+            "",
+            "1234567",
+            "123456789",
+            "1234 678",
+            "1234567a",
+            "--------",
+            "１２３４５６７８",
+        ] {
+            let config = ClientConfig {
+                static_pairing_code: Some(code.to_owned()),
+                ..valid()
+            };
+            let error = config
+                .validate()
+                .expect_err("a code that is not eight digits must be rejected");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("static_pairing_code"),
+                "the error must name the field, got: {message}"
+            );
+            assert!(
+                !message.contains(code) || code.is_empty(),
+                "the code is a credential and must not appear in the error: {message}"
+            );
+        }
+    }
+
+    /// The window has no pause, so a zero lifetime would close it before any attempt could start.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn the_pairing_window_and_pending_text_are_bounded() {
+        let config = ClientConfig {
+            pairing_window: Duration::ZERO,
+            ..valid()
+        };
+        let error = config
+            .validate()
+            .expect_err("a zero window cannot admit an attempt");
+        assert!(
+            format!("{error:#}").contains("pairing_window"),
+            "the error must name the field, got: {error:#}"
+        );
+
+        let longest = ClientConfig {
+            pairing_pending_text: Some("a".repeat(MAX_PAIRING_PENDING_TEXT_LEN)),
+            ..valid()
+        };
+        longest
+            .validate()
+            .expect("a sentence at the limit must be accepted");
+
+        let config = ClientConfig {
+            pairing_pending_text: Some("a".repeat(MAX_PAIRING_PENDING_TEXT_LEN + 1)),
+            ..valid()
+        };
+        let error = config
+            .validate()
+            .expect_err("a sentence above the limit must be rejected");
+        assert!(
+            format!("{error:#}").contains("pairing_pending_text"),
+            "the error must name the field, got: {error:#}"
+        );
+    }
+
+    /// The static code is a credential, so a `Debug` log of the configuration must not print it.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_static_pairing_code_is_redacted_in_debug() {
+        let config = ClientConfig {
+            static_pairing_code: Some("12345678".to_owned()),
+            ..valid()
+        };
+        let text = format!("{config:?}");
+        assert!(
+            text.contains("static_pairing_code: Some(\"<redacted>\")"),
+            "the field must be named but redacted: {text}"
+        );
+        assert!(
+            !text.contains("12345678"),
+            "the code must never appear in a debug format: {text}"
+        );
     }
 }

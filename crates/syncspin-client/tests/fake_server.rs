@@ -31,9 +31,17 @@ use syncspin_core::messages::{
     PairingActivation, ServerActivate, ServerHello, ServerPairFinalize, ServerState, ServerTime,
     StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
 };
+#[cfg(feature = "pairing-code")]
+use syncspin_core::messages::{
+    ClientPairAuth, ClientPairFinalize, ServerPairAuth, ServerPairConfirm,
+};
 use syncspin_core::noise::{
     psk_id_for, MAX_MESSAGE_LEN, NOISE_PARAMS, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
+#[cfg(feature = "pairing-code")]
+use syncspin_core::pairing::pake;
+#[cfg(feature = "pairing-code")]
+use syncspin_core::pairing::wrap;
 
 type Socket = WebSocketStream<TcpStream>;
 
@@ -101,6 +109,13 @@ pub struct ServerOptions {
     /// A conformant server sends nothing after Noise message 1, but a client has to survive a frame
     /// that was already on its way: the client may discard such a message without acting on it.
     pub stale_message_on_rehandshake: bool,
+    /// The static pairing code this server expects, which selects the static flow when set.
+    ///
+    /// The harness plays the server's CPace side with the code as `PRS`. A test that plays an
+    /// operator who typed a different code sets a value the client does not hold, so the two sides
+    /// derive different generators and the client's `server_kc` verification fails.
+    #[cfg(feature = "pairing-code")]
+    pub static_pairing_code: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -133,6 +148,8 @@ impl Default for ServerOptions {
             first_activate: None,
             acknowledge_pairing: true,
             stale_message_on_rehandshake: false,
+            #[cfg(feature = "pairing-code")]
+            static_pairing_code: None,
         }
     }
 }
@@ -225,6 +242,23 @@ pub enum Observation {
     PairInit {
         /// Index the client reported for the activation that admitted the attempt.
         pairing_index: u32,
+    },
+    /// The client reported that it is holding the pairing attempt back.
+    PairPending {
+        /// Index of the activation whose attempt is held back.
+        pairing_index: u32,
+        /// The host's sentence for the operator, when it set one.
+        message: Option<String>,
+    },
+    /// The client sent its CPace share.
+    PairAuth {
+        /// `pake_msg_2`, the client's share, as base64url.
+        pake_msg_2: String,
+    },
+    /// The client sent its key-confirmation tag.
+    PairConfirm {
+        /// `client_kc`, the client's tag, as base64url.
+        client_kc: String,
     },
     /// The client delivered the long-term PSK of a pairing.
     PairFinalize {
@@ -553,6 +587,42 @@ impl FakeServer {
         }
     }
 
+    /// Waits until the client reports a held-back pairing attempt.
+    pub async fn wait_for_pair_pending(&mut self) -> Option<(u32, Option<String>)> {
+        loop {
+            match self.observation().await {
+                Some(Observation::PairPending {
+                    pairing_index,
+                    message,
+                }) => return Some((pairing_index, message)),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client answers `server/pair-auth` with its CPace share.
+    pub async fn wait_for_pair_auth(&mut self) -> Option<String> {
+        loop {
+            match self.observation().await {
+                Some(Observation::PairAuth { pake_msg_2 }) => return Some(pake_msg_2),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client sends its key-confirmation tag.
+    pub async fn wait_for_pair_confirm(&mut self) -> Option<String> {
+        loop {
+            match self.observation().await {
+                Some(Observation::PairConfirm { client_kc }) => return Some(client_kc),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     /// Waits until the client delivers a pairing's long-term PSK.
     pub async fn wait_for_pair_finalize(&mut self) -> Option<PairingKey> {
         loop {
@@ -812,6 +882,7 @@ async fn serve_connection(
 
     // 8. Serve until a close.
     let mut answered_time = 0usize;
+    let mut pake = PairingServer::default();
     loop {
         // The two sources are turned into one event first, so the socket is only borrowed by the
         // select itself and the handlers can still write to it.
@@ -830,6 +901,8 @@ async fn serve_connection(
                     &mut answered_time,
                     observations,
                     paired,
+                    &handshake_hash,
+                    &mut pake,
                 )
                 .await?;
             }
@@ -1010,6 +1083,160 @@ enum LinkEvent {
     Command(Option<Command>),
 }
 
+/// The server-side CPace state of the connection.
+///
+/// The harness plays the initiator (the server) of the static flow; without the feature it is an
+/// empty value so the call sites do not need two shapes.
+#[derive(Default)]
+struct PairingServer {
+    #[cfg(feature = "pairing-code")]
+    round: Option<StaticRound>,
+}
+
+/// The server half of one static-code CPace round.
+#[cfg(feature = "pairing-code")]
+struct StaticRound {
+    /// The `sid` both sides derive the generator and the tags from.
+    sid: Vec<u8>,
+    /// The server's scalar, which only it holds.
+    scalar: [u8; 32],
+    /// `Ya`, the server's share.
+    ya: [u8; 32],
+    /// The intermediate session key, set once the client's share arrived.
+    isk: Option<[u8; 64]>,
+    /// `Tb`, the tag the client's `client_kc` must equal.
+    expected_client_tag: Option<[u8; 64]>,
+    /// Whether the client's tag verified. Only then is the sealed PSK unwrapped.
+    client_verified: bool,
+}
+
+/// The CPace session id of a static-code attempt: label, `h`, pairing index and round 1.
+#[cfg(feature = "pairing-code")]
+fn pake_sid(handshake_hash: &[u8; 32], pairing_index: u32) -> Vec<u8> {
+    let mut sid = Vec::from(b"sendspin-pair-pake-v1".as_slice());
+    sid.extend_from_slice(handshake_hash);
+    sid.extend_from_slice(&pairing_index.to_be_bytes());
+    sid.extend_from_slice(&1u32.to_be_bytes());
+    sid
+}
+
+/// Starts the harness's CPace round and sends `server/pair-auth`.
+#[cfg(feature = "pairing-code")]
+async fn start_static_round(
+    socket: &mut Socket,
+    noise: &mut SnowTransport,
+    options: &ServerOptions,
+    handshake_hash: &[u8; 32],
+    pairing_index: u32,
+    pake: &mut PairingServer,
+) -> Result<()> {
+    let code = options
+        .static_pairing_code
+        .as_deref()
+        .expect("the caller checked that the harness plays the static flow");
+    let sid = pake_sid(handshake_hash, pairing_index);
+    let generator = pake::generator(code.as_bytes(), b"", &sid);
+    let mut scalar = [0u8; 32];
+    getrandom::fill(&mut scalar)
+        .map_err(|_| anyhow!("the test server cannot draw a CPace scalar"))?;
+    let ya = pake::public_share(&scalar, &generator)?;
+    pake.round = Some(StaticRound {
+        sid,
+        scalar,
+        ya,
+        isk: None,
+        expected_client_tag: None,
+        client_verified: false,
+    });
+
+    let reply = Incoming::ServerPairAuth(ServerPairAuth {
+        pake_msg_1: URL_SAFE_NO_PAD.encode(ya),
+    });
+    send_encrypted(socket, noise, &reply).await
+}
+
+/// Derives the round's key material from the client's share and sends `server/pair-confirm`.
+#[cfg(feature = "pairing-code")]
+async fn complete_static_round(
+    socket: &mut Socket,
+    noise: &mut SnowTransport,
+    auth: &ClientPairAuth,
+    pake: &mut PairingServer,
+) -> Result<()> {
+    let Some(round) = pake.round.as_mut() else {
+        bail!("client/pair-auth arrived before client/pair-init");
+    };
+    let yb: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&auth.pake_msg_2)
+        .context("pake_msg_2 is not base64url")?
+        .try_into()
+        .map_err(|_| anyhow!("pake_msg_2 is not 32 bytes"))?;
+
+    let point = pake::scalar_mult_vfy(&round.scalar, &yb)?;
+    let transcript = pake::transcript_ir(&round.ya, b"server", &yb, b"client");
+    let isk = pake::intermediate_session_key(&round.sid, &point, &transcript);
+    let ta = pake::key_confirmation_tag(&round.sid, &isk, &round.ya, b"server");
+    round.expected_client_tag = Some(pake::key_confirmation_tag(&round.sid, &isk, &yb, b"client"));
+    round.isk = Some(isk);
+
+    let reply = Incoming::ServerPairConfirm(ServerPairConfirm {
+        server_kc: URL_SAFE_NO_PAD.encode(ta),
+    });
+    send_encrypted(socket, noise, &reply).await
+}
+
+/// Verifies the client's tag and unwraps the long-term PSK it delivered.
+#[cfg(feature = "pairing-code")]
+async fn finish_static_pairing(
+    socket: &mut Socket,
+    noise: &mut SnowTransport,
+    options: &ServerOptions,
+    observations: &UnboundedSender<Observation>,
+    paired: &Arc<Mutex<Option<[u8; 32]>>>,
+    pake: &mut PairingServer,
+    finalize: &ClientPairFinalize,
+) -> Result<()> {
+    let Some(round) = pake.round.take() else {
+        bail!("client/pair-finalize arrived without a CPace round");
+    };
+    if !round.client_verified {
+        bail!("the client finalized before its key-confirmation tag verified");
+    }
+    if finalize.long_term_psk.is_some() {
+        bail!("the static flow must not carry the long-term PSK in clear");
+    }
+    let Some(encoded) = finalize.wrapped_psk.as_deref() else {
+        bail!("the static flow carries the long-term PSK sealed under the CPace output");
+    };
+    let sealed: [u8; 48] = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .context("wrapped_psk is not base64url")?
+        .try_into()
+        .map_err(|_| anyhow!("wrapped_psk is not 48 bytes"))?;
+    let isk = round
+        .isk
+        .ok_or_else(|| anyhow!("the CPace round never derived a session key"))?;
+    let key = wrap::k_wrap(wrap::PSK_LABEL, &round.sid, &isk);
+    let long_term_psk = wrap::unwrap(&key, &sealed)?;
+    if long_term_psk == SENTINEL_PSK {
+        bail!("the client delivered the published Sentinel key as a long-term PSK");
+    }
+
+    // The server persists its record: the next handshake announces this key as `lt`.
+    *paired
+        .lock()
+        .expect("the fake server's record lock is not poisoned") = Some(long_term_psk);
+    let _ = observations.send(Observation::PairFinalize {
+        long_term_psk: PairingKey(long_term_psk),
+    });
+
+    if options.acknowledge_pairing {
+        let reply = Incoming::ServerPairFinalize(ServerPairFinalize {});
+        send_encrypted(socket, noise, &reply).await?;
+    }
+    Ok(())
+}
+
 /// Answers the messages a client sends after the handshake.
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
@@ -1020,7 +1247,13 @@ async fn handle_client_message(
     answered_time: &mut usize,
     observations: &UnboundedSender<Observation>,
     paired: &Arc<Mutex<Option<[u8; 32]>>>,
+    handshake_hash: &[u8; 32],
+    pake: &mut PairingServer,
 ) -> Result<()> {
+    // Without the feature the static flow does not exist, so neither parameter is read.
+    #[cfg(not(feature = "pairing-code"))]
+    let _ = (handshake_hash, pake);
+
     let Some(&0) = plaintext.first() else {
         return Ok(());
     };
@@ -1049,10 +1282,66 @@ async fn handle_client_message(
             let _ = observations.send(Observation::PairInit {
                 pairing_index: init.pairing_index,
             });
+            #[cfg(feature = "pairing-code")]
+            if options.static_pairing_code.is_some() {
+                start_static_round(
+                    socket,
+                    noise,
+                    options,
+                    handshake_hash,
+                    init.pairing_index,
+                    pake,
+                )
+                .await?;
+            }
+        }
+        Some(Incoming::ClientPairPending(pending)) => {
+            let _ = observations.send(Observation::PairPending {
+                pairing_index: pending.pairing_index,
+                message: pending.message,
+            });
+        }
+        Some(Incoming::ClientPairAuth(auth)) => {
+            #[cfg(feature = "pairing-code")]
+            complete_static_round(socket, noise, &auth, pake).await?;
+            let _ = observations.send(Observation::PairAuth {
+                pake_msg_2: auth.pake_msg_2,
+            });
+        }
+        Some(Incoming::ClientPairConfirm(confirm)) => {
+            #[cfg(feature = "pairing-code")]
+            if let Some(round) = pake.round.as_mut() {
+                let tag: [u8; 64] = URL_SAFE_NO_PAD
+                    .decode(&confirm.client_kc)
+                    .context("client_kc is not base64url")?
+                    .try_into()
+                    .map_err(|_| anyhow!("client_kc is not 64 bytes"))?;
+                round.client_verified = round
+                    .expected_client_tag
+                    .as_ref()
+                    .is_some_and(|expected| pake::verify_key_confirmation_tag(expected, &tag));
+            }
+            let _ = observations.send(Observation::PairConfirm {
+                client_kc: confirm.client_kc,
+            });
         }
         Some(Incoming::ClientPairFinalize(finalize)) => {
+            #[cfg(feature = "pairing-code")]
+            if options.static_pairing_code.is_some() {
+                finish_static_pairing(
+                    socket,
+                    noise,
+                    options,
+                    observations,
+                    paired,
+                    pake,
+                    &finalize,
+                )
+                .await?;
+                return Ok(());
+            }
             // The Pairing PSK flow carries the key directly; the wrapped form belongs to the code
-            // flows this harness does not speak.
+            // flows, which this harness speaks only with the `pairing-code` feature.
             let Some(encoded) = finalize.long_term_psk.as_deref() else {
                 bail!(
                     "client/pair-finalize carried no long_term_psk; this harness speaks the \

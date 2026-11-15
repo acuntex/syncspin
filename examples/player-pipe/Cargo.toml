@@ -9,6 +9,12 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Mirrors the client's code-pairing feature, so a workspace `--all-features` build sees the
+# configuration fields that only exist there. A host crate that enables `pairing-code` on the
+# client needs the same mirror to construct `ClientConfig`.
+pairing-code = ["syncspin-client/pairing-code"]
+
 [dependencies]
 syncspin-client = { version = "0.1.0", path = "../../crates/syncspin-client" }
 anyhow.workspace = true

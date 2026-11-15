@@ -479,6 +479,25 @@ impl ControlHandle {
         self.volume.load(Ordering::Relaxed)
     }
 
+    /// Opens a pairing window on the live connection and starts a waiting static-code attempt.
+    ///
+    /// The pairing window is the client's half of the static code flow's operator gesture: the host
+    /// decides what the gesture is - a button press, a pinhole, a power-cycle pattern - and calls
+    /// this when it happened. The window belongs to the connection that is live now, so it is
+    /// opened there and closes when that connection ends, when the configured lifetime expires,
+    /// when a pairing completes, or after five failed key confirmations.
+    ///
+    /// # Errors
+    /// Returns an error when no connection is established at this moment. A call that arrives while
+    /// the client is reconnecting is refused rather than remembered for the next connection, which
+    /// the spec requires: a window admits attempts only on the connection that carries its gesture.
+    #[cfg(feature = "pairing-code")]
+    pub async fn open_pairing_window(&self) -> Result<()> {
+        self.send(ControlAction::OpenPairingWindow)
+            .await
+            .map(|_level| ())
+    }
+
     /// Sends one controller command.
     async fn transport(&self, command: &'static str) -> Result<()> {
         self.send(ControlAction::Transport(command))
@@ -509,6 +528,9 @@ pub(crate) enum ControlAction {
     ReportVolume(u8),
     /// Set the mute state, keeping the level.
     Mute(bool),
+    /// Open a pairing window for this connection and start a waiting static-code attempt.
+    #[cfg(feature = "pairing-code")]
+    OpenPairingWindow,
 }
 
 /// One request from a [`ControlHandle`], with the channel its answer travels back on.
@@ -987,6 +1009,12 @@ mod tests {
                 volume_policy: VolumePolicy::default(),
                 max_backoff: Duration::from_secs(30),
                 pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+                #[cfg(feature = "pairing-code")]
+                static_pairing_code: None,
+                #[cfg(feature = "pairing-code")]
+                pairing_window: crate::DEFAULT_PAIRING_WINDOW,
+                #[cfg(feature = "pairing-code")]
+                pairing_pending_text: None,
             },
             psks: Vec::new(),
             pairing: None,

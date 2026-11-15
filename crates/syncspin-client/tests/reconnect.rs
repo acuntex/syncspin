@@ -117,6 +117,12 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
+        #[cfg(feature = "pairing-code")]
+        pairing_pending_text: None,
     }
 }
 
@@ -280,6 +286,12 @@ async fn an_unreachable_server_is_an_event_and_not_an_error() {
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
+        #[cfg(feature = "pairing-code")]
+        pairing_pending_text: None,
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(recordings.clone())))
         .await
@@ -543,6 +555,12 @@ async fn the_retry_delay_is_awaited_before_the_next_attempt() {
         volume_policy: VolumePolicy::default(),
         max_backoff: retry,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
+        #[cfg(feature = "pairing-code")]
+        pairing_pending_text: None,
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(Recordings::default())))
         .await

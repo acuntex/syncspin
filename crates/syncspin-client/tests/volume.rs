@@ -52,6 +52,12 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(30),
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
+        #[cfg(feature = "pairing-code")]
+        pairing_pending_text: None,
     }
 }
 

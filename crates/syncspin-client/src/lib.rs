@@ -39,6 +39,14 @@
 //! `pair/abort` reason `method_not_supported`. A pairing attempt is bounded by
 //! [`ClientConfig::pairing_timeout`], [`DEFAULT_PAIRING_TIMEOUT`] by default.
 //!
+//! With the `pairing-code` feature and a code in
+//! [`ClientConfig::static_pairing_code`](crate::ClientConfig::static_pairing_code), the client also
+//! offers the Static Pairing Code method. Every attempt is gated by an operator gesture:
+//! [`ControlHandle::open_pairing_window`] opens a window on the live connection, the client answers
+//! a pairing activation with `client/pair-pending` while none is open, and the fifth failed key
+//! confirmation closes the window. The round runs CPace over X25519 with SHA-512 and delivers the
+//! new long-term PSK sealed under its output; that layer has not had an external review.
+//!
 //! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
 //! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
 //! [`Event::StreamClear`] for a seek, plus [`Event::Track`] for the now-playing metadata with its
@@ -64,6 +72,8 @@ pub use client::{
 pub use config::{
     AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, MAX_PLAYER_NAME_LEN,
 };
+#[cfg(feature = "pairing-code")]
+pub use config::{DEFAULT_PAIRING_WINDOW, MAX_PAIRING_PENDING_TEXT_LEN, STATIC_PAIRING_CODE_LEN};
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};
 
 // The identity is part of [`ClientConfig`], so a host that builds a configuration needs it. A

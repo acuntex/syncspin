@@ -36,15 +36,24 @@ use syncspin_core::messages::{
     ServerState, ServerTime, StreamClear, StreamStart, SupportedFormat, SupportedPairMethods,
     UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
 };
+#[cfg(feature = "pairing-code")]
+use syncspin_core::messages::{
+    ClientPairAuth, ClientPairConfirm, ClientPairPending, ServerPairAuth, ServerPairConfirm,
+    StaticPairingCodeMethod,
+};
 use syncspin_core::noise::{
     psk_id_for, Responder, TransportState as NoiseTransport, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
+#[cfg(feature = "pairing-code")]
+use syncspin_core::pairing::pake::TAG_LEN;
 
 use crate::client::{
     check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, PairingFailure,
     PlaybackState, StreamEndReason, NORMAL_PLAYBACK_SPEED,
 };
 use crate::config::{AudioMode, ClientConfig, PskCategory, StoredPsk};
+#[cfg(feature = "pairing-code")]
+use crate::pairing::{pake_sid, METHOD_STATIC_PAIRING_CODE, STATIC_CODE_ROUND};
 use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_PAIRING_PSK};
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 use crate::storage::persist_pairing;
@@ -103,6 +112,13 @@ const SUPPORTED_BIT_DEPTH: u8 = 16;
 
 /// Length of a canonical unpadded base64url key id.
 const PSK_ID_LEN: usize = 43;
+
+/// How many failed key confirmations one pairing window admits.
+///
+/// `pairing.md`: the window closes on its fifth failed attempt, where a failure is the client's
+/// verification of `server_kc`. Any other way an attempt ends leaves the window open.
+#[cfg(feature = "pairing-code")]
+const WINDOW_FAILURE_LIMIT: u8 = 5;
 
 /// Player commands this client accepts from the server.
 const PLAYER_COMMANDS: [&str; 2] = ["volume", "mute"];
@@ -204,6 +220,40 @@ struct Rehandshake {
     previous: NoiseTransport,
     /// Deadline for the activation under the new keys.
     deadline: Instant,
+}
+
+/// The pairing window of this connection.
+///
+/// The window belongs to the connection that carried its opening gesture: it is opened by a
+/// [`ControlHandle`](crate::ControlHandle) request on that connection and closes when the session
+/// ends, so it can never admit an attempt on a later connection. The lifetime runs from the
+/// gesture without pausing during attempts, and the fifth failed key confirmation closes it too.
+#[cfg(feature = "pairing-code")]
+struct PairingWindow {
+    /// When the operator's gesture opened the window.
+    opened: Instant,
+    /// Failed `server_kc` verifications this window has seen.
+    failed_attempts: u8,
+}
+
+/// A static-code activation whose attempt waits for an operator gesture.
+///
+/// `client/pair-pending` is on the wire and no attempt is running: the timeout starts with
+/// `client/pair-init`, so a server that waits for the gesture is not racing it.
+#[cfg(feature = "pairing-code")]
+struct PendingPairing {
+    /// The pairing index its activation gave `client/pair-init`.
+    pairing_index: u32,
+}
+
+/// The pairing methods an activation can admit on this connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmittedMethod {
+    /// The Pairing PSK flow.
+    PairingPsk,
+    /// The Static Pairing Code flow.
+    #[cfg(feature = "pairing-code")]
+    StaticCode,
 }
 
 /// State a connection keeps across attempts.
@@ -335,6 +385,12 @@ pub(crate) struct Session<'a> {
     pairing_index: u32,
     /// The pairing attempt in progress, or `None` when this connection is not pairing.
     pairing: Option<PairingAttempt>,
+    /// The pairing window the operator opened on this connection, or `None` when it is closed.
+    #[cfg(feature = "pairing-code")]
+    pairing_window: Option<PairingWindow>,
+    /// A static-code activation whose attempt waits for an operator gesture.
+    #[cfg(feature = "pairing-code")]
+    pending_pairing: Option<PendingPairing>,
     /// A re-handshake whose new keys are in place, or `None` when the connection is not switching
     /// keys.
     rehandshake: Option<Rehandshake>,
@@ -419,6 +475,10 @@ pub(crate) async fn attempt(
         candidates,
         pairing_index: 0,
         pairing: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: None,
+        #[cfg(feature = "pairing-code")]
+        pending_pairing: None,
         rehandshake: None,
     };
     session.publish_volume();
@@ -734,6 +794,10 @@ impl Session<'_> {
             Incoming::StreamClear(clear) => self.handle_stream_clear(clear),
             Incoming::ServerPairFinalize(_) => self.confirm_pairing(),
             Incoming::PairAbort(abort) => self.handle_pairing_abort(abort),
+            #[cfg(feature = "pairing-code")]
+            Incoming::ServerPairAuth(auth) => self.handle_server_auth(auth).await,
+            #[cfg(feature = "pairing-code")]
+            Incoming::ServerPairConfirm(confirm) => self.handle_server_confirm(confirm).await,
             // A message for a role or direction this client does not act on.
             _ => Ok(()),
         }
@@ -780,6 +844,14 @@ impl Session<'_> {
         // The index counts pairing activations since the last handshake, and this is a new one.
         self.pairing_index = 0;
         self.matched = selected.matched;
+        // An attempt belongs to the activation and the `h` that admitted it; the new handshake gives
+        // both a new value, so the attempt and anything it was holding for are discarded. A server
+        // that still wants to pair admits a new attempt under the new keys.
+        self.pairing = None;
+        #[cfg(feature = "pairing-code")]
+        {
+            self.pending_pairing = None;
+        }
         self.rehandshake = Some(Rehandshake {
             previous,
             deadline: Instant::now() + HANDSHAKE_TIMEOUT,
@@ -815,6 +887,10 @@ impl Session<'_> {
         if pairing.is_none() {
             // A cancelling activation discards the attempt and anything it already received.
             self.pairing = None;
+            #[cfg(feature = "pairing-code")]
+            {
+                self.pending_pairing = None;
+            }
         }
 
         let had_player = self.player_active();
@@ -851,45 +927,225 @@ impl Session<'_> {
         self.pairing.as_ref().map(|attempt| attempt.deadline)
     }
 
-    /// Whether this client currently offers the Pairing PSK method.
+    /// The method an activation may run on this connection, or `None` when it is inadmissible.
     ///
-    /// The method is offered exactly when a store exists. A client without one cannot keep the
-    /// pairing PSK across restarts and cannot write the record a completed pairing produces, so it
-    /// must not advertise the method - and it never draws a key it cannot hand back.
-    fn pairing_offered(&self) -> bool {
-        self.config.storage.is_some()
+    /// The Pairing PSK method needs a store and is admissible only on a connection the pairing PSK
+    /// sealed. The static code needs a configured code and a store for the record it produces, is
+    /// admissible only while the connection is *not* keyed by the pairing PSK - the spec's
+    /// invariant, since a code round authenticates a Sentinel-keyed or long-term-keyed channel -
+    /// and takes no emission format, which belongs to the dynamic flow.
+    fn admitted_method(&self, activation: &PairingActivation) -> Option<AdmittedMethod> {
+        match activation.method.as_str() {
+            METHOD_PAIRING_PSK => (self.config.storage.is_some()
+                && self.matched == MatchedPsk::PairingPsk)
+                .then_some(AdmittedMethod::PairingPsk),
+            #[cfg(feature = "pairing-code")]
+            METHOD_STATIC_PAIRING_CODE => (self.config.storage.is_some()
+                && self.config.static_pairing_code.is_some()
+                && self.matched != MatchedPsk::PairingPsk
+                && activation.format.is_none())
+            .then_some(AdmittedMethod::StaticCode),
+            _ => None,
+        }
+    }
+
+    /// Whether the pairing window of this connection is open right now.
+    ///
+    /// An expired window closes silently, as the spec requires; expiry is noticed here rather than
+    /// by a timer, because the only thing it changes is whether a future attempt may start. An
+    /// attempt already in progress runs to its own end either way.
+    #[cfg(feature = "pairing-code")]
+    fn window_is_open(&mut self) -> bool {
+        let expired = self
+            .pairing_window
+            .as_ref()
+            .is_some_and(|window| window.opened.elapsed() >= self.config.pairing_window);
+        if expired {
+            self.pairing_window = None;
+        }
+        self.pairing_window.is_some()
+    }
+
+    /// Counts a failed `server_kc` verification against the window, closing it at the limit.
+    #[cfg(feature = "pairing-code")]
+    fn record_window_failure(&mut self) {
+        if !self.window_is_open() {
+            return;
+        }
+        let window = self
+            .pairing_window
+            .as_mut()
+            .expect("the window was just found open");
+        window.failed_attempts = window.failed_attempts.saturating_add(1);
+        if window.failed_attempts >= WINDOW_FAILURE_LIMIT {
+            self.pairing_window = None;
+        }
+    }
+
+    /// Opens a pairing window for the connection, and starts the attempt that was waiting for it.
+    ///
+    /// The gesture belongs to the host; this only records the window and, when a static-code
+    /// activation is already pending, sends the `client/pair-init` it was holding back. A fresh
+    /// gesture starts a fresh window: its lifetime runs from now and its failure count is its own,
+    /// so an operator can deliberately try again after five failures.
+    #[cfg(feature = "pairing-code")]
+    async fn open_pairing_window(&mut self) -> Result<()> {
+        self.pairing_window = Some(PairingWindow {
+            opened: Instant::now(),
+            failed_attempts: 0,
+        });
+        let Some(pending) = self.pending_pairing.take() else {
+            return Ok(());
+        };
+        if self.pairing.is_some() {
+            // An activation that superseded the pending one owns the attempt now.
+            return Ok(());
+        }
+        self.start_static_attempt(pending.pairing_index).await
+    }
+
+    /// Sends `client/pair-init` and starts the attempt whose timeout runs from it.
+    #[cfg(feature = "pairing-code")]
+    async fn start_static_attempt(&mut self, pairing_index: u32) -> Result<()> {
+        let init = Incoming::ClientPairInit(ClientPairInit {
+            pairing_index,
+            commit_b: None,
+        });
+        self.send_json(&init).await?;
+        self.pairing = Some(PairingAttempt::static_code(
+            pairing_index,
+            self.config.pairing_timeout,
+        ));
+        Ok(())
     }
 
     /// Starts the one attempt a pairing activation admits, or aborts it as unsupported.
     ///
     /// The Pairing PSK flow sends `client/pair-init` and `client/pair-finalize` back to back,
-    /// without waiting for a server response. Before the first of them the client checks that the
-    /// activation is admissible: the method has to be `pairing_psk` exactly when the handshake was
-    /// sealed with this client's pairing PSK, and the client has to offer it. Anything else is a
-    /// `pair/abort` with reason `method_not_supported`, which leaves the connection open.
+    /// without waiting for a server response. The static flow sends only `client/pair-init`, and
+    /// only once a pairing window is open: while the window is closed it sends
+    /// `client/pair-pending` instead and the attempt starts with a later gesture. Before either,
+    /// the activation has to be admissible; anything else is a `pair/abort` with reason
+    /// `method_not_supported`, which leaves the connection open.
     async fn start_pairing(&mut self, activation: PairingActivation) -> Result<()> {
         // A second activation supersedes an attempt that is still running; its state is discarded
         // without an abort, exactly as a cancelling activation does.
         self.pairing = None;
-        if !self.pairing_offered()
-            || activation.method != METHOD_PAIRING_PSK
-            || self.matched != MatchedPsk::PairingPsk
+        #[cfg(feature = "pairing-code")]
         {
-            return self.abort_pairing(PairingFailure::MethodNotSupported).await;
+            self.pending_pairing = None;
         }
 
-        let attempt = PairingAttempt::new(self.pairing_index, self.config.pairing_timeout);
-        let init = Incoming::ClientPairInit(ClientPairInit {
-            pairing_index: attempt.pairing_index,
-            commit_b: None,
+        let Some(method) = self.admitted_method(&activation) else {
+            return self.abort_pairing(PairingFailure::MethodNotSupported).await;
+        };
+
+        match method {
+            AdmittedMethod::PairingPsk => {
+                let attempt = PairingAttempt::new(self.pairing_index, self.config.pairing_timeout);
+                let init = Incoming::ClientPairInit(ClientPairInit {
+                    pairing_index: attempt.pairing_index,
+                    commit_b: None,
+                });
+                self.send_json(&init).await?;
+                let finalize = Incoming::ClientPairFinalize(ClientPairFinalize {
+                    long_term_psk: Some(attempt.psk_base64()),
+                    wrapped_psk: None,
+                });
+                self.send_json(&finalize).await?;
+                // The attempt begins with `client/pair-init`; its timeout runs from there.
+                self.pairing = Some(attempt);
+                Ok(())
+            }
+            #[cfg(feature = "pairing-code")]
+            AdmittedMethod::StaticCode => {
+                if !self.window_is_open() {
+                    let pending = Incoming::ClientPairPending(ClientPairPending {
+                        pairing_index: self.pairing_index,
+                        message: self.config.pairing_pending_text.clone(),
+                    });
+                    self.send_json(&pending).await?;
+                    self.pending_pairing = Some(PendingPairing {
+                        pairing_index: self.pairing_index,
+                    });
+                    return Ok(());
+                }
+                self.start_static_attempt(self.pairing_index).await
+            }
+        }
+    }
+
+    /// Answers `server/pair-auth`: runs the client half of the CPace round.
+    ///
+    /// The reply, `client/pair-auth`, carries this client's share `Yb`. A message that arrives when
+    /// no attempt is running belongs to an attempt the client already ended, and is discarded
+    /// silently as the spec requires. A message at the wrong point of a running attempt is a
+    /// sequence violation, and a share that is malformed or encodes a low-order point is a
+    /// protocol error: both close the connection without an application-level message.
+    #[cfg(feature = "pairing-code")]
+    async fn handle_server_auth(&mut self, auth: ServerPairAuth) -> Result<()> {
+        let Some(mut attempt) = self.pairing.take() else {
+            return Ok(());
+        };
+        if !attempt.awaiting_server_auth() {
+            self.pairing = Some(attempt);
+            bail!("the server sent server/pair-auth out of sequence");
+        }
+        let Some(code) = self.config.static_pairing_code.as_deref() else {
+            // The method is only admitted with a code, so this is a configuration changed during
+            // the connection; failing loudly is better than deriving a round from nothing.
+            self.pairing = Some(attempt);
+            bail!("the static pairing code is no longer configured");
+        };
+        let peer_share: [u8; 32] = decode_pairing_field(&auth.pake_msg_1, "pake_msg_1")?;
+        let sid = pake_sid(
+            self.noise.handshake_hash(),
+            attempt.pairing_index,
+            STATIC_CODE_ROUND,
+        );
+        let share = attempt.accept_server_share(code, &sid, &peer_share)?;
+        let reply = Incoming::ClientPairAuth(ClientPairAuth {
+            pake_msg_2: URL_SAFE_NO_PAD.encode(share),
         });
-        self.send_json(&init).await?;
+        self.send_json(&reply).await?;
+        self.pairing = Some(attempt);
+        Ok(())
+    }
+
+    /// Handles `server/pair-confirm`: verifies `server_kc` before anything is revealed.
+    ///
+    /// A verified tag releases the client's tag and the sealed long-term PSK, which travel back to
+    /// back with no server response awaited. The static flow has no retry: a mismatch ends the
+    /// attempt with `pairing_code_mismatch` and counts it against the pairing window, whose fifth
+    /// failure closes it.
+    #[cfg(feature = "pairing-code")]
+    async fn handle_server_confirm(&mut self, confirm: ServerPairConfirm) -> Result<()> {
+        let Some(mut attempt) = self.pairing.take() else {
+            return Ok(());
+        };
+        if !attempt.awaiting_server_confirm() {
+            self.pairing = Some(attempt);
+            bail!("the server sent server/pair-confirm out of sequence");
+        }
+        let received: [u8; TAG_LEN] = decode_pairing_field(&confirm.server_kc, "server_kc")?;
+        let Some(confirmation) = attempt.verify_server_tag(&received) else {
+            self.record_window_failure();
+            return self
+                .abort_pairing(PairingFailure::PairingCodeMismatch)
+                .await;
+        };
+
+        let reply = Incoming::ClientPairConfirm(ClientPairConfirm {
+            client_kc: confirmation.client_kc,
+            wrapped_nonce_b: None,
+        });
+        self.send_json(&reply).await?;
         let finalize = Incoming::ClientPairFinalize(ClientPairFinalize {
-            long_term_psk: Some(attempt.psk_base64()),
-            wrapped_psk: None,
+            long_term_psk: None,
+            wrapped_psk: Some(confirmation.wrapped_psk),
         });
         self.send_json(&finalize).await?;
-        // The attempt begins with `client/pair-init`; its timeout runs from there.
+        // The key is on the wire; the attempt keeps only the long-term PSK the record needs.
         self.pairing = Some(attempt);
         Ok(())
     }
@@ -912,12 +1168,18 @@ impl Session<'_> {
     ///
     /// Only now may the client write its side: the server has persisted the new long-term PSK, so a
     /// client that never receives this message - because the server cancelled instead - stores
-    /// nothing and stays a guest on this connection.
+    /// nothing and stays a guest on this connection. A completed pairing of either method closes
+    /// the pairing window.
     fn confirm_pairing(&mut self) -> Result<()> {
         let Some(attempt) = self.pairing.take() else {
             // A late finalize for an attempt that already ended has no effect.
             return Ok(());
         };
+        #[cfg(feature = "pairing-code")]
+        if attempt.is_static_code() && !attempt.awaiting_finalize() {
+            self.pairing = Some(attempt);
+            bail!("the server finalized a static-code attempt before confirming its tag");
+        }
         let Some(storage) = self.config.storage.as_deref() else {
             // An attempt only starts when a store exists, so this is unreachable; failing loudly
             // beats storing a key nowhere and reporting a pairing that cannot survive a restart.
@@ -933,6 +1195,10 @@ impl Session<'_> {
         // The server rotates this connection to the key it just persisted, and the candidate set
         // was read before that record existed.
         self.candidates.remember(record);
+        #[cfg(feature = "pairing-code")]
+        {
+            self.pairing_window = None;
+        }
         self.emit(Event::Paired {
             server_id: self.server_id.clone(),
         });
@@ -1267,6 +1533,10 @@ impl Session<'_> {
                 self.apply_report_volume(level).await.map(|()| self.volume)
             }
             ControlAction::Mute(muted) => self.apply_mute(muted).await.map(|()| self.volume),
+            #[cfg(feature = "pairing-code")]
+            ControlAction::OpenPairingWindow => {
+                self.open_pairing_window().await.map(|()| self.volume)
+            }
         };
         match result {
             Ok(level) => {
@@ -1318,6 +1588,10 @@ impl Session<'_> {
                 }
                 Ok(())
             }
+            // The window is a local state: opening it sends nothing itself, and whatever it starts
+            // needs no role.
+            #[cfg(feature = "pairing-code")]
+            ControlAction::OpenPairingWindow => Ok(()),
         }
     }
 
@@ -1547,13 +1821,22 @@ fn client_hello(config: &ClientConfig) -> Incoming {
 /// Derives the pairing methods this client currently offers from its configuration.
 ///
 /// `pairing_psk` is offered exactly when a store is configured, because the method needs a pairing
-/// PSK that survives restarts and a place to write the record. The code methods are configuration
-/// too - a static code, or the out-channels and formats a dynamic code is emitted through - and
-/// arrive with their flows behind the `pairing-code` feature; this build carries neither, so it
-/// never advertises them. A method the client cannot complete must not be offered.
+/// PSK that survives restarts and a place to write the record. `static_pairing_code` is offered
+/// exactly when the feature is on, a code is configured and a store exists: the code is the
+/// method's whole credential, and the record it produces has to be persisted, so without either the
+/// client cannot complete an attempt and must not advertise it. The dynamic code arrives with its
+/// own flow; a method the client cannot complete is never offered.
 fn pair_methods(config: &ClientConfig) -> SupportedPairMethods {
     SupportedPairMethods {
         pairing_psk: config.storage.is_some().then_some(PairingPskMethod {}),
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: config
+            .static_pairing_code
+            .as_ref()
+            .filter(|_| config.storage.is_some())
+            .map(|_| StaticPairingCodeMethod::default()),
+        #[cfg(not(feature = "pairing-code"))]
+        static_pairing_code: None,
     }
 }
 
@@ -1685,6 +1968,24 @@ fn decode_server_key(server_id: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|_| anyhow!("server_id does not decode to a 32-byte X25519 key"))
+}
+
+/// Decodes one fixed-length base64url field of a pairing message.
+///
+/// The spec gives every such field as unpadded base64url, so the canonical re-encoding has to match
+/// the received text; a value with spare bits set is not a field a conformant peer sends. The error
+/// names the field but never repeats its value: one of these fields is a key-confirmation tag.
+#[cfg(feature = "pairing-code")]
+fn decode_pairing_field<const N: usize>(value: &str, name: &str) -> Result<[u8; N]> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .with_context(|| format!("{name} is not unpadded base64url"))?;
+    if URL_SAFE_NO_PAD.encode(&bytes) != value {
+        bail!("{name} is not the canonical base64url encoding");
+    }
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("{name} does not decode to {N} bytes"))
 }
 
 /// Whether `value` is the canonical unpadded base64url encoding of a 32-byte key id.
@@ -2034,6 +2335,12 @@ mod tests {
             volume_policy: crate::config::VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             pairing_timeout: crate::client::DEFAULT_PAIRING_TIMEOUT,
+            #[cfg(feature = "pairing-code")]
+            static_pairing_code: None,
+            #[cfg(feature = "pairing-code")]
+            pairing_window: crate::config::DEFAULT_PAIRING_WINDOW,
+            #[cfg(feature = "pairing-code")]
+            pairing_pending_text: None,
         }
     }
 
@@ -2074,6 +2381,10 @@ mod tests {
             candidates: Candidates::load(None, &[], None).expect("an empty candidate set builds"),
             pairing_index: 0,
             pairing: None,
+            #[cfg(feature = "pairing-code")]
+            pairing_window: None,
+            #[cfg(feature = "pairing-code")]
+            pending_pairing: None,
             rehandshake: None,
         }
     }
@@ -2271,6 +2582,150 @@ mod tests {
         assert!(
             pair_methods(&config).pairing_psk.is_some(),
             "a configured store makes the Pairing PSK method available"
+        );
+    }
+
+    /// The static code is configuration, and its record needs a store to live in.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn the_static_code_is_offered_exactly_with_a_configured_code_and_a_store() {
+        let mut config = test_config();
+        assert!(
+            pair_methods(&config).static_pairing_code.is_none(),
+            "a client without a code must not offer the method"
+        );
+
+        config.static_pairing_code = Some("12345678".to_owned());
+        assert!(
+            pair_methods(&config).static_pairing_code.is_none(),
+            "a client that cannot persist the record must not offer the method"
+        );
+
+        config.storage = Some(std::sync::Arc::new(
+            crate::test_support::MemoryStore::holding([7u8; 32]),
+        ));
+        assert!(
+            pair_methods(&config).static_pairing_code.is_some(),
+            "a configured code and a store make the method available"
+        );
+
+        config.static_pairing_code = None;
+        assert!(
+            pair_methods(&config).static_pairing_code.is_none(),
+            "the code is the method's credential and cannot be absent"
+        );
+    }
+
+    /// The method is admissible on an unauthenticated connection, not on the pairing PSK's.
+    #[cfg(feature = "pairing-code")]
+    #[tokio::test]
+    async fn the_static_code_is_admissible_only_without_the_pairing_psk() {
+        let plain_config = test_config();
+        let coded_config = ClientConfig {
+            static_pairing_code: Some("12345678".to_owned()),
+            storage: Some(std::sync::Arc::new(
+                crate::test_support::MemoryStore::holding([7u8; 32]),
+            )),
+            ..test_config()
+        };
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &plain_config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        let activation = PairingActivation {
+            method: "static_pairing_code".to_owned(),
+            format: None,
+        };
+        assert_eq!(
+            session.admitted_method(&activation),
+            None,
+            "a client without a code cannot run the method"
+        );
+
+        session.config = &coded_config;
+        assert_eq!(
+            session.admitted_method(&activation),
+            Some(AdmittedMethod::StaticCode),
+            "a Sentinel-keyed connection admits the code flow"
+        );
+        session.matched = MatchedPsk::Stored(PskCategory::LongTerm);
+        assert_eq!(
+            session.admitted_method(&activation),
+            Some(AdmittedMethod::StaticCode),
+            "a long-term-keyed connection admits the code flow as well"
+        );
+        session.matched = MatchedPsk::PairingPsk;
+        assert_eq!(
+            session.admitted_method(&activation),
+            None,
+            "the method and the matched pairing PSK are an inadmissible combination"
+        );
+
+        // A format belongs to the dynamic flow; a static activation that carries one was not offered.
+        session.matched = MatchedPsk::Sentinel;
+        let formatted = PairingActivation {
+            method: "static_pairing_code".to_owned(),
+            format: Some("digits".to_owned()),
+        };
+        assert_eq!(session.admitted_method(&formatted), None);
+    }
+
+    /// The window closes on its fifth failed verification, and expiry closes it as well.
+    #[cfg(feature = "pairing-code")]
+    #[tokio::test]
+    async fn the_fifth_failed_verification_closes_the_pairing_window() {
+        let config = test_config();
+        // A window that expires while the test runs; the default is minutes.
+        let short_config = ClientConfig {
+            pairing_window: Duration::from_millis(1),
+            ..test_config()
+        };
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        assert!(!session.window_is_open(), "no gesture, no window");
+        session.open_pairing_window().await.expect("a window opens");
+        assert!(session.window_is_open());
+
+        for attempt in 1..5 {
+            session.record_window_failure();
+            assert!(
+                session.window_is_open(),
+                "failure {attempt} must leave the window open"
+            );
+        }
+        session.record_window_failure();
+        assert!(
+            !session.window_is_open(),
+            "the fifth failed verification closes the window"
+        );
+
+        // Expiry is silent and only noticed the next time the window is consulted.
+        session.config = &short_config;
+        session.open_pairing_window().await.expect("a window opens");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !session.window_is_open(),
+            "a window past its lifetime is closed"
+        );
+        assert!(
+            session.pairing_window.is_none(),
+            "the expired window is dropped rather than kept"
         );
     }
 

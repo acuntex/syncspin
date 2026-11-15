@@ -6,12 +6,14 @@ use syncspin_core::framing::{
     FRAGMENT_FLAG_LAST, MAX_PLAINTEXT_LEN, MAX_REASSEMBLED_LEN,
 };
 use syncspin_core::messages::{
-    AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientPairFinalize, ClientPairInit,
-    ClientState, ClientTime, ControllerCommand, DecodeError, DeviceInfo, Incoming, NoiseHandshake,
-    PairAbort, PairingPskMethod, PlayerState, PlayerSupport, ServerActivate, ServerCommand,
-    ServerHello, ServerInit, ServerPairFinalize, ServerState, ServerTime, StreamClear, StreamEnd,
-    StreamStart, StreamStartPlayer, SupportedFormat, SupportedPairMethods, UnpairedAccess,
-    AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
+    AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientPairAuth, ClientPairConfirm,
+    ClientPairFinalize, ClientPairInit, ClientPairPending, ClientState, ClientTime,
+    ControllerCommand, DecodeError, DeviceInfo, Incoming, NoiseHandshake, PairAbort,
+    PairingPskMethod, PlayerState, PlayerSupport, ServerActivate, ServerCommand, ServerHello,
+    ServerInit, ServerPairAuth, ServerPairConfirm, ServerPairFinalize, ServerState, ServerTime,
+    StaticPairingCodeMethod, StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
+    SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
+    PROTOCOL_VERSION,
 };
 
 /// A payload whose first bytes differ, so a reassembled message is easy to verify.
@@ -106,6 +108,7 @@ fn client_hello_and_server_hello_roundtrip_on_the_wire() {
         }),
         supported_pair_methods: SupportedPairMethods {
             pairing_psk: Some(PairingPskMethod {}),
+            static_pairing_code: None,
         },
         unpaired_access: UnpairedAccess { enabled: true },
     };
@@ -380,6 +383,203 @@ fn a_pair_finalize_formats_without_its_key_material() {
     assert_eq!(
         format!("{empty:?}"),
         "ClientPairFinalize { long_term_psk: None, wrapped_psk: None }"
+    );
+}
+
+#[test]
+fn code_pairing_messages_roundtrip_on_the_wire() {
+    // `client/pair-pending` without text carries only the index.
+    let pending = ClientPairPending {
+        pairing_index: 2,
+        message: None,
+    };
+    let json = serde_json::to_string(&Incoming::ClientPairPending(pending.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/pair-pending",
+            "payload": {"pairing_index": 2},
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientPairPending(pending)
+    );
+
+    // The host's sentence is optional and travels verbatim.
+    let explained = ClientPairPending {
+        pairing_index: 2,
+        message: Some("Press the button".to_owned()),
+    };
+    let json = serde_json::to_string(&Incoming::ClientPairPending(explained.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/pair-pending",
+            "payload": {"pairing_index": 2, "message": "Press the button"},
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientPairPending(explained)
+    );
+
+    // The two PAKE shares use the field names the spec spells, with the capitalization it uses.
+    let server_auth = ServerPairAuth {
+        pake_msg_1: "A".repeat(43),
+    };
+    let json = serde_json::to_string(&Incoming::ServerPairAuth(server_auth.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "server/pair-auth",
+            "payload": {"pake_msg_1": "A".repeat(43)},
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ServerPairAuth(server_auth)
+    );
+
+    let client_auth = ClientPairAuth {
+        pake_msg_2: "B".repeat(43),
+    };
+    let json = serde_json::to_string(&Incoming::ClientPairAuth(client_auth.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/pair-auth",
+            "payload": {"pake_msg_2": "B".repeat(43)},
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientPairAuth(client_auth)
+    );
+
+    // A static flow's confirm carries only the tag; the sealed nonce belongs to the dynamic flow
+    // and must stay absent rather than serialize as null.
+    let confirm = ClientPairConfirm {
+        client_kc: "C".repeat(86),
+        wrapped_nonce_b: None,
+    };
+    let json = serde_json::to_string(&Incoming::ClientPairConfirm(confirm.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/pair-confirm",
+            "payload": {"client_kc": "C".repeat(86)},
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientPairConfirm(confirm)
+    );
+
+    let with_nonce = ClientPairConfirm {
+        client_kc: "C".repeat(86),
+        wrapped_nonce_b: Some("D".repeat(64)),
+    };
+    let json = serde_json::to_string(&Incoming::ClientPairConfirm(with_nonce.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()["payload"]["wrapped_nonce_B"],
+        serde_json::json!("D".repeat(64))
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientPairConfirm(with_nonce)
+    );
+
+    let server_confirm = ServerPairConfirm {
+        server_kc: "E".repeat(86),
+    };
+    let json = serde_json::to_string(&Incoming::ServerPairConfirm(server_confirm.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "server/pair-confirm",
+            "payload": {"server_kc": "E".repeat(86)},
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ServerPairConfirm(server_confirm)
+    );
+
+    // The index is required: a pending message without it cannot name its activation.
+    assert!(matches!(
+        Incoming::parse(r#"{"type":"client/pair-pending","payload":{}}"#),
+        Err(DecodeError::Malformed(_))
+    ));
+}
+
+#[test]
+fn a_pair_confirm_formats_without_its_tags() {
+    let client_tag = "C".repeat(86);
+    let sealed_nonce = "D".repeat(64);
+    let confirm = ClientPairConfirm {
+        client_kc: client_tag.clone(),
+        wrapped_nonce_b: Some(sealed_nonce.clone()),
+    };
+    for text in [
+        format!("{confirm:?}"),
+        format!("{:?}", Incoming::ClientPairConfirm(confirm.clone())),
+    ] {
+        assert!(text.contains("client_kc: \"<redacted>\""), "got: {text}");
+        assert!(
+            text.contains("wrapped_nonce_B: Some(\"<redacted>\")"),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains(&client_tag),
+            "the tag must not appear: {text}"
+        );
+        assert!(
+            !text.contains(&sealed_nonce),
+            "the sealed nonce must not appear: {text}"
+        );
+    }
+
+    let server_tag = "E".repeat(86);
+    let server = ServerPairConfirm {
+        server_kc: server_tag.clone(),
+    };
+    for text in [
+        format!("{server:?}"),
+        format!("{:?}", Incoming::ServerPairConfirm(server.clone())),
+    ] {
+        assert!(text.contains("server_kc: \"<redacted>\""), "got: {text}");
+        assert!(
+            !text.contains(&server_tag),
+            "the tag must not appear: {text}"
+        );
+    }
+}
+
+#[test]
+fn a_static_pairing_code_descriptor_serializes_as_an_empty_object() {
+    let methods = SupportedPairMethods {
+        pairing_psk: Some(PairingPskMethod {}),
+        static_pairing_code: Some(StaticPairingCodeMethod::default()),
+    };
+    assert_eq!(
+        serde_json::to_value(&methods).unwrap(),
+        serde_json::json!({"pairing_psk": {}, "static_pairing_code": {}}),
+        "a method with no parameters is the empty object"
+    );
+
+    let located = StaticPairingCodeMethod {
+        locations: Some(vec!["device".to_owned()]),
+    };
+    assert_eq!(
+        serde_json::to_value(&located).unwrap(),
+        serde_json::json!({"locations": ["device"]})
+    );
+
+    assert_eq!(
+        serde_json::to_value(SupportedPairMethods::default()).unwrap(),
+        serde_json::json!({}),
+        "an absent method is omitted instead of serializing as null"
     );
 }
 
