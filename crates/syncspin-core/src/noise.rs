@@ -218,11 +218,27 @@ impl Responder {
         Ok(Responder { handshake })
     }
 
+    /// Replaces the pre-shared key used by the rest of the handshake.
+    ///
+    /// The responder starts with the published Sentinel PSK because the key is selected from the
+    /// metadata that message 1 carries. Call this after [`Responder::read_message`] and before
+    /// [`Responder::write_message`]: Noise mixes the key into message 2, so both sides must use
+    /// the same value and the initiator rejects a message sealed with another one.
+    ///
+    /// # Errors
+    /// Fails when the handshake has already mixed in the key, which makes a late change
+    /// impossible.
+    pub fn set_psk(&mut self, psk: &[u8; 32]) -> Result<()> {
+        self.handshake
+            .set_psk(2, psk)
+            .context("failed to set the Noise handshake PSK")
+    }
+
     /// Reads one Noise handshake message and returns its decrypted payload.
     ///
     /// The payload is returned verbatim. Message 1 carries the PSK metadata
-    /// (`psk_id`, `psk_category`) for the session layer to validate; the handshake itself uses
-    /// the Sentinel PSK in this milestone.
+    /// (`psk_id`, `psk_category`) for the session layer to validate; the handshake itself starts
+    /// with the Sentinel PSK, which [`Responder::set_psk`] can replace.
     pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
         ensure_message_len(msg.len(), "handshake message")?;
         let mut payload = vec![0u8; plaintext_capacity(msg.len(), "handshake message")?];

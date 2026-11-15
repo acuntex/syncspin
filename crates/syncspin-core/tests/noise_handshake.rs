@@ -183,6 +183,59 @@ fn responder_completes_a_kkpsk2_handshake_with_a_snow_initiator() {
 }
 
 #[test]
+fn a_changed_psk_produces_a_message_2_that_the_original_initiator_rejects() {
+    let server = generate_keypair();
+    let client = Identity::generate();
+    let prologue = prologue(&client, &URL_SAFE_NO_PAD.encode(&server.public));
+
+    // One initiator, two responders: the same message 1 reaches a responder that keeps the
+    // Sentinel key and one that switches to another key, so message 2 differs only by the PSK.
+    let mut first_initiator = initiator(&server, &client.public, &prologue);
+    let metadata = handshake_metadata();
+    let message_1 = write(&mut first_initiator, metadata.as_bytes());
+
+    let mut sentinel = Responder::new(&client, &prologue).expect("build the sentinel responder");
+    sentinel
+        .read_message(&message_1)
+        .expect("read message 1 with the sentinel key");
+    let sentinel_message_2 = sentinel.write_message().expect("write message 2");
+
+    let other: [u8; 32] = std::array::from_fn(|index| index as u8 ^ 0x5a);
+    let mut changed = Responder::new(&client, &prologue).expect("build the changed responder");
+    changed
+        .read_message(&message_1)
+        .expect("read message 1 with the sentinel key");
+    changed.set_psk(&other).expect("select another PSK");
+    let changed_message_2 = changed.write_message().expect("write message 2");
+
+    assert_ne!(
+        sentinel_message_2, changed_message_2,
+        "message 2 must authenticate the selected PSK"
+    );
+
+    // The initiator only holds the Sentinel key, so the changed message 2 must not authenticate.
+    let mut payload = vec![0u8; MAX_MESSAGE_LEN];
+    assert!(
+        first_initiator
+            .read_message(&changed_message_2, &mut payload)
+            .is_err(),
+        "an initiator with the Sentinel key must reject a message 2 sealed with another key"
+    );
+
+    // A fresh initiator with the Sentinel key still completes against the sentinel responder,
+    // which pins that the rejection above came from the key and not from the sequence.
+    let mut sentinel_initiator = initiator(&server, &client.public, &prologue);
+    let message_1 = write(&mut sentinel_initiator, metadata.as_bytes());
+    let mut sentinel = Responder::new(&client, &prologue).expect("build the sentinel responder");
+    assert_eq!(
+        sentinel.read_message(&message_1).expect("read message 1"),
+        metadata.as_bytes()
+    );
+    let message_2 = sentinel.write_message().expect("write message 2");
+    assert_eq!(read(&mut sentinel_initiator, &message_2), b"{}");
+}
+
+#[test]
 fn a_tampered_prologue_fails_the_handshake() {
     let server = generate_keypair();
     let client = Identity::generate();
