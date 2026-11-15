@@ -16,7 +16,7 @@ use base64::Engine as _;
 use syncspin_client::{
     connect, connect_with_psks, AudioFormat, AudioFrame, ClientConfig, ClientHandle, Codec, Event,
     EventStream, PskCategory, Sink, StoredPsk, StreamEndReason, VolumePolicy,
-    NORMAL_PLAYBACK_SPEED,
+    DEFAULT_PAIRING_TIMEOUT, NORMAL_PLAYBACK_SPEED,
 };
 use syncspin_core::messages::{
     ClientState, ControllerState, Incoming, PlayerCommand, Progress, ServerCommand, ServerState,
@@ -286,11 +286,13 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         player_name: "Test player".to_owned(),
         device_info: None,
         identity: Identity::generate(),
+        storage: None,
         audio_mode: mode,
         volume: 100,
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
+        pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
     }
 }
 
@@ -1215,11 +1217,13 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         player_name: name.to_owned(),
         device_info: None,
         identity: Identity::generate(),
+        storage: None,
         audio_mode: syncspin_client::AudioMode::Passthrough,
         volume: 100,
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
+        pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
     };
 
     for (label, config, field) in [

@@ -46,7 +46,8 @@ cargo run -p player-pipe -- --server music-assistant.local:8927 | aplay -f S16_L
 
 Run `cargo run -p player-pipe -- --help` for the player name and identity file. The first run writes
 `./identity.key` with owner-only permissions and prints the public key the server sees; later runs
-reuse it. The server must allow unpaired access, because this revision has no pairing yet.
+reuse it. The example configures no pairing store, so it connects as an unpaired guest and the server
+must allow unpaired access.
 
 The example's source is meant to be read: `src/main.rs` holds the event loop and the identity
 handling, `src/pipe_sink.rs` the `Sink` implementation.
@@ -89,9 +90,10 @@ where `1000` is normal speed.
 
 ## What does not work yet
 
-- **Pairing.** No pairing flow: no PSK negotiation, no code pairing, no pairing window. A client
-  connects as an unpaired guest, which the server must allow. A host that already holds a pairing
-  record can hand it in through `connect_with_psks`.
+- **Pairing.** The Pairing PSK flow works when `ClientConfig::storage` is set: the client draws and
+  persists its pairing PSK, offers `pairing_psk`, runs the flow and stores the record, reporting
+  `Event::Paired`. Without a store it offers no pairing method and stays a guest. Still missing: the
+  code methods, `server/unpair`, the pairing window and the operator-facing pairing token.
 - **Server.** `syncspin-server` is a stub; the listener, streams, roles and pairing server arrive in
   0.2.
 - **Discovery.** Clients do not advertise over mDNS and do not accept server-initiated connections.

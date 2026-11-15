@@ -34,3 +34,6 @@ x25519-dalek = "3.0.0"
 tokio = "1.54.1"
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"
+# Draws the pairing PSK and each pairing's long-term PSK from the operating system's CSPRNG. Already
+# in the tree, and small enough that the client can depend on it directly rather than on `rand`.
+getrandom = "0.3.4"

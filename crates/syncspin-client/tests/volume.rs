@@ -12,6 +12,7 @@ use anyhow::Result;
 use syncspin_client::{
     clamp_volume, clamp_volume_with, connect, AudioFormat, AudioFrame, AudioMode, ClientConfig,
     ClientHandle, ControlHandle, Event, EventStream, Identity, Sink, VolumePolicy,
+    DEFAULT_PAIRING_TIMEOUT,
 };
 use syncspin_core::messages::{
     ClientState, ControllerCommand, ControllerState, Incoming, PlayerCommand, ServerCommand,
@@ -44,11 +45,13 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         player_name: "Test player".to_owned(),
         device_info: None,
         identity: Identity::generate(),
+        storage: None,
         audio_mode: AudioMode::Passthrough,
         volume: 100,
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(30),
+        pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
     }
 }
 

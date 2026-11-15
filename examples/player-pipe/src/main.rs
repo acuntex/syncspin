@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use syncspin_client::{
-    AudioMode, Client, ClientConfig, Event, Identity, VolumePolicy, MAX_PLAYER_NAME_LEN,
+    AudioMode, Client, ClientConfig, Event, Identity, VolumePolicy, DEFAULT_PAIRING_TIMEOUT,
+    MAX_PLAYER_NAME_LEN,
 };
 use tokio::signal;
 
@@ -82,6 +83,7 @@ async fn run(options: Options) -> Result<()> {
         // device passes the product name, manufacturer and version here so the server shows it.
         device_info: None,
         identity,
+        storage: None,
         // This example has no decoder, so it asks for raw samples. A host that wants encoded
         // frames selects `AudioMode::Passthrough` and brings its own decoder.
         audio_mode: AudioMode::Decode,
@@ -90,6 +92,7 @@ async fn run(options: Options) -> Result<()> {
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
+        pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
     };
 
     // The client owns the reconnect loop: a dropped session is reported on the stream and retried

@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::config::{ClientConfig, StoredPsk, VolumePolicy};
+use crate::pairing::{load_or_draw_pairing_psk, PairingPsk};
 use crate::session::{self, Carried, Transport};
 use crate::sink::{AudioFormat, Sink};
 
@@ -17,6 +18,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Delay before the first reconnect attempt, and the value the backoff resets to.
 pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
+/// How long one pairing attempt may run, measured from `client/pair-init`.
+///
+/// `pairing.md` recommends two minutes. On expiry the client sends `pair/abort` with reason
+/// `attempt_timeout` and reports [`Event::PairingFailed`]; a host that wants a tighter bound sets
+/// [`ClientConfig::pairing_timeout`].
+pub const DEFAULT_PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Highest level the protocol defines, in its 0-100 volume range.
 pub(crate) const MAX_VOLUME: u8 = 100;
@@ -145,6 +153,61 @@ pub enum StreamEndReason {
     RoleRemoved,
 }
 
+/// Why a pairing attempt ended without a record.
+///
+/// Each value is the `reason` field of a `pair/abort`: the client sends the ones it causes and
+/// reports the ones it receives. The enum is non-exhaustive: a later revision defines reasons this
+/// one does not name, which arrive as [`Unrecognised`](PairingFailure::Unrecognised).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PairingFailure {
+    /// The attempt did not complete within [`ClientConfig::pairing_timeout`].
+    AttemptTimeout,
+    /// The matched key and the requested method are not a permitted combination, or the client
+    /// does not currently offer the method: it has no store, or the activation names a code method
+    /// this build does not carry.
+    MethodNotSupported,
+    /// A key confirmation failed, so the code was wrong or a peer relayed between two handshakes.
+    PairingCodeMismatch,
+    /// The operator cancelled the pairing, on either side.
+    UserCancelled,
+    /// Another pairing attempt is already in progress with this client.
+    ConcurrentAttempt,
+    /// A reason this revision does not name, as it arrived on the wire.
+    Unrecognised(String),
+}
+
+impl PairingFailure {
+    /// Returns the reason as `pair/abort` spells it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::AttemptTimeout => "attempt_timeout",
+            Self::MethodNotSupported => "method_not_supported",
+            Self::PairingCodeMismatch => "pairing_code_mismatch",
+            Self::UserCancelled => "user_cancelled",
+            Self::ConcurrentAttempt => "concurrent_attempt",
+            Self::Unrecognised(reason) => reason,
+        }
+    }
+
+    /// Decodes the `reason` of a received `pair/abort`.
+    ///
+    /// An unknown value is carried verbatim rather than rejected: the message is a wellformed
+    /// abort from a peer that may speak a later revision, and ending the connection over it would
+    /// be worse than reporting the reason the host cannot classify.
+    pub(crate) fn from_wire(reason: &str) -> Self {
+        match reason {
+            "attempt_timeout" => Self::AttemptTimeout,
+            "method_not_supported" => Self::MethodNotSupported,
+            "pairing_code_mismatch" => Self::PairingCodeMismatch,
+            "user_cancelled" => Self::UserCancelled,
+            "concurrent_attempt" => Self::ConcurrentAttempt,
+            other => Self::Unrecognised(other.to_owned()),
+        }
+    }
+}
+
 /// Something that happened on the connection.
 ///
 /// Events are ordered as the connection produced them. A connection attempt ends with at most one
@@ -249,6 +312,26 @@ pub enum Event {
         applied: u8,
         /// Mute state that was requested, absent for a volume command.
         muted: Option<bool>,
+    },
+    /// A pairing completed and the record is stored.
+    ///
+    /// Reported after `server/pair-finalize`, once [`Storage`](crate::storage::Storage) accepted
+    /// the record. The record is what authenticates the next connection to that server: a paired
+    /// connection is keyed by the new long-term PSK from then on. A server also rotates the live
+    /// connection with an in-band re-handshake; this revision does not answer that yet (see
+    /// `docs/spec-deviations.md`, entry 10), so the record takes effect on the next connection.
+    Paired {
+        /// Static public key of the server the record belongs to, as 43 base64url characters.
+        server_id: String,
+    },
+    /// A pairing attempt ended without a record.
+    ///
+    /// Nothing was stored: the host has to offer pairing again, or act on the reason. The
+    /// connection itself stays open - a pairing abort is not a connection failure - so the session
+    /// keeps serving playback in the roles it had.
+    PairingFailed {
+        /// Why the attempt ended.
+        reason: PairingFailure,
     },
 }
 
@@ -519,11 +602,17 @@ pub async fn connect(
 /// key, which is why [`connect`] is the same call with no candidates.
 ///
 /// The keys are used for the handshake only; they are not stored or logged. A reconnect uses them
-/// again, so a pairing that worked keeps working.
+/// again, so a pairing that worked keeps working. A [`Storage`](crate::storage::Storage) configured
+/// on `config` joins them: its records are read for every attempt, and on the same `server_id` the
+/// stored record wins over `explicit`, because the store is the authority for the servers it knows.
+/// The pairing PSK the store holds is always a candidate as well, whether or not a pairing is
+/// running.
 ///
 /// # Errors
 /// Same as [`connect`]. A record that belongs to another server fails the handshake of that
-/// attempt and is reported as [`Event::Disconnected`].
+/// attempt and is reported as [`Event::Disconnected`]. A store that cannot be read or cannot hold
+/// the pairing PSK is reported from this call before the first attempt. A configuration with a
+/// store makes the client draw and persist its pairing PSK on a device's first run.
 pub async fn connect_with_psks(
     config: ClientConfig,
     sink: Box<dyn Sink>,
@@ -531,6 +620,13 @@ pub async fn connect_with_psks(
 ) -> Result<(ClientHandle, EventStream)> {
     config.validate()?;
     let endpoint = endpoint(&config.server)?;
+    // The pairing PSK is settled before the first attempt, so a store that cannot hold it is
+    // reported to the caller instead of a connection that silently cannot pair. A restored key is
+    // used as it is; a missing one is drawn and stored once, here.
+    let pairing = match config.storage.as_deref() {
+        Some(storage) => Some(load_or_draw_pairing_psk(storage)?),
+        None => None,
+    };
 
     let (events, receiver) = mpsc::unbounded_channel();
     let (commands, control) = mpsc::unbounded_channel();
@@ -548,6 +644,7 @@ pub async fn connect_with_psks(
         endpoint,
         config,
         psks,
+        pairing,
         events: events.clone(),
         reported_volume: Arc::clone(&reported_volume),
     };
@@ -582,6 +679,8 @@ struct Connection {
     endpoint: String,
     config: ClientConfig,
     psks: Vec<StoredPsk>,
+    /// This client's pairing PSK, present exactly when a store is configured.
+    pairing: Option<PairingPsk>,
     events: mpsc::UnboundedSender<Event>,
     /// Level shared with every [`ControlHandle`].
     reported_volume: Arc<AtomicU8>,
@@ -676,6 +775,7 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
             &connection.config,
             &connection.events,
             &connection.psks,
+            connection.pairing,
             &connection.reported_volume,
             carried,
         )
@@ -777,6 +877,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_abort_reason_round_trips_through_the_wire_spelling() {
+        for (wire, reason) in [
+            ("attempt_timeout", PairingFailure::AttemptTimeout),
+            ("method_not_supported", PairingFailure::MethodNotSupported),
+            ("pairing_code_mismatch", PairingFailure::PairingCodeMismatch),
+            ("user_cancelled", PairingFailure::UserCancelled),
+            ("concurrent_attempt", PairingFailure::ConcurrentAttempt),
+        ] {
+            assert_eq!(reason.as_str(), wire);
+            assert_eq!(PairingFailure::from_wire(wire), reason);
+        }
+
+        // A reason from a later revision is carried, not rejected.
+        assert_eq!(
+            PairingFailure::from_wire("future_reason"),
+            PairingFailure::Unrecognised("future_reason".to_owned())
+        );
+        assert_eq!(
+            PairingFailure::Unrecognised("future_reason".to_owned()).as_str(),
+            "future_reason"
+        );
+    }
+
+    #[test]
     fn a_bare_address_gets_the_default_websocket_endpoint() {
         assert_eq!(
             endpoint("192.0.2.10:8927").unwrap(),
@@ -856,13 +980,16 @@ mod tests {
                 player_name: "Test player".to_owned(),
                 device_info: None,
                 identity: crate::Identity::generate(),
+                storage: None,
                 audio_mode: crate::AudioMode::Passthrough,
                 volume: 42,
                 muted: false,
                 volume_policy: VolumePolicy::default(),
                 max_backoff: Duration::from_secs(30),
+                pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
             },
             psks: Vec::new(),
+            pairing: None,
             events,
             reported_volume: Arc::new(AtomicU8::new(42)),
         }

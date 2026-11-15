@@ -1,12 +1,14 @@
 //! Connection configuration.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use syncspin_core::noise::Identity;
 
 use crate::client::MAX_VOLUME;
+use crate::storage::Storage;
 
 /// Longest player name the protocol allows, in bytes of UTF-8.
 pub const MAX_PLAYER_NAME_LEN: usize = 64;
@@ -150,7 +152,7 @@ pub struct DeviceInfo {
 /// The identity is the client's long-lived X25519 keypair. It also becomes the `client_id` the
 /// server sees, so reusing it keeps the player recognisable across reconnects; the crate never
 /// generates or replaces one on its own.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientConfig {
     /// Server address as `host:port`, or a full `ws://` URL.
     ///
@@ -169,6 +171,14 @@ pub struct ClientConfig {
     /// Restore a stored keypair with [`Identity::from_secret_base64`]; generating a fresh one
     /// makes the server treat the player as a new device.
     pub identity: Identity,
+    /// Where the pairing PSK and the pairing records live, or `None` for a guest-only client.
+    ///
+    /// The host owns the store; see [`Storage`]. With a store the client offers the Pairing PSK
+    /// method, keeps one pairing PSK across restarts and writes a record for every completed
+    /// pairing. Without one it offers no pairing method at all: it never draws a key it cannot
+    /// hand back, and it answers a pairing activation with `pair/abort` reason
+    /// `method_not_supported`. A plain guest session is unchanged either way.
+    pub storage: Option<Arc<dyn Storage>>,
     /// Whether the sink receives samples or encoded frames.
     pub audio_mode: AudioMode,
     /// Output level to start from, in the protocol's 0-100 range.
@@ -194,6 +204,37 @@ pub struct ClientConfig {
     /// [`Event::Disconnected`](crate::Event::Disconnected) and waits it before the next attempt;
     /// [`next_backoff`](crate::next_backoff) never returns more than this.
     pub max_backoff: Duration,
+    /// How long one pairing attempt may run, measured from `client/pair-init`.
+    ///
+    /// On expiry the client sends `pair/abort` with reason `attempt_timeout` and reports
+    /// [`Event::PairingFailed`](crate::Event::PairingFailed). The protocol recommends two minutes,
+    /// which is [`DEFAULT_PAIRING_TIMEOUT`](crate::DEFAULT_PAIRING_TIMEOUT); a host shortens it
+    /// only for tests or for a deployment that wants a tighter bound.
+    pub pairing_timeout: Duration,
+}
+
+impl fmt::Debug for ClientConfig {
+    /// Formats the configuration without the store and without key material.
+    ///
+    /// The store holds the pairing PSK and the records, and its own `Debug` is the host's; the
+    /// identity redacts its secret. Neither is delegated to here, so a `Debug` log of a
+    /// configuration cannot leak a key.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientConfig")
+            .field("server", &self.server)
+            .field("player_name", &self.player_name)
+            .field("device_info", &self.device_info)
+            .field("identity", &self.identity)
+            .field("storage", &self.storage.as_ref().map(|_| "<host storage>"))
+            .field("audio_mode", &self.audio_mode)
+            .field("volume", &self.volume)
+            .field("muted", &self.muted)
+            .field("volume_policy", &self.volume_policy)
+            .field("max_backoff", &self.max_backoff)
+            .field("pairing_timeout", &self.pairing_timeout)
+            .finish()
+    }
 }
 
 impl ClientConfig {
@@ -235,6 +276,9 @@ impl ClientConfig {
         if self.max_backoff.is_zero() {
             bail!("ClientConfig::max_backoff must not be zero");
         }
+        if self.pairing_timeout.is_zero() {
+            bail!("ClientConfig::pairing_timeout must not be zero");
+        }
         Ok(())
     }
 }
@@ -250,12 +294,58 @@ mod tests {
             player_name: "Test player".to_owned(),
             device_info: None,
             identity: Identity::generate(),
+            storage: None,
             audio_mode: AudioMode::Passthrough,
             volume: 100,
             muted: false,
             volume_policy: VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
+            pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
         }
+    }
+
+    #[test]
+    fn the_pairing_timeout_must_be_positive() {
+        let config = ClientConfig {
+            pairing_timeout: Duration::ZERO,
+            ..valid()
+        };
+        let error = config
+            .validate()
+            .expect_err("a zero timeout would abort every attempt at once");
+        assert!(
+            format!("{error:#}").contains("pairing_timeout"),
+            "the error must name the field, got: {error:#}"
+        );
+        config_with_default_timeout()
+            .validate()
+            .expect("120s is valid");
+    }
+
+    /// A configuration with the protocol's recommended attempt timeout.
+    fn config_with_default_timeout() -> ClientConfig {
+        let config = valid();
+        assert_eq!(config.pairing_timeout, crate::DEFAULT_PAIRING_TIMEOUT);
+        config
+    }
+
+    #[test]
+    fn a_configuration_debug_names_no_key_material() {
+        let store = std::sync::Arc::new(crate::test_support::MemoryStore::holding([7u8; 32]));
+        let config = ClientConfig {
+            storage: Some(store),
+            ..valid()
+        };
+        let text = format!("{config:?}");
+        assert!(text.contains("ClientConfig"), "unexpected format: {text}");
+        assert!(
+            text.contains("<host storage>"),
+            "the store is named but never delegated to: {text}"
+        );
+        assert!(
+            !text.contains(&config.identity.secret_base64()),
+            "the identity secret must stay out of a debug format: {text}"
+        );
     }
 
     #[test]

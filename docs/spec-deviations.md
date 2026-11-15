@@ -14,7 +14,7 @@ harmless.
 | --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
 | 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Closes in 0.2                      |
 | 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
-| 3   | No version-0 pairing-token export                               | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Closes with pairing (stage 2)      |
+| 3   | No `pairing_token()` export                                     | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Closes with the control surface    |
 | 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Closes with pairing (stage 2)      |
 | 5   | No code pairing (PAKE)                                          | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Stage 4                            |
 | 6   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Stage 1b                           |
@@ -22,7 +22,7 @@ harmless.
 | 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
 | 9   | No `client/goodbye` writer                                      | [`messaging.md` — `client/goodbye`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clientgoodbye)                                                         | Stage 1b                           |
 | 10  | Transport-mode re-handshake ignored                             | [`connection.md` — Re-handshake](https://github.com/Sendspin/spec/blob/main/connection.md#re-handshake)                                                                           | Stage 2                            |
-| 11  | `pairing_psk` advertised without the Pairing PSK flow           | [`messaging.md` — `client/hello`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clienthello)                                                             | Stage 2                            |
+| 11  | No `server/unpair` and no pairing-required signal                | [`pairing.md` — Pairing Records](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-records)                                                                            | Stage 2                            |
 | 12  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
 | 13  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
 | 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
@@ -66,10 +66,11 @@ playback-capable connection carries `active_roles`. An inadmissible activation m
 
 **What we do:** the session starts the first sync burst once the connection is ready
 (`session::attempt`). `apply_activate` records `active_roles`, starts a burst only when a re-added
-`player@v1` has no sample yet, and flushes the player stream when the role disappears; it never
-inspects `activities`, never evaluates the playback-capable rule and never re-evaluates persisted
-roles. There is no `client/goodbye` writer and no `pair/abort` writer, so an inadmissible activation
-is accepted and the session carries on.
+`player@v1` has no sample yet, and flushes the player stream when the role disappears. It checks
+only the pairing half of the table: a pairing activity whose method does not match the matched PSK,
+or which this build does not offer, is answered with `pair/abort` reason `method_not_supported`.
+The activity set itself is never validated and there is no `client/goodbye` writer, so every other
+inadmissible activation is accepted and the session carries on.
 
 **Why:** the allowed set depends on the matched PSK and its category. The Sentinel row alone already
 allows four sets — `[]`, `['pairing']`, `['playback']` and `['playback','pairing']` — so this is not
@@ -83,26 +84,27 @@ category instead of assuming the Sentinel row.
 `active_roles` re-evaluation on later activations, and the two rejection paths (stage 1b). Test each
 rejection reason against the fake server.
 
-## 3. No version-0 pairing-token export
+## 3. No `pairing_token()` export
 
 **Spec:** `pairing.md`, _Pairing Token_ and _Pairing PSK Flow_. The pairing PSK MUST be exposed to
 the operator as a version-0 token, `SP:0` plus the base32 body of
 `client_key (32 bytes) || pairing_psk (32 bytes)`, transliterating `2` to `9`. The bare PSK is not
 an acceptable interface.
 
-**What we do:** the library has no `pairing_token()` and never generates a pairing PSK. The only key
-it holds by itself is the published Sentinel PSK, which is not a pairing credential; a host can pass
-stored records through `connect_with_psks` (entry 4), but nothing here produces one.
+**What we do:** the client draws the pairing PSK from the CSPRNG, persists it through `Storage` and
+offers the Pairing PSK method, but nothing hands the operator a token: there is no
+`pairing_token()` on the handle, and the crate never writes or prints the PSK. The encoder
+(`syncspin_core::pairing::token`) exists and is pinned to both spec vectors, so the missing part is
+the accessor and not the encoding.
 
-**Why:** a token is a credential: whoever holds it can pair any server with the client. Emitting one
-before the pairing PSK is generated, persisted and covered by the record lifecycle would ship a
-secret with no rotation and no test for its lifecycle. The spec's reference vector makes the
-encoder testable only once the pairing PSK exists.
+**Why:** a token is a credential: whoever holds it can pair any server with the client. The accessor
+belongs with the rest of the pairing control surface - it has to be documented as a credential, and
+its lifetime is the host's UI, not a protocol message - so it ships with that surface rather than as
+a lone getter.
 
-**Removing it:** in stage 2, generate and persist the pairing PSK, add `pairing_token()` returning
-the encoded string (never the raw PSK), and pin it with the spec's reference vector plus a decoder
-round trip that exercises the `2`/`9` transliteration. Record handling for `server/unpair` arrives
-in the same stage.
+**Removing it:** add `pairing_token()` to the control handle, returning the version-0 token built
+from the identity's public key and the stored pairing PSK, and test it against the spec's reference
+vector plus a decoder round trip that exercises the `2`/`9` transliteration.
 
 ## 4. `psk_id` validation deferred to the session layer
 
@@ -243,31 +245,39 @@ over the same transport, without repeating the cleartext init exchange.
 `Incoming::NoiseHandshake`, so a re-handshake arrives as an ignored message and the connection keeps
 its original key. There is no second handshake path at all.
 
-**Why:** the guest client only ever uses the published Sentinel key, and no pairing PSK exists to
-rotate to (entries 3 and 5). A half-implemented re-handshake that ignored a failed message 2 would
-be worse than leaving the upgrade to stage 2, where records and the server-id binding exist.
+**Why:** the in-band upgrade belongs with the pairing flow it serves: the server rotates the
+connection to the long-term PSK it just received, so the client has to have stored the record and
+recognise the announced key before it can answer message 2. Until that path exists, a connection
+whose server rotates after a pairing drops and is re-established by the ordinary reconnect, which
+re-runs the full initial handshake under the new record.
 
 **Removing it:** add a re-handshake state entered on an encrypted `noise/handshake` message 1,
 answer with message 2 over the same transport, swap the `TransportState`, and fail the connection
 when the selected key is a miss (no Sentinel fallback). Test the successful rotation and the miss
 against the fake server.
 
-## 11. `pairing_psk` advertised before the Pairing PSK flow exists
+## 11. No `server/unpair` and no pairing-required signal
 
-**Spec:** `messaging.md`, `client/hello` → `supported_pair_methods`. A client that advertises
-`pairing_psk` MUST be able to run the Pairing PSK flow, and a server may select the method from
-that advertisement.
+**Spec:** `pairing.md`, _Pairing Records_ and _Unpaired Access_, and `messaging.md`,
+`server/unpair`. A server that drops a client's record tells it with `server/unpair`, and a client
+that stops admitting unpaired access closes an unpaired connection with `client/goodbye` reason
+`pairing_required`. When a server announces a `psk_id` the client does not hold, the client is
+expected to surface the credential mismatch to its operator.
 
-**What we do:** `client_hello` always sends `supported_pair_methods: {"pairing_psk": {}}`, but the
-client has no `client/pair-init` or `client/pair-auth` handling, no storage trait and no pairing
-PSK. A server that selects the method starts a flow the client cannot answer.
+**What we do:** a completed pairing stores the record and reports `Event::Paired`, and a server
+that announces a key the client does not hold remains a plain Sentinel fallback on the initial
+handshake (entry 4): no event, no `server/unpair` handling and no `client/goodbye` writer (entry 9).
+The record a server asks to remove therefore stays until the host removes it itself.
 
-**Why:** the field is part of the hello the extracted client already sends, and pairing is stage 2;
-removing it would change the wire format twice. The advertisement is currently only consistent with
-the guest transport it offers.
+**Why:** removal has to be actionable - a host needs an event to re-offer pairing - and the
+credential-mismatch signal needs a once-per-connection rule so a reconnect loop does not spam the
+UI. Both belong with the pairing control surface (window, operator cancellation, token), which is
+the next step after the PSK flow.
 
-**Removing it:** implement the Pairing PSK flow and record storage (stage 2), or stop advertising
-the method until it exists. Test the server's selected method against the fake server either way.
+**Removing it:** add `server/unpair` to `Incoming`, remove the record through `Storage`, emit
+`Event::Unpaired { server_id }`; classify a Sentinel fallback that announced a non-Sentinel
+`psk_id` as `Event::PairingRequired { server_id, reason: CredentialMismatch }`, once per connection;
+and test all three against the fake server.
 
 ## 12. Scheduled metadata applied immediately
 

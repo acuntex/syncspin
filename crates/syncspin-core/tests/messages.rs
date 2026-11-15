@@ -6,12 +6,12 @@ use syncspin_core::framing::{
     FRAGMENT_FLAG_LAST, MAX_PLAINTEXT_LEN, MAX_REASSEMBLED_LEN,
 };
 use syncspin_core::messages::{
-    AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientState, ClientTime,
-    ControllerCommand, DecodeError, DeviceInfo, Incoming, NoiseHandshake, PairingPskMethod,
-    PlayerState, PlayerSupport, ServerActivate, ServerCommand, ServerHello, ServerInit,
-    ServerState, ServerTime, StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
-    SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
-    PROTOCOL_VERSION,
+    AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientPairFinalize, ClientPairInit,
+    ClientState, ClientTime, ControllerCommand, DecodeError, DeviceInfo, Incoming, NoiseHandshake,
+    PairAbort, PairingPskMethod, PlayerState, PlayerSupport, ServerActivate, ServerCommand,
+    ServerHello, ServerInit, ServerPairFinalize, ServerState, ServerTime, StreamClear, StreamEnd,
+    StreamStart, StreamStartPlayer, SupportedFormat, SupportedPairMethods, UnpairedAccess,
+    AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
 };
 
 /// A payload whose first bytes differ, so a reassembled message is easy to verify.
@@ -242,6 +242,105 @@ fn server_activate_and_player_state_roundtrip() {
         serde_json::from_str::<Incoming>(&json).unwrap(),
         Incoming::ClientState(state)
     );
+}
+
+#[test]
+fn pairing_messages_roundtrip_on_the_wire() {
+    // A Pairing PSK attempt: no commitment, the key itself in the finalize.
+    let init = ClientPairInit {
+        pairing_index: 0,
+        commit_b: None,
+    };
+    let json = serde_json::to_string(&Incoming::ClientPairInit(init.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/pair-init",
+            "payload": {"pairing_index": 0},
+        }),
+        "the commitment belongs to the code flows and must stay absent"
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientPairInit(init)
+    );
+
+    // A dynamic-code attempt spells `commit_B` with the capital the spec uses.
+    let commitment = ClientPairInit {
+        pairing_index: 3,
+        commit_b: Some("AA".to_owned()),
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &serde_json::to_string(&Incoming::ClientPairInit(commitment.clone())).unwrap()
+        )
+        .unwrap()["payload"]["commit_B"],
+        serde_json::json!("AA")
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(
+            &serde_json::to_string(&Incoming::ClientPairInit(commitment)).unwrap()
+        )
+        .unwrap(),
+        Incoming::ClientPairInit(ClientPairInit {
+            pairing_index: 3,
+            commit_b: Some("AA".to_owned())
+        })
+    );
+
+    let finalize = ClientPairFinalize {
+        long_term_psk: Some("key".to_owned()),
+        wrapped_psk: None,
+    };
+    let json = serde_json::to_string(&Incoming::ClientPairFinalize(finalize.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/pair-finalize",
+            "payload": {"long_term_psk": "key"},
+        }),
+        "exactly one of the two key fields is present"
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientPairFinalize(finalize)
+    );
+
+    let json = serde_json::to_string(&Incoming::ServerPairFinalize(ServerPairFinalize {})).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({"type": "server/pair-finalize", "payload": {}})
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ServerPairFinalize(ServerPairFinalize {})
+    );
+
+    let abort = PairAbort {
+        reason: "method_not_supported".to_owned(),
+    };
+    let json = serde_json::to_string(&Incoming::PairAbort(abort.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "pair/abort",
+            "payload": {"reason": "method_not_supported"},
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::PairAbort(abort)
+    );
+
+    // `commit_B` and `reason` are required where the spec requires them.
+    assert!(matches!(
+        Incoming::parse(r#"{"type":"client/pair-init","payload":{}}"#),
+        Err(DecodeError::Malformed(_))
+    ));
+    assert!(matches!(
+        Incoming::parse(r#"{"type":"pair/abort","payload":{}}"#),
+        Err(DecodeError::Malformed(_))
+    ));
 }
 
 #[test]
@@ -487,6 +586,12 @@ fn parse_accepts_every_message_this_revision_implements() {
             unpaired_access: UnpairedAccess::default(),
         }),
         Incoming::ServerActivate(ServerActivate::default()),
+        Incoming::ClientPairInit(ClientPairInit::default()),
+        Incoming::ClientPairFinalize(ClientPairFinalize::default()),
+        Incoming::ServerPairFinalize(ServerPairFinalize {}),
+        Incoming::PairAbort(PairAbort {
+            reason: "attempt_timeout".to_owned(),
+        }),
         Incoming::ClientTime(ClientTime {
             client_transmitted: 1,
         }),
@@ -506,7 +611,7 @@ fn parse_accepts_every_message_this_revision_implements() {
         Incoming::StreamClear(StreamClear::default()),
         Incoming::StreamEnd(StreamEnd::default()),
     ];
-    assert_eq!(messages.len(), 15, "one instance per message type");
+    assert_eq!(messages.len(), 19, "one instance per message type");
     for message in messages {
         let text = serde_json::to_string(&message).unwrap();
         assert_eq!(

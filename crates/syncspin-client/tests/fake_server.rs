@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -26,10 +27,12 @@ use tokio_tungstenite::{accept_async, WebSocketStream};
 use syncspin_core::framing::{split_binary, MAX_PLAINTEXT_LEN};
 use syncspin_core::messages::{
     ClientCommand, ClientHello, ClientState, ClientTime, Incoming, Metadata, NoiseHandshake,
-    ServerActivate, ServerHello, ServerState, ServerTime, StreamClear, StreamEnd, StreamStart,
-    StreamStartPlayer,
+    PairingActivation, ServerActivate, ServerHello, ServerPairFinalize, ServerState, ServerTime,
+    StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
 };
-use syncspin_core::noise::{MAX_MESSAGE_LEN, NOISE_PARAMS, SENTINEL_PSK, SENTINEL_PSK_ID};
+use syncspin_core::noise::{
+    psk_id_for, MAX_MESSAGE_LEN, NOISE_PARAMS, SENTINEL_PSK, SENTINEL_PSK_ID,
+};
 
 type Socket = WebSocketStream<TcpStream>;
 
@@ -83,6 +86,15 @@ pub struct ServerOptions {
     pub hello_override: Option<String>,
     /// Text sent as the activation instead of the normal `server/activate`.
     pub activate_override: Option<String>,
+    /// Full activation sent as the first `server/activate`, overriding the built one.
+    ///
+    /// A typed alternative to [`activate_override`](ServerOptions::activate_override), for the
+    /// activation that carries a pairing attempt.
+    pub first_activate: Option<ServerActivate>,
+    /// Whether `client/pair-finalize` is answered with `server/pair-finalize`.
+    ///
+    /// With `false` the attempt hangs, which is what a server that went silent looks like.
+    pub acknowledge_pairing: bool,
 }
 
 impl Default for ServerOptions {
@@ -112,6 +124,8 @@ impl Default for ServerOptions {
             close_after_message_2: false,
             hello_override: None,
             activate_override: None,
+            first_activate: None,
+            acknowledge_pairing: true,
         }
     }
 }
@@ -134,6 +148,8 @@ pub enum Command {
     StreamClear { from_timestamp: Option<i64> },
     /// Sends `server/activate` with a new role set.
     Activate(Vec<String>),
+    /// Sends a complete `server/activate`, including a pairing attempt.
+    ActivateMessage(Box<ServerActivate>),
     /// Sends `server/state` with title and artist.
     Metadata {
         title: &'static str,
@@ -177,6 +193,18 @@ pub enum Observation {
     TimeReply(usize),
     /// A `client/time` request arrived and is waiting for a manual answer.
     TimeRequest(i64),
+    /// The client started a pairing attempt.
+    PairInit {
+        /// Index the client reported for the activation that admitted the attempt.
+        pairing_index: u32,
+    },
+    /// The client delivered the long-term PSK of a pairing.
+    PairFinalize {
+        /// The key the client proposed; the server stores it as its record.
+        long_term_psk: [u8; 32],
+    },
+    /// The client aborted a pairing attempt, with the reason it reported.
+    PairingAborted(String),
     /// The connection closed.
     Closed,
 }
@@ -204,8 +232,18 @@ impl FakeServer {
 
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (observation_tx, observations) = mpsc::unbounded_channel();
+        // The server-side record of one completed pairing: the key the next handshake announces.
+        let paired = Arc::new(Mutex::new(None));
         let task = tokio::spawn(async move {
-            if let Err(error) = serve(listener, keypair, options, command_rx, observation_tx).await
+            if let Err(error) = serve(
+                listener,
+                keypair,
+                options,
+                command_rx,
+                observation_tx,
+                paired,
+            )
+            .await
             {
                 // A test that waits for an observation fails with its own timeout; the reason is
                 // printed to make that failure diagnosable.
@@ -300,6 +338,34 @@ impl FakeServer {
         let _ = self.commands.send(Command::Activate(
             roles.iter().map(|role| (*role).to_owned()).collect(),
         ));
+    }
+
+    /// Sends `server/activate` that admits a pairing attempt with `method`.
+    ///
+    /// The activation declares the pairing activity, no roles, and the method; the client answers
+    /// with `client/pair-init` or with `pair/abort`.
+    pub fn activate_pairing(&self, method: &str) {
+        let _ = self
+            .commands
+            .send(Command::ActivateMessage(Box::new(ServerActivate {
+                activities: vec!["pairing".to_owned()],
+                active_roles: Some(Vec::new()),
+                pairing: Some(PairingActivation {
+                    method: method.to_owned(),
+                    format: None,
+                }),
+            })));
+    }
+
+    /// Sends `server/activate` that ends the pairing transition without finalizing it.
+    pub fn cancel_pairing(&self, roles: &[&str]) {
+        let _ = self
+            .commands
+            .send(Command::ActivateMessage(Box::new(ServerActivate {
+                activities: vec!["playback".to_owned()],
+                active_roles: Some(roles.iter().map(|role| (*role).to_owned()).collect()),
+                pairing: None,
+            })));
     }
 
     /// Sends `server/state` with the given metadata.
@@ -401,6 +467,39 @@ impl FakeServer {
         }
     }
 
+    /// Waits until the client starts a pairing attempt and returns its `pairing_index`.
+    pub async fn wait_for_pair_init(&mut self) -> Option<u32> {
+        loop {
+            match self.observation().await {
+                Some(Observation::PairInit { pairing_index }) => return Some(pairing_index),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client delivers a pairing's long-term PSK.
+    pub async fn wait_for_pair_finalize(&mut self) -> Option<[u8; 32]> {
+        loop {
+            match self.observation().await {
+                Some(Observation::PairFinalize { long_term_psk }) => return Some(long_term_psk),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client aborts a pairing attempt and returns the reason it sent.
+    pub async fn wait_for_pairing_abort(&mut self) -> Option<String> {
+        loop {
+            match self.observation().await {
+                Some(Observation::PairingAborted(reason)) => return Some(reason),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     /// Waits until the server task ends.
     pub async fn finished(self) {
         let _ = self.task.await;
@@ -414,6 +513,7 @@ async fn serve(
     options: ServerOptions,
     mut commands: UnboundedReceiver<Command>,
     observations: UnboundedSender<Observation>,
+    paired: Arc<Mutex<Option<[u8; 32]>>>,
 ) -> Result<()> {
     for index in 0..options.connections {
         let (tcp, _peer) = listener
@@ -431,6 +531,7 @@ async fn serve(
             &mut commands,
             &observations,
             announce_roles,
+            &paired,
         )
         .await?;
     }
@@ -445,6 +546,7 @@ async fn serve_connection(
     commands: &mut UnboundedReceiver<Command>,
     observations: &UnboundedSender<Observation>,
     announce_roles: bool,
+    paired: &Arc<Mutex<Option<[u8; 32]>>>,
 ) -> Result<()> {
     // 1. client/init, whose exact bytes start the Noise prologue.
     let client_init_text = read_text(&mut socket).await?;
@@ -493,23 +595,32 @@ async fn serve_connection(
         return Ok(());
     }
 
-    // 3. Noise message 1, sent as the initiator.
+    // 3. Noise message 1, sent as the initiator. A completed pairing promotes the announced key:
+    // the server persists the record and the next handshake references it as a long-term key.
+    let paired_psk = *paired
+        .lock()
+        .expect("the fake server's record lock is not poisoned");
+    let (psk, psk_id, psk_category) = match paired_psk {
+        Some(psk) => (psk, psk_id_for(&psk), "lt".to_owned()),
+        None => (
+            options.psk,
+            options.psk_id.clone(),
+            options.psk_category.clone(),
+        ),
+    };
     let mut prologue = client_init_text.into_bytes();
     prologue.extend_from_slice(server_init_text.as_bytes());
     let mut initiator = Builder::new(NOISE_PARAMS.parse()?)
         .local_private_key(&keypair.private)?
         .remote_public_key(&client_public)?
-        .psk(2, &options.psk)?
+        .psk(2, &psk)?
         .prologue(&prologue)?
         .build_initiator()
         .context("failed to build the Noise initiator")?;
 
     let metadata = match options.metadata.as_deref() {
         Some(metadata) => metadata.to_owned(),
-        None => format!(
-            r#"{{"psk_id":"{}","psk_category":"{}"}}"#,
-            options.psk_id, options.psk_category
-        ),
+        None => format!(r#"{{"psk_id":"{psk_id}","psk_category":"{psk_category}"}}"#),
     };
     let message_1 = write_handshake(&mut initiator, metadata.as_bytes())?;
     let message_1 = options.message_1_override.clone().unwrap_or_else(|| {
@@ -587,21 +698,28 @@ async fn serve_connection(
         _ => bail!("expected client/hello"),
     }
 
-    // 7. server/activate with the announced roles.
-    match options.activate_override.as_deref() {
-        Some(activate) => send_raw_json(&mut socket, &mut noise, activate).await?,
-        None => {
-            send_encrypted(
-                &mut socket,
-                &mut noise,
-                &Incoming::ServerActivate(ServerActivate {
-                    activities: vec!["playback".to_owned()],
-                    active_roles: announce_roles.then(|| options.active_roles.clone()),
-                    pairing: None,
-                }),
-            )
-            .await?
-        }
+    // 7. server/activate with the announced roles. A typed first activation belongs to the
+    // connection before a record exists: once the server holds a pairing, the connection is a
+    // normal playback connection and activating the pairing activity on it would be inadmissible.
+    if let Some(activate) = options
+        .first_activate
+        .clone()
+        .filter(|_| paired_psk.is_none())
+    {
+        send_encrypted(&mut socket, &mut noise, &Incoming::ServerActivate(activate)).await?;
+    } else if let Some(activate) = options.activate_override.as_deref() {
+        send_raw_json(&mut socket, &mut noise, activate).await?;
+    } else {
+        send_encrypted(
+            &mut socket,
+            &mut noise,
+            &Incoming::ServerActivate(ServerActivate {
+                activities: vec!["playback".to_owned()],
+                active_roles: announce_roles.then(|| options.active_roles.clone()),
+                pairing: None,
+            }),
+        )
+        .await?;
     }
 
     // 8. Serve until a close.
@@ -623,6 +741,7 @@ async fn serve_connection(
                     options,
                     &mut answered_time,
                     observations,
+                    paired,
                 )
                 .await?;
             }
@@ -697,6 +816,14 @@ async fn serve_connection(
                 )
                 .await?;
             }
+            LinkEvent::Command(Some(Command::ActivateMessage(activate))) => {
+                send_encrypted(
+                    &mut socket,
+                    &mut noise,
+                    &Incoming::ServerActivate(*activate),
+                )
+                .await?;
+            }
             LinkEvent::Command(Some(Command::Metadata { title, artist })) => {
                 send_encrypted(
                     &mut socket,
@@ -763,6 +890,7 @@ enum LinkEvent {
 }
 
 /// Answers the messages a client sends after the handshake.
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
     plaintext: &[u8],
     socket: &mut Socket,
@@ -770,6 +898,7 @@ async fn handle_client_message(
     options: &ServerOptions,
     answered_time: &mut usize,
     observations: &UnboundedSender<Observation>,
+    paired: &Arc<Mutex<Option<[u8; 32]>>>,
 ) -> Result<()> {
     let Some(&0) = plaintext.first() else {
         return Ok(());
@@ -794,6 +923,46 @@ async fn handle_client_message(
         }
         Some(Incoming::ClientCommand(command)) => {
             let _ = observations.send(Observation::ClientCommand(Box::new(command)));
+        }
+        Some(Incoming::ClientPairInit(init)) => {
+            let _ = observations.send(Observation::PairInit {
+                pairing_index: init.pairing_index,
+            });
+        }
+        Some(Incoming::ClientPairFinalize(finalize)) => {
+            // The Pairing PSK flow carries the key directly; the wrapped form belongs to the code
+            // flows this harness does not speak.
+            let Some(encoded) = finalize.long_term_psk.as_deref() else {
+                bail!(
+                    "client/pair-finalize carried no long_term_psk; this harness speaks the \
+                     Pairing PSK flow only"
+                );
+            };
+            let bytes = URL_SAFE_NO_PAD
+                .decode(encoded)
+                .context("long_term_psk is not unpadded base64url")?;
+            let long_term_psk: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow!("long_term_psk is not 32 bytes"))?;
+            if long_term_psk == SENTINEL_PSK {
+                bail!("the client delivered the published Sentinel key as a long-term PSK");
+            }
+            // The server persists its record: the next handshake announces this key as `lt`.
+            *paired
+                .lock()
+                .expect("the fake server's record lock is not poisoned") = Some(long_term_psk);
+            let _ = observations.send(Observation::PairFinalize { long_term_psk });
+            if options.acknowledge_pairing {
+                send_encrypted(
+                    socket,
+                    noise,
+                    &Incoming::ServerPairFinalize(ServerPairFinalize {}),
+                )
+                .await?;
+            }
+        }
+        Some(Incoming::PairAbort(abort)) => {
+            let _ = observations.send(Observation::PairingAborted(abort.reason));
         }
         // `client/hello`, `client/time` while answers are disabled, and future types.
         _ => {}

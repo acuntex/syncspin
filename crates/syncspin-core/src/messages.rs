@@ -221,6 +221,62 @@ pub struct ServerActivate {
 }
 
 // ---------------------------------------------------------------------------
+// Pairing
+// ---------------------------------------------------------------------------
+
+/// `client/pair-init`: starts a pairing attempt.
+///
+/// Only the Pairing PSK flow is implemented by this revision, so `commit_B` - the commitment of
+/// the dynamic code's client nonce - is absent. The field is modelled because a server validates
+/// the message it expects for the method it picked, and because the code flows build on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairInit {
+    /// Number of pairing `server/activate` messages received since the last Noise handshake.
+    pub pairing_index: u32,
+    /// `SHA-256(label || nonce_B)` of the dynamic flow's client nonce, when the method needs one.
+    ///
+    /// The wire spells the field `commit_B`, so the rename is explicit.
+    #[serde(rename = "commit_B", default, skip_serializing_if = "Option::is_none")]
+    pub commit_b: Option<String>,
+}
+
+/// `client/pair-finalize`: the long-term PSK this pairing establishes.
+///
+/// Exactly one of the two fields is present: `long_term_psk` in the Pairing PSK flow, where the
+/// key travels inside the authenticated channel, and `wrapped_psk` in the code flows, where it is
+/// sealed under the CPace output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairFinalize {
+    /// 32-byte long-term PSK as 43 base64url characters without padding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_term_psk: Option<String>,
+    /// 48-byte sealed long-term PSK as 64 base64url characters without padding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapped_psk: Option<String>,
+}
+
+/// `server/pair-finalize`: the server persisted its pairing record.
+///
+/// The payload is the empty object; the message is the client's signal to persist its own record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerPairFinalize {}
+
+/// `pair/abort`: ends a pairing attempt, whether or not it started.
+///
+/// Both directions send it. The reason is one of the values `pairing.md` defines; an unknown
+/// value is carried verbatim rather than treated as a decoding failure, so a later revision's
+/// reason does not end the connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PairAbort {
+    /// Why the attempt ended, for example `attempt_timeout` or `method_not_supported`.
+    pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
 // Clock synchronization
 // ---------------------------------------------------------------------------
 
@@ -598,6 +654,18 @@ pub enum Incoming {
     /// `server/activate`.
     #[serde(rename = "server/activate")]
     ServerActivate(ServerActivate),
+    /// `client/pair-init`.
+    #[serde(rename = "client/pair-init")]
+    ClientPairInit(ClientPairInit),
+    /// `client/pair-finalize`.
+    #[serde(rename = "client/pair-finalize")]
+    ClientPairFinalize(ClientPairFinalize),
+    /// `server/pair-finalize`.
+    #[serde(rename = "server/pair-finalize")]
+    ServerPairFinalize(ServerPairFinalize),
+    /// `pair/abort`, in both directions.
+    #[serde(rename = "pair/abort")]
+    PairAbort(PairAbort),
     /// `client/time`.
     #[serde(rename = "client/time")]
     ClientTime(ClientTime),
@@ -696,13 +764,17 @@ struct EnvelopeType {
 ///
 /// A variant added without its entry here would silently read as an unknown type, so the
 /// integration tests parse one instance of every variant.
-const KNOWN_TYPES: [&str; 15] = [
+const KNOWN_TYPES: [&str; 19] = [
     "client/init",
     "server/init",
     "noise/handshake",
     "server/hello",
     "client/hello",
     "server/activate",
+    "client/pair-init",
+    "client/pair-finalize",
+    "server/pair-finalize",
+    "pair/abort",
     "client/time",
     "server/time",
     "client/state",

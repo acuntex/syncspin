@@ -10,7 +10,7 @@ use anyhow::Result;
 use fake_server::{FakeServer, ServerOptions};
 use syncspin_client::{
     connect, AudioFormat, AudioFrame, AudioMode, ClientConfig, ClientHandle, Event, EventStream,
-    Identity, Sink, VolumePolicy,
+    Identity, Sink, VolumePolicy, DEFAULT_PAIRING_TIMEOUT,
 };
 
 /// A sink that accepts every call; these tests never announce a stream.
@@ -37,11 +37,13 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         player_name: "Test player".to_owned(),
         device_info: None,
         identity: Identity::generate(),
+        storage: None,
         audio_mode: AudioMode::Passthrough,
         volume: 100,
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
+        pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
     }
 }
 
