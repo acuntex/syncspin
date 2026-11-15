@@ -15,6 +15,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Mutation testing is slow (every mutant runs the suite), so it runs weekly instead of
+  # per push. A red run means a test no longer notices a deliberate code change.
+  schedule:
+    - cron: "0 4 * * 1"
 
 # The repository is public and no job needs a secret, so every job gets the
 # read-only default: no token can write, comment or publish.
@@ -94,6 +98,54 @@ jobs:
       # actually exercised.
       - name: cargo check (armv7)
         run: cargo check -p syncspin-core -p syncspin-client --target armv7-unknown-linux-gnueabihf --locked
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+      - name: Coverage floor
+        # Raised to 100 once the gap-closing tests land; keeping the floor at the
+        # measured baseline means a regression fails today without blocking work.
+        env:
+          COVERAGE_FLOOR: "92"
+        run: |
+          cargo llvm-cov --workspace --locked --ignore-filename-regex 'examples/' \
+            --lcov --output-path lcov.info --fail-under-lines "${COVERAGE_FLOOR}"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: ignore
+
+  mutants:
+    # Weekly only: one full test run per mutant. `syncspin-core` first - it holds the
+    # protocol and crypto code where a silent behaviour change would be worst.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Mutation testing (core)
+        run: cargo mutants -p syncspin-core --timeout 120 --no-times
+      - name: Upload the surviving mutants
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out/
+          if-no-files-found: ignore
 
   deny:
     name: deny
