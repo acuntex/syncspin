@@ -12,6 +12,8 @@ pub mod clock;
 pub mod framing;
 pub mod messages;
 pub mod noise;
+#[cfg(feature = "pairing-code")]
+pub mod pairing;
 
 /// Returns the version of this crate as recorded in its manifest.
 pub fn version() -> &'static str {

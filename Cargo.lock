@@ -282,6 +282,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "elligator2"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bda9a01fd3e5f7867279ca9b5104507cb2421e7987cb96af6397d84676de4af5"
+dependencies = [
+ "fiat-crypto 0.3.0",
+ "subtle",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -857,6 +867,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "elligator2",
  "proptest",
  "serde",
  "serde_json",
