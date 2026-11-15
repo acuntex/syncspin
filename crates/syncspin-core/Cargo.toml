@@ -1,0 +1,10 @@
+[package]
+name = "syncspin-core"
+description = "Sendspin protocol core: Noise handshake, framing, messages and the clock filter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
