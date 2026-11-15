@@ -6,12 +6,14 @@
 //! is the whole surface the client needs, and a host that has no store configures none - the client
 //! then does not pair at all, and a plain guest session is unchanged.
 //!
-//! # Recency is list order
+//! # Order and eviction
 //!
-//! [`Storage::load_pairings`] returns records oldest first. Using a record stores it again so it
-//! moves to the end, and [`persist_pairing`] drops the first record that does not back the live
-//! connection. There is no timestamp in the rule and no extra method: a backend that keeps a list in
-//! file order is a recency-ordered store.
+//! [`Storage::load_pairings`] returns records oldest first, and a store the client writes keeps at
+//! most [`MAX_PAIRINGS`]. [`persist_pairing`] drops the first record that does not back the live
+//! connection, so eviction follows the order the store returns. That order is insertion order, not
+//! use order: a record only moves to the end when it is stored again, and the client does that
+//! after a completed pairing, not when it selects a record. A record kept since long ago can
+//! therefore be evicted before one used recently.
 //!
 //! # Capacity
 //!
@@ -23,7 +25,8 @@
 //! The rules are enforced by [`persist_pairing`], not by a backend: a host implements the four
 //! primitive operations of [`Storage`] and the crate does the ordering, the capacity and the
 //! live-record pin on top of them. A pairing therefore never fails for lack of space, whichever
-//! store the host chose.
+//! store the host chose. Calling [`Storage::store_pairing`] directly bypasses both rules, so a host
+//! that writes a record itself has to keep the capacity and the live-record pin as well.
 //!
 //! # File backend
 //!
@@ -56,8 +59,11 @@ pub trait Storage: Send + Sync + 'static {
     /// The long-lived pairing PSK the host restored, or `None` on a device's first run.
     ///
     /// The client draws a key when this is `None`, hands it back through
-    /// [`store_pairing_psk`](Storage::store_pairing_psk), and exports it as a pairing token for the
-    /// operator. A key the host restored is used as it is, so pairing survives a restart.
+    /// [`store_pairing_psk`](Storage::store_pairing_psk), and uses it on every connection. The
+    /// operator-facing version-0 token is `client_key || pairing_psk`; the crate has no accessor
+    /// that builds it yet, so a host assembles it from the identity's public key and this value
+    /// with `syncspin_core::pairing::token::encode_v0`. A key the host restored is used as it is, so
+    /// pairing survives a restart.
     fn pairing_psk(&self) -> Result<Option<[u8; 32]>>;
 
     /// Persists the pairing PSK the client drew on this run.

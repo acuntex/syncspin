@@ -58,6 +58,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
         run: cargo test --workspace --locked
+      # The pairing code flows and the JSON store are behind features, so the
+      # default run never compiles or executes them. Both runs are the `test`
+      # gate; CONTRIBUTING describes it that way.
+      - name: cargo test (pairing features)
+        run: cargo test --workspace --features pairing-code,storage-file --locked
 
   msrv:
     name: msrv
@@ -175,7 +180,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc
-        run: cargo doc --workspace --no-deps --locked
+        run: cargo doc --workspace --no-deps --locked --all-features
 
   secrets:
     name: secrets

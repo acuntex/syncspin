@@ -10,6 +10,10 @@ repository.workspace = true
 publish = false
 
 [features]
+# The example pairs out of the box: it keeps its pairing PSK and records in one JSON file through
+# the client's optional file backend. The library itself still does no file I/O by default.
+default = ["storage-file"]
+storage-file = ["syncspin-client/storage-file"]
 # Mirrors the client's code-pairing feature, so a workspace `--all-features` build sees the
 # configuration fields that only exist there. A host crate that enables `pairing-code` on the
 # client needs the same mirror to construct `ClientConfig`.
@@ -17,5 +21,9 @@ pairing-code = ["syncspin-client/pairing-code"]
 
 [dependencies]
 syncspin-client = { version = "0.1.0", path = "../../crates/syncspin-client" }
+# The example builds its own version-0 pairing token, which the client has no accessor for yet:
+# the encoder is the pairing token module, so the example depends on the protocol crate directly.
+syncspin-core = { version = "0.1.0", path = "../../crates/syncspin-core" }
 anyhow.workspace = true
+getrandom.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }

@@ -10,7 +10,7 @@
 //! `commit_B` travels in `client/pair-init`, before any value from the server is known, so the
 //! client is bound to the `nonce_B` it later reveals under the CPace output. The digest yields the
 //! code in one of two emission formats: the six ASCII digits of `digits` (also CPace's `PRS`) or
-//! the first 24 bytes of the digest, carried as a version-1 [token](super::token) in `qr_code`.
+//! the first 24 bytes of the digest, carried as a version-1 [token] in `qr_code`.
 //!
 //! # Secret handling
 //!

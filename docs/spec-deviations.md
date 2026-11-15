@@ -14,9 +14,9 @@ harmless.
 | --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
 | 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Closes in 0.2                      |
 | 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
-| 3   | No `pairing_token()` export                                     | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Closes with the control surface    |
+| 3   | No `pairing_token()` export                                     | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Open, accessor only                |
 | 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
-| 5   | No code pairing (PAKE)                                          | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Stage 4                            |
+| 5   | Code pairing behind a feature; CPace layer unaudited            | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
 | 6   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Stage 1b                           |
 | 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                           |
 | 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
@@ -74,10 +74,10 @@ inadmissible activation is accepted and the session carries on.
 **Why:** the allowed set depends on the matched PSK and its category. The Sentinel row alone already
 allows four sets — `[]`, `['pairing']`, `['playback']` and `['playback','pairing']` — so this is not
 a single case that a bare parser could settle: the playback-capable rule, the re-evaluation of
-`active_roles` on later activations and the two rejection paths all have to exist first. The client
-stores no PSK of its own, but a host can pass records through `connect_with_psks` (entry 4), so an
-`lt` or `pr` announcement is reachable and the allowed set has to be keyed by the matched record's
-category instead of assuming the Sentinel row.
+`active_roles` on later activations and the two rejection paths all have to exist first. The
+candidate set can hold this client's pairing PSK (`pr`), the records in `Storage` (`lt`) and records a
+host passes through `connect_with_psks` (entry 4), so both announcements are reachable and the
+allowed set has to be keyed by the matched record's category instead of assuming the Sentinel row.
 
 **Removing it:** add the allowed-set table per PSK category, the playback-capable rule with the
 `active_roles` re-evaluation on later activations, and the two rejection paths (stage 1b). Test each
@@ -91,15 +91,17 @@ the operator as a version-0 token, `SP:0` plus the base32 body of
 an acceptable interface.
 
 **What we do:** the client draws the pairing PSK from the CSPRNG, persists it through `Storage` and
-offers the Pairing PSK method, but nothing hands the operator a token: there is no
-`pairing_token()` on the handle, and the crate never writes or prints the PSK. The encoder
-(`syncspin_core::pairing::token`) exists and is pinned to both spec vectors, so the missing part is
-the accessor and not the encoding.
+offers the Pairing PSK method, but no accessor hands the operator a token: `ControlHandle` carries a
+command channel and the level in force, not the identity or the store, so there is no
+`pairing_token()`. The encoder (`syncspin_core::pairing::token::encode_v0`) exists and is pinned to
+both spec vectors. A host can assemble the token itself from the identity's public key and
+`Storage::pairing_psk()`, and `player-pipe --pairing-token` does exactly that.
 
 **Why:** a token is a credential: whoever holds it can pair any server with the client. The accessor
 belongs with the rest of the pairing control surface - it has to be documented as a credential, and
-its lifetime is the host's UI, not a protocol message - so it ships with that surface rather than as
-a lone getter.
+its lifetime is the host's UI, not a protocol message. The rest of that surface
+(`open_pairing_window`, `release_holdback`) shipped; this getter did not, because it needs the
+identity and the store carried into the handle, which the handle does not hold.
 
 **Removing it:** add `pairing_token()` to the control handle, returning the version-0 token built
 from the identity's public key and the stored pairing PSK, and test it against the spec's reference
@@ -143,21 +145,37 @@ into the responder) so the handshake cannot finish without a matched category an
 the record's `server_id` check and the fallback-on-miss rule there. Then narrow `set_psk` or delete
 it.
 
-## 5. No code pairing (PAKE)
+## 5. Code pairing is a feature and the CPace layer is unaudited
 
 **Spec:** `pairing.md`, _PAKE_, _Dynamic Pairing Code Flow_ and _Static Pairing Code Flow_ — a
 SHOULD, not a MUST. `CPACE-X25519-SHA512` per `draft-irtf-cfrg-cpace-21`, with the server as `A`,
 the client as `B` and the `MCF` generator, plus the wrapped-PSK exchange.
 
-**What we do:** nothing. No `client/pair-init`, `client/pair-auth`, `client/pair-confirm`,
-`server/pair-*` parsing and no CPace implementation.
+**What we do:** both flows are implemented in `syncspin-client` behind the `pairing-code` feature
+and offered only when a `Storage` can persist the record they produce - and, for the dynamic flow,
+when the host advertises an emission format and an out-channel. The static flow is gated by the
+pairing window `ControlHandle::open_pairing_window` opens; the dynamic flow is gated by its
+20-round limit and `ControlHandle::release_holdback`. The CPace layer is built here - `x25519-dalek`,
+`elligator2` for the `MCF` map, SHA-512 - because no crate was found that matched draft-21 with the
+spec's `MCF` and `sid` layout. It is pinned to the draft's vectors and the spec's `sid` construction.
+The wrapping uses ChaCha20-Poly1305, fixed in `syncspin-core::pairing::wrap`, which is correct for
+`25519_ChaChaPoly_SHA256`, the only suite this build negotiates; offering
+`25519_AESGCM_SHA256` would need the AEAD selected per connection instead. The specification
+publishes no test vectors for the dynamic code derivation: the tests pin a vector computed from the
+spec's formula and run the flow end to end against the fake server only.
 
-**Why:** no vetted crate is known to match draft-21 with the spec's `MCF` and `sid` layout. Writing
-the PAKE by hand before that is settled would put unaudited crypto in the handshake path.
+**The CPace and wrapping layer has not had an external review.** That is the reason this entry still
+exists after both flows shipped.
 
-**Removing it:** check the candidate crates against draft-21 first; if they do not match, build the
-wrapper on `x25519-dalek` and SHA-512 with the draft test vectors and an external review, then add
-the message flow and negative cases (wrong code, replay, `method_not_supported`).
+**Why:** a default build must not advertise a method whose PAKE it does not carry, and unaudited
+crypto stays out of the default surface. A host that does not enable the feature gets the mandatory
+Pairing PSK flow only; one that enables it accepts that the layer is new code with draft vectors but
+no review.
+
+**Removing it:** get the layer reviewed externally. Then decide whether the feature becomes default:
+while it is not, a default build departs from the SHOULD by offering only the mandatory method. Select
+the AEAD from the negotiated suite when a second suite is offered, and add spec vectors for the
+dynamic derivation when they are published.
 
 ## 6. `group/update` is not the state source
 
@@ -232,7 +250,9 @@ shutdown from a restart, and the one MUST that can arise — a client leaving on
 cannot be expressed. The one place the protocol asks this client for a goodbye today is
 `server/unpair`, where the reason would be `unpaired`: `session::handle_unpair` removes the record,
 reports `Event::Unpaired` and closes the socket without one, so the server learns nothing beyond the
-close (entry 10).
+close (entry 10). `concurrent_attempt` is unreachable as a goodbye reason for a second reason: the
+process holds one connection, so no other pairing attempt can arrive to be turned away, and the
+reason waits for multi-server support or a second process.
 
 **Why:** the reasons are only actionable once a close path exists and multiple servers or
 displacement exist. The guest session ends by dropping the socket, and a writer without the call

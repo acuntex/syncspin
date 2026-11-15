@@ -8,9 +8,20 @@
 //!
 //! The player keeps its identity in a file so the server sees the same player across restarts. That
 //! file holds the bare 43-character base64url X25519 secret on one line, not JSON: the library has
-//! no storage format of its own, so the example owns this one.
+//! no storage format of its own, so the example owns this one. Its pairing PSK and records live in
+//! a second file, through the client's optional `FileStorage` backend.
 //!
-//! Status lines are for people; audio is the only thing that reaches stdout.
+//! To pair with a server, print the version-0 pairing token and enter it there:
+//!
+//! ```sh
+//! player-pipe --pairing-token
+//! ```
+//!
+//! The token is a credential: whoever holds it can pair a server with this client. It is printed on
+//! stdout, so it can be piped into whatever renders it; every status line in this example is on
+//! stderr. A build with `--features pairing-code` also carries the static pairing code flow.
+//!
+//! Status lines are for people. In a playback run, audio is the only thing that reaches stdout.
 
 mod pipe_sink;
 
@@ -21,6 +32,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "storage-file")]
+use syncspin_client::storage::{FileStorage, Storage};
 use syncspin_client::{
     AudioMode, Client, ClientConfig, Event, Identity, VolumePolicy, DEFAULT_PAIRING_TIMEOUT,
     MAX_PLAYER_NAME_LEN,
@@ -35,6 +48,10 @@ const DEFAULT_NAME: &str = "syncspin-pipe";
 /// Identity file used when `--identity` is absent.
 const DEFAULT_IDENTITY: &str = "./identity.key";
 
+/// Pairing store used when `--pairing-store` is absent.
+#[cfg(feature = "storage-file")]
+const DEFAULT_PAIRING_STORE: &str = "./pairing.json";
+
 /// Longest delay between reconnects, handed to [`ClientConfig::max_backoff`].
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -44,6 +61,8 @@ fn main() -> Result<()> {
             print!("{}", usage());
             return Ok(());
         }
+        #[cfg(feature = "storage-file")]
+        Ok(Parse::Token(options)) => return print_pairing_token(options),
         Ok(Parse::Run(options)) => options,
         Err(error) => {
             eprint!("error: {error}\n\n{}", usage());
@@ -51,6 +70,49 @@ fn main() -> Result<()> {
         }
     };
     play(options)
+}
+
+/// Prints the version-0 pairing token and exits.
+///
+/// The token carries the identity's public key and the pairing PSK, which is drawn and stored on
+/// this run if the store does not hold one yet. The client would draw the same key on its first
+/// connection; doing it here lets the operator enter the token before the server admits anything.
+#[cfg(feature = "storage-file")]
+fn print_pairing_token(options: TokenOptions) -> Result<()> {
+    let identity = load_or_create_identity(&options.identity)?;
+    let store = FileStorage::new(&options.pairing_store).with_context(|| {
+        format!(
+            "failed to open the pairing store {}",
+            options.pairing_store.display()
+        )
+    })?;
+    let psk = match store
+        .pairing_psk()
+        .context("the pairing store did not return the pairing PSK")?
+    {
+        Some(psk) => psk,
+        None => {
+            let mut psk = [0u8; 32];
+            getrandom::fill(&mut psk)
+                .map_err(|error| anyhow!("the operating system CSPRNG is unavailable: {error}"))?;
+            store
+                .store_pairing_psk(&psk)
+                .context("the pairing store did not accept the new pairing PSK")?;
+            eprintln!(
+                "drew a pairing PSK and stored it in {}",
+                options.pairing_store.display()
+            );
+            psk
+        }
+    };
+
+    let token = syncspin_core::pairing::token::encode_v0(&identity.public, &psk);
+    writeln!(io::stdout().lock(), "{token}").context("failed to write the pairing token")?;
+    eprintln!(
+        "pairing token for identity {}: a credential, hand it over directly",
+        identity.public_base64()
+    );
+    Ok(())
 }
 
 /// Builds the runtime, runs the player until Ctrl-C and bounds the shutdown wait.
@@ -76,6 +138,22 @@ async fn run(options: Options) -> Result<()> {
         options.identity.display()
     );
 
+    #[cfg(feature = "storage-file")]
+    let storage: Option<std::sync::Arc<dyn Storage>> = {
+        let store = FileStorage::new(&options.pairing_store).with_context(|| {
+            format!(
+                "failed to open the pairing store {}",
+                options.pairing_store.display()
+            )
+        })?;
+        eprintln!("pairing store {}", options.pairing_store.display());
+        Some(std::sync::Arc::new(store))
+    };
+    // A build without the file backend offers no pairing method: the host would have to implement
+    // `Storage` itself, which is more code than an example of the player loop needs.
+    #[cfg(not(feature = "storage-file"))]
+    let storage: Option<std::sync::Arc<dyn syncspin_client::storage::Storage>> = None;
+
     let config = ClientConfig {
         server: options.server,
         player_name: options.name,
@@ -83,17 +161,20 @@ async fn run(options: Options) -> Result<()> {
         // device passes the product name, manufacturer and version here so the server shows it.
         device_info: None,
         identity,
-        storage: None,
+        storage,
         // This example has no decoder, so it asks for raw samples. A host that wants encoded
         // frames selects `AudioMode::Passthrough` and brings its own decoder.
         audio_mode: AudioMode::Decode,
-        // Nothing is restored across restarts, so the output starts at full scale and unmuted.
+        // Volume and mute are not restored across restarts, so the output starts at full scale and
+        // unmuted.
         volume: 100,
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
-        #[cfg(feature = "pairing-code")]
+        #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+        static_pairing_code: options.static_code.clone(),
+        #[cfg(all(feature = "pairing-code", not(feature = "storage-file")))]
         static_pairing_code: None,
         #[cfg(feature = "pairing-code")]
         pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
@@ -125,6 +206,18 @@ async fn run(options: Options) -> Result<()> {
                     Event::Connected { server_id, encrypted } => {
                         let security = if encrypted { "encrypted" } else { "not encrypted" };
                         eprintln!("connected: server {server_id}, {security}");
+                        // A pairing window belongs to one connection, so a reconnect needs the
+                        // gesture again. The operator gave it by starting the player this way.
+                        #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+                        if options.open_window {
+                            match handle.control().open_pairing_window().await {
+                                Ok(()) => eprintln!(
+                                    "pairing window open for {}s",
+                                    syncspin_client::DEFAULT_PAIRING_WINDOW.as_secs()
+                                ),
+                                Err(error) => eprintln!("pairing window: {error:#}"),
+                            }
+                        }
                     }
                     Event::StreamStart { format } => eprintln!(
                         "stream: {} {} Hz, {} channels, {}-bit",
@@ -173,6 +266,26 @@ async fn run(options: Options) -> Result<()> {
                         } else {
                             eprintln!("state: {}", parts.join(", "));
                         }
+                    }
+                    Event::Paired { server_id } => {
+                        eprintln!("paired: record stored for server {server_id}")
+                    }
+                    Event::Unpaired { server_id } => eprintln!(
+                        "unpaired: the server dropped the record for {server_id}"
+                    ),
+                    Event::PairingRequired { server_id, reason } => eprintln!(
+                        "pairing required by {server_id}: {reason:?}"
+                    ),
+                    Event::PairingFailed { reason } => {
+                        eprintln!("pairing failed: {}", reason.as_str())
+                    }
+                    #[cfg(feature = "pairing-code")]
+                    Event::PairingCode { code, format, round } => {
+                        let format = match format {
+                            syncspin_client::CodeFormat::Digits => "digits",
+                            syncspin_client::CodeFormat::QrCode => "QR token",
+                        };
+                        eprintln!("pairing code ({format}, round {round}): {code}");
                     }
                     Event::Disconnected { reason, retry_in } => eprintln!(
                         "disconnected: {reason}; retrying in {}s",
@@ -256,7 +369,6 @@ fn save_identity(path: &Path, identity: &Identity) -> Result<()> {
 }
 
 /// What the command line asked for.
-#[derive(Debug)]
 struct Options {
     /// Server address as `host[:port]` or a `ws://` URL.
     server: String,
@@ -264,12 +376,33 @@ struct Options {
     name: String,
     /// File that holds the X25519 identity.
     identity: PathBuf,
+    /// File that holds the pairing PSK and records.
+    #[cfg(feature = "storage-file")]
+    pairing_store: PathBuf,
+    /// Static pairing code, shared with the server.
+    #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+    static_code: Option<String>,
+    /// Whether to open a pairing window on every connection.
+    #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+    open_window: bool,
+}
+
+/// What `--pairing-token` needs: no server and no player name, only the credentials.
+#[cfg(feature = "storage-file")]
+struct TokenOptions {
+    /// File that holds the X25519 identity.
+    identity: PathBuf,
+    /// File that holds the pairing PSK and records.
+    pairing_store: PathBuf,
 }
 
 /// Result of parsing the command line.
 enum Parse {
     /// Print the usage text and exit.
     Help,
+    /// Print the pairing token and exit.
+    #[cfg(feature = "storage-file")]
+    Token(TokenOptions),
     /// Run the player with these options.
     Run(Options),
 }
@@ -282,7 +415,14 @@ where
     let mut server = None;
     let mut name = DEFAULT_NAME.to_owned();
     let mut identity = PathBuf::from(DEFAULT_IDENTITY);
-
+    #[cfg(feature = "storage-file")]
+    let mut pairing_store = PathBuf::from(DEFAULT_PAIRING_STORE);
+    #[cfg(feature = "storage-file")]
+    let mut pairing_token = false;
+    #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+    let mut static_code: Option<String> = None;
+    #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+    let mut open_window = false;
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         let (flag, inline) = split_flag(&argument);
@@ -291,8 +431,39 @@ where
             "--server" => server = Some(take_value(flag, inline, &mut args)?),
             "--name" => name = take_value(flag, inline, &mut args)?,
             "--identity" => identity = PathBuf::from(take_value(flag, inline, &mut args)?),
+            #[cfg(feature = "storage-file")]
+            "--pairing-store" => {
+                pairing_store = PathBuf::from(take_value(flag, inline, &mut args)?)
+            }
+            #[cfg(feature = "storage-file")]
+            "--pairing-token" => pairing_token = true,
+            #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+            "--static-code" => static_code = Some(take_value(flag, inline, &mut args)?),
+            #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+            "--open-window" => open_window = true,
+            #[cfg(all(feature = "pairing-code", not(feature = "storage-file")))]
+            "--static-code" | "--open-window" => bail!(
+                "the code flows need the storage-file feature: a completed pairing has to be stored"
+            ),
             other => bail!("unknown argument {other:?}; try --help"),
         }
+    }
+
+    #[cfg(feature = "storage-file")]
+    if pairing_token {
+        if server.is_some() {
+            bail!("--pairing-token prints the token and exits; drop --server");
+        }
+        #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+        if static_code.is_some() || open_window {
+            bail!(
+                "--pairing-token prints the token and exits; drop --static-code and --open-window"
+            );
+        }
+        return Ok(Parse::Token(TokenOptions {
+            identity,
+            pairing_store,
+        }));
     }
 
     let server = server.ok_or_else(|| anyhow!("--server is required; try --help"))?;
@@ -304,11 +475,50 @@ where
         );
     }
 
+    #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+    {
+        if let Some(code) = &static_code {
+            check_static_code(code)?;
+        }
+        match (static_code.is_some(), open_window) {
+            (true, false) => bail!(
+                "--static-code needs --open-window: the window is the operator gesture that admits \
+                 a static-code attempt"
+            ),
+            (false, true) => bail!(
+                "--open-window needs --static-code: the window admits only the static code flow"
+            ),
+            _ => {}
+        }
+    }
+
     Ok(Parse::Run(Options {
         server,
         name,
         identity,
+        #[cfg(feature = "storage-file")]
+        pairing_store,
+        #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+        static_code,
+        #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+        open_window,
     }))
+}
+
+/// Rejects a static code that is not exactly the eight decimal digits the protocol defines.
+///
+/// The code is a credential, so the error names the shape and never echoes the value.
+#[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+fn check_static_code(code: &str) -> Result<()> {
+    if code.len() != syncspin_client::STATIC_PAIRING_CODE_LEN
+        || !code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!(
+            "--static-code must be {} ASCII digits",
+            syncspin_client::STATIC_PAIRING_CODE_LEN
+        );
+    }
+    Ok(())
 }
 
 /// Rejects an address this build cannot use, before a connection is attempted.
@@ -354,12 +564,20 @@ fn take_value(
 
 /// The help text; the defaults come from the same constants the parser uses.
 fn usage() -> String {
-    format!(
+    let mut text = String::from(
         "\
 player-pipe - stream one Sendspin player's audio to standard output
 
 Usage: player-pipe --server <host[:port] | ws://url> [options]
+",
+    );
+    #[cfg(feature = "storage-file")]
+    text.push_str(
+        "       player-pipe --pairing-token [--identity <path>] [--pairing-store <path>]\n",
+    );
 
+    text.push_str(&format!(
+        "\
 Options:
       --server <host[:port] | ws://url>
                               Address of the Sendspin server (required), for
@@ -370,13 +588,39 @@ Options:
                               43-character base64url secret on one line, not JSON;
                               created with owner-only permissions when missing
                               [default: {DEFAULT_IDENTITY}]
+"
+    ));
+    #[cfg(feature = "storage-file")]
+    text.push_str(&format!(
+        "\
+      --pairing-token         Print this client's version-0 pairing token (SP:...)
+                              and exit; the token carries the identity and the
+                              pairing PSK, so treat it as a credential
+      --pairing-store <path>  JSON file holding the pairing PSK and the pairing
+                              records; created with owner-only permissions
+                              [default: {DEFAULT_PAIRING_STORE}]
+"
+    ));
+    #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+    text.push_str(
+        "\
+      --static-code <code>    Static pairing code, exactly eight digits, shared
+                              with the server; treat it as a credential
+                              (needs --open-window)
+      --open-window           Open a pairing window on every connection
+                              (needs --static-code)
+",
+    );
+    text.push_str(
+        "\
   -h, --help                  Print this help and exit
 
 Audio goes to standard output as raw samples in the announced format; status
 lines go to standard error. The player reconnects with backoff and stops on
 Ctrl-C.
-"
-    )
+",
+    );
+    text
 }
 
 #[cfg(test)]
@@ -392,8 +636,21 @@ mod tests {
     fn options(args: &[&str]) -> Options {
         match parse(args) {
             Ok(Parse::Run(options)) => options,
+            #[cfg(feature = "storage-file")]
+            Ok(Parse::Token(_)) => panic!("expected options, got the token mode"),
             Ok(Parse::Help) => panic!("expected options, got the help text"),
             Err(error) => panic!("expected options, got the error {error:#}"),
+        }
+    }
+
+    /// Parses a command line that is expected to print the pairing token.
+    #[cfg(feature = "storage-file")]
+    fn token_options(args: &[&str]) -> TokenOptions {
+        match parse(args) {
+            Ok(Parse::Token(options)) => options,
+            Ok(Parse::Run(_)) => panic!("expected the token mode, got a run"),
+            Ok(Parse::Help) => panic!("expected the token mode, got the help text"),
+            Err(error) => panic!("expected the token mode, got the error {error:#}"),
         }
     }
 
@@ -404,6 +661,13 @@ mod tests {
         assert_eq!(options.server, "music-assistant.local");
         assert_eq!(options.name, DEFAULT_NAME);
         assert_eq!(options.identity, PathBuf::from(DEFAULT_IDENTITY));
+        #[cfg(feature = "storage-file")]
+        assert_eq!(options.pairing_store, PathBuf::from(DEFAULT_PAIRING_STORE));
+        #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+        {
+            assert_eq!(options.static_code, None);
+            assert!(!options.open_window);
+        }
     }
 
     #[test]
@@ -417,6 +681,102 @@ mod tests {
         assert_eq!(options.server, "music-assistant.local:8927");
         assert_eq!(options.name, "Kitchen");
         assert_eq!(options.identity, PathBuf::from("/tmp/identity.key"));
+    }
+
+    #[cfg(feature = "storage-file")]
+    #[test]
+    fn the_token_mode_needs_no_server_and_names_its_own_files() {
+        let options = token_options(&["--pairing-token"]);
+        assert_eq!(options.identity, PathBuf::from(DEFAULT_IDENTITY));
+        assert_eq!(options.pairing_store, PathBuf::from(DEFAULT_PAIRING_STORE));
+
+        let options = token_options(&[
+            "--pairing-token",
+            "--identity=/tmp/identity.key",
+            "--pairing-store=/tmp/pairing.json",
+        ]);
+        assert_eq!(options.identity, PathBuf::from("/tmp/identity.key"));
+        assert_eq!(options.pairing_store, PathBuf::from("/tmp/pairing.json"));
+    }
+
+    #[cfg(feature = "storage-file")]
+    #[test]
+    fn the_token_mode_refuses_a_connection() {
+        let Err(error) = parse(&["--pairing-token", "--server", "host"]) else {
+            panic!("a token run must not connect");
+        };
+        assert!(
+            format!("{error}").contains("drop --server"),
+            "the error should say what to drop, got: {error}"
+        );
+    }
+
+    #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+    #[test]
+    fn a_static_code_attempt_needs_the_code_and_the_window() {
+        let options = options(&[
+            "--server",
+            "host",
+            "--static-code",
+            "12345678",
+            "--open-window",
+        ]);
+        assert_eq!(options.static_code.as_deref(), Some("12345678"));
+        assert!(options.open_window);
+
+        for args in [
+            &["--server", "host", "--static-code", "12345678"][..],
+            &["--server", "host", "--open-window"][..],
+            &[
+                "--server",
+                "host",
+                "--static-code",
+                "1234567",
+                "--open-window",
+            ][..],
+            &[
+                "--server",
+                "host",
+                "--static-code",
+                "1234567a",
+                "--open-window",
+            ][..],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} must be rejected");
+        }
+    }
+
+    #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
+    #[test]
+    fn a_bad_static_code_is_never_echoed() {
+        let Err(error) = parse(&[
+            "--server",
+            "host",
+            "--static-code",
+            "8765432",
+            "--open-window",
+        ]) else {
+            panic!("a seven-digit code must be rejected");
+        };
+        let text = format!("{error}");
+        assert!(
+            text.contains("eight") || text.contains("8 ASCII digits"),
+            "the error should name the shape, got: {text}"
+        );
+        assert!(
+            !text.contains("8765432"),
+            "the code is a credential and must not be echoed: {text}"
+        );
+    }
+
+    #[cfg(feature = "storage-file")]
+    #[test]
+    fn the_usage_lists_the_flags_this_build_has() {
+        let text = usage();
+        assert!(text.contains("--pairing-token"), "got: {text}");
+        assert!(text.contains("--pairing-store"), "got: {text}");
+        #[cfg(feature = "pairing-code")]
+        assert!(text.contains("--open-window"), "got: {text}");
     }
 
     #[test]

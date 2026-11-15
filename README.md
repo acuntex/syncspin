@@ -10,9 +10,12 @@ state back.
 
 ## Status
 
-**0.1, client first.** The client is implemented and covered by a hermetic test suite;
-`syncspin-server` is a stub with `publish = false`. No crate is published on crates.io — `v0.1.0` is
-a pre-release tag that marks the first pinnable state. The API may change before 1.0.
+**0.1, client first.** The client is implemented and covered by a hermetic test suite, including
+pairing: the Pairing PSK flow, the records it writes, the in-band re-handshake and `server/unpair`,
+plus the static and dynamic code flows behind the `pairing-code` feature. `syncspin-server` is a stub
+with `publish = false`. No crate is published on crates.io — `v0.1.0` is a pre-release tag that marks
+the first pinnable state. The API may change before 1.0. The CPace layer behind the code flows has
+not been reviewed externally, so it is unaudited code until it has been.
 
 `syncspin` is not an official Sendspin implementation and is not affiliated with the Sendspin
 project; the name describes only the protocol the code speaks.
@@ -22,9 +25,9 @@ project; the name describes only the protocol the code speaks.
 | Path                      | Contents                                                                        |
 | ------------------------- | ------------------------------------------------------------------------------- |
 | `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
-| `crates/syncspin-client/` | Session loop, `Sink` trait, event stream.                                       |
+| `crates/syncspin-client/` | Session loop, `Sink` trait, event stream, pairing and its `Storage` trait.      |
 | `crates/syncspin-server/` | Planned for 0.2: listener, streams, roles, pairing.                             |
-| `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr.               |
+| `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr, pairing.      |
 
 `syncspin-core` never depends on `syncspin-client` or `syncspin-server`; every protocol and crypto
 decision lives in one place.
@@ -44,13 +47,21 @@ The example player needs a Sendspin server to talk to:
 cargo run -p player-pipe -- --server music-assistant.local:8927 | aplay -f S16_LE -r 48000 -c 2
 ```
 
-Run `cargo run -p player-pipe -- --help` for the player name and identity file. The first run writes
-`./identity.key` with owner-only permissions and prints the public key the server sees; later runs
-reuse it. The example configures no pairing store, so it connects as an unpaired guest and the server
-must allow unpaired access.
+Run `cargo run -p player-pipe -- --help` for the player name, the identity file and the pairing
+store. The first run writes `./identity.key` and `./pairing.json` with owner-only permissions; later
+runs reuse both. To pair the player, print its version-0 pairing token and enter it in the server:
 
-The example's source is meant to be read: `src/main.rs` holds the event loop and the identity
-handling, `src/pipe_sink.rs` the `Sink` implementation.
+```sh
+cargo run -p player-pipe -- --pairing-token
+```
+
+The token is a credential: whoever holds it can pair a server with this client, so hand it over
+directly and keep it out of logs and issues. A server that admits unpaired clients still accepts the
+player as a guest. `--features pairing-code` adds `--static-code` and `--open-window` for the static
+code flow.
+
+The example's source is meant to be read: `src/main.rs` holds the event loop, the identity handling
+and the pairing token, `src/pipe_sink.rs` the `Sink` implementation.
 
 ## What works today
 
@@ -88,16 +99,38 @@ mute, stop or restart its output first; a reconnect flush produces no stream eve
 carries the now-playing metadata with the position, the duration and the playback speed in per-mille,
 where `1000` is normal speed.
 
+## Pairing
+
+Pairing belongs to the host: it supplies a [`Storage`](crates/syncspin-client/src/storage.rs) with the
+pairing PSK, the records of servers it has paired with, and the calls that read and write them. The
+crate draws and persists the PSK on the first run, offers the Pairing PSK method on every connection,
+and writes a record after `server/pair-finalize`; `Event::Paired` reports it. A record authenticates
+the next connection, and the session survives the server's in-band re-handshake without dropping the
+stream. `server/unpair` removes the record and arrives as `Event::Unpaired`; a server that names a
+`psk_id` the client does not hold produces `Event::PairingRequired` once per connection. Without a
+store the client offers no pairing method and stays a guest.
+
+`FileStorage` is the optional JSON backend behind the `storage-file` feature, and the example uses
+it. The crate writes at most five records into a store it manages, evicting the oldest first and
+never the record backing the live connection; a store that already holds more is read as it is. That
+order is insertion order, not use order, so a record kept since long ago can be evicted before one
+used recently. Calling `Storage::store_pairing` directly bypasses the capacity and the live-record
+pin: the crate writes through `persist_pairing`, and a host that stores records itself has to apply
+the same rules.
+
+With the `pairing-code` feature the client also runs the static and dynamic code flows, gated by a
+pairing window the host opens or by the process-wide round limit. The dynamic flow shows the operator
+a six-digit code or a version-1 token; both flows deliver the long-term key sealed under the CPace
+output. The CPace layer is unaudited — see [Status](#status).
+
 ## What does not work yet
 
-- **Pairing.** With `ClientConfig::storage` set, the client draws and persists its pairing PSK,
-  offers `pairing_psk`, runs the flow and stores the record, reporting `Event::Paired`. A record the
-  server drops arrives as `server/unpair` and is reported as `Event::Unpaired`, and a `psk_id` the
-  client does not hold is reported once per connection as `Event::PairingRequired`. With the
-  `pairing-code` feature the client also runs the static and dynamic code flows, gated by a pairing
-  window the host opens or by the process-wide round limit. Without a store it offers no pairing
-  method and stays a guest. Still missing: the operator-facing pairing token and a `client/goodbye`
-  writer.
+- **Pairing control surface.** There is no `ControlHandle::pairing_token()`, so a host that wants the
+  operator-facing `SP:` token assembles it from the identity's public key and `Storage::pairing_psk()`
+  with the encoder in `syncspin_core::pairing::token` — `player-pipe --pairing-token` does exactly
+  that. There is no `client/goodbye` writer, so a graceful close carries no reason and
+  `concurrent_attempt` cannot be sent as a goodbye reason; with one connection that reason is
+  unreachable anyway. Unpaired access is always admitted, and nothing turns it off.
 - **Server.** `syncspin-server` is a stub; the listener, streams, roles and pairing server arrive in
   0.2.
 - **Discovery.** Clients do not advertise over mDNS and do not accept server-initiated connections.
@@ -116,7 +149,8 @@ A host supplies a [`Sink`](crates/syncspin-client/src/sink.rs): `open` for a new
 every chunk with the playout deadline the client computed, `flush` at each boundary the crate
 announces, and optionally `latency` and `underruns` so the client can hold its buffer and report
 timing. The crate owns the connection, the clock and the reconnect loop; the host owns the output
-device, the identity file and everything below the pipe.
+device, the identity file and everything below the pipe. Pairing needs a
+[`Storage`](crates/syncspin-client/src/storage.rs) as well; without one the client is a guest.
 
 ```rust
 let (handle, mut events) = Client::connect(config, Box::new(my_sink)).await?;
@@ -150,7 +184,7 @@ handbook.
 - **MSRV 1.85**, edition 2021.
 - On the ARMv7 / glibc 2.24 target build with
   `cargo zigbuild --target armv7-unknown-linux-gnueabihf`. `openssl` and `ring` are out: the crypto
-  stack is `snow` plus `x25519-dalek`.
+  stack is `snow`, `x25519-dalek` and the RustCrypto primitives the pairing code flows need.
 
 ## Licence
 

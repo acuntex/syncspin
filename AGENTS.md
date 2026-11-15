@@ -26,6 +26,7 @@ never knows a transport. A dependency pointing from core towards a crate is a bu
 
 ```sh
 cargo test --workspace --locked
+cargo test --workspace --features pairing-code,storage-file --locked
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 cargo zigbuild --target armv7-unknown-linux-gnueabihf   # once the player/controller features land
@@ -41,9 +42,9 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
   There is no plaintext fallback and no downgrade - not behind a flag, not in a test.
 - **Never log key material or pairing records.** No static keys, no PSKs, no pairing blobs, no
   Noise handshake hashes - not at `trace`, not in `Debug` output, not in error strings.
-- **When the feature flags land, the defaults stay `player`, `controller`, `metadata`.**
-  `artwork`, `visualizer`, `color` and `source` stay off unless a caller opts in. No crate has a
-  `[features]` table today, so this is a constraint on the work, not a description of it.
+- **When the role feature flags land, the defaults stay `player`, `controller`, `metadata`.**
+  `artwork`, `visualizer`, `color` and `source` stay off unless a caller opts in. The role features
+  do not exist yet: the only tables today are `storage-file` and `pairing-code`, both off by default.
 - **MSRV 1.85.** A dependency that demands more is pinned or replaced, not silently accepted; the
   `msrv` CI job is the gate.
 - **Names and licence are fixed:** crates `syncspin-core`, `syncspin-client` and `syncspin-server`;
