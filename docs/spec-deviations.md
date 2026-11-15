@@ -14,24 +14,23 @@ harmless.
 | --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
 | 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Closes in 0.2                      |
 | 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
-| 3   | No version-0 pairing-token export                               | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Closes with pairing (stage 2)      |
-| 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Closes with pairing (stage 2)      |
-| 5   | No code pairing (PAKE)                                          | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Stage 4                            |
+| 3   | No `pairing_token()` export                                     | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Open, accessor only                |
+| 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
+| 5   | Code pairing behind a feature; CPace layer unaudited            | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
 | 6   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Stage 1b                           |
 | 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                           |
 | 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
 | 9   | No `client/goodbye` writer                                      | [`messaging.md` — `client/goodbye`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clientgoodbye)                                                         | Stage 1b                           |
-| 10  | Transport-mode re-handshake ignored                             | [`connection.md` — Re-handshake](https://github.com/Sendspin/spec/blob/main/connection.md#re-handshake)                                                                           | Stage 2                            |
-| 11  | `pairing_psk` advertised without the Pairing PSK flow           | [`messaging.md` — `client/hello`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clienthello)                                                             | Stage 2                            |
-| 12  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
-| 13  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
-| 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
-| 15  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                           |
-| 16  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                         |
-| 17  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`      |
-| 18  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
-| 19  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
-| 20  | A malformed control message is ignored, not fatal               | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
+| 10  | No unpaired-access switch; unpair closes without a goodbye      | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Accepted, `handle_unpair`          |
+| 11  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
+| 12  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
+| 13  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
+| 14  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                           |
+| 15  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                         |
+| 16  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`      |
+| 17  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
+| 18  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
+| 19  | A malformed control message is ignored, not fatal               | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
 
 ## 1. Client-initiated connections only
 
@@ -66,43 +65,47 @@ playback-capable connection carries `active_roles`. An inadmissible activation m
 
 **What we do:** the session starts the first sync burst once the connection is ready
 (`session::attempt`). `apply_activate` records `active_roles`, starts a burst only when a re-added
-`player@v1` has no sample yet, and flushes the player stream when the role disappears; it never
-inspects `activities`, never evaluates the playback-capable rule and never re-evaluates persisted
-roles. There is no `client/goodbye` writer and no `pair/abort` writer, so an inadmissible activation
-is accepted and the session carries on.
+`player@v1` has no sample yet, and flushes the player stream when the role disappears. It checks
+only the pairing half of the table: a pairing activity whose method does not match the matched PSK,
+or which this build does not offer, is answered with `pair/abort` reason `method_not_supported`.
+The activity set itself is never validated and there is no `client/goodbye` writer, so every other
+inadmissible activation is accepted and the session carries on.
 
 **Why:** the allowed set depends on the matched PSK and its category. The Sentinel row alone already
 allows four sets — `[]`, `['pairing']`, `['playback']` and `['playback','pairing']` — so this is not
 a single case that a bare parser could settle: the playback-capable rule, the re-evaluation of
-`active_roles` on later activations and the two rejection paths all have to exist first. The client
-stores no PSK of its own, but a host can pass records through `connect_with_psks` (entry 4), so an
-`lt` or `pr` announcement is reachable and the allowed set has to be keyed by the matched record's
-category instead of assuming the Sentinel row.
+`active_roles` on later activations and the two rejection paths all have to exist first. The
+candidate set can hold this client's pairing PSK (`pr`), the records in `Storage` (`lt`) and records a
+host passes through `connect_with_psks` (entry 4), so both announcements are reachable and the
+allowed set has to be keyed by the matched record's category instead of assuming the Sentinel row.
 
 **Removing it:** add the allowed-set table per PSK category, the playback-capable rule with the
 `active_roles` re-evaluation on later activations, and the two rejection paths (stage 1b). Test each
 rejection reason against the fake server.
 
-## 3. No version-0 pairing-token export
+## 3. No `pairing_token()` export
 
 **Spec:** `pairing.md`, _Pairing Token_ and _Pairing PSK Flow_. The pairing PSK MUST be exposed to
 the operator as a version-0 token, `SP:0` plus the base32 body of
 `client_key (32 bytes) || pairing_psk (32 bytes)`, transliterating `2` to `9`. The bare PSK is not
 an acceptable interface.
 
-**What we do:** the library has no `pairing_token()` and never generates a pairing PSK. The only key
-it holds by itself is the published Sentinel PSK, which is not a pairing credential; a host can pass
-stored records through `connect_with_psks` (entry 4), but nothing here produces one.
+**What we do:** the client draws the pairing PSK from the CSPRNG, persists it through `Storage` and
+offers the Pairing PSK method, but no accessor hands the operator a token: `ControlHandle` carries a
+command channel and the level in force, not the identity or the store, so there is no
+`pairing_token()`. The encoder (`syncspin_core::pairing::token::encode_v0`) exists and is pinned to
+both spec vectors. A host can assemble the token itself from the identity's public key and
+`Storage::pairing_psk()`, and `player-pipe --pairing-token` does exactly that.
 
-**Why:** a token is a credential: whoever holds it can pair any server with the client. Emitting one
-before the pairing PSK is generated, persisted and covered by the record lifecycle would ship a
-secret with no rotation and no test for its lifecycle. The spec's reference vector makes the
-encoder testable only once the pairing PSK exists.
+**Why:** a token is a credential: whoever holds it can pair any server with the client. The accessor
+belongs with the rest of the pairing control surface - it has to be documented as a credential, and
+its lifetime is the host's UI, not a protocol message. The rest of that surface
+(`open_pairing_window`, `release_holdback`) shipped; this getter did not, because it needs the
+identity and the store carried into the handle, which the handle does not hold.
 
-**Removing it:** in stage 2, generate and persist the pairing PSK, add `pairing_token()` returning
-the encoded string (never the raw PSK), and pin it with the spec's reference vector plus a decoder
-round trip that exercises the `2`/`9` transliteration. Record handling for `server/unpair` arrives
-in the same stage.
+**Removing it:** add `pairing_token()` to the control handle, returning the version-0 token built
+from the identity's public key and the stored pairing PSK, and test it against the spec's reference
+vector plus a decoder round trip that exercises the `2`/`9` transliteration.
 
 ## 4. `psk_id` validation deferred to the session layer
 
@@ -116,10 +119,16 @@ Sentinel PSK and hands the decrypted message-1 payload back verbatim; the caller
 with `Responder::set_psk` between reading message 1 and writing message 2. The selecting and
 validating is the session layer's job: `PskMetadata::parse` rejects an unknown category and a
 non-canonical id, and `select_psk` applies the matching key and falls back to the Sentinel key only
-on the initial handshake. A host can pass pairing records through `connect_with_psks`
-(`StoredPsk`: category, key and `server_id`); `select_psk` matches category and id, then checks the
-record's `server_id` against `server/init`. `connect` passes no records, so the guest path always
-falls back. `core` itself enforces none of that.
+on the initial handshake. The candidates come from `pairing::Candidates::load`: the records
+`ClientConfig::storage` holds, the records `connect_with_psks` passes (the store wins for a
+`server_id` it already knows), and the client's own pairing PSK. That pairing PSK is drawn once,
+persisted through `Storage::store_pairing_psk` and offered on every connection; it is a client-wide
+credential, so `select_psk` matches it for the announced `pr` id without a `server_id` check, which
+is what lets one token pair any number of servers. A stored record still has to match category and
+id and then name the `server_id` from `server/init`. A pairing that completes is persisted on
+`server/pair-finalize` as a `LongTerm` record, so the next handshake reads it as a stored record.
+`connect` passes no records and configures no store, so the guest path always falls back. `core`
+itself enforces none of that.
 
 **Why:** the Noise module owns no storage and no policy, so it cannot enumerate candidate PSKs or
 decide what a category mismatch means. Splitting it this way keeps `core` free of file I/O and lets
@@ -128,29 +137,45 @@ a host with its own identity store drive selection.
 **Consequence while it stands:** a caller that drives `Responder` directly and ignores the payload
 completes a handshake against any announced `psk_id`/`psk_category` pair, with no fallback decision
 made for it. The client path is covered: the session validates the metadata, checks the category,
-id and server id of a stored record, and falls back to the Sentinel key on the initial handshake
-only. No pairing record is generated or persisted by this crate yet.
+id and server id of a stored record, checks the pairing PSK against the announced id alone, and
+falls back to the Sentinel key on the initial handshake only.
 
 **Removing it:** give `core` a PSK resolver (a trait the session implements over its storage, passed
 into the responder) so the handshake cannot finish without a matched category and id, and enforce
 the record's `server_id` check and the fallback-on-miss rule there. Then narrow `set_psk` or delete
 it.
 
-## 5. No code pairing (PAKE)
+## 5. Code pairing is a feature and the CPace layer is unaudited
 
 **Spec:** `pairing.md`, _PAKE_, _Dynamic Pairing Code Flow_ and _Static Pairing Code Flow_ — a
 SHOULD, not a MUST. `CPACE-X25519-SHA512` per `draft-irtf-cfrg-cpace-21`, with the server as `A`,
 the client as `B` and the `MCF` generator, plus the wrapped-PSK exchange.
 
-**What we do:** nothing. No `client/pair-init`, `client/pair-auth`, `client/pair-confirm`,
-`server/pair-*` parsing and no CPace implementation.
+**What we do:** both flows are implemented in `syncspin-client` behind the `pairing-code` feature
+and offered only when a `Storage` can persist the record they produce - and, for the dynamic flow,
+when the host advertises an emission format and an out-channel. The static flow is gated by the
+pairing window `ControlHandle::open_pairing_window` opens; the dynamic flow is gated by its
+20-round limit and `ControlHandle::release_holdback`. The CPace layer is built here - `x25519-dalek`,
+`elligator2` for the `MCF` map, SHA-512 - because no crate was found that matched draft-21 with the
+spec's `MCF` and `sid` layout. It is pinned to the draft's vectors and the spec's `sid` construction.
+The wrapping uses ChaCha20-Poly1305, fixed in `syncspin-core::pairing::wrap`, which is correct for
+`25519_ChaChaPoly_SHA256`, the only suite this build negotiates; offering
+`25519_AESGCM_SHA256` would need the AEAD selected per connection instead. The specification
+publishes no test vectors for the dynamic code derivation: the tests pin a vector computed from the
+spec's formula and run the flow end to end against the fake server only.
 
-**Why:** no vetted crate is known to match draft-21 with the spec's `MCF` and `sid` layout. Writing
-the PAKE by hand before that is settled would put unaudited crypto in the handshake path.
+**The CPace and wrapping layer has not had an external review.** That is the reason this entry still
+exists after both flows shipped.
 
-**Removing it:** check the candidate crates against draft-21 first; if they do not match, build the
-wrapper on `x25519-dalek` and SHA-512 with the draft test vectors and an external review, then add
-the message flow and negative cases (wrong code, replay, `method_not_supported`).
+**Why:** a default build must not advertise a method whose PAKE it does not carry, and unaudited
+crypto stays out of the default surface. A host that does not enable the feature gets the mandatory
+Pairing PSK flow only; one that enables it accepts that the layer is new code with draft vectors but
+no review.
+
+**Removing it:** get the layer reviewed externally. Then decide whether the feature becomes default:
+while it is not, a default build departs from the SHOULD by offering only the mandatory method. Select
+the AEAD from the negotiated suite when a second suite is offered, and add spec vectors for the
+dynamic derivation when they are published.
 
 ## 6. `group/update` is not the state source
 
@@ -222,7 +247,12 @@ it, except that a client leaving one server for another MUST send `another_serve
 **What we do:** the library has no writer for the message and no typed reason. A connection that is
 dropped looks the same to the server whatever the caller intended, so the server cannot tell a
 shutdown from a restart, and the one MUST that can arise — a client leaving one server for another —
-cannot be expressed.
+cannot be expressed. The one place the protocol asks this client for a goodbye today is
+`server/unpair`, where the reason would be `unpaired`: `session::handle_unpair` removes the record,
+reports `Event::Unpaired` and closes the socket without one, so the server learns nothing beyond the
+close (entry 10). `concurrent_attempt` is unreachable as a goodbye reason for a second reason: the
+process holds one connection, so no other pairing attempt can arrive to be turned away, and the
+reason waits for multi-server support or a second process.
 
 **Why:** the reasons are only actionable once a close path exists and multiple servers or
 displacement exist. The guest session ends by dropping the socket, and a writer without the call
@@ -232,44 +262,50 @@ sites would be an API nobody can reach.
 shutdown, restart, another server), then test on the fake server that the server sees the reason
 before the close.
 
-## 10. Transport-mode re-handshake ignored
+## 10. No unpaired-access switch and no goodbye after `server/unpair`
 
-**Spec:** `connection.md`, _Re-handshake_. Once the transport is established, the server may send
-Noise message 1 again to rotate the connection to a paired PSK; the client answers with message 2
-over the same transport, without repeating the cleartext init exchange.
+**Spec:** `pairing.md`, _Unpaired Access_ and _Pairing Records_, and `messaging.md`, `server/unpair`
+and `client/goodbye`. Whether a client admits unpaired access is a local setting, advertised in
+`client/hello` as `unpaired_access.enabled`; a client that stops admitting it closes an unpaired
+connection with `client/goodbye` reason `pairing_required`. On `server/unpair` the client removes the
+matched pairing record, sends `client/goodbye` reason `unpaired` and closes. A server that announces
+a `psk_id` the client does not hold receives the Sentinel Fallback's authenticated
+credential-mismatch signal, and the client is expected to surface the mismatch to its operator.
 
-**What we do:** `handshake` runs once per WebSocket. `serve` decrypts later messages and
-`handle_control_message` parses them into `Incoming`, where `dispatch` has no arm for
-`Incoming::NoiseHandshake`, so a re-handshake arrives as an ignored message and the connection keeps
-its original key. There is no second handshake path at all.
+**What we do:** the signal and the record handling are implemented. `session::select_psk` sets its
+`credential_mismatch` flag when the initial handshake falls back to the Sentinel key although the
+server named another credential, and `session::attempt` reports
+`Event::PairingRequired { server_id, reason: CredentialMismatch }` once per connection, after
+`Event::Connected` and before the first activation; a plain Sentinel announcement, a matched record
+and the pairing PSK all report nothing, and `Event::PairingRequired` is never sent twice.
+`Incoming::ServerUnpair` is decoded as `server/unpair`, and `Session::handle_unpair` removes the
+record through `Storage::remove_pairing`, emits `Event::Unpaired { server_id }` and ends the
+connection with the disconnect reason `Ending::Unpaired`. A session that is unpaired - Sentinel-keyed
+or pairing-PSK-keyed - ignores the message, as the spec requires. A record the host passed through
+`connect_with_psks` is not in a store the crate may write, so the event reports it and the host has
+to drop it. `server_unpair_drops_the_record_and_ends_the_connection`,
+`an_unpair_on_an_unpaired_session_is_ignored`,
+`an_unheld_psk_id_is_reported_once_as_a_credential_mismatch` and
+`a_plain_guest_handshake_does_not_ask_for_pairing` pin the observable behaviour, and
+`a_credential_mismatch_is_reported_once_per_connection` pins the once-per-connection rule.
 
-**Why:** the guest client only ever uses the published Sentinel key, and no pairing PSK exists to
-rotate to (entries 3 and 5). A half-implemented re-handshake that ignored a failed message 2 would
-be worse than leaving the upgrade to stage 2, where records and the server-id binding exist.
+Two parts are still missing. Unpaired access is always admitted: `client/hello` carries
+`unpaired_access: { enabled: true }` unconditionally, there is no setting that turns it off, and so
+no `pairing_required` close exists. And the close after `server/unpair` carries no `client/goodbye`
+reason `unpaired`, because the crate has no writer for that message (entry 9): the server sees the
+socket close and learns nothing more.
 
-**Removing it:** add a re-handshake state entered on an encrypted `noise/handshake` message 1,
-answer with message 2 over the same transport, swap the `TransportState`, and fail the connection
-when the selected key is a miss (no Sentinel fallback). Test the successful rotation and the miss
-against the fake server.
+**Why:** the goodbye reasons are only actionable once a close path with a typed reason exists, and
+the unpaired-access switch is a manufacturer decision the host exposes in its own UI; both belong to
+the pairing control surface rather than to the record handling. Removing the record and reporting the
+mismatch do not depend on either, so they ship first.
 
-## 11. `pairing_psk` advertised before the Pairing PSK flow exists
+**Removing it:** add the `client/goodbye` writer with a typed reason and send `unpaired` in
+`Session::handle_unpair` before the close; expose the unpaired-access setting on `ClientConfig`,
+advertise it in `client/hello`, and close an unpaired connection with `pairing_required` when it is
+turned off. Test both on the fake server by asserting the goodbye reason arrives before the close.
 
-**Spec:** `messaging.md`, `client/hello` → `supported_pair_methods`. A client that advertises
-`pairing_psk` MUST be able to run the Pairing PSK flow, and a server may select the method from
-that advertisement.
-
-**What we do:** `client_hello` always sends `supported_pair_methods: {"pairing_psk": {}}`, but the
-client has no `client/pair-init` or `client/pair-auth` handling, no storage trait and no pairing
-PSK. A server that selects the method starts a flow the client cannot answer.
-
-**Why:** the field is part of the hello the extracted client already sends, and pairing is stage 2;
-removing it would change the wire format twice. The advertisement is currently only consistent with
-the guest transport it offers.
-
-**Removing it:** implement the Pairing PSK flow and record storage (stage 2), or stop advertising
-the method until it exists. Test the server's selected method against the fake server either way.
-
-## 12. Scheduled metadata applied immediately
+## 11. Scheduled metadata applied immediately
 
 **Spec:** `messaging.md`, `server/state` → `metadata.timestamp`. The field is the server time at
 which the metadata becomes valid; a client that buffers audio ahead of playout should schedule the
@@ -288,7 +324,7 @@ queue.
 and emit at the mapped deadline. Test a future timestamp, a past one, and a change superseded before
 it becomes valid.
 
-## 13. In-place format change flushes buffered audio
+## 12. In-place format change flushes buffered audio
 
 **Spec:** `messaging.md`, `stream/start`. The server may send it again with a new format to
 reconfigure a running stream.
@@ -305,7 +341,7 @@ offers, and the current consumer's format does not change mid-stream.
 for the old buffer to drain at the switch timestamp, and test a mid-stream change against a sink
 that records the boundary.
 
-## 14. `Sink::underruns()` is not used
+## 13. `Sink::underruns()` is not used
 
 **Spec:** none; this is the design's sink contract (`docs/design/syncspin-design.md`, _Playout
 timing_), which expects underrun counts to feed buffer corrections.
@@ -323,7 +359,7 @@ number into playback would be an unverified control loop.
 `min_buffer_ms` (bounded) when the count rises, and test the reported value against a fake sink that
 returns a fixed count.
 
-## 15. `stream/clear` with `from_timestamp` flushes everything
+## 14. `stream/clear` with `from_timestamp` flushes everything
 
 **Spec:** `messaging.md`, `stream/clear`. A `from_timestamp` asks the client to discard the buffered
 audio from that server time onward and keep what is earlier; an absent timestamp clears everything.
@@ -343,7 +379,7 @@ at a seek, but leaving stale audio buffered would be worse.
 into the session) and discard only frames whose deadline is at or after the mapped timestamp; test a
 clear in the middle of a burst of buffered frames.
 
-## 16. Playout deadlines begin after three clock bursts
+## 15. Playout deadlines begin after three clock bursts
 
 **Spec:** `messaging.md`, _Clock Synchronization_. The client estimates the server clock from bursts
 of `client/time`/`server/time`, one request at a time, and schedules each frame's playout from that
@@ -367,7 +403,7 @@ required earlier, seed the filter from the first three bursts before reporting t
 readiness with an explicit accuracy bound; test deadlines with one, two and three answered
 requests.
 
-## 17. A player volume above 100 is capped, not rejected
+## 16. A player volume above 100 is capped, not rejected
 
 **Spec:** `roles/player/v1.md`, `server/command` player object. `volume` is an integer in the range
 0-100, and `messaging.md` says a field value outside the fixed range its definition gives is a
@@ -389,7 +425,7 @@ belongs with the failure handling that `server/error` and typed protocol errors 
 connection with a protocol-error reason once that path exists, or reject the value at the parser
 with the same effect. Test the closed connection instead of the capped level.
 
-## 18. A transport command before the controller state is not checked
+## 17. A transport command before the controller state is not checked
 
 **Spec:** `roles/controller/v1.md`, `client/command` controller object. `command` MUST be one of
 the values listed in `supported_commands` from the latest controller state the client received in
@@ -409,7 +445,7 @@ closes with the first controller state, which the server sends promptly after ac
 `ControlHandle` query) and let the host disable its buttons until the first state arrives, then
 refuse every command while the set is unknown.
 
-## 19. A reconnect keeps the last known `active_roles`
+## 18. A reconnect keeps the last known `active_roles`
 
 **Spec:** `messaging.md`, `server/activate`. `active_roles` is required on the first activation of a
 connection and persists across later activations that omit it; a client treats a first
@@ -435,7 +471,7 @@ is exactly when a silent player is hardest to notice.
 server to send a conformant activation; test that no `client/state` and no audio follow until it
 does.
 
-## 20. A malformed control message is ignored, not fatal
+## 19. A malformed control message is ignored, not fatal
 
 **Spec:** `messaging.md`, _Communication_ and _Binary Message ID Structure_. A field value in a
 recognized message that is outside the fixed range or length limit its definition gives is a
@@ -446,11 +482,22 @@ not a valid UTF-8 JSON object with a `type` string and a `payload` object is a p
 hands the control kind - id `0` - to `Session::handle_control_message`, which parses it with
 `Incoming::parse`. A body that does not decode is written to stderr and dropped: a truncated
 envelope, JSON that is not an object, and a known `type` whose payload does not deserialize, such as
-`server/command` with `volume: 300`. The session, its clock and its audio continue. Every framing
-rule stays strict: a body that is not valid UTF-8, an empty plaintext, a malformed audio chunk
-header, a bad fragment sequence and an oversize reassembly all end the connection.
+`server/command` with `volume: 300`. The session, its clock and its audio continue. One class is
+exempt: `session::names_pairing_message` reads the envelope's `type` before the payload, and a decode
+failure for one of the five pairing types - `server/pair-init`, `server/pair-auth`,
+`server/pair-confirm`, `server/pair-finalize` and `pair/abort` - closes the connection instead,
+because a half-open pairing attempt must not continue; every other type keeps the lenient path.
+`a_malformed_pairing_message_is_a_protocol_error` pins that exception. Every framing rule stays
+strict: a body that is not valid UTF-8, an empty plaintext, a malformed audio chunk header, a bad
+fragment sequence and an oversize reassembly all end the connection.
 `a_malformed_control_message_is_ignored` pins the lenient path; `a_malformed_audio_header_is_a_protocol_error`
 and the fragmentation tests pin the strict ones.
+
+The leniency covers decode failures only: a message that decodes but is unusable is still a protocol
+error. `session::admits_pairing` returns an error for a `server/activate` that declares the
+`pairing` activity without its `pairing` parameters, which closes the connection instead of
+guessing - the alternative would leave the server waiting for a `client/pair-init` the client never
+sends - and `a_pairing_activity_without_parameters_ends_the_attempt_with_an_error` pins it.
 
 **Why:** the extracted consumer depended on the leniency: one bad field from the server should not
 silence playback, and closing turns a single message into a gap plus a reconnect. A message the

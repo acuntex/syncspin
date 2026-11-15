@@ -262,6 +262,78 @@ fn a_tampered_prologue_fails_the_handshake() {
 }
 
 #[test]
+fn the_transport_carries_the_handshake_hash_both_sides_agree_on() {
+    let server = generate_keypair();
+    let client = Identity::generate();
+    let prologue = prologue(&client, &URL_SAFE_NO_PAD.encode(&server.public));
+
+    let mut first_initiator = initiator(&server, &client.public, &prologue);
+    let mut responder = Responder::new(&client, &prologue).expect("build the responder");
+    let message_1 = write(&mut first_initiator, handshake_metadata().as_bytes());
+    responder.read_message(&message_1).expect("read message 1");
+    let message_2 = responder.write_message().expect("write message 2");
+    assert_eq!(read(&mut first_initiator, &message_2), b"{}");
+
+    // `h` is final once message 2 is processed, and both sides must hold the same 32 bytes.
+    let initiator_hash: [u8; 32] = first_initiator
+        .get_handshake_hash()
+        .try_into()
+        .expect("SHA-256 produces 32 bytes");
+    let mut transport = responder.into_transport().expect("the handshake finishes");
+    assert_eq!(
+        transport.handshake_hash(),
+        &initiator_hash,
+        "a re-handshake would mix in a hash the peer does not share"
+    );
+    assert_ne!(transport.handshake_hash(), &[0u8; 32]);
+
+    // Transport traffic does not move the handshake hash.
+    let mut first_transport = first_initiator
+        .into_transport_mode()
+        .expect("the initiator finishes");
+    let ciphertext = transport.encrypt(b"a message").expect("encrypt");
+    let mut plaintext = vec![0u8; MAX_MESSAGE_LEN];
+    first_transport
+        .read_message(&ciphertext, &mut plaintext)
+        .expect("decrypt");
+    assert_eq!(transport.handshake_hash(), &initiator_hash);
+
+    // A second handshake that uses `h` as its prologue completes and produces a different hash,
+    // which is the property a re-handshake relies on.
+    let mut second_initiator = initiator(&server, &client.public, &initiator_hash);
+    let peer: [u8; 32] = server
+        .public
+        .clone()
+        .try_into()
+        .expect("an X25519 public key is 32 bytes");
+    let mut second_responder = Responder::with_peer(&client, &peer, &initiator_hash)
+        .expect("build the responder on the previous hash");
+    let metadata = handshake_metadata();
+    let message_1 = write(&mut second_initiator, metadata.as_bytes());
+    assert_eq!(
+        second_responder
+            .read_message(&message_1)
+            .expect("read message 1"),
+        metadata.as_bytes()
+    );
+    let message_2 = second_responder.write_message().expect("write message 2");
+    assert_eq!(read(&mut second_initiator, &message_2), b"{}");
+    let second_hash = *second_responder
+        .into_transport()
+        .expect("the second handshake finishes")
+        .handshake_hash();
+    assert_ne!(
+        second_hash, initiator_hash,
+        "a re-handshake must derive a new handshake hash"
+    );
+    let second_peer_hash: [u8; 32] = second_initiator
+        .get_handshake_hash()
+        .try_into()
+        .expect("SHA-256 produces 32 bytes");
+    assert_eq!(second_hash, second_peer_hash);
+}
+
+#[test]
 fn into_transport_before_the_handshake_fails() {
     let server = generate_keypair();
     let client = Identity::generate();

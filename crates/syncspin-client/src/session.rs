@@ -5,9 +5,18 @@
 //! messages travel as cleartext text, and every application message is a Noise transport message.
 //! A server that does not start the handshake times out; there is no plaintext path to fall back
 //! to.
+//!
+//! The server may repeat the Noise handshake inside the encrypted channel to rotate the session
+//! keys; that second handshake keeps the WebSocket, the open stream, the buffered audio and the
+//! clock estimate, and changes nothing but the keys and the pairing index. See
+//! `Session::begin_rehandshake`.
 
 use std::future::pending;
+#[cfg(feature = "pairing-code")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(feature = "pairing-code")]
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -25,24 +34,43 @@ use syncspin_core::framing::{
     encode_binary, Reassembler, BINARY_MESSAGE_ID_JSON, MAX_REASSEMBLED_LEN,
 };
 use syncspin_core::messages::{
-    AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientState, ClientTime,
-    ControllerCommand, DeviceInfo, Incoming, NoiseHandshake, PairingPskMethod, PlayerState,
-    PlayerSupport, ServerActivate, ServerCommand, ServerState, ServerTime, StreamClear,
-    StreamStart, SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID,
-    NOISE_SUITE, PROTOCOL_VERSION,
+    AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientPairFinalize, ClientPairInit,
+    ClientState, ClientTime, ControllerCommand, DeviceInfo, Incoming, NoiseHandshake, PairAbort,
+    PairingActivation, PairingPskMethod, PlayerState, PlayerSupport, ServerActivate, ServerCommand,
+    ServerState, ServerTime, StreamClear, StreamStart, SupportedFormat, SupportedPairMethods,
+    UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
+};
+#[cfg(feature = "pairing-code")]
+use syncspin_core::messages::{
+    ClientPairAuth, ClientPairConfirm, ClientPairPending, ClientPairRetry,
+    DynamicPairingCodeMethod, ServerPairAuth, ServerPairConfirm, ServerPairInit,
+    StaticPairingCodeMethod,
 };
 use syncspin_core::noise::{
     psk_id_for, Responder, TransportState as NoiseTransport, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
+#[cfg(feature = "pairing-code")]
+use syncspin_core::pairing::pake::TAG_LEN;
 
 use crate::client::{
-    check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, PlaybackState,
-    StreamEndReason, NORMAL_PLAYBACK_SPEED,
+    check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, PairingFailure,
+    PairingRequiredReason, PlaybackState, StreamEndReason, NORMAL_PLAYBACK_SPEED,
 };
+#[cfg(feature = "pairing-code")]
+use crate::config::CodeFormat;
 use crate::config::{AudioMode, ClientConfig, PskCategory, StoredPsk};
+#[cfg(feature = "pairing-code")]
+use crate::pairing::{
+    pake_sid, TagOutcome, METHOD_DYNAMIC_PAIRING_CODE, METHOD_STATIC_PAIRING_CODE,
+};
+use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_PAIRING_PSK};
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
+use crate::storage::persist_pairing;
 
 /// How long the Noise handshake may take, from `client/init` to the first `server/activate`.
+///
+/// The same bound applies to a re-handshake: from the moment message 2 puts the new keys in place,
+/// the server has this long to send the activation they belong to.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of `client/time` round trips in one clock-sync burst.
@@ -94,8 +122,38 @@ const SUPPORTED_BIT_DEPTH: u8 = 16;
 /// Length of a canonical unpadded base64url key id.
 const PSK_ID_LEN: usize = 43;
 
+/// How many failed key confirmations one pairing window admits.
+///
+/// `pairing.md`: the window closes on its fifth failed attempt, where a failure is the client's
+/// verification of `server_kc`. Any other way an attempt ends leaves the window open.
+#[cfg(feature = "pairing-code")]
+const WINDOW_FAILURE_LIMIT: u8 = 5;
+
+/// How many rounds the Dynamic Pairing Code Flow runs without a verified `server_kc`.
+///
+/// `pairing.md`: after twenty rounds since the last verified `server_kc`, the client MUST abort
+/// instead of retrying, and holds further attempts back until a deliberate operator action. The
+/// count is per process, not per server, so it lives beside the connection rather than in it.
+#[cfg(feature = "pairing-code")]
+const ROUND_LIMIT: u32 = 20;
+
 /// Player commands this client accepts from the server.
 const PLAYER_COMMANDS: [&str; 2] = ["volume", "mute"];
+
+/// Control message types that belong to pairing, whose malformed form is a protocol error.
+///
+/// `pairing.md` treats a malformed or missing pairing field as a protocol error: the connection
+/// closes without an application-level message and nothing is persisted. Every other malformed
+/// control message keeps the lenient path, because one bad optional field must not silence
+/// playback. `server/pair-init` belongs to the dynamic flow; the client's own `client/pair-retry`
+/// never arrives, so it needs no entry here.
+const PAIRING_MESSAGE_TYPES: [&str; 5] = [
+    "server/pair-init",
+    "server/pair-auth",
+    "server/pair-confirm",
+    "server/pair-finalize",
+    "pair/abort",
+];
 
 /// An established WebSocket connection to a server.
 ///
@@ -173,7 +231,71 @@ struct Ready {
     transport: Transport,
     noise: NoiseTransport,
     server_id: String,
+    /// Roles the first `server/activate` declares, with the previous set when it omits them.
     active_roles: Vec<String>,
+    /// The first `server/activate` itself, applied by the session once it is running.
+    activate: ServerActivate,
+    /// Which key sealed the handshake, which decides the pairing methods this connection allows.
+    matched: MatchedPsk,
+    /// Whether the handshake fell back to the Sentinel key although the server named another
+    /// credential, which is the server's authenticated credential-mismatch signal.
+    credential_mismatch: bool,
+}
+
+/// A re-handshake whose keys are already in place, waiting for its activation.
+///
+/// The client is the responder, as in the initial handshake, but the two `noise/handshake`
+/// messages travel inside the encrypted channel: message 1 arrives under the keys in force,
+/// message 2 goes back the same way, and the keys change as soon as it is written. This window
+/// spans the gap between those new keys and the `server/activate` that must be their first
+/// message; while it is open the client sends no application message and acts on none.
+struct Rehandshake {
+    /// The keys of the previous handshake, kept only to recognise and discard a message the server
+    /// sent before it processed message 2. Dropped when the activation ends the window.
+    previous: NoiseTransport,
+    /// Deadline for the activation under the new keys.
+    deadline: Instant,
+}
+
+/// The pairing window of this connection.
+///
+/// The window belongs to the connection that carried its opening gesture: it is opened by a
+/// [`ControlHandle`](crate::ControlHandle) request on that connection and closes when the session
+/// ends, so it can never admit an attempt on a later connection. The lifetime runs from the
+/// gesture without pausing during attempts, and the fifth failed key confirmation closes it too.
+#[cfg(feature = "pairing-code")]
+struct PairingWindow {
+    /// When the operator's gesture opened the window.
+    opened: Instant,
+    /// Failed `server_kc` verifications this window has seen.
+    failed_attempts: u8,
+}
+
+/// A code-flow activation whose attempt waits for an operator gesture or a released hold-back.
+///
+/// `client/pair-pending` is on the wire and no attempt is running: the timeout starts with
+/// `client/pair-init`, so a server that waits for the gesture is not racing it.
+#[cfg(feature = "pairing-code")]
+struct PendingPairing {
+    /// The pairing index its activation gave `client/pair-init`.
+    pairing_index: u32,
+    /// The method whose gesture releases the attempt.
+    method: AdmittedMethod,
+    /// The emission format the dynamic flow was activated with; `None` for the static flow.
+    format: Option<CodeFormat>,
+}
+
+/// The pairing methods an activation can admit on this connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmittedMethod {
+    /// The Pairing PSK flow.
+    PairingPsk,
+    /// The Static Pairing Code flow.
+    #[cfg(feature = "pairing-code")]
+    StaticCode,
+    /// The Dynamic Pairing Code flow.
+    #[cfg(feature = "pairing-code")]
+    DynamicCode,
 }
 
 /// State a connection keeps across attempts.
@@ -188,12 +310,22 @@ pub(crate) struct Carried {
     pub(crate) muted: bool,
     /// Roles the last session had active.
     pub(crate) active_roles: Vec<String>,
+    /// Failed dynamic pairing rounds since the last verified `server_kc`.
+    ///
+    /// The count belongs to the process, not to the connection: `pairing.md` does not partition it
+    /// by server, and a reconnect must not reset it. Only a verified `server_kc` or
+    /// [`ControlHandle::release_holdback`](crate::ControlHandle::release_holdback) resets it.
+    #[cfg(feature = "pairing-code")]
+    pub(crate) failed_rounds: Arc<AtomicU32>,
 }
 
 /// How one connection attempt ended.
+#[derive(Debug)]
 pub(crate) enum Ending {
     /// The server closed the connection.
     Closed,
+    /// The server dropped this client's pairing record, so the client ended the connection.
+    Unpaired,
     /// The attempt failed.
     Failed(anyhow::Error),
 }
@@ -203,6 +335,7 @@ impl Ending {
     pub(crate) fn reason(&self) -> String {
         match self {
             Self::Closed => "the server closed the connection".to_owned(),
+            Self::Unpaired => "the server dropped this client's pairing record".to_owned(),
             Self::Failed(error) => format!("{error:#}"),
         }
     }
@@ -293,6 +426,46 @@ pub(crate) struct Session<'a> {
     /// Controller commands the server last advertised, or `None` before its first controller
     /// state.
     controller_commands: Option<Vec<String>>,
+    /// Static public key of the server this connection talks to.
+    server_id: String,
+    /// Which key sealed the handshake.
+    matched: MatchedPsk,
+    /// A pairing requirement this connection still has to report, or `None` once it has.
+    ///
+    /// The handshake decides it once, but the spec's rule is about the event: a host must see one
+    /// [`Event::PairingRequired`] per connection, not one per frame. Taking the value is what makes
+    /// a second report impossible.
+    pairing_required: Option<PairingRequiredReason>,
+    /// Why this connection has to end after the current wake-up, when a handler ended it instead of
+    /// the peer. `serve` returns it on its next iteration.
+    ending: Option<Ending>,
+    /// The keys this connection may seal a re-handshake with, and the records a pairing completed
+    /// on this connection adds to them.
+    candidates: Candidates,
+    /// Pairing `server/activate` messages received since the last handshake, the `pairing_index` a
+    /// `client/pair-init` carries.
+    pairing_index: u32,
+    /// The pairing attempt in progress, or `None` when this connection is not pairing.
+    pairing: Option<PairingAttempt>,
+    /// Whether an attempt ended under the current activation, so its late messages are discarded.
+    ///
+    /// `pairing: None` means one of two things: no attempt was admitted since the last activation
+    /// (a pairing message out of sequence is a protocol error), or an attempt ended and messages
+    /// still in flight must be ignored until the next `server/activate` (the spec's silent-discard
+    /// rule). This flag is what tells them apart. `apply_activate` and a re-handshake clear it.
+    discarding_pairing_messages: bool,
+    /// The pairing window the operator opened on this connection, or `None` when it is closed.
+    #[cfg(feature = "pairing-code")]
+    pairing_window: Option<PairingWindow>,
+    /// A code-flow activation whose attempt waits for an operator gesture.
+    #[cfg(feature = "pairing-code")]
+    pending_pairing: Option<PendingPairing>,
+    /// Failed dynamic pairing rounds since the last verified `server_kc`, shared by the process.
+    #[cfg(feature = "pairing-code")]
+    failed_rounds: Arc<AtomicU32>,
+    /// A re-handshake whose new keys are in place, or `None` when the connection is not switching
+    /// keys.
+    rehandshake: Option<Rehandshake>,
 }
 
 /// Runs one connection attempt: the handshake, then the session loop.
@@ -306,12 +479,28 @@ pub(crate) async fn attempt(
     config: &ClientConfig,
     events: &mpsc::UnboundedSender<Event>,
     psks: &[StoredPsk],
+    pairing_psk: Option<PairingPsk>,
     reported_volume: &AtomicU8,
     carried: Carried,
 ) -> Attempt {
+    // The store's records are read for every attempt, so a record a completed pairing wrote is a
+    // candidate for the next connection. A store that cannot be read fails this attempt rather
+    // than letting the handshake continue with fewer keys.
+    let candidates = match Candidates::load(config.storage.as_deref(), psks, pairing_psk) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            return Attempt {
+                carried,
+                connected: false,
+                sink_failed: false,
+                ending: Ending::Failed(error),
+            };
+        }
+    };
+
     let handshake = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        handshake(transport, config, psks, &carried.active_roles),
+        handshake(transport, config, &candidates, &carried.active_roles),
     )
     .await;
     let ready = match handshake {
@@ -353,6 +542,23 @@ pub(crate) async fn attempt(
         muted: carried.muted,
         sink_failed: false,
         controller_commands: None,
+        server_id: ready.server_id.clone(),
+        matched: ready.matched,
+        pairing_required: ready
+            .credential_mismatch
+            .then_some(PairingRequiredReason::CredentialMismatch),
+        ending: None,
+        candidates,
+        pairing_index: 0,
+        pairing: None,
+        discarding_pairing_messages: false,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: None,
+        #[cfg(feature = "pairing-code")]
+        pending_pairing: None,
+        #[cfg(feature = "pairing-code")]
+        failed_rounds: carried.failed_rounds,
+        rehandshake: None,
     };
     session.publish_volume();
 
@@ -360,13 +566,23 @@ pub(crate) async fn attempt(
         server_id: ready.server_id,
         encrypted: true,
     });
-    if session.player_active() {
+    // The handshake's credential decision reaches the host before anything the session does with
+    // it, and exactly once per connection.
+    session.report_pairing_required();
+
+    // The handshake consumed the first activation; it is applied here, now that the session can
+    // answer it. A pairing activation in it starts the attempt just as a later one does.
+    let prepared = session.apply_activate(ready.activate).await;
+    if prepared.is_ok() && session.player_active() {
         session.start_burst();
     }
 
-    let ending = match session.serve().await {
-        Ok(()) => Ending::Closed,
+    let ending = match prepared {
         Err(error) => Ending::Failed(error),
+        Ok(()) => match session.serve().await {
+            Ok(ending) => ending,
+            Err(error) => Ending::Failed(error),
+        },
     };
     let sink_failed = session.sink_failed;
     let carried = session.into_carried();
@@ -387,26 +603,43 @@ impl Session<'_> {
             volume: self.volume,
             muted: self.muted,
             active_roles: self.active_roles,
+            #[cfg(feature = "pairing-code")]
+            failed_rounds: self.failed_rounds,
         }
     }
 
     /// Reads, dispatches and delivers until the connection ends.
-    async fn serve(&mut self) -> Result<()> {
+    async fn serve(&mut self) -> Result<Ending> {
         loop {
             if self.events.is_closed() {
-                return Ok(());
+                return Ok(Ending::Closed);
+            }
+            // A handler that ends the connection - `server/unpair` is the only one today - set the
+            // reason while the frame was dispatched; the connection is closed here.
+            if let Some(ending) = self.ending.take() {
+                return Ok(ending);
             }
 
-            self.drive_clock().await?;
+            // A re-handshake suspends the clock work: no application message may be sent until the
+            // new activation arrives, so a burst is not started and no request is put on the wire.
+            if self.rehandshake.is_none() {
+                self.drive_clock().await?;
+            }
 
             // While a request is on the wire the read has its reply deadline; the overall burst
-            // deadline is the backstop. Any other frame still arrives normally, and a control
-            // request is served between frames.
-            let deadline = match (self.reply_deadline, self.burst_deadline) {
-                (Some(reply), Some(burst)) => Some(reply.min(burst)),
-                (Some(reply), None) => Some(reply),
-                (None, Some(burst)) => Some(burst),
-                (None, None) => None,
+            // deadline and the pairing attempt's deadline are the backstops. Any other frame still
+            // arrives normally, and a control request is served between frames. A re-handshake
+            // replaces all of them with its own deadline for the activation.
+            let deadline = match &self.rehandshake {
+                Some(window) => Some(window.deadline),
+                None => [
+                    self.reply_deadline,
+                    self.burst_deadline,
+                    self.pairing_deadline(),
+                ]
+                .into_iter()
+                .flatten()
+                .min(),
             };
 
             // The control receiver outlives individual handles: dropping the last one disables the
@@ -438,10 +671,17 @@ impl Session<'_> {
                     }
                     // The caller turns the end into a Disconnected event and schedules the next
                     // attempt, so the sink, the level and the roles survive the drop.
-                    SocketMessage::Closed => return Ok(()),
+                    SocketMessage::Closed => return Ok(Ending::Closed),
                     SocketMessage::Binary(ciphertext) => self.receive(&ciphertext).await?,
                 },
-                Wakeup::Clock => self.handle_clock_timeout().await?,
+                Wakeup::Clock => {
+                    if self.rehandshake.is_some() {
+                        // The server must send its activation under the new keys; staying silent
+                        // leaves the client with no channel it may use.
+                        bail!("timed out waiting for the server/activate of a re-handshake")
+                    }
+                    self.handle_clock_timeout().await?;
+                }
             }
         }
     }
@@ -499,11 +739,19 @@ impl Session<'_> {
         self.burst_samples.clear();
     }
 
-    /// Handles the deadline that fired while waiting for a reply.
+    /// Handles a deadline that fired while the session was waiting.
     ///
-    /// A per-message timeout moves the burst on to its next request; when the last request has no
-    /// reply, or the overall burst deadline elapsed, the burst ends with the measurements it has.
+    /// A per-message clock timeout moves the burst on to its next request; when the last request
+    /// has no reply, or the overall burst deadline elapsed, the burst ends with the measurements it
+    /// has. The pairing attempt's timeout is checked first, because it ends the attempt instead of
+    /// continuing it.
     async fn handle_clock_timeout(&mut self) -> Result<()> {
+        if self
+            .pairing_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            return self.abort_pairing(PairingFailure::AttemptTimeout).await;
+        }
         let burst_expired = self
             .burst_deadline
             .is_some_and(|deadline| deadline <= Instant::now());
@@ -535,11 +783,31 @@ impl Session<'_> {
     }
 
     /// Decrypts one transport message and dispatches the message it carries.
+    ///
+    /// While a re-handshake waits for its activation, the only message the client may act on is
+    /// that activation. A message that still authenticates under the previous keys was sent by the
+    /// server before it processed message 2: the spec allows discarding it, and it must not end a
+    /// connection that is otherwise fine.
     async fn receive(&mut self, ciphertext: &[u8]) -> Result<()> {
-        let plaintext = self.noise.decrypt(ciphertext)?;
+        let plaintext = match self.noise.decrypt(ciphertext) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                let tolerated = self
+                    .rehandshake
+                    .as_mut()
+                    .is_some_and(|window| window.previous.decrypt(ciphertext).is_ok());
+                if tolerated {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
         let Some((id, body)) = self.reassembler.push(&plaintext)? else {
             return Ok(());
         };
+        if self.rehandshake.is_some() {
+            return self.handle_activation_message(id, &body).await;
+        }
         // The kind of the message decides how strict the dispatch is: a control message that does
         // not decode is ignored, while a malformed audio chunk stays a protocol error.
         match MessageKind::of(id) {
@@ -550,21 +818,53 @@ impl Session<'_> {
         }
     }
 
+    /// Acts on the one message a re-handshake window admits: its `server/activate`.
+    ///
+    /// The spec makes that activation the server's first message under the new keys and forbids
+    /// every other application message until it arrives, so anything else ends the attempt. The
+    /// failure is silent on the wire, like every other handshake failure.
+    async fn handle_activation_message(&mut self, id: u8, body: &[u8]) -> Result<()> {
+        if id != BINARY_MESSAGE_ID_JSON {
+            bail!("the server sent a non-control message instead of activating a re-handshake")
+        }
+        let text = std::str::from_utf8(body).context("decrypted JSON is not valid UTF-8")?;
+        match Incoming::parse(text) {
+            Ok(Some(Incoming::ServerActivate(activate))) => self.finish_rehandshake(activate).await,
+            Ok(_) => {
+                bail!("the server sent an application message before activating a re-handshake")
+            }
+            Err(error) => {
+                bail!(
+                    "the server sent a malformed message before activating a re-handshake: {error}"
+                )
+            }
+        }
+    }
+
     /// Dispatches one decrypted control or state message.
     ///
     /// A `type` this revision does not implement is ignored, as the protocol requires. A message
     /// that does not decode is ignored as well, with a line on stderr, instead of ending the
     /// session: one malformed field must not silence playback, and a message the client cannot
     /// decode carries nothing it could act on. The audio path keeps the strict rule - a malformed
-    /// chunk header is a protocol error. See `docs/spec-deviations.md`, entry 20.
+    /// chunk header is a protocol error. See `docs/spec-deviations.md`, entry 19.
     ///
     /// A body that is not valid UTF-8 is a framing error and still closes the connection.
     async fn handle_control_message(&mut self, body: &[u8]) -> Result<()> {
         let text = std::str::from_utf8(body).context("decrypted JSON is not valid UTF-8")?;
         match Incoming::parse(text) {
             Ok(None) => Ok(()), // A type this revision does not implement is ignored.
+            // `noise/handshake` inside the transport is the server starting a re-handshake.
+            Ok(Some(Incoming::NoiseHandshake(handshake))) => {
+                self.begin_rehandshake(handshake).await
+            }
             Ok(Some(message)) => self.dispatch(message).await,
             Err(error) => {
+                if names_pairing_message(text) {
+                    // A pairing message that does not decode is a protocol error: the flow cannot
+                    // continue without the field, and ignoring it would leave a half-open attempt.
+                    return Err(error.into());
+                }
                 eprintln!("ignoring a malformed control message: {error}");
                 Ok(())
             }
@@ -586,13 +886,116 @@ impl Session<'_> {
             Incoming::StreamEnd(_) => self.stop_stream(StreamEndReason::End),
             Incoming::StreamClear(clear) if !affects_player(clear.roles.as_deref()) => Ok(()),
             Incoming::StreamClear(clear) => self.handle_stream_clear(clear),
+            Incoming::ServerPairFinalize(_) => self.confirm_pairing(),
+            Incoming::ServerUnpair(_) => self.handle_unpair(),
+            Incoming::PairAbort(abort) => self.handle_pairing_abort(abort),
+            #[cfg(feature = "pairing-code")]
+            Incoming::ServerPairInit(init) => self.handle_server_init(init).await,
+            #[cfg(feature = "pairing-code")]
+            Incoming::ServerPairAuth(auth) => self.handle_server_auth(auth).await,
+            #[cfg(feature = "pairing-code")]
+            Incoming::ServerPairConfirm(confirm) => self.handle_server_confirm(confirm).await,
             // A message for a role or direction this client does not act on.
             _ => Ok(()),
         }
     }
 
-    /// Applies a `server/activate`: role changes, stream teardown and state reporting.
+    /// Starts the in-band re-handshake a `noise/handshake` message 1 announces.
+    ///
+    /// The new handshake's prologue is the hash of the handshake that established the current keys,
+    /// and the client answers with message 2 without waiting for anything: both messages travel
+    /// inside the channel the previous keys encrypt, and no init exchange is repeated. The new keys
+    /// take over as soon as message 2 is written; from then until the `server/activate` that must
+    /// follow, the client sends no application message and acts on none.
+    ///
+    /// A key none of the candidates matches ends the connection: a re-handshake has no Sentinel
+    /// fallback, because falling back would silently drop the pairing the previous handshake
+    /// authenticated. The failure is silent on the wire, like every other handshake failure.
+    async fn begin_rehandshake(&mut self, handshake: NoiseHandshake) -> Result<()> {
+        if self.rehandshake.is_some() {
+            bail!("the server started a second Noise handshake before the first was activated");
+        }
+        let message_1 = URL_SAFE_NO_PAD
+            .decode(&handshake.data)
+            .context("noise/handshake data is not unpadded base64url")?;
+        let peer = decode_server_key(&self.server_id)?;
+        let prologue = *self.noise.handshake_hash();
+        let mut responder = Responder::with_peer(&self.config.identity, &peer, &prologue)?;
+        let metadata_payload = responder
+            .read_message(&message_1)
+            .context("failed to read Noise re-handshake message 1")?;
+        let metadata = PskMetadata::parse(&metadata_payload)?;
+        let selected = select_psk(&metadata, &self.candidates, &self.server_id, false)?;
+        responder.set_psk(&selected.psk)?;
+
+        // Message 2 is the last message the client sends under the previous keys.
+        let message_2 = Incoming::NoiseHandshake(NoiseHandshake {
+            data: URL_SAFE_NO_PAD.encode(responder.write_message()?),
+        });
+        self.send_json(&message_2).await?;
+        let previous = std::mem::replace(&mut self.noise, responder.into_transport()?);
+
+        // The burst belonged to the previous keys. The estimate itself stays: suspension only drops
+        // the requests in flight, so playout deadlines keep their meaning across the swap.
+        self.suspend_burst();
+        // The index counts pairing activations since the last handshake, and this is a new one.
+        self.pairing_index = 0;
+        self.matched = selected.matched;
+        self.discarding_pairing_messages = false;
+        // An attempt belongs to the activation and the `h` that admitted it; the new handshake gives
+        // both a new value, so the attempt and anything it was holding for are discarded. A server
+        // that still wants to pair admits a new attempt under the new keys.
+        self.pairing = None;
+        #[cfg(feature = "pairing-code")]
+        {
+            self.pending_pairing = None;
+        }
+        self.rehandshake = Some(Rehandshake {
+            previous,
+            deadline: Instant::now() + HANDSHAKE_TIMEOUT,
+        });
+        Ok(())
+    }
+
+    /// Ends a re-handshake with the server's first activation under the new keys.
+    async fn finish_rehandshake(&mut self, activate: ServerActivate) -> Result<()> {
+        self.rehandshake = None;
+        self.apply_activate(activate).await
+    }
+
+    /// Drops the run of clock requests while keeping the estimate they produced.
+    ///
+    /// Used whenever the connection has to stop sending for a moment: removing the player role and
+    /// swapping session keys both cancel the requests an older state put on the wire.
+    fn suspend_burst(&mut self) {
+        self.sync_remaining = 0;
+        self.burst_deadline = None;
+        self.reply_deadline = None;
+        self.outstanding_sent_us = None;
+        self.burst_samples.clear();
+    }
+
+    /// Applies a `server/activate`: role changes, stream teardown, pairing and state reporting.
+    ///
+    /// An activation that adds the `pairing` activity admits one pairing attempt; one that does not
+    /// cancels the attempt in progress and persists nothing, which is how the spec lets a server
+    /// end a pairing without finalizing it.
     async fn apply_activate(&mut self, activate: ServerActivate) -> Result<()> {
+        // Every activation starts a new regime: messages from an attempt that ended before it are
+        // stale, and a new attempt has not started yet.
+        self.discarding_pairing_messages = false;
+        let pairing = admits_pairing(&activate)?;
+        if pairing.is_none() {
+            // A cancelling activation discards the attempt and anything it already received. An
+            // attempt that existed may still have messages on the wire, and those are discarded;
+            // with no attempt at all, a pairing message is a sequence violation.
+            self.discarding_pairing_messages = self.pairing.take().is_some();
+            #[cfg(feature = "pairing-code")]
+            {
+                self.pending_pairing = None;
+            }
+        }
+
         let had_player = self.player_active();
         if let Some(roles) = activate.active_roles {
             self.active_roles = roles;
@@ -602,11 +1005,7 @@ impl Session<'_> {
         if had_player && !has_player {
             // The player role is gone: nothing that is still buffered may become audible.
             self.state_sent = false;
-            self.sync_remaining = 0;
-            self.burst_deadline = None;
-            self.reply_deadline = None;
-            self.outstanding_sent_us = None;
-            self.burst_samples.clear();
+            self.suspend_burst();
             self.stop_stream(StreamEndReason::RoleRemoved)?;
         } else if !had_player && has_player {
             // A re-added role reports itself again, from the existing estimate when there is one.
@@ -616,7 +1015,575 @@ impl Session<'_> {
                 self.start_burst();
             }
         }
+
+        if let Some(activation) = pairing {
+            // Each pairing activation gets its own index, so a server can discard an attempt that
+            // belongs to a superseded activation.
+            self.pairing_index = self.pairing_index.saturating_add(1);
+            self.start_pairing(activation).await?;
+        }
         Ok(())
+    }
+
+    /// The deadline of the pairing attempt in progress, for the session's wait.
+    fn pairing_deadline(&self) -> Option<Instant> {
+        self.pairing.as_ref().map(|attempt| attempt.deadline)
+    }
+
+    /// The method an activation may run on this connection, or `None` when it is inadmissible.
+    ///
+    /// The Pairing PSK method needs a store and is admissible only on a connection the pairing PSK
+    /// sealed. The static code needs a configured code and a store for the record it produces. The
+    /// dynamic code needs the formats and out-channels the host advertised, the emission format the
+    /// server picked among them, and a store as well. Both code methods are admissible only while
+    /// the connection is *not* keyed by the pairing PSK - the spec's invariant, since a code round
+    /// authenticates a Sentinel-keyed or long-term-keyed channel.
+    fn admitted_method(&self, activation: &PairingActivation) -> Option<AdmittedMethod> {
+        match activation.method.as_str() {
+            METHOD_PAIRING_PSK => (self.config.storage.is_some()
+                && self.matched == MatchedPsk::PairingPsk)
+                .then_some(AdmittedMethod::PairingPsk),
+            #[cfg(feature = "pairing-code")]
+            METHOD_STATIC_PAIRING_CODE => (self.config.storage.is_some()
+                && self.config.static_pairing_code.is_some()
+                && self.matched != MatchedPsk::PairingPsk
+                && activation.format.is_none())
+            .then_some(AdmittedMethod::StaticCode),
+            #[cfg(feature = "pairing-code")]
+            METHOD_DYNAMIC_PAIRING_CODE => (self.config.storage.is_some()
+                && self.matched != MatchedPsk::PairingPsk
+                && self.dynamic_format(activation).is_some())
+            .then_some(AdmittedMethod::DynamicCode),
+            _ => None,
+        }
+    }
+
+    /// The emission format an activation selected, when the client offers it.
+    ///
+    /// A method the client would offer with formats but no channel is refused here too: the
+    /// protocol treats such a descriptor as unrecognized, so no server should have picked it, and
+    /// a client that runs it anyway would emit a code nowhere.
+    #[cfg(feature = "pairing-code")]
+    fn dynamic_format(&self, activation: &PairingActivation) -> Option<CodeFormat> {
+        if self.config.code_out_channels.is_empty() || self.config.code_formats.is_empty() {
+            return None;
+        }
+        let format = CodeFormat::from_wire(activation.format.as_deref()?)?;
+        self.config.code_formats.contains(&format).then_some(format)
+    }
+
+    /// Whether the pairing window of this connection is open right now.
+    ///
+    /// An expired window closes silently, as the spec requires; expiry is noticed here rather than
+    /// by a timer, because the only thing it changes is whether a future attempt may start. An
+    /// attempt already in progress runs to its own end either way.
+    #[cfg(feature = "pairing-code")]
+    fn window_is_open(&mut self) -> bool {
+        let expired = self
+            .pairing_window
+            .as_ref()
+            .is_some_and(|window| window.opened.elapsed() >= self.config.pairing_window);
+        if expired {
+            self.pairing_window = None;
+        }
+        self.pairing_window.is_some()
+    }
+
+    /// Counts a failed `server_kc` verification against the window, closing it at the limit.
+    #[cfg(feature = "pairing-code")]
+    fn record_window_failure(&mut self) {
+        if !self.window_is_open() {
+            return;
+        }
+        let window = self
+            .pairing_window
+            .as_mut()
+            .expect("the window was just found open");
+        window.failed_attempts = window.failed_attempts.saturating_add(1);
+        if window.failed_attempts >= WINDOW_FAILURE_LIMIT {
+            self.pairing_window = None;
+        }
+    }
+
+    /// Whether the dynamic flow's round limit holds new attempts back.
+    #[cfg(feature = "pairing-code")]
+    fn rounds_are_exhausted(&self) -> bool {
+        self.failed_rounds.load(Ordering::SeqCst) >= ROUND_LIMIT
+    }
+
+    /// The rounds counted since the last verified `server_kc`.
+    #[cfg(feature = "pairing-code")]
+    fn failed_rounds(&self) -> u32 {
+        self.failed_rounds.load(Ordering::SeqCst)
+    }
+
+    /// Counts one dynamic round that began, returning the count after it.
+    ///
+    /// A round counts from the moment the code is emitted, so an attempt that ends later - by a
+    /// cancelling activation, a timeout or a failed key confirmation - leaves its round counted.
+    /// That is what stops a peer from starting rounds forever without ever confirming one.
+    #[cfg(feature = "pairing-code")]
+    fn record_round(&self) -> u32 {
+        self.failed_rounds.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Opens a pairing window for the connection, and starts the attempt that was waiting for it.
+    ///
+    /// The gesture belongs to the host; this only records the window and, when a static-code
+    /// activation is already pending, sends the `client/pair-init` it was holding back. A fresh
+    /// gesture starts a fresh window: its lifetime runs from now and its failure count is its own,
+    /// so an operator can deliberately try again after five failures.
+    #[cfg(feature = "pairing-code")]
+    async fn open_pairing_window(&mut self) -> Result<()> {
+        self.pairing_window = Some(PairingWindow {
+            opened: Instant::now(),
+            failed_attempts: 0,
+        });
+        self.start_pending(AdmittedMethod::StaticCode).await
+    }
+
+    /// Releases the dynamic flow's round limit and starts the attempt it held back.
+    ///
+    /// The count is per process, so the operator action also clears it without a connection; this
+    /// is the session's half, for a gesture that arrives while one is established.
+    #[cfg(feature = "pairing-code")]
+    async fn release_holdback(&mut self) -> Result<()> {
+        self.failed_rounds.store(0, Ordering::SeqCst);
+        self.start_pending(AdmittedMethod::DynamicCode).await
+    }
+
+    /// Starts the held-back activation whose method is `method`, if one is waiting.
+    #[cfg(feature = "pairing-code")]
+    async fn start_pending(&mut self, method: AdmittedMethod) -> Result<()> {
+        let Some(pending) = self.pending_pairing.take() else {
+            return Ok(());
+        };
+        if pending.method != method {
+            // The gesture belongs to the other method: the activation keeps waiting for its own.
+            self.pending_pairing = Some(pending);
+            return Ok(());
+        }
+        if self.pairing.is_some() {
+            // An activation that superseded the pending one owns the attempt now.
+            return Ok(());
+        }
+        self.start_code_attempt(pending.pairing_index, pending.method, pending.format)
+            .await
+    }
+
+    /// Sends `client/pair-init` and starts the attempt whose timeout runs from it.
+    #[cfg(feature = "pairing-code")]
+    async fn start_code_attempt(
+        &mut self,
+        pairing_index: u32,
+        method: AdmittedMethod,
+        format: Option<CodeFormat>,
+    ) -> Result<()> {
+        let attempt = match method {
+            AdmittedMethod::StaticCode => PairingAttempt::static_code(
+                pairing_index,
+                self.config.pairing_timeout,
+                self.candidates.pairing(),
+            ),
+            AdmittedMethod::DynamicCode => {
+                let Some(format) = format else {
+                    // The activation decided the format; without one no code can be derived, and
+                    // starting an attempt that cannot emit would only waste the operator's time.
+                    return self.abort_pairing(PairingFailure::MethodNotSupported).await;
+                };
+                PairingAttempt::dynamic_code(
+                    pairing_index,
+                    self.config.pairing_timeout,
+                    self.candidates.pairing(),
+                    format,
+                )
+            }
+            AdmittedMethod::PairingPsk => {
+                bail!("the Pairing PSK flow does not start a code attempt")
+            }
+        };
+        let init = Incoming::ClientPairInit(ClientPairInit {
+            pairing_index,
+            commit_b: attempt.commit_b(),
+        });
+        self.send_json(&init).await?;
+        self.pairing = Some(attempt);
+        Ok(())
+    }
+
+    /// Starts the one attempt a pairing activation admits, or aborts it as unsupported.
+    ///
+    /// The Pairing PSK flow sends `client/pair-init` and `client/pair-finalize` back to back,
+    /// without waiting for a server response. A code flow sends only `client/pair-init`, and only
+    /// once its gate is open: the static flow waits for a pairing window, the dynamic flow for a
+    /// round count below the limit. While the gate is closed the client sends
+    /// `client/pair-pending` instead, and the attempt starts with a later operator action. Before
+    /// either, the activation has to be admissible; anything else is a `pair/abort` with reason
+    /// `method_not_supported`, which leaves the connection open.
+    async fn start_pairing(&mut self, activation: PairingActivation) -> Result<()> {
+        // A second activation supersedes an attempt that is still running; its state is discarded
+        // without an abort, exactly as a cancelling activation does.
+        self.pairing = None;
+        #[cfg(feature = "pairing-code")]
+        {
+            self.pending_pairing = None;
+        }
+
+        let Some(method) = self.admitted_method(&activation) else {
+            return self.abort_pairing(PairingFailure::MethodNotSupported).await;
+        };
+
+        match method {
+            AdmittedMethod::PairingPsk => {
+                let attempt = PairingAttempt::new(
+                    self.pairing_index,
+                    self.config.pairing_timeout,
+                    self.candidates.pairing(),
+                );
+                let init = Incoming::ClientPairInit(ClientPairInit {
+                    pairing_index: attempt.pairing_index,
+                    commit_b: None,
+                });
+                self.send_json(&init).await?;
+                let finalize = Incoming::ClientPairFinalize(ClientPairFinalize {
+                    long_term_psk: Some(attempt.psk_base64()),
+                    wrapped_psk: None,
+                });
+                self.send_json(&finalize).await?;
+                // The attempt begins with `client/pair-init`; its timeout runs from there.
+                self.pairing = Some(attempt);
+                Ok(())
+            }
+            #[cfg(feature = "pairing-code")]
+            AdmittedMethod::StaticCode => {
+                if !self.window_is_open() {
+                    return self
+                        .hold_pairing_back(self.pairing_index, AdmittedMethod::StaticCode, None)
+                        .await;
+                }
+                self.start_code_attempt(self.pairing_index, AdmittedMethod::StaticCode, None)
+                    .await
+            }
+            #[cfg(feature = "pairing-code")]
+            AdmittedMethod::DynamicCode => {
+                let Some(format) = self.dynamic_format(&activation) else {
+                    // `admitted_method` checked it; nothing can change between the two calls.
+                    return self.abort_pairing(PairingFailure::MethodNotSupported).await;
+                };
+                if self.rounds_are_exhausted() {
+                    return self
+                        .hold_pairing_back(
+                            self.pairing_index,
+                            AdmittedMethod::DynamicCode,
+                            Some(format),
+                        )
+                        .await;
+                }
+                self.start_code_attempt(
+                    self.pairing_index,
+                    AdmittedMethod::DynamicCode,
+                    Some(format),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Sends `client/pair-pending` and remembers the activation until its gate opens.
+    #[cfg(feature = "pairing-code")]
+    async fn hold_pairing_back(
+        &mut self,
+        pairing_index: u32,
+        method: AdmittedMethod,
+        format: Option<CodeFormat>,
+    ) -> Result<()> {
+        let pending = Incoming::ClientPairPending(ClientPairPending {
+            pairing_index,
+            message: self.config.pairing_pending_text.clone(),
+        });
+        self.send_json(&pending).await?;
+        self.pending_pairing = Some(PendingPairing {
+            pairing_index,
+            method,
+            format,
+        });
+        Ok(())
+    }
+
+    /// Handles `server/pair-init`: begins a round of the dynamic flow and emits the code.
+    ///
+    /// The first round carries `nonce_A`; the client derives the code from it, the handshake hash
+    /// and its own nonce, and emits it through [`Event::PairingCode`]. A later round repeats the
+    /// same code with a higher round number: the binding values do not change within an attempt.
+    ///
+    /// A message that arrives when no attempt is running belongs to an attempt the client already
+    /// ended and is discarded silently. A message at the wrong point of a running attempt, a
+    /// missing first-round nonce or a changed one is a protocol error: the connection closes
+    /// without an application-level message, as `pairing.md` requires.
+    #[cfg(feature = "pairing-code")]
+    async fn handle_server_init(&mut self, init: ServerPairInit) -> Result<()> {
+        let Some(mut attempt) = self.pairing.take() else {
+            return self.discard_or_reject_pairing_message("server/pair-init");
+        };
+        if !attempt.awaiting_server_init() {
+            self.pairing = Some(attempt);
+            bail!("the server sent server/pair-init out of sequence");
+        }
+        let nonce_a = match init.nonce_a.as_deref() {
+            Some(value) => Some(decode_pairing_field::<32>(value, "nonce_A")?),
+            None => None,
+        };
+        let emission = attempt.begin_round(nonce_a, self.noise.handshake_hash())?;
+        self.emit(Event::PairingCode {
+            code: emission.code,
+            format: emission.format,
+            round: emission.round,
+        });
+        // The round counts from here: the code is emitted, so the operator and the server have
+        // everything one round needs. An attempt that ends later leaves this round counted.
+        self.record_round();
+        self.pairing = Some(attempt);
+        Ok(())
+    }
+
+    /// Answers `server/pair-auth`: runs the client half of the CPace round.
+    ///
+    /// The reply, `client/pair-auth`, carries this client's share `Yb`. The round's `PRS` is the
+    /// configured static code, or the code the dynamic flow derived for this attempt. A message
+    /// that arrives when no attempt is running belongs to an attempt the client already ended, and
+    /// is discarded silently as the spec requires. A message at the wrong point of a running
+    /// attempt is a sequence violation, and a share that is malformed or encodes a low-order point
+    /// is a protocol error: both close the connection without an application-level message.
+    #[cfg(feature = "pairing-code")]
+    async fn handle_server_auth(&mut self, auth: ServerPairAuth) -> Result<()> {
+        let Some(mut attempt) = self.pairing.take() else {
+            return self.discard_or_reject_pairing_message("server/pair-auth");
+        };
+        if !attempt.awaiting_server_auth() {
+            self.pairing = Some(attempt);
+            bail!("the server sent server/pair-auth out of sequence");
+        }
+        let prs = if attempt.is_dynamic_code() {
+            match attempt.prs() {
+                Some(prs) => prs,
+                None => {
+                    // The code is derived in `server/pair-init`, so this cannot happen unless the
+                    // attempt was started without one.
+                    self.pairing = Some(attempt);
+                    bail!("the dynamic pairing code was never derived");
+                }
+            }
+        } else {
+            let Some(code) = self.config.static_pairing_code.as_deref() else {
+                // The method is only admitted with a code, so this is a configuration changed
+                // during the connection; failing loudly beats deriving a round from nothing.
+                self.pairing = Some(attempt);
+                bail!("the static pairing code is no longer configured");
+            };
+            code.as_bytes().to_vec()
+        };
+        let peer_share: [u8; 32] = decode_pairing_field(&auth.pake_msg_1, "pake_msg_1")?;
+        let sid = pake_sid(
+            self.noise.handshake_hash(),
+            attempt.pairing_index,
+            attempt.round(),
+        );
+        let share = attempt.accept_server_share(&prs, &sid, &peer_share)?;
+        let reply = Incoming::ClientPairAuth(ClientPairAuth {
+            pake_msg_2: URL_SAFE_NO_PAD.encode(share),
+        });
+        self.send_json(&reply).await?;
+        self.pairing = Some(attempt);
+        Ok(())
+    }
+
+    /// Handles `server/pair-confirm`: verifies `server_kc` before anything is revealed.
+    ///
+    /// A verified tag releases the client's tag and the seals, which travel back to back with no
+    /// server response awaited; it also clears the round count, because the spec counts rounds
+    /// since the last verified `server_kc`. A mismatch ends the static flow's attempt with
+    /// `pairing_code_mismatch` - it has no retry - while the dynamic flow answers with
+    /// `client/pair-retry` and keeps the attempt, its code and its deadline. At the twentieth
+    /// failed round the dynamic flow aborts with the same reason instead of retrying.
+    #[cfg(feature = "pairing-code")]
+    async fn handle_server_confirm(&mut self, confirm: ServerPairConfirm) -> Result<()> {
+        let Some(mut attempt) = self.pairing.take() else {
+            return self.discard_or_reject_pairing_message("server/pair-confirm");
+        };
+        if !attempt.awaiting_server_confirm() {
+            self.pairing = Some(attempt);
+            bail!("the server sent server/pair-confirm out of sequence");
+        }
+        let received: [u8; TAG_LEN] = decode_pairing_field(&confirm.server_kc, "server_kc")?;
+        let confirmation = match attempt.verify_server_tag(&received) {
+            TagOutcome::Confirmed(confirmation) => confirmation,
+            TagOutcome::Mismatch => {
+                if attempt.is_dynamic_code() {
+                    // The round was counted when it began. Below the limit the client retries;
+                    // at the limit it aborts, as `pairing.md` requires.
+                    if self.failed_rounds() < ROUND_LIMIT {
+                        let retry = Incoming::ClientPairRetry(ClientPairRetry {});
+                        self.send_json(&retry).await?;
+                        // The attempt keeps its binding values, its code and its deadline; the
+                        // server begins the next round with `server/pair-init`.
+                        self.pairing = Some(attempt);
+                        return Ok(());
+                    }
+                } else {
+                    self.record_window_failure();
+                }
+                return self
+                    .abort_pairing(PairingFailure::PairingCodeMismatch)
+                    .await;
+            }
+        };
+        // A verified tag is the one thing besides an operator action that clears the round count.
+        self.failed_rounds.store(0, Ordering::SeqCst);
+
+        let reply = Incoming::ClientPairConfirm(ClientPairConfirm {
+            client_kc: confirmation.client_kc,
+            wrapped_nonce_b: confirmation.wrapped_nonce_b,
+        });
+        self.send_json(&reply).await?;
+        let finalize = Incoming::ClientPairFinalize(ClientPairFinalize {
+            long_term_psk: None,
+            wrapped_psk: Some(confirmation.wrapped_psk),
+        });
+        self.send_json(&finalize).await?;
+        // The key is on the wire; the attempt keeps only the long-term PSK the record needs.
+        self.pairing = Some(attempt);
+        Ok(())
+    }
+
+    /// Discards a late pairing message, or rejects one that has no attempt behind it.
+    ///
+    /// The spec's silent-discard rule covers messages a peer sent before it observed the end of an
+    /// attempt; it does not cover a pairing message while no attempt was ever admitted, which is a
+    /// sequence violation and a protocol error. `pairing: None` alone cannot tell the two apart,
+    /// so [`Session::discarding_pairing_messages`] decides.
+    fn discard_or_reject_pairing_message(&self, message: &'static str) -> Result<()> {
+        if self.discarding_pairing_messages {
+            return Ok(());
+        }
+        bail!("the server sent {message} without an active pairing attempt")
+    }
+
+    /// Ends the attempt with `reason`: sends `pair/abort` and reports it.
+    ///
+    /// The connection stays open, as the spec requires for every reason but `concurrent_attempt`:
+    /// playback continues in whatever roles the activation left active.
+    async fn abort_pairing(&mut self, reason: PairingFailure) -> Result<()> {
+        self.pairing = None;
+        // Pairing messages already on their way may still arrive before the next activation; the
+        // spec says to discard them instead of treating them as a sequence violation.
+        self.discarding_pairing_messages = true;
+        let abort = Incoming::PairAbort(PairAbort {
+            reason: reason.as_str().to_owned(),
+        });
+        self.send_json(&abort).await?;
+        self.emit(Event::PairingFailed { reason });
+        Ok(())
+    }
+
+    /// Persists the record after `server/pair-finalize`, the server's confirmation.
+    ///
+    /// Only now may the client write its side: the server has persisted the new long-term PSK, so a
+    /// client that never receives this message - because the server cancelled instead - stores
+    /// nothing and stays a guest on this connection. A completed pairing of either method closes
+    /// the pairing window.
+    fn confirm_pairing(&mut self) -> Result<()> {
+        let Some(attempt) = self.pairing.take() else {
+            return self.discard_or_reject_pairing_message("server/pair-finalize");
+        };
+        #[cfg(feature = "pairing-code")]
+        if (attempt.is_static_code() || attempt.is_dynamic_code()) && !attempt.awaiting_finalize() {
+            self.pairing = Some(attempt);
+            bail!("the server finalized a code-flow attempt before confirming its tag");
+        }
+        let Some(storage) = self.config.storage.as_deref() else {
+            // An attempt only starts when a store exists, so this is unreachable; failing loudly
+            // beats storing a key nowhere and reporting a pairing that cannot survive a restart.
+            bail!("the server finalized a pairing on a client without a pairing store");
+        };
+        let record = StoredPsk {
+            category: PskCategory::LongTerm,
+            psk: attempt.psk(),
+            server_id: self.server_id.clone(),
+        };
+        persist_pairing(storage, record.clone(), Some(&self.server_id))
+            .context("cannot store the pairing record")?;
+        // The server rotates this connection to the key it just persisted, and the candidate set
+        // was read before that record existed.
+        self.candidates.remember(record);
+        self.discarding_pairing_messages = true;
+        #[cfg(feature = "pairing-code")]
+        {
+            self.pairing_window = None;
+        }
+        self.emit(Event::Paired {
+            server_id: self.server_id.clone(),
+        });
+        Ok(())
+    }
+
+    /// Ends the attempt a server's `pair/abort` names, if one is running.
+    ///
+    /// An abort that arrives after the client ended the attempt - because it timed out, paired, or
+    /// saw a cancelling activation - has no effect, so no second event is reported.
+    fn handle_pairing_abort(&mut self, abort: PairAbort) -> Result<()> {
+        if self.pairing.take().is_some() {
+            self.discarding_pairing_messages = true;
+            self.emit(Event::PairingFailed {
+                reason: PairingFailure::from_wire(&abort.reason),
+            });
+        }
+        Ok(())
+    }
+
+    /// Handles `server/unpair`: drops this client's record for the server and ends the connection.
+    ///
+    /// The message is valid under any activity set, but only a paired session - one the handshake
+    /// keyed with a stored long-term record - has a record to drop. A session keyed by the Sentinel
+    /// key or by the pairing PSK is unpaired, and the spec says to ignore the message there: the
+    /// record it could drop would not be the one the server means.
+    ///
+    /// The record is removed through [`Storage`], so the host owns the file and the crate owns the
+    /// rule. A store that refuses the removal leaves the record in place, and the connection ends
+    /// with the store's error: reporting [`Event::Unpaired`] for a record that is still there would
+    /// be a lie. A record the host passed through
+    /// [`connect_with_psks`](crate::connect_with_psks) is not in a store the client may write, so
+    /// the event is reported without removing it - that record belongs to the host.
+    ///
+    /// The client then closes the connection, deliberately and without `client/goodbye`: the crate
+    /// has no writer for it yet (`docs/spec-deviations.md`, entry 9).
+    fn handle_unpair(&mut self) -> Result<()> {
+        if self.matched != MatchedPsk::Stored(PskCategory::LongTerm) {
+            return Ok(());
+        }
+        if let Some(storage) = self.config.storage.as_deref() {
+            storage
+                .remove_pairing(&self.server_id)
+                .context("cannot remove the pairing record")?;
+        }
+        self.emit(Event::Unpaired {
+            server_id: self.server_id.clone(),
+        });
+        self.ending = Some(Ending::Unpaired);
+        Ok(())
+    }
+
+    /// Reports a pairing requirement this connection still owes the host, at most once.
+    ///
+    /// [`Event::Connected`] goes out first, so the host knows which server the requirement belongs
+    /// to. The handshake decides the requirement once per connection; taking the value here is what
+    /// makes a second report impossible, however many messages the session goes on to handle.
+    fn report_pairing_required(&mut self) {
+        if let Some(reason) = self.pairing_required.take() {
+            self.emit(Event::PairingRequired {
+                server_id: self.server_id.clone(),
+                reason,
+            });
+        }
     }
 
     /// Feeds one `server/time` reply into the current burst.
@@ -934,6 +1901,12 @@ impl Session<'_> {
                 self.apply_report_volume(level).await.map(|()| self.volume)
             }
             ControlAction::Mute(muted) => self.apply_mute(muted).await.map(|()| self.volume),
+            #[cfg(feature = "pairing-code")]
+            ControlAction::OpenPairingWindow => {
+                self.open_pairing_window().await.map(|()| self.volume)
+            }
+            #[cfg(feature = "pairing-code")]
+            ControlAction::ReleaseHoldback => self.release_holdback().await.map(|()| self.volume),
         };
         match result {
             Ok(level) => {
@@ -955,6 +1928,9 @@ impl Session<'_> {
     /// controller state is left open, because nothing is known yet. A level the host reports above
     /// the protocol range is refused here as well, since `client/state` cannot carry it.
     fn check_control(&self, action: &ControlAction) -> Result<()> {
+        if self.rehandshake.is_some() {
+            bail!("the connection is switching keys and cannot send yet");
+        }
         match action {
             ControlAction::Transport(command) => {
                 if !self.role_active(CONTROLLER_ROLE) {
@@ -982,6 +1958,10 @@ impl Session<'_> {
                 }
                 Ok(())
             }
+            // The window and the hold-back release are local state: neither sends anything itself,
+            // and whatever they start needs no role.
+            #[cfg(feature = "pairing-code")]
+            ControlAction::OpenPairingWindow | ControlAction::ReleaseHoldback => Ok(()),
         }
     }
 
@@ -1065,7 +2045,13 @@ impl Session<'_> {
     }
 
     /// Encrypts and sends one control message.
+    ///
+    /// During a re-handshake the client may send nothing but message 2, so a send here is a bug;
+    /// failing loudly is better than putting a frame under the wrong keys on the wire.
     async fn send_json(&mut self, message: &Incoming) -> Result<()> {
+        if self.rehandshake.is_some() {
+            bail!("the client may not send an application message during a re-handshake");
+        }
         let ciphertext = encrypt_json(&mut self.noise, message)?;
         self.transport.send_binary(ciphertext).await
     }
@@ -1079,7 +2065,7 @@ impl Session<'_> {
 async fn handshake(
     mut transport: Transport,
     config: &ClientConfig,
-    psks: &[StoredPsk],
+    candidates: &Candidates,
     previous_roles: &[String],
 ) -> Result<Ready> {
     // 1. client/init. Its exact bytes are the first half of the Noise prologue.
@@ -1121,8 +2107,8 @@ async fn handshake(
         .read_message(&message_1)
         .context("failed to read Noise handshake message 1")?;
     let metadata = PskMetadata::parse(&metadata_payload)?;
-    let psk = select_psk(&metadata, psks, &server_init.server_id, true)?;
-    responder.set_psk(&psk)?;
+    let selected = select_psk(&metadata, candidates, &server_init.server_id, true)?;
+    responder.set_psk(&selected.psk)?;
 
     let message_2 = responder.write_message()?;
     let message_2 = Incoming::NoiseHandshake(NoiseHandshake {
@@ -1147,21 +2133,26 @@ async fn handshake(
 
     // 7. The first server/activate, which completes the handshake.
     let activate = read_encrypted_json(&mut transport, &mut noise).await?;
+    let activate = match Incoming::parse(&activate)? {
+        Some(Incoming::ServerActivate(activate)) => activate,
+        _ => bail!("expected an encrypted server/activate after client/hello"),
+    };
     // The first activation of a connection must carry the roles. If it does not, the previous
     // session's set is the safer starting point than none, because the server is already breaking
     // its own rule and a player that forgets it could drop audio.
-    let active_roles = match Incoming::parse(&activate)? {
-        Some(Incoming::ServerActivate(activate)) => activate
-            .active_roles
-            .unwrap_or_else(|| previous_roles.to_vec()),
-        _ => bail!("expected an encrypted server/activate after client/hello"),
-    };
+    let active_roles = activate
+        .active_roles
+        .clone()
+        .unwrap_or_else(|| previous_roles.to_vec());
 
     Ok(Ready {
         transport,
         noise,
         server_id: server_init.server_id,
         active_roles,
+        activate,
+        matched: selected.matched,
+        credential_mismatch: selected.credential_mismatch,
     })
 }
 
@@ -1193,11 +2184,50 @@ fn client_hello(config: &ClientConfig) -> Incoming {
             }],
             buffer_capacity: BUFFER_CAPACITY,
         }),
-        supported_pair_methods: SupportedPairMethods {
-            pairing_psk: Some(PairingPskMethod {}),
-        },
+        supported_pair_methods: pair_methods(config),
         unpaired_access: UnpairedAccess { enabled: true },
     })
+}
+
+/// Derives the pairing methods this client currently offers from its configuration.
+///
+/// `pairing_psk` is offered exactly when a store is configured, because the method needs a pairing
+/// PSK that survives restarts and a place to write the record. `static_pairing_code` is offered
+/// exactly when the feature is on, a code is configured and a store exists: the code is the
+/// method's whole credential, and the record it produces has to be persisted. `dynamic_pairing_code`
+/// is offered exactly when the feature is on, the host advertised at least one emission format and
+/// one out-channel, and a store exists: the code is derived per attempt and needs somewhere to go.
+/// A method the client cannot complete is never offered.
+fn pair_methods(config: &ClientConfig) -> SupportedPairMethods {
+    SupportedPairMethods {
+        pairing_psk: config.storage.is_some().then_some(PairingPskMethod {}),
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: config
+            .static_pairing_code
+            .as_ref()
+            .filter(|_| config.storage.is_some())
+            .map(|_| StaticPairingCodeMethod::default()),
+        #[cfg(not(feature = "pairing-code"))]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        dynamic_pairing_code: (config.storage.is_some()
+            && !config.code_formats.is_empty()
+            && !config.code_out_channels.is_empty())
+        .then(|| DynamicPairingCodeMethod {
+            out_channels: config
+                .code_out_channels
+                .iter()
+                .map(|channel| channel.as_wire().to_owned())
+                .collect(),
+            formats: config
+                .code_formats
+                .iter()
+                .map(|format| format.as_wire().to_owned())
+                .collect(),
+        }),
+        #[cfg(not(feature = "pairing-code"))]
+        dynamic_pairing_code: None,
+    }
 }
 
 /// Reads cleartext text frames, ignoring binary frames and answering pings.
@@ -1283,6 +2313,25 @@ impl PskMetadata {
     }
 }
 
+/// The pairing attempt a `server/activate` admits, if it declares the pairing activity.
+///
+/// An activation that declares `pairing` without its parameters is malformed: no conformant server
+/// produces it, and guessing what it meant would leave the server waiting for a `client/pair-init`
+/// the client never sends. `pairing` stays ignored when the activity is absent, as the spec allows.
+fn admits_pairing(activate: &ServerActivate) -> Result<Option<PairingActivation>> {
+    if !activate
+        .activities
+        .iter()
+        .any(|activity| activity == "pairing")
+    {
+        return Ok(None);
+    }
+    let activation = activate.pairing.clone().ok_or_else(|| {
+        anyhow!("server/activate declares the pairing activity without pairing parameters")
+    })?;
+    Ok(Some(activation))
+}
+
 /// Whether a `stream/end` or `stream/clear` role list affects the player stream.
 ///
 /// An absent list means every role. Otherwise it has to name the player: `messaging.md` lists the
@@ -1298,6 +2347,52 @@ fn affects_player(roles: Option<&[String]>) -> bool {
     }
 }
 
+/// Decodes the server's static public key from the `server_id` it announced.
+///
+/// A re-handshake does not repeat `server/init`, so the key the responder needs comes from the
+/// initial handshake's announcement. The value is a public key, not key material.
+fn decode_server_key(server_id: &str) -> Result<[u8; 32]> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(server_id)
+        .context("server_id is not unpadded base64url")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("server_id does not decode to a 32-byte X25519 key"))
+}
+
+/// Decodes one fixed-length base64url field of a pairing message.
+///
+/// The spec gives every such field as unpadded base64url, so the canonical re-encoding has to match
+/// the received text; a value with spare bits set is not a field a conformant peer sends. The error
+/// names the field but never repeats its value: one of these fields is a key-confirmation tag.
+#[cfg(feature = "pairing-code")]
+fn decode_pairing_field<const N: usize>(value: &str, name: &str) -> Result<[u8; N]> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .with_context(|| format!("{name} is not unpadded base64url"))?;
+    if URL_SAFE_NO_PAD.encode(&bytes) != value {
+        bail!("{name} is not the canonical base64url encoding");
+    }
+    bytes
+        .try_into()
+        .map_err(|_| anyhow!("{name} does not decode to {N} bytes"))
+}
+
+/// Returns whether a control frame names a pairing message, even when it does not decode.
+///
+/// The envelope's `type` survives a malformed payload, which is what lets the session tell a
+/// pairing protocol error from a control message this revision may ignore. A frame that is not a
+/// JSON object with a string `type` names nothing and keeps the lenient path.
+fn names_pairing_message(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    value
+        .get("type")
+        .and_then(|message_type| message_type.as_str())
+        .is_some_and(|message_type| PAIRING_MESSAGE_TYPES.contains(&message_type))
+}
+
 /// Whether `value` is the canonical unpadded base64url encoding of a 32-byte key id.
 fn is_canonical_psk_id(value: &str) -> bool {
     if value.len() != PSK_ID_LEN {
@@ -1309,33 +2404,72 @@ fn is_canonical_psk_id(value: &str) -> bool {
     }
 }
 
+/// The key that seals a handshake, and what kind of key it is.
+struct Selected {
+    /// The 32-byte key the responder seals message 2 with.
+    psk: [u8; 32],
+    /// Which key it is, which decides the pairing methods this connection allows.
+    matched: MatchedPsk,
+    /// Whether the Sentinel key stands in for a credential the server named and this client does
+    /// not hold, which is the server's authenticated credential-mismatch signal.
+    credential_mismatch: bool,
+}
+
 /// Chooses the key that seals Noise message 2.
 ///
-/// A stored record matches only when both its category and its derived id equal the announcement;
-/// its `server_id` must then equal the one in `server/init`, so a key recorded for a different
-/// server can never seal this handshake. A plain lookup miss is the documented unpaired path during
-/// the initial handshake; during a re-handshake it is an error, because falling back would silently
-/// drop a pairing the previous connection authenticated.
+/// A record matches only when its category and its derived id equal the announcement; its
+/// `server_id` must then equal the one in `server/init`, so a record recorded for a different
+/// server can never seal this handshake. The pairing PSK is checked first and belongs to no server:
+/// it pairs this client with any server, which is what makes one token usable everywhere. A plain
+/// lookup miss is the documented unpaired path during the initial handshake; during a re-handshake
+/// it is an error, because falling back would silently drop a pairing the previous connection
+/// authenticated.
 fn select_psk(
     metadata: &PskMetadata,
-    stored: &[StoredPsk],
+    candidates: &Candidates,
     server_id: &str,
     initial: bool,
-) -> Result<[u8; 32]> {
+) -> Result<Selected> {
     if metadata.category == PskCategory::Sentinel && metadata.psk_id == SENTINEL_PSK_ID {
-        return Ok(SENTINEL_PSK);
+        return Ok(Selected {
+            psk: SENTINEL_PSK,
+            matched: MatchedPsk::Sentinel,
+            credential_mismatch: false,
+        });
     }
-    let matched = stored.iter().find(|candidate| {
+    if metadata.category == PskCategory::Pairing {
+        if let Some(pairing) = candidates.pairing() {
+            if psk_id_for(&pairing) == metadata.psk_id {
+                return Ok(Selected {
+                    psk: pairing,
+                    matched: MatchedPsk::PairingPsk,
+                    credential_mismatch: false,
+                });
+            }
+        }
+    }
+    let matched = candidates.records().iter().find(|candidate| {
         candidate.category == metadata.category && psk_id_for(&candidate.psk) == metadata.psk_id
     });
     if let Some(candidate) = matched {
         if candidate.server_id != server_id {
             bail!("the stored key for the announced PSK id belongs to another server");
         }
-        return Ok(candidate.psk);
+        return Ok(Selected {
+            psk: candidate.psk,
+            matched: MatchedPsk::Stored(candidate.category),
+            credential_mismatch: false,
+        });
     }
     if initial {
-        return Ok(SENTINEL_PSK);
+        // The announcement named a credential this client cannot use: either it holds no record
+        // for it, or it holds the key under another category. The fallback is what turns that into
+        // the server's credential-mismatch signal, and the session reports it once per connection.
+        return Ok(Selected {
+            psk: SENTINEL_PSK,
+            matched: MatchedPsk::Sentinel,
+            credential_mismatch: true,
+        });
     }
     bail!("no stored key matches the announced PSK id, so a re-handshake cannot continue")
 }
@@ -1376,6 +2510,8 @@ fn now_us() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "pairing-code")]
+    use crate::config::CodeOutChannel;
 
     /// Builds a metadata payload with the Sentinel id and the given category.
     fn sentinel_metadata(category: &str) -> String {
@@ -1394,18 +2530,26 @@ mod tests {
         }
     }
 
+    /// Builds a candidate set without a store, as `connect_with_psks` would.
+    fn candidates(records: &[StoredPsk], pairing: Option<[u8; 32]>) -> Candidates {
+        Candidates::load(None, records, pairing.map(PairingPsk))
+            .expect("a candidate set without a store always builds")
+    }
+
     #[test]
     fn a_sentinel_announcement_selects_the_published_key() {
         let metadata = PskMetadata::parse(sentinel_metadata("sn").as_bytes()).unwrap();
+        let candidates = candidates(&[], None);
         assert_eq!(metadata.category, PskCategory::Sentinel);
-        assert_eq!(
-            select_psk(&metadata, &[], SERVER_ID, true).unwrap(),
-            SENTINEL_PSK
-        );
-        assert_eq!(
-            select_psk(&metadata, &[], SERVER_ID, false).unwrap(),
-            SENTINEL_PSK
-        );
+        for initial in [true, false] {
+            let selected = select_psk(&metadata, &candidates, SERVER_ID, initial).unwrap();
+            assert_eq!(selected.psk, SENTINEL_PSK);
+            assert_eq!(selected.matched, MatchedPsk::Sentinel);
+            assert!(
+                !selected.credential_mismatch,
+                "a Sentinel announcement names the key every client holds"
+            );
+        }
     }
 
     #[test]
@@ -1413,28 +2557,77 @@ mod tests {
         let psk: [u8; 32] = std::array::from_fn(|index| index as u8);
         let announcement = format!(r#"{{"psk_id":"{}","psk_category":"pr"}}"#, psk_id_for(&psk));
         let metadata = PskMetadata::parse(announcement.as_bytes()).unwrap();
-        let candidates = [stored(PskCategory::Pairing, psk, SERVER_ID)];
-        assert_eq!(
-            select_psk(&metadata, &candidates, SERVER_ID, true).unwrap(),
-            psk
-        );
-        assert_eq!(
-            select_psk(&metadata, &candidates, SERVER_ID, false).unwrap(),
-            psk
-        );
+        let candidates = candidates(&[stored(PskCategory::Pairing, psk, SERVER_ID)], None);
+        for initial in [true, false] {
+            let selected = select_psk(&metadata, &candidates, SERVER_ID, initial).unwrap();
+            assert_eq!(selected.psk, psk);
+            assert_eq!(
+                selected.matched,
+                MatchedPsk::Stored(PskCategory::Pairing),
+                "a host-supplied pairing key is not this client's pairing PSK"
+            );
+        }
 
         let unknown = format!(
             r#"{{"psk_id":"{}","psk_category":"lt"}}"#,
             psk_id_for(b"a key this client does not have")
         );
         let metadata = PskMetadata::parse(unknown.as_bytes()).unwrap();
-        assert_eq!(
-            select_psk(&metadata, &candidates, SERVER_ID, true).unwrap(),
-            SENTINEL_PSK
+        let selected = select_psk(&metadata, &candidates, SERVER_ID, true).unwrap();
+        assert_eq!(selected.psk, SENTINEL_PSK);
+        assert!(
+            selected.credential_mismatch,
+            "the fallback stands in for a credential the server named and this client lacks"
         );
         assert!(
             select_psk(&metadata, &candidates, SERVER_ID, false).is_err(),
             "a re-handshake must not silently drop the established key"
+        );
+    }
+
+    #[test]
+    fn the_pairing_psk_matches_its_own_announcement_for_any_server() {
+        let pairing: [u8; 32] = std::array::from_fn(|index| index as u8 ^ 0x11);
+        let announcement = format!(
+            r#"{{"psk_id":"{}","psk_category":"pr"}}"#,
+            psk_id_for(&pairing)
+        );
+        let metadata = PskMetadata::parse(announcement.as_bytes()).unwrap();
+        let candidates = candidates(&[], Some(pairing));
+
+        for server_id in [SERVER_ID, "any other server"] {
+            let selected = select_psk(&metadata, &candidates, server_id, true).unwrap();
+            assert_eq!(selected.psk, pairing);
+            assert_eq!(
+                selected.matched,
+                MatchedPsk::PairingPsk,
+                "the pairing PSK is not tied to one server"
+            );
+            assert!(!selected.credential_mismatch);
+        }
+
+        // The same key announced as a long-term key is not the pairing PSK, and there is no record
+        // for it: the initial handshake falls back to the Sentinel key.
+        let as_long_term = format!(
+            r#"{{"psk_id":"{}","psk_category":"lt"}}"#,
+            psk_id_for(&pairing)
+        );
+        let metadata = PskMetadata::parse(as_long_term.as_bytes()).unwrap();
+        let selected = select_psk(&metadata, &candidates, SERVER_ID, true).unwrap();
+        assert_eq!(selected.matched, MatchedPsk::Sentinel);
+
+        // A pairing key that is not this client's is a miss as well; it belongs to another
+        // device, and only the record lookup could match it.
+        let foreign = format!(
+            r#"{{"psk_id":"{}","psk_category":"pr"}}"#,
+            psk_id_for(b"a pairing key this client does not hold")
+        );
+        let metadata = PskMetadata::parse(foreign.as_bytes()).unwrap();
+        let selected = select_psk(&metadata, &candidates, SERVER_ID, true).unwrap();
+        assert_eq!(selected.matched, MatchedPsk::Sentinel);
+        assert!(
+            selected.credential_mismatch,
+            "a pairing key that is not this client's is the credential-mismatch signal"
         );
     }
 
@@ -1445,11 +2638,19 @@ mod tests {
         let metadata = PskMetadata::parse(announcement.as_bytes()).unwrap();
 
         // The id matches, but the record was filed under another category.
-        let wrong_category = [stored(PskCategory::LongTerm, psk, SERVER_ID)];
+        let wrong_category = candidates(&[stored(PskCategory::LongTerm, psk, SERVER_ID)], None);
         assert_eq!(
-            select_psk(&metadata, &wrong_category, SERVER_ID, true).unwrap(),
+            select_psk(&metadata, &wrong_category, SERVER_ID, true)
+                .unwrap()
+                .psk,
             SENTINEL_PSK,
             "a category mismatch is a miss, not a match"
+        );
+        assert!(
+            select_psk(&metadata, &wrong_category, SERVER_ID, true)
+                .unwrap()
+                .credential_mismatch,
+            "a key held under another category is exactly what the signal is for"
         );
         assert!(
             select_psk(&metadata, &wrong_category, SERVER_ID, false).is_err(),
@@ -1457,7 +2658,7 @@ mod tests {
         );
 
         // The category and id match, but the record belongs to another server.
-        let other_server = [stored(PskCategory::Pairing, psk, "wrong-server")];
+        let other_server = candidates(&[stored(PskCategory::Pairing, psk, "wrong-server")], None);
         assert!(
             select_psk(&metadata, &other_server, SERVER_ID, true).is_err(),
             "a key recorded for another server must never seal this handshake"
@@ -1551,5 +2752,701 @@ mod tests {
         non_canonical.pop();
         non_canonical.push('p');
         assert!(!is_canonical_psk_id(&non_canonical));
+    }
+
+    use crate::test_support::NullSink;
+    use syncspin_core::noise::Identity;
+
+    /// A configuration for a session that is never connected to a real server.
+    fn test_config() -> ClientConfig {
+        ClientConfig {
+            server: "127.0.0.1:1".to_owned(),
+            player_name: "Test player".to_owned(),
+            device_info: None,
+            identity: Identity::generate(),
+            storage: None,
+            audio_mode: AudioMode::Passthrough,
+            volume: 50,
+            muted: false,
+            volume_policy: crate::config::VolumePolicy::default(),
+            max_backoff: Duration::from_secs(1),
+            pairing_timeout: crate::client::DEFAULT_PAIRING_TIMEOUT,
+            #[cfg(feature = "pairing-code")]
+            static_pairing_code: None,
+            #[cfg(feature = "pairing-code")]
+            pairing_window: crate::config::DEFAULT_PAIRING_WINDOW,
+            #[cfg(feature = "pairing-code")]
+            pairing_pending_text: None,
+            #[cfg(feature = "pairing-code")]
+            code_formats: Vec::new(),
+            #[cfg(feature = "pairing-code")]
+            code_out_channels: Vec::new(),
+        }
+    }
+
+    /// Builds a session around the given transport and control receiver.
+    fn test_session<'a>(
+        config: &'a ClientConfig,
+        events: &'a mpsc::UnboundedSender<Event>,
+        reported_volume: &'a AtomicU8,
+        transport: Transport,
+        noise: NoiseTransport,
+        control: Option<mpsc::UnboundedReceiver<ControlRequest>>,
+    ) -> Session<'a> {
+        Session {
+            transport,
+            noise,
+            config,
+            sink: Box::new(NullSink),
+            events,
+            reported_volume,
+            clock: ClockFilter::new(),
+            reassembler: Reassembler::new(MAX_REASSEMBLED_LEN),
+            active_roles: vec![CONTROLLER_ROLE.to_owned()],
+            stream: None,
+            sync_remaining: 0,
+            burst_deadline: None,
+            reply_deadline: None,
+            outstanding_sent_us: None,
+            burst_started: None,
+            burst_samples: Vec::new(),
+            state_sent: false,
+            control,
+            volume: 50,
+            muted: false,
+            sink_failed: false,
+            controller_commands: None,
+            server_id: SERVER_ID.to_owned(),
+            matched: MatchedPsk::Sentinel,
+            pairing_required: None,
+            ending: None,
+            candidates: Candidates::load(None, &[], None).expect("an empty candidate set builds"),
+            pairing_index: 0,
+            pairing: None,
+            discarding_pairing_messages: false,
+            #[cfg(feature = "pairing-code")]
+            pairing_window: None,
+            #[cfg(feature = "pairing-code")]
+            pending_pairing: None,
+            #[cfg(feature = "pairing-code")]
+            failed_rounds: Arc::new(AtomicU32::new(0)),
+            rehandshake: None,
+        }
+    }
+
+    /// A client WebSocket whose peer was reset, so the next write fails.
+    ///
+    /// `SO_LINGER` with a zero timeout makes the dropped peer send a reset instead of a clean
+    /// close, which is what a server that vanished mid-session looks like. It is the only way to
+    /// exercise the write-failure path; the deprecation note is about a blocking drop, which a
+    /// zero timeout avoids.
+    #[allow(deprecated)]
+    async fn reset_socket() -> Transport {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a loopback listener");
+        let address = listener.local_addr().expect("the bound address");
+        let client = TcpStream::connect(address)
+            .await
+            .expect("a loopback connection");
+        let (server_side, _peer) = listener.accept().await.expect("the accepted connection");
+        let (client_handshake, server_handshake) = tokio::join!(
+            tokio_tungstenite::client_async(
+                format!("ws://{address}/"),
+                tokio_tungstenite::MaybeTlsStream::Plain(client),
+            ),
+            tokio_tungstenite::accept_async(server_side),
+        );
+        let (socket, _response) = client_handshake.expect("the client WebSocket handshake");
+        let server_socket = server_handshake.expect("the server WebSocket upgrade");
+        server_socket
+            .get_ref()
+            .set_linger(Some(Duration::ZERO))
+            .expect("the socket accepts SO_LINGER");
+        drop(server_socket);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Transport { socket }
+    }
+
+    /// Runs a complete Noise handshake locally and returns the responder's transport.
+    fn local_noise_transport() -> NoiseTransport {
+        const PROLOGUE: &[u8] = b"syncspin unit-test prologue";
+        let identity = Identity::generate();
+        let peer = Identity::generate();
+        let mut responder =
+            Responder::with_peer(&identity, &peer.public, PROLOGUE).expect("the responder builds");
+        let mut initiator = snow::Builder::new(
+            syncspin_core::noise::NOISE_PARAMS
+                .parse()
+                .expect("the protocol name parses"),
+        )
+        .local_private_key(&peer.secret)
+        .expect("the initiator key is set")
+        .remote_public_key(&identity.public)
+        .expect("the responder key is set")
+        .psk(2, &SENTINEL_PSK)
+        .expect("the PSK is set")
+        .prologue(PROLOGUE)
+        .expect("the prologue is set")
+        .build_initiator()
+        .expect("the initiator builds");
+
+        let mut buffer = vec![0u8; syncspin_core::noise::MAX_MESSAGE_LEN];
+        let len = initiator
+            .write_message(b"{}", &mut buffer)
+            .expect("message 1 is written");
+        responder
+            .read_message(&buffer[..len])
+            .expect("message 1 is read");
+        let message_2 = responder.write_message().expect("message 2 is written");
+        initiator
+            .read_message(&message_2, &mut buffer)
+            .expect("message 2 is read");
+        responder.into_transport().expect("the handshake finishes")
+    }
+
+    #[tokio::test]
+    async fn a_closed_control_channel_is_disabled_instead_of_polled_forever() {
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let (commands, control) = mpsc::unbounded_channel();
+        drop(commands);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            Some(control),
+        );
+
+        let outcome = session.serve().await;
+        assert!(
+            outcome.is_err(),
+            "the reset socket must end the session: {outcome:?}"
+        );
+        assert!(
+            session.control.is_none(),
+            "a control channel without senders is cleared, not selected forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_control_request_that_cannot_be_written_ends_the_session() {
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let request = ControlRequest {
+            action: ControlAction::Transport("play"),
+            reply,
+        };
+        let error = session
+            .handle_control(request)
+            .await
+            .expect_err("a failed write must end the session");
+        assert!(
+            format!("{error:#}").contains("WebSocket send failed"),
+            "the error must name the failed write, got: {error:#}"
+        );
+
+        let answer = response
+            .await
+            .expect("the waiting call is answered")
+            .expect_err("the call does not succeed");
+        assert!(
+            format!("{answer:#}").contains("WebSocket send failed"),
+            "the caller sees the write failure, got: {answer:#}"
+        );
+    }
+
+    #[test]
+    fn only_an_activation_that_declares_pairing_admits_an_attempt() {
+        let playing = ServerActivate {
+            activities: vec!["playback".to_owned()],
+            ..ServerActivate::default()
+        };
+        assert_eq!(admits_pairing(&playing).unwrap(), None);
+
+        // A pairing object without the pairing activity is ignored, as the spec requires.
+        let stray = ServerActivate {
+            activities: vec!["playback".to_owned()],
+            pairing: Some(PairingActivation {
+                method: "pairing_psk".to_owned(),
+                format: None,
+            }),
+            ..ServerActivate::default()
+        };
+        assert_eq!(admits_pairing(&stray).unwrap(), None);
+
+        let pairing = ServerActivate {
+            activities: vec!["pairing".to_owned()],
+            pairing: Some(PairingActivation {
+                method: "pairing_psk".to_owned(),
+                format: None,
+            }),
+            ..ServerActivate::default()
+        };
+        assert_eq!(
+            admits_pairing(&pairing).unwrap().map(|a| a.method),
+            Some("pairing_psk".to_owned())
+        );
+
+        // The activity without its parameters is malformed, not an attempt with defaults.
+        let missing = ServerActivate {
+            activities: vec!["pairing".to_owned()],
+            ..ServerActivate::default()
+        };
+        let error = admits_pairing(&missing).expect_err("a missing object is a protocol error");
+        assert!(
+            format!("{error:#}").contains("pairing parameters"),
+            "got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn the_pairing_method_is_offered_exactly_with_a_store() {
+        let mut config = test_config();
+        assert!(
+            pair_methods(&config).pairing_psk.is_none(),
+            "a client without a store cannot pair and must not offer the method"
+        );
+        config.storage = Some(std::sync::Arc::new(
+            crate::test_support::MemoryStore::holding([7u8; 32]),
+        ));
+        assert!(
+            pair_methods(&config).pairing_psk.is_some(),
+            "a configured store makes the Pairing PSK method available"
+        );
+    }
+
+    /// The static code is configuration, and its record needs a store to live in.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn the_static_code_is_offered_exactly_with_a_configured_code_and_a_store() {
+        let mut config = test_config();
+        assert!(
+            pair_methods(&config).static_pairing_code.is_none(),
+            "a client without a code must not offer the method"
+        );
+
+        config.static_pairing_code = Some("12345678".to_owned());
+        assert!(
+            pair_methods(&config).static_pairing_code.is_none(),
+            "a client that cannot persist the record must not offer the method"
+        );
+
+        config.storage = Some(std::sync::Arc::new(
+            crate::test_support::MemoryStore::holding([7u8; 32]),
+        ));
+        assert!(
+            pair_methods(&config).static_pairing_code.is_some(),
+            "a configured code and a store make the method available"
+        );
+
+        config.static_pairing_code = None;
+        assert!(
+            pair_methods(&config).static_pairing_code.is_none(),
+            "the code is the method's credential and cannot be absent"
+        );
+    }
+
+    /// The method is admissible on an unauthenticated connection, not on the pairing PSK's.
+    #[cfg(feature = "pairing-code")]
+    #[tokio::test]
+    async fn the_static_code_is_admissible_only_without_the_pairing_psk() {
+        let plain_config = test_config();
+        let coded_config = ClientConfig {
+            static_pairing_code: Some("12345678".to_owned()),
+            storage: Some(std::sync::Arc::new(
+                crate::test_support::MemoryStore::holding([7u8; 32]),
+            )),
+            ..test_config()
+        };
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &plain_config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        let activation = PairingActivation {
+            method: "static_pairing_code".to_owned(),
+            format: None,
+        };
+        assert_eq!(
+            session.admitted_method(&activation),
+            None,
+            "a client without a code cannot run the method"
+        );
+
+        session.config = &coded_config;
+        assert_eq!(
+            session.admitted_method(&activation),
+            Some(AdmittedMethod::StaticCode),
+            "a Sentinel-keyed connection admits the code flow"
+        );
+        session.matched = MatchedPsk::Stored(PskCategory::LongTerm);
+        assert_eq!(
+            session.admitted_method(&activation),
+            Some(AdmittedMethod::StaticCode),
+            "a long-term-keyed connection admits the code flow as well"
+        );
+        session.matched = MatchedPsk::PairingPsk;
+        assert_eq!(
+            session.admitted_method(&activation),
+            None,
+            "the method and the matched pairing PSK are an inadmissible combination"
+        );
+
+        // A format belongs to the dynamic flow; a static activation that carries one was not offered.
+        session.matched = MatchedPsk::Sentinel;
+        let formatted = PairingActivation {
+            method: "static_pairing_code".to_owned(),
+            format: Some("digits".to_owned()),
+        };
+        assert_eq!(session.admitted_method(&formatted), None);
+    }
+
+    /// The dynamic method needs its descriptor, the format the server picked and a store.
+    #[cfg(feature = "pairing-code")]
+    #[tokio::test]
+    async fn the_dynamic_code_needs_formats_channels_and_a_store() {
+        let empty_config = test_config();
+        let formatted_config = ClientConfig {
+            code_formats: vec![CodeFormat::Digits],
+            code_out_channels: vec![CodeOutChannel::Display],
+            ..test_config()
+        };
+        let offered_config = ClientConfig {
+            storage: Some(std::sync::Arc::new(
+                crate::test_support::MemoryStore::holding([7u8; 32]),
+            )),
+            ..formatted_config.clone()
+        };
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &empty_config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+        let activation = PairingActivation {
+            method: "dynamic_pairing_code".to_owned(),
+            format: Some("digits".to_owned()),
+        };
+
+        assert_eq!(
+            session.admitted_method(&activation),
+            None,
+            "without formats and a channel the method is not offered"
+        );
+        assert_eq!(
+            session.dynamic_format(&activation),
+            None,
+            "no descriptor, no emission format"
+        );
+
+        // A descriptor without a store is not offerable: the record could not be persisted.
+        assert!(
+            pair_methods(&formatted_config)
+                .dynamic_pairing_code
+                .is_none(),
+            "the advertisement follows the same rule"
+        );
+        session.config = &formatted_config;
+        assert_eq!(session.admitted_method(&activation), None);
+
+        let descriptor = pair_methods(&offered_config)
+            .dynamic_pairing_code
+            .expect("formats, a channel and a store make the method offerable");
+        assert_eq!(descriptor.formats, vec!["digits"]);
+        assert_eq!(descriptor.out_channels, vec!["display"]);
+
+        session.config = &offered_config;
+        assert_eq!(
+            session.admitted_method(&activation),
+            Some(AdmittedMethod::DynamicCode),
+            "an offered format on a Sentinel-keyed connection is admissible"
+        );
+        assert_eq!(
+            session.dynamic_format(&activation),
+            Some(CodeFormat::Digits),
+            "the activation's format is the one the attempt runs"
+        );
+
+        for format in ["qr_code", "nfc", ""] {
+            let other = PairingActivation {
+                method: "dynamic_pairing_code".to_owned(),
+                format: Some(format.to_owned()),
+            };
+            assert_eq!(
+                session.admitted_method(&other),
+                None,
+                "{format:?} is not an offered format"
+            );
+        }
+        let unformatted = PairingActivation {
+            method: "dynamic_pairing_code".to_owned(),
+            format: None,
+        };
+        assert_eq!(
+            session.admitted_method(&unformatted),
+            None,
+            "the dynamic flow always names its emission format"
+        );
+
+        session.matched = MatchedPsk::PairingPsk;
+        assert_eq!(
+            session.admitted_method(&activation),
+            None,
+            "the method and the matched pairing PSK are an inadmissible combination"
+        );
+    }
+
+    /// The round limit is twenty, and only a release or a verified tag resets it.
+    #[cfg(feature = "pairing-code")]
+    #[tokio::test]
+    async fn the_round_limit_holds_attempts_back_and_a_release_resets_it() {
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        assert!(
+            !session.rounds_are_exhausted(),
+            "a fresh process is below the limit"
+        );
+        for round in 1..20 {
+            assert_eq!(session.record_round(), round);
+            assert!(
+                !session.rounds_are_exhausted(),
+                "round {round} must still admit another one"
+            );
+        }
+        assert_eq!(session.record_round(), 20);
+        assert!(
+            session.rounds_are_exhausted(),
+            "the twentieth begun round reaches the limit"
+        );
+
+        // The release is the operator action the spec requires, and it clears the count.
+        session
+            .release_holdback()
+            .await
+            .expect("a release needs no connection and no pending attempt");
+        assert!(!session.rounds_are_exhausted());
+        assert_eq!(session.failed_rounds.load(Ordering::SeqCst), 0);
+    }
+
+    /// The window closes on its fifth failed verification, and expiry closes it as well.
+    #[cfg(feature = "pairing-code")]
+    #[tokio::test]
+    async fn the_fifth_failed_verification_closes_the_pairing_window() {
+        let config = test_config();
+        // A window that expires while the test runs; the default is minutes.
+        let short_config = ClientConfig {
+            pairing_window: Duration::from_millis(1),
+            ..test_config()
+        };
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        assert!(!session.window_is_open(), "no gesture, no window");
+        session.open_pairing_window().await.expect("a window opens");
+        assert!(session.window_is_open());
+
+        for attempt in 1..5 {
+            session.record_window_failure();
+            assert!(
+                session.window_is_open(),
+                "failure {attempt} must leave the window open"
+            );
+        }
+        session.record_window_failure();
+        assert!(
+            !session.window_is_open(),
+            "the fifth failed verification closes the window"
+        );
+
+        // Expiry is silent and only noticed the next time the window is consulted.
+        session.config = &short_config;
+        session.open_pairing_window().await.expect("a window opens");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !session.window_is_open(),
+            "a window past its lifetime is closed"
+        );
+        assert!(
+            session.pairing_window.is_none(),
+            "the expired window is dropped rather than kept"
+        );
+    }
+
+    #[test]
+    fn only_pairing_message_types_are_fatal_when_malformed() {
+        for text in [
+            r#"{"type":"server/pair-init"}"#,
+            r#"{"type":"server/pair-auth"}"#,
+            r#"{"type":"server/pair-confirm"}"#,
+            r#"{"type":"server/pair-finalize"}"#,
+            r#"{"type":"pair/abort","payload":{}}"#,
+        ] {
+            assert!(
+                names_pairing_message(text),
+                "{text} names a pairing message"
+            );
+        }
+
+        for text in [
+            r#"{"type":"server/state","payload":{}}"#,
+            r#"{"type":"future/message","payload":{}}"#,
+            "{}",
+            "not json",
+            "",
+        ] {
+            assert!(
+                !names_pairing_message(text),
+                "{text} must stay on the lenient path"
+            );
+        }
+    }
+
+    /// A pairing requirement reaches the host once per connection, not once per frame.
+    #[tokio::test]
+    async fn a_credential_mismatch_is_reported_once_per_connection() {
+        let config = test_config();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+        session.pairing_required = Some(PairingRequiredReason::CredentialMismatch);
+
+        session.report_pairing_required();
+        session.report_pairing_required();
+
+        let mut seen = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            seen.push(event);
+        }
+        assert_eq!(
+            seen,
+            vec![Event::PairingRequired {
+                server_id: SERVER_ID.to_owned(),
+                reason: PairingRequiredReason::CredentialMismatch,
+            }],
+            "one connection, one requirement"
+        );
+        assert!(
+            session.pairing_required.is_none(),
+            "the requirement is consumed, so nothing can report it again"
+        );
+    }
+
+    /// A guest session has no record to drop, so `server/unpair` leaves it untouched.
+    #[tokio::test]
+    async fn an_unpair_on_an_unpaired_session_is_ignored() {
+        let config = test_config();
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+        assert_eq!(session.matched, MatchedPsk::Sentinel);
+
+        session
+            .handle_unpair()
+            .expect("an ignored unpair is not an error");
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "the client must not report a record it never held"
+        );
+        assert!(
+            session.ending.is_none(),
+            "the connection stays open, as the spec requires for an unpaired session"
+        );
+
+        // A session keyed by the pairing PSK is unpaired as well: the record it would drop would
+        // be the client's own pairing credential, which no server owns.
+        session.matched = MatchedPsk::PairingPsk;
+        session
+            .handle_unpair()
+            .expect("an ignored unpair is not an error");
+        assert!(receiver.try_recv().is_err());
+        assert!(session.ending.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_finalize_without_a_store_is_an_error_instead_of_a_silent_pairing() {
+        // The attempt only starts with a store, so this guard is unreachable through the wire; it
+        // must still fail loudly rather than report a pairing whose record went nowhere.
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+        session.pairing = Some(PairingAttempt::new(1, Duration::from_secs(120), None));
+
+        let error = session
+            .confirm_pairing()
+            .expect_err("a finalize without a store cannot be recorded");
+        assert!(
+            format!("{error:#}").contains("without a pairing store"),
+            "got: {error:#}"
+        );
+        assert!(
+            session.pairing.is_none(),
+            "the attempt is consumed even when the record cannot be stored"
+        );
     }
 }

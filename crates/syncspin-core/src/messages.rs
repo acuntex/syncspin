@@ -129,6 +129,32 @@ pub struct PlayerSupport {
 #[serde(rename_all = "snake_case")]
 pub struct PairingPskMethod {}
 
+/// The `static_pairing_code` descriptor of [`SupportedPairMethods`].
+///
+/// The only field is an informational hint: where the operator finds the configured code. A client
+/// that does not know leaves it absent, and the descriptor serializes as the empty object.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StaticPairingCodeMethod {
+    /// Where the code is available: `device`, `leaflet` or `operator`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locations: Option<Vec<String>>,
+}
+
+/// The `dynamic_pairing_code` descriptor of [`SupportedPairMethods`].
+///
+/// The protocol requires both lists to be non-empty for a server to recognize the method: a
+/// descriptor left empty is treated as unrecognized, so the client only advertises it when it can
+/// actually emit a code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DynamicPairingCodeMethod {
+    /// Channels that carry the per-session code to the operator: `display` or `speaker`.
+    pub out_channels: Vec<String>,
+    /// Emission formats the client offers: `digits` or `qr_code`.
+    pub formats: Vec<String>,
+}
+
 /// The `supported_pair_methods` object of [`ClientHello`], keyed by method identifier.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,6 +162,12 @@ pub struct SupportedPairMethods {
     /// The pairing PSK method, offered by every conformant client; absent when a peer omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_psk: Option<PairingPskMethod>,
+    /// The static pairing code method, offered when the client has a code configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_pairing_code: Option<StaticPairingCodeMethod>,
+    /// The dynamic pairing code method, offered when the client can derive and emit a code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_pairing_code: Option<DynamicPairingCodeMethod>,
 }
 
 /// The `unpaired_access` object of [`ClientHello`].
@@ -218,6 +250,211 @@ pub struct ServerActivate {
     /// Parameters of an admitted pairing attempt; present only with `pairing` activity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing: Option<PairingActivation>,
+}
+
+// ---------------------------------------------------------------------------
+// Pairing
+// ---------------------------------------------------------------------------
+
+/// `client/pair-init`: starts a pairing attempt.
+///
+/// The Pairing PSK flow leaves `commit_B` absent. The Dynamic Pairing Code Flow requires it: the
+/// commitment locks the client's nonce before any value from the server is known. The Static
+/// Pairing Code Flow has no nonce of its own and leaves it absent as well.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairInit {
+    /// Number of pairing `server/activate` messages received since the last Noise handshake.
+    pub pairing_index: u32,
+    /// `SHA-256(label || nonce_B)` of the dynamic flow's client nonce, when the method needs one.
+    ///
+    /// The wire spells the field `commit_B`, so the rename is explicit.
+    #[serde(rename = "commit_B", default, skip_serializing_if = "Option::is_none")]
+    pub commit_b: Option<String>,
+}
+
+/// `server/pair-init`: begins a round of the Dynamic Pairing Code Flow.
+///
+/// The server sends it in answer to `client/pair-init`, and again after every
+/// [`ClientPairRetry`]. Only the first round carries the server's nonce: the binding values, and
+/// with them the code, are unchanged across the rounds of one attempt.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerPairInit {
+    /// 32-byte server nonce as 43 unpadded base64url characters; present in the first round only.
+    ///
+    /// The value is public - it is the server's half of the code binding - and is renamed to the
+    /// `nonce_A` the wire spells. `Debug` redacts it anyway, so that no pairing message can carry
+    /// a nonce into a log line.
+    #[serde(rename = "nonce_A", default, skip_serializing_if = "Option::is_none")]
+    pub nonce_a: Option<String>,
+}
+
+impl fmt::Debug for ServerPairInit {
+    /// Formats the message with the server nonce redacted.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerPairInit")
+            .field("nonce_A", &redacted(&self.nonce_a))
+            .finish()
+    }
+}
+
+/// `client/pair-retry`: asks for another round of the dynamic flow.
+///
+/// Sent in place of [`ClientPairConfirm`] when `server_kc` did not verify and the round limit still
+/// admits another round. The payload is the empty object.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairRetry {}
+
+/// `client/pair-finalize`: the long-term PSK this pairing establishes.
+///
+/// Exactly one of the two fields is present: `long_term_psk` in the Pairing PSK flow, where the
+/// key travels inside the authenticated channel, and `wrapped_psk` in the code flows, where it is
+/// sealed under the CPace output. Both fields are key material, so `Debug` redacts them.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairFinalize {
+    /// 32-byte long-term PSK as 43 base64url characters without padding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_term_psk: Option<String>,
+    /// 48-byte sealed long-term PSK as 64 base64url characters without padding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapped_psk: Option<String>,
+}
+
+impl fmt::Debug for ClientPairFinalize {
+    /// Formats the message with both key fields redacted.
+    ///
+    /// `long_term_psk` and `wrapped_psk` are key material: the first is the new long-term PSK
+    /// itself and the second seals it. A `Debug` log of a decoded message, including one reached
+    /// through [`Incoming`], therefore prints `<redacted>` and never the value.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientPairFinalize")
+            .field("long_term_psk", &redacted(&self.long_term_psk))
+            .field("wrapped_psk", &redacted(&self.wrapped_psk))
+            .finish()
+    }
+}
+
+/// Renders a key field as `Some("<redacted>")`, or `None` when the field is absent.
+fn redacted(value: &Option<String>) -> Option<&'static str> {
+    value.as_ref().map(|_| "<redacted>")
+}
+
+/// `server/pair-finalize`: the server persisted its pairing record.
+///
+/// The payload is the empty object; the message is the client's signal to persist its own record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerPairFinalize {}
+
+/// `server/unpair`: the server dropped its pairing record for this client.
+///
+/// The payload is the empty object, the same shape as [`ServerPairFinalize`]. The message means the
+/// server no longer holds the long-term PSK that authenticates this client, so the client removes
+/// its own record and closes the connection. It is valid under any activity set, and a client on an
+/// unpaired session - one keyed by the Sentinel key or by its pairing PSK - ignores it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerUnpair {}
+
+/// `client/pair-pending`: the client is holding the admitted attempt back.
+///
+/// Sent instead of [`ClientPairInit`] while the static flow's pairing window is closed, or while
+/// the dynamic flow's round limit holds attempts back. It neither starts the attempt nor its
+/// timeout, so a `pairing_index` here may be followed by an init carrying the same value later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairPending {
+    /// Number of pairing `server/activate` messages received since the last Noise handshake.
+    pub pairing_index: u32,
+    /// Short sentence for the operator, supplied by the host.
+    ///
+    /// The spec allows at most 200 bytes of UTF-8; the client sends what its configuration holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// `server/pair-auth`: the server's CPace public share `Ya`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerPairAuth {
+    /// 32-byte share as 43 base64url characters without padding.
+    pub pake_msg_1: String,
+}
+
+/// `client/pair-auth`: the client's CPace public share `Yb`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairAuth {
+    /// 32-byte share as 43 base64url characters without padding.
+    pub pake_msg_2: String,
+}
+
+/// `server/pair-confirm`: the server's MCF tag `Ta`.
+///
+/// The tag is derived from the CPace session key, so `Debug` redacts it: no log line or failed
+/// assertion prints it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerPairConfirm {
+    /// 64-byte HMAC-SHA-512 tag as 86 base64url characters without padding.
+    pub server_kc: String,
+}
+
+impl fmt::Debug for ServerPairConfirm {
+    /// Formats the message with the key-confirmation tag redacted.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerPairConfirm")
+            .field("server_kc", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `client/pair-confirm`: the client's MCF tag `Tb`, plus the dynamic flow's sealed opening.
+///
+/// Both fields are derived from the CPace session key, so `Debug` redacts them.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientPairConfirm {
+    /// 64-byte HMAC-SHA-512 tag as 86 base64url characters without padding.
+    pub client_kc: String,
+    /// 48-byte sealing of `nonce_B`, present only in the Dynamic Pairing Code Flow.
+    ///
+    /// The wire spells the field `wrapped_nonce_B`, so the rename is explicit.
+    #[serde(
+        rename = "wrapped_nonce_B",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wrapped_nonce_b: Option<String>,
+}
+
+impl fmt::Debug for ClientPairConfirm {
+    /// Formats the message with the tag and the sealed nonce redacted.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientPairConfirm")
+            .field("client_kc", &"<redacted>")
+            .field("wrapped_nonce_B", &redacted(&self.wrapped_nonce_b))
+            .finish()
+    }
+}
+
+/// `pair/abort`: ends a pairing attempt, whether or not it started.
+///
+/// Both directions send it. The reason is one of the values `pairing.md` defines; an unknown
+/// value is carried verbatim rather than treated as a decoding failure, so a later revision's
+/// reason does not end the connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PairAbort {
+    /// Why the attempt ended, for example `attempt_timeout` or `method_not_supported`.
+    pub reason: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +835,42 @@ pub enum Incoming {
     /// `server/activate`.
     #[serde(rename = "server/activate")]
     ServerActivate(ServerActivate),
+    /// `client/pair-init`.
+    #[serde(rename = "client/pair-init")]
+    ClientPairInit(ClientPairInit),
+    /// `client/pair-pending`.
+    #[serde(rename = "client/pair-pending")]
+    ClientPairPending(ClientPairPending),
+    /// `server/pair-init`.
+    #[serde(rename = "server/pair-init")]
+    ServerPairInit(ServerPairInit),
+    /// `server/pair-auth`.
+    #[serde(rename = "server/pair-auth")]
+    ServerPairAuth(ServerPairAuth),
+    /// `client/pair-auth`.
+    #[serde(rename = "client/pair-auth")]
+    ClientPairAuth(ClientPairAuth),
+    /// `client/pair-retry`.
+    #[serde(rename = "client/pair-retry")]
+    ClientPairRetry(ClientPairRetry),
+    /// `server/pair-confirm`.
+    #[serde(rename = "server/pair-confirm")]
+    ServerPairConfirm(ServerPairConfirm),
+    /// `client/pair-confirm`.
+    #[serde(rename = "client/pair-confirm")]
+    ClientPairConfirm(ClientPairConfirm),
+    /// `client/pair-finalize`.
+    #[serde(rename = "client/pair-finalize")]
+    ClientPairFinalize(ClientPairFinalize),
+    /// `server/pair-finalize`.
+    #[serde(rename = "server/pair-finalize")]
+    ServerPairFinalize(ServerPairFinalize),
+    /// `server/unpair`.
+    #[serde(rename = "server/unpair")]
+    ServerUnpair(ServerUnpair),
+    /// `pair/abort`, in both directions.
+    #[serde(rename = "pair/abort")]
+    PairAbort(PairAbort),
     /// `client/time`.
     #[serde(rename = "client/time")]
     ClientTime(ClientTime),
@@ -696,13 +969,25 @@ struct EnvelopeType {
 ///
 /// A variant added without its entry here would silently read as an unknown type, so the
 /// integration tests parse one instance of every variant.
-const KNOWN_TYPES: [&str; 15] = [
+const KNOWN_TYPES: [&str; 27] = [
     "client/init",
     "server/init",
     "noise/handshake",
     "server/hello",
     "client/hello",
     "server/activate",
+    "client/pair-init",
+    "client/pair-pending",
+    "server/pair-init",
+    "server/pair-auth",
+    "client/pair-auth",
+    "client/pair-retry",
+    "server/pair-confirm",
+    "client/pair-confirm",
+    "client/pair-finalize",
+    "server/pair-finalize",
+    "server/unpair",
+    "pair/abort",
     "client/time",
     "server/time",
     "client/state",

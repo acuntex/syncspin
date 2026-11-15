@@ -1,5 +1,8 @@
 //! Public client surface: events, handles and the connection entry point.
 
+use std::fmt;
+#[cfg(feature = "pairing-code")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +11,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+#[cfg(feature = "pairing-code")]
+use crate::config::CodeFormat;
 use crate::config::{ClientConfig, StoredPsk, VolumePolicy};
+use crate::pairing::{load_or_draw_pairing_psk, PairingPsk};
 use crate::session::{self, Carried, Transport};
 use crate::sink::{AudioFormat, Sink};
 
@@ -17,6 +23,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Delay before the first reconnect attempt, and the value the backoff resets to.
 pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
+/// How long one pairing attempt may run, measured from `client/pair-init`.
+///
+/// `pairing.md` recommends two minutes. On expiry the client sends `pair/abort` with reason
+/// `attempt_timeout` and reports [`Event::PairingFailed`]; a host that wants a tighter bound sets
+/// [`ClientConfig::pairing_timeout`].
+pub const DEFAULT_PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Highest level the protocol defines, in its 0-100 volume range.
 pub(crate) const MAX_VOLUME: u8 = 100;
@@ -145,13 +158,86 @@ pub enum StreamEndReason {
     RoleRemoved,
 }
 
+/// Why a server needs a pairing this client cannot satisfy with what it holds.
+///
+/// The value is the reason field of [`Event::PairingRequired`]. The enum is non-exhaustive: a later
+/// revision may classify another situation the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PairingRequiredReason {
+    /// The server announced a `psk_id` this client does not hold, so the handshake fell back to
+    /// the Sentinel key.
+    ///
+    /// `connection.md` calls the resulting handshake the server's authenticated
+    /// credential-mismatch signal: the server still holds a record for this client, and the client
+    /// has none it can use for it. The signal alone never removes or replaces a record - not the
+    /// server's and not the client's - so the host decides whether to offer pairing again. A code
+    /// flow or the Pairing PSK flow then replaces the record on both sides.
+    CredentialMismatch,
+}
+
+/// Why a pairing attempt ended without a record.
+///
+/// Each value is the `reason` field of a `pair/abort`: the client sends the ones it causes and
+/// reports the ones it receives. The enum is non-exhaustive: a later revision defines reasons this
+/// one does not name, which arrive as [`Unrecognised`](PairingFailure::Unrecognised).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PairingFailure {
+    /// The attempt did not complete within [`ClientConfig::pairing_timeout`].
+    AttemptTimeout,
+    /// The matched key and the requested method are not a permitted combination, or the client
+    /// does not currently offer the method: it has no store, or the activation names a code method
+    /// this build does not carry.
+    MethodNotSupported,
+    /// A key confirmation failed, so the code was wrong or a peer relayed between two handshakes.
+    PairingCodeMismatch,
+    /// The operator cancelled the pairing, on either side.
+    UserCancelled,
+    /// Another pairing attempt is already in progress with this client.
+    ConcurrentAttempt,
+    /// A reason this revision does not name, as it arrived on the wire.
+    Unrecognised(String),
+}
+
+impl PairingFailure {
+    /// Returns the reason as `pair/abort` spells it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::AttemptTimeout => "attempt_timeout",
+            Self::MethodNotSupported => "method_not_supported",
+            Self::PairingCodeMismatch => "pairing_code_mismatch",
+            Self::UserCancelled => "user_cancelled",
+            Self::ConcurrentAttempt => "concurrent_attempt",
+            Self::Unrecognised(reason) => reason,
+        }
+    }
+
+    /// Decodes the `reason` of a received `pair/abort`.
+    ///
+    /// An unknown value is carried verbatim rather than rejected: the message is a wellformed
+    /// abort from a peer that may speak a later revision, and ending the connection over it would
+    /// be worse than reporting the reason the host cannot classify.
+    pub(crate) fn from_wire(reason: &str) -> Self {
+        match reason {
+            "attempt_timeout" => Self::AttemptTimeout,
+            "method_not_supported" => Self::MethodNotSupported,
+            "pairing_code_mismatch" => Self::PairingCodeMismatch,
+            "user_cancelled" => Self::UserCancelled,
+            "concurrent_attempt" => Self::ConcurrentAttempt,
+            other => Self::Unrecognised(other.to_owned()),
+        }
+    }
+}
+
 /// Something that happened on the connection.
 ///
 /// Events are ordered as the connection produced them. A connection attempt ends with at most one
 /// [`Event::Disconnected`], and the crate then reconnects on its own, so a later event belongs to
 /// the next attempt. The enum is non-exhaustive: a later revision adds events without breaking a
 /// host's match.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
     /// The Noise handshake finished and the session is ready for playback.
@@ -250,6 +336,171 @@ pub enum Event {
         /// Mute state that was requested, absent for a volume command.
         muted: Option<bool>,
     },
+    /// A pairing completed and the record is stored.
+    ///
+    /// Reported after `server/pair-finalize`, once [`Storage`](crate::storage::Storage) accepted
+    /// the record. The record authenticates later connections to that server, and the server
+    /// normally rotates the live connection to it with an in-band re-handshake: the session swaps
+    /// its keys without reopening the stream, so playback continues and the next connection is
+    /// keyed by the same long-term PSK.
+    Paired {
+        /// Static public key of the server the record belongs to, as 43 base64url characters.
+        server_id: String,
+    },
+    /// The server dropped its pairing record for this client.
+    ///
+    /// Reported when a paired session receives `server/unpair`. The record is gone from
+    /// [`Storage`](crate::storage::Storage) by the time the event arrives, and the client closes
+    /// the connection: the next connection to that server lands in the Sentinel fallback unless the
+    /// host pairs again. The client does not send `client/goodbye` - the crate has no writer for it
+    /// (`docs/spec-deviations.md`, entry 9) - so the server sees the close without a reason.
+    ///
+    /// A record the host passed through
+    /// [`connect_with_psks`](crate::connect_with_psks) is not in a store the client may write, so
+    /// the client reports it and ends the connection without removing it: the host owns that
+    /// record and has to drop it.
+    Unpaired {
+        /// Static public key of the server that dropped the record, as 43 base64url characters.
+        server_id: String,
+    },
+    /// A server needs a pairing this client cannot complete with what it holds.
+    ///
+    /// Reported once per connection, never once per message: the situation is decided by the
+    /// Noise handshake, so the event fires after [`Event::Connected`] and before the session acts
+    /// on its first message, and never again while that connection lasts. A plain guest handshake -
+    /// an unpaired connection whose server announced the Sentinel key - is not a mismatch and
+    /// reports nothing.
+    ///
+    /// Nothing is removed or replaced on either side, and the session continues as an ordinary
+    /// unpaired one. A server that holds a record for this client will keep the connection in
+    /// pairing or idle until the host offers pairing again.
+    PairingRequired {
+        /// Static public key of the server that announced the unknown credential.
+        server_id: String,
+        /// What the server expects and the client cannot provide.
+        reason: PairingRequiredReason,
+    },
+    /// A pairing attempt ended without a record.
+    ///
+    /// Nothing was stored: the host has to offer pairing again, or act on the reason. The
+    /// connection itself stays open - a pairing abort is not a connection failure - so the session
+    /// keeps serving playback in the roles it had.
+    PairingFailed {
+        /// Why the attempt ended.
+        reason: PairingFailure,
+    },
+    /// A dynamic pairing code is ready for the operator.
+    ///
+    /// The code belongs to one attempt and is bound to the Noise handshake and to the two nonces
+    /// of that attempt. A client with a display or a speaker shows or speaks it; the operator then
+    /// types or scans it into the server. The code does not change across the rounds of an attempt,
+    /// so a host that already shows it can ignore a repeat with the same `code`, while `round`
+    /// tells it that another round is running.
+    ///
+    /// The value is deliberate: it is the method's whole point, and the host is expected to render
+    /// it. It is not key material, but it does authorise one pairing, so a host should not keep it
+    /// longer than the attempt.
+    #[cfg(feature = "pairing-code")]
+    PairingCode {
+        /// The code to show: six digits in the `digits` format, a version-1 token in `qr_code`.
+        code: String,
+        /// Emission format the server activated.
+        format: CodeFormat,
+        /// Round this emission belongs to, counting from one.
+        round: u32,
+    },
+}
+
+impl fmt::Debug for Event {
+    /// Formats an event, redacting the dynamic pairing code it may carry.
+    ///
+    /// A host renders that code deliberately, through the event itself; a `Debug` format is what a
+    /// panic, an assertion or a logging facade writes, and the code authorises one pairing, so it
+    /// must not appear there. Every other field is what a log line needs.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connected {
+                server_id,
+                encrypted,
+            } => formatter
+                .debug_struct("Connected")
+                .field("server_id", server_id)
+                .field("encrypted", encrypted)
+                .finish(),
+            Self::Disconnected { reason, retry_in } => formatter
+                .debug_struct("Disconnected")
+                .field("reason", reason)
+                .field("retry_in", retry_in)
+                .finish(),
+            Self::StreamStart { format } => formatter
+                .debug_struct("StreamStart")
+                .field("format", format)
+                .finish(),
+            Self::StreamEnd { reason } => formatter
+                .debug_struct("StreamEnd")
+                .field("reason", reason)
+                .finish(),
+            Self::StreamClear { from_timestamp } => formatter
+                .debug_struct("StreamClear")
+                .field("from_timestamp", from_timestamp)
+                .finish(),
+            Self::Track {
+                title,
+                artist,
+                album,
+                album_artist,
+                artwork_url,
+                progress_ms,
+                duration_ms,
+                playback_speed,
+            } => formatter
+                .debug_struct("Track")
+                .field("title", title)
+                .field("artist", artist)
+                .field("album", album)
+                .field("album_artist", album_artist)
+                .field("artwork_url", artwork_url)
+                .field("progress_ms", progress_ms)
+                .field("duration_ms", duration_ms)
+                .field("playback_speed", playback_speed)
+                .finish(),
+            Self::State(state) => formatter.debug_tuple("State").field(state).finish(),
+            Self::Volume {
+                requested,
+                applied,
+                muted,
+            } => formatter
+                .debug_struct("Volume")
+                .field("requested", requested)
+                .field("applied", applied)
+                .field("muted", muted)
+                .finish(),
+            Self::Paired { server_id } => formatter
+                .debug_struct("Paired")
+                .field("server_id", server_id)
+                .finish(),
+            Self::Unpaired { server_id } => formatter
+                .debug_struct("Unpaired")
+                .field("server_id", server_id)
+                .finish(),
+            Self::PairingRequired { server_id, reason } => formatter
+                .debug_struct("PairingRequired")
+                .field("server_id", server_id)
+                .field("reason", reason)
+                .finish(),
+            Self::PairingFailed { reason } => formatter
+                .debug_struct("PairingFailed")
+                .field("reason", reason)
+                .finish(),
+            #[cfg(feature = "pairing-code")]
+            Self::PairingCode { format, round, .. } => formatter
+                .debug_struct("PairingCode")
+                .field("code", &"<redacted>")
+                .field("format", format)
+                .field("round", round)
+                .finish(),
+        }
+    }
 }
 
 /// Playback state as the server describes it.
@@ -396,6 +647,42 @@ impl ControlHandle {
         self.volume.load(Ordering::Relaxed)
     }
 
+    /// Opens a pairing window on the live connection and starts a waiting static-code attempt.
+    ///
+    /// The pairing window is the client's half of the static code flow's operator gesture: the host
+    /// decides what the gesture is - a button press, a pinhole, a power-cycle pattern - and calls
+    /// this when it happened. The window belongs to the connection that is live now, so it is
+    /// opened there and closes when that connection ends, when the configured lifetime expires,
+    /// when a pairing completes, or after five failed key confirmations.
+    ///
+    /// # Errors
+    /// Returns an error when no connection is established at this moment. A call that arrives while
+    /// the client is reconnecting is refused rather than remembered for the next connection, which
+    /// the spec requires: a window admits attempts only on the connection that carries its gesture.
+    #[cfg(feature = "pairing-code")]
+    pub async fn open_pairing_window(&self) -> Result<()> {
+        self.send(ControlAction::OpenPairingWindow)
+            .await
+            .map(|_level| ())
+    }
+
+    /// Releases the dynamic flow's round limit: the deliberate operator action the spec requires.
+    ///
+    /// After twenty rounds without a verified `server_kc`, the client aborts the attempt and holds
+    /// further dynamic attempts back, answering their activations with `client/pair-pending`. The
+    /// counter is not partitioned by server and only this call - or a verified `server_kc` - resets
+    /// it. A host wires it to whatever gesture means "let this device try pairing again".
+    ///
+    /// Unlike a pairing window, the release needs no connection: the count belongs to the process,
+    /// and the next connection starts from a clean one. The call still answers the current level,
+    /// so it observes the same contract as the other control requests.
+    #[cfg(feature = "pairing-code")]
+    pub async fn release_holdback(&self) -> Result<()> {
+        self.send(ControlAction::ReleaseHoldback)
+            .await
+            .map(|_level| ())
+    }
+
     /// Sends one controller command.
     async fn transport(&self, command: &'static str) -> Result<()> {
         self.send(ControlAction::Transport(command))
@@ -426,6 +713,12 @@ pub(crate) enum ControlAction {
     ReportVolume(u8),
     /// Set the mute state, keeping the level.
     Mute(bool),
+    /// Open a pairing window for this connection and start a waiting static-code attempt.
+    #[cfg(feature = "pairing-code")]
+    OpenPairingWindow,
+    /// Reset the dynamic flow's round counter and start the attempt it held back.
+    #[cfg(feature = "pairing-code")]
+    ReleaseHoldback,
 }
 
 /// One request from a [`ControlHandle`], with the channel its answer travels back on.
@@ -519,11 +812,17 @@ pub async fn connect(
 /// key, which is why [`connect`] is the same call with no candidates.
 ///
 /// The keys are used for the handshake only; they are not stored or logged. A reconnect uses them
-/// again, so a pairing that worked keeps working.
+/// again, so a pairing that worked keeps working. A [`Storage`](crate::storage::Storage) configured
+/// on `config` joins them: its records are read for every attempt, and on the same `server_id` the
+/// stored record wins over `explicit`, because the store is the authority for the servers it knows.
+/// The pairing PSK the store holds is always a candidate as well, whether or not a pairing is
+/// running.
 ///
 /// # Errors
 /// Same as [`connect`]. A record that belongs to another server fails the handshake of that
-/// attempt and is reported as [`Event::Disconnected`].
+/// attempt and is reported as [`Event::Disconnected`]. A store that cannot be read or cannot hold
+/// the pairing PSK is reported from this call before the first attempt. A configuration with a
+/// store makes the client draw and persist its pairing PSK on a device's first run.
 pub async fn connect_with_psks(
     config: ClientConfig,
     sink: Box<dyn Sink>,
@@ -531,11 +830,22 @@ pub async fn connect_with_psks(
 ) -> Result<(ClientHandle, EventStream)> {
     config.validate()?;
     let endpoint = endpoint(&config.server)?;
+    // The pairing PSK is settled before the first attempt, so a store that cannot hold it is
+    // reported to the caller instead of a connection that silently cannot pair. A restored key is
+    // used as it is; a missing one is drawn and stored once, here.
+    let pairing = match config.storage.as_deref() {
+        Some(storage) => Some(load_or_draw_pairing_psk(storage)?),
+        None => None,
+    };
 
     let (events, receiver) = mpsc::unbounded_channel();
     let (commands, control) = mpsc::unbounded_channel();
     let (shutdown, shutdown_rx) = oneshot::channel();
     let reported_volume = Arc::new(AtomicU8::new(config.volume));
+    // The dynamic flow's round counter belongs to the process, not to a connection or a server:
+    // only a verified `server_kc` or a deliberate operator action resets it.
+    #[cfg(feature = "pairing-code")]
+    let failed_rounds = Arc::new(AtomicU32::new(0));
 
     let carried = Carried {
         sink,
@@ -543,13 +853,18 @@ pub async fn connect_with_psks(
         volume: config.volume,
         muted: config.muted,
         active_roles: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        failed_rounds: Arc::clone(&failed_rounds),
     };
     let connection = Connection {
         endpoint,
         config,
         psks,
+        pairing,
         events: events.clone(),
         reported_volume: Arc::clone(&reported_volume),
+        #[cfg(feature = "pairing-code")]
+        failed_rounds,
     };
 
     let task = tokio::spawn(async move {
@@ -582,9 +897,15 @@ struct Connection {
     endpoint: String,
     config: ClientConfig,
     psks: Vec<StoredPsk>,
+    /// This client's pairing PSK, present exactly when a store is configured.
+    pairing: Option<PairingPsk>,
     events: mpsc::UnboundedSender<Event>,
     /// Level shared with every [`ControlHandle`].
     reported_volume: Arc<AtomicU8>,
+    /// Failed dynamic rounds since the last verified `server_kc`, shared with every session this
+    /// connection runs and with [`ControlHandle::release_holdback`].
+    #[cfg(feature = "pairing-code")]
+    failed_rounds: Arc<AtomicU32>,
 }
 
 impl Connection {
@@ -605,6 +926,23 @@ enum Wakeup {
 }
 
 /// Answers a request that arrived while no session was established.
+///
+/// A pairing window belongs to a connection and is refused; releasing the round hold-back belongs
+/// to the process and is honoured, so an operator gesture made during a reconnect is not lost.
+#[cfg(feature = "pairing-code")]
+fn refuse(connection: &Connection, carried: &Carried, request: ControlRequest) {
+    if matches!(request.action, ControlAction::ReleaseHoldback) {
+        connection.failed_rounds.store(0, Ordering::SeqCst);
+        let _ = request.reply.send(Ok(carried.volume));
+        return;
+    }
+    let _ = request
+        .reply
+        .send(Err(anyhow!("no connection is established")));
+}
+
+/// Answers a request that arrived while no session was established.
+#[cfg(not(feature = "pairing-code"))]
 fn refuse(request: ControlRequest) {
     let _ = request
         .reply
@@ -637,7 +975,12 @@ async fn wait_before_retry(
             () = connection.events.closed() => Wakeup::Closed,
         };
         match wakeup {
-            Wakeup::Control(Some(request)) => refuse(request),
+            Wakeup::Control(Some(request)) => {
+                #[cfg(feature = "pairing-code")]
+                refuse(connection, carried, request);
+                #[cfg(not(feature = "pairing-code"))]
+                refuse(request);
+            }
             Wakeup::Control(None) => *control = None,
             Wakeup::Deadline => return true,
             Wakeup::Closed => return false,
@@ -676,6 +1019,7 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
             &connection.config,
             &connection.events,
             &connection.psks,
+            connection.pairing,
             &connection.reported_volume,
             carried,
         )
@@ -707,7 +1051,9 @@ async fn serve_until_dropped(connection: Connection, mut carried: Carried) -> Re
             // The host has to fix the sink; a retry would only fail the same way.
             return match attempt.ending {
                 session::Ending::Failed(error) => Err(error),
-                session::Ending::Closed => Err(anyhow!("the audio sink failed")),
+                session::Ending::Closed | session::Ending::Unpaired => {
+                    Err(anyhow!("the audio sink failed"))
+                }
             };
         }
         if let Some(error) = flush_error {
@@ -776,6 +1122,111 @@ fn endpoint(server: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// A pairing code is a credential for one attempt: `Debug` names it but never prints it.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn the_pairing_code_event_formats_without_its_code() {
+        for (code, format) in [
+            ("482913".to_owned(), CodeFormat::Digits),
+            (
+                "SP:1QJOHGMGBXP55Y6KMJD3KOYR9F6OWYD6QQPIKEFY".to_owned(),
+                CodeFormat::QrCode,
+            ),
+        ] {
+            let event = Event::PairingCode {
+                code: code.clone(),
+                format,
+                round: 3,
+            };
+            let text = format!("{event:?}");
+            assert!(text.contains("code: \"<redacted>\""), "got: {text}");
+            assert!(
+                !text.contains(&code),
+                "the code must never reach a log line: {text}"
+            );
+            assert!(
+                text.contains(&format!("format: {format:?}")),
+                "the format is not secret: {text}"
+            );
+            assert!(text.contains("round: 3"), "the round is not secret: {text}");
+        }
+    }
+
+    /// The record-lifecycle events name the server, which is not secret, and nothing else.
+    #[test]
+    fn the_record_lifecycle_events_format_their_server_id() {
+        let server_id = "B1y4w7z0c3f6i9l2o5r8u1x4a7d0g3j6m9p2s5v8y1b".to_owned();
+
+        let unpaired = format!(
+            "{:?}",
+            Event::Unpaired {
+                server_id: server_id.clone(),
+            }
+        );
+        assert!(
+            unpaired.contains(&format!("Unpaired {{ server_id: \"{server_id}\" }}")),
+            "got: {unpaired}"
+        );
+
+        let required = format!(
+            "{:?}",
+            Event::PairingRequired {
+                server_id: server_id.clone(),
+                reason: PairingRequiredReason::CredentialMismatch,
+            }
+        );
+        assert!(required.contains(&server_id), "got: {required}");
+        assert!(
+            required.contains("CredentialMismatch"),
+            "the reason is what the host acts on: {required}"
+        );
+        assert!(
+            !required.contains("<redacted>"),
+            "neither event carries a secret, so neither redacts a field: {required}"
+        );
+    }
+
+    /// Every other event keeps the fields a log line needs.
+    #[test]
+    fn an_event_still_formats_its_readable_fields() {
+        let text = format!(
+            "{:?}",
+            Event::Disconnected {
+                reason: "the server closed the connection".to_owned(),
+                retry_in: Duration::from_secs(2),
+            }
+        );
+        assert!(
+            text.contains("Disconnected { reason: \"the server closed the connection\""),
+            "got: {text}"
+        );
+        assert!(text.contains("retry_in: 2s"), "got: {text}");
+    }
+
+    #[test]
+    fn every_abort_reason_round_trips_through_the_wire_spelling() {
+        for (wire, reason) in [
+            ("attempt_timeout", PairingFailure::AttemptTimeout),
+            ("method_not_supported", PairingFailure::MethodNotSupported),
+            ("pairing_code_mismatch", PairingFailure::PairingCodeMismatch),
+            ("user_cancelled", PairingFailure::UserCancelled),
+            ("concurrent_attempt", PairingFailure::ConcurrentAttempt),
+        ] {
+            assert_eq!(reason.as_str(), wire);
+            assert_eq!(PairingFailure::from_wire(wire), reason);
+        }
+
+        // A reason from a later revision is carried, not rejected.
+        assert_eq!(
+            PairingFailure::from_wire("future_reason"),
+            PairingFailure::Unrecognised("future_reason".to_owned())
+        );
+        assert_eq!(
+            PairingFailure::Unrecognised("future_reason".to_owned()).as_str(),
+            "future_reason"
+        );
+    }
+
     #[test]
     fn a_bare_address_gets_the_default_websocket_endpoint() {
         assert_eq!(
@@ -832,11 +1283,147 @@ mod tests {
             "wss://example.test",
             "https://example.test",
             "ws://",
+            "ws://?token=1",
+            "ws://#fragment",
+            "ws:///player",
+            "?token=1",
+            "#fragment",
         ] {
             assert!(
                 endpoint(server).is_err(),
                 "{server:?} must not be turned into a cleartext endpoint"
             );
         }
+    }
+
+    use crate::test_support::NullSink;
+
+    /// Builds the parts of a connection that do not change across attempts.
+    fn connection_at(endpoint: &str, events: mpsc::UnboundedSender<Event>) -> Connection {
+        Connection {
+            endpoint: endpoint.to_owned(),
+            config: ClientConfig {
+                server: endpoint.to_owned(),
+                player_name: "Test player".to_owned(),
+                device_info: None,
+                identity: crate::Identity::generate(),
+                storage: None,
+                audio_mode: crate::AudioMode::Passthrough,
+                volume: 42,
+                muted: false,
+                volume_policy: VolumePolicy::default(),
+                max_backoff: Duration::from_secs(30),
+                pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+                #[cfg(feature = "pairing-code")]
+                static_pairing_code: None,
+                #[cfg(feature = "pairing-code")]
+                pairing_window: crate::DEFAULT_PAIRING_WINDOW,
+                #[cfg(feature = "pairing-code")]
+                pairing_pending_text: None,
+                #[cfg(feature = "pairing-code")]
+                code_formats: Vec::new(),
+                #[cfg(feature = "pairing-code")]
+                code_out_channels: Vec::new(),
+            },
+            psks: Vec::new(),
+            pairing: None,
+            events,
+            reported_volume: Arc::new(AtomicU8::new(42)),
+            #[cfg(feature = "pairing-code")]
+            failed_rounds: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn empty_carried(control: Option<mpsc::UnboundedReceiver<ControlRequest>>) -> Carried {
+        Carried {
+            sink: Box::new(NullSink),
+            control,
+            volume: 42,
+            muted: false,
+            active_roles: Vec::new(),
+            #[cfg(feature = "pairing-code")]
+            failed_rounds: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_wait_without_a_control_handle_still_honours_the_delay() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let connection = connection_at("127.0.0.1:1", events);
+        let (commands, control) = mpsc::unbounded_channel();
+        drop(commands);
+        let mut carried = empty_carried(Some(control));
+
+        let started = std::time::Instant::now();
+        let retry = wait_before_retry(&connection, &mut carried, Duration::from_millis(50)).await;
+
+        assert!(retry, "the delay elapsed, so the next attempt must follow");
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "the delay must be waited out, not skipped"
+        );
+        assert!(
+            carried.control.is_none(),
+            "a control channel whose senders are gone is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_event_stream_during_a_retry_ends_the_connection() {
+        let (events, receiver) = mpsc::unbounded_channel();
+        let connection = connection_at("127.0.0.1:1", events);
+        let mut carried = empty_carried(None);
+
+        let retry = wait_before_retry(&connection, &mut carried, Duration::from_secs(60));
+        tokio::pin!(retry);
+        let mut finished = false;
+        tokio::select! {
+            _ = &mut retry => finished = true,
+            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        assert!(!finished, "the wait must not end while the stream is open");
+
+        drop(receiver);
+        assert!(
+            !retry.await,
+            "a dropped event stream must stop the retry loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_with_no_event_stream_ends_the_connection() {
+        // Bind and release a loopback port, so the open fails immediately rather than timing out.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+        let address = listener.local_addr().expect("the bound address");
+        drop(listener);
+
+        let (events, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let connection = connection_at(&address.to_string(), events);
+
+        let outcome = serve_until_dropped(connection, empty_carried(None)).await;
+        assert!(
+            outcome.is_ok(),
+            "a host that dropped the stream ends the connection cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_namespace_entry_points_wrap_the_free_functions() {
+        // A bad configuration is rejected by both before any socket is opened, which pins the
+        // forwarding: a wrapper that inverted the result would not return this error.
+        let mut config = connection_at("127.0.0.1:1", mpsc::unbounded_channel().0).config;
+        config.player_name.clear();
+        let error = Client::connect(config, Box::new(NullSink))
+            .await
+            .expect_err("an invalid configuration must be rejected");
+        assert!(format!("{error:#}").contains("player_name"));
+
+        let mut config = connection_at("127.0.0.1:1", mpsc::unbounded_channel().0).config;
+        config.server = "wss://example.test".to_owned();
+        let error = Client::connect_with_psks(config, Box::new(NullSink), Vec::new())
+            .await
+            .expect_err("a TLS address must be rejected before connecting");
+        assert!(format!("{error:#}").contains("TLS"));
     }
 }

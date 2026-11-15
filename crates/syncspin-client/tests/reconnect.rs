@@ -13,7 +13,7 @@ use anyhow::Result;
 use fake_server::{FakeServer, ServerOptions};
 use syncspin_client::{
     connect, next_backoff, AudioFormat, AudioFrame, AudioMode, ClientConfig, ClientHandle, Codec,
-    Event, EventStream, Identity, Sink, VolumePolicy, INITIAL_BACKOFF,
+    Event, EventStream, Identity, Sink, VolumePolicy, DEFAULT_PAIRING_TIMEOUT, INITIAL_BACKOFF,
 };
 use syncspin_core::messages::ClientState;
 
@@ -110,11 +110,23 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         player_name: "Test player".to_owned(),
         device_info: None,
         identity: Identity::generate(),
+        storage: None,
         audio_mode: AudioMode::Passthrough,
         volume: 100,
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
+        pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
+        #[cfg(feature = "pairing-code")]
+        pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     }
 }
 
@@ -271,11 +283,23 @@ async fn an_unreachable_server_is_an_event_and_not_an_error() {
         player_name: "Test player".to_owned(),
         device_info: None,
         identity: Identity::generate(),
+        storage: None,
         audio_mode: AudioMode::Passthrough,
         volume: 100,
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
+        pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
+        #[cfg(feature = "pairing-code")]
+        pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(recordings.clone())))
         .await
@@ -532,11 +556,23 @@ async fn the_retry_delay_is_awaited_before_the_next_attempt() {
         player_name: "Test player".to_owned(),
         device_info: None,
         identity: Identity::generate(),
+        storage: None,
         audio_mode: AudioMode::Passthrough,
         volume: 100,
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: retry,
+        pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "pairing-code")]
+        static_pairing_code: None,
+        #[cfg(feature = "pairing-code")]
+        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
+        #[cfg(feature = "pairing-code")]
+        pairing_pending_text: None,
+        #[cfg(feature = "pairing-code")]
+        code_formats: Vec::new(),
+        #[cfg(feature = "pairing-code")]
+        code_out_channels: Vec::new(),
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(Recordings::default())))
         .await

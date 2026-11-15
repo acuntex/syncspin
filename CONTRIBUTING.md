@@ -32,13 +32,20 @@ CI gates, so a green local run is what a reviewer will see; prettier is a local 
 
 ```sh
 cargo test --workspace --locked
-cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --features pairing-code,storage-file --locked
+cargo test -p syncspin-core -p syncspin-client --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 npx --yes prettier@3.9.10 --check .
 ```
 
-`--locked` is not optional: the workspace ships a `Cargo.lock`, and a test run that silently
-resolves new versions tells you nothing about the code that will be released.
+Feature unification decides what those three runs cover. `syncspin-client` has no default
+features, but `player-pipe` enables `storage-file` by default, so the workspace run turns it on for
+the client and runs the file backend's tests; `pairing-code` is off everywhere unless requested. The
+second run adds the code flows, and the third tests the library crates with their own defaults —
+what a consumer that enables nothing gets. All three are the `test` gate. `--locked` is not
+optional: the workspace ships a `Cargo.lock`, and a test run that silently resolves new versions
+tells you nothing about the code that will be released.
 
 The MSRV is 1.85 and is checked separately:
 
@@ -59,7 +66,7 @@ are configured in [`.pre-commit-config.yaml`](.pre-commit-config.yaml); install 
 | Check     | What it proves                                                                                                                                                |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `lint`    | `cargo fmt --check` and clippy without warnings.                                                                                                              |
-| `test`    | The hermetic suite on x86_64.                                                                                                                                 |
+| `test`    | The hermetic suite on x86_64: the workspace, the pairing features, and the library crates with their own defaults.                                            |
 | `msrv`    | The suite still builds and passes on 1.85.                                                                                                                    |
 | `arm`     | The crates still compile for ARMv7. The glibc 2.24 baseline itself needs the `zigbuild` run in [`docs/testing.md`](docs/testing.md); CI does not link it yet. |
 | `deny`    | Licences, advisories and sources of every dependency.                                                                                                         |
