@@ -460,6 +460,40 @@ pub struct ServerCommand {
     pub player: Option<PlayerCommand>,
 }
 
+/// The `controller` object of [`ClientCommand`].
+///
+/// `command` names the operation and the other fields carry its parameter; a field that does not
+/// belong to the command is absent rather than null.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ControllerCommand {
+    /// Command to run: `play`, `pause`, `stop`, `next`, `previous`, `volume`, `mute`,
+    /// `repeat_off`, `repeat_one`, `repeat_all`, `shuffle`, `unshuffle`, `switch`, `seek` or
+    /// `seek_relative`. A command outside the server's advertised set is ignored by the server.
+    pub command: String,
+    /// Target group volume in the range 0-100; only for `volume`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u8>,
+    /// Target mute state; only for `mute`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mute: Option<bool>,
+    /// Absolute position in milliseconds; only for `seek`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_ms: Option<u64>,
+    /// Offset from the current position in milliseconds; only for `seek_relative`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_ms: Option<i64>,
+}
+
+/// `client/command`: a command the client sends to the server for one of its active roles.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ClientCommand {
+    /// Controller command; present exactly when the `controller` role is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<ControllerCommand>,
+}
+
 // ---------------------------------------------------------------------------
 // Binary audio
 // ---------------------------------------------------------------------------
@@ -579,6 +613,9 @@ pub enum Incoming {
     /// `server/command`.
     #[serde(rename = "server/command")]
     ServerCommand(ServerCommand),
+    /// `client/command`.
+    #[serde(rename = "client/command")]
+    ClientCommand(ClientCommand),
     /// `stream/start`.
     #[serde(rename = "stream/start")]
     StreamStart(StreamStart),
@@ -659,7 +696,7 @@ struct EnvelopeType {
 ///
 /// A variant added without its entry here would silently read as an unknown type, so the
 /// integration tests parse one instance of every variant.
-const KNOWN_TYPES: [&str; 14] = [
+const KNOWN_TYPES: [&str; 15] = [
     "client/init",
     "server/init",
     "noise/handshake",
@@ -671,6 +708,7 @@ const KNOWN_TYPES: [&str; 14] = [
     "client/state",
     "server/state",
     "server/command",
+    "client/command",
     "stream/start",
     "stream/clear",
     "stream/end",

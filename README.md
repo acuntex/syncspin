@@ -10,6 +10,19 @@ Sendspin project; "Sendspin" is used only to describe what the code speaks.
 **Status: 0.1 work in progress.** The workspace exists and compiles, the client is being extracted
 from a working player, the server is a stub. Nothing here is stable yet.
 
+## Client behaviour
+
+A connection reconnects on its own: when an attempt ends, the crate flushes the sink, reports
+`Event::Disconnected` with the delay it applies (2 s at first, doubling up to
+`ClientConfig::max_backoff`, and 1 s again after a session that connected) and tries again with the
+same sink, identity, volume and mute state. It stops only when the audio sink fails or when the
+handle or event stream is dropped.
+
+`ClientConfig::volume` and `ClientConfig::muted` are the level and mute state the first `client/state`
+carries. A host passes the values it restored, so the server never sees an invented baseline; a host
+without stored values passes `100` and `false`. `ControlHandle::set_volume` returns the level that
+was applied, and `ControlHandle::volume` reports the level in force without a call.
+
 ## Layout
 
 | Path                      | Contents                                                                        |

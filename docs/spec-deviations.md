@@ -10,24 +10,26 @@ harmless.
 
 ## Summary
 
-| #   | Area                                                            | Spec section                                                                                                                            | Status                        |
-| --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
-| 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)       | Closes in 0.2                 |
-| 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)             | Stage 1b                      |
-| 3   | No version-0 pairing-token export                               | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                     | Closes with pairing (stage 2) |
-| 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                             | Closes with pairing (stage 2) |
-| 5   | No code pairing (PAKE)                                          | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                       | Stage 4                       |
-| 6   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                   | Stage 1b                      |
-| 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                   | Stage 1b                      |
-| 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections) | Closes in 0.2                 |
-| 9   | No `client/goodbye` writer                                      | [`messaging.md` — `client/goodbye`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clientgoodbye)               | Stage 1b                      |
-| 10  | Transport-mode re-handshake ignored                             | [`connection.md` — Re-handshake](https://github.com/Sendspin/spec/blob/main/connection.md#re-handshake)                                 | Stage 2                       |
-| 11  | `pairing_psk` advertised without the Pairing PSK flow           | [`messaging.md` — `client/hello`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clienthello)                   | Stage 2                       |
-| 12  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                   | Stage 1b                      |
-| 13  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                   | Stage 1b                      |
-| 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                     | Stage 1b                      |
-| 15  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                   | Stage 1b                      |
-| 16  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                 | Documented                    |
+| #   | Area                                                            | Spec section                                                                                                                                                                      | Status                        |
+| --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Closes in 0.2                 |
+| 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                      |
+| 3   | No version-0 pairing-token export                               | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Closes with pairing (stage 2) |
+| 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Closes with pairing (stage 2) |
+| 5   | No code pairing (PAKE)                                          | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Stage 4                       |
+| 6   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Stage 1b                      |
+| 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                      |
+| 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                 |
+| 9   | No `client/goodbye` writer                                      | [`messaging.md` — `client/goodbye`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clientgoodbye)                                                         | Stage 1b                      |
+| 10  | Transport-mode re-handshake ignored                             | [`connection.md` — Re-handshake](https://github.com/Sendspin/spec/blob/main/connection.md#re-handshake)                                                                           | Stage 2                       |
+| 11  | `pairing_psk` advertised without the Pairing PSK flow           | [`messaging.md` — `client/hello`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clienthello)                                                             | Stage 2                       |
+| 12  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                      |
+| 13  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                      |
+| 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                      |
+| 15  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                      |
+| 16  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                    |
+| 17  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume`      |
+| 18  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`     |
 
 ## 1. Client-initiated connections only
 
@@ -341,10 +343,11 @@ estimate.
 
 **What we do:** each burst contributes one measurement, the one with the lowest positive
 `max_error`. `ClockFilter` has an estimate only after three accepted samples
-(`READY_AFTER_SAMPLES`), so the player state is reported as soon as the first reply arrives, but
-audio that arrives before the third burst is handed to the sink with `Instant::now()` instead of a
-scheduled deadline. With a responsive server the three bursts follow each other immediately; with lost
-replies each burst costs its per-message timeouts first.
+(`READY_AFTER_SAMPLES`), and the player state goes out when the first burst completes with at least
+one measurement, so the report never precedes the filter's first sample. Audio that arrives before
+the third burst is handed to the sink with `Instant::now()` instead of a scheduled deadline. With a
+responsive server the three bursts follow each other immediately; with lost replies each burst costs
+its per-message timeouts first.
 
 **Why:** one measurement per burst is the spec's rule, and a readiness threshold below three would
 schedule from a single offset sample with no drift or error estimate. Delivering the audio without a
@@ -355,6 +358,47 @@ as soon as possible".
 required earlier, seed the filter from the first three bursts before reporting the state or relax
 readiness with an explicit accuracy bound; test deadlines with one, two and three answered
 requests.
+
+## 17. A player volume above 100 is capped, not rejected
+
+**Spec:** `roles/player/v1.md`, `server/command` player object. `volume` is an integer in the range
+0-100, and `messaging.md` says a field value outside the fixed range its definition gives is a
+protocol error: the receiver MUST close the connection.
+
+**What we do:** a `server/command` carrying a volume of 101-255 - the wire field is a `u8`, so such
+a value decodes - is applied as 100 and reported as 100. `clamp_volume` limits both the level in
+force and the requested one before it applies the +20 rule, so the client's own `client/state`
+stays inside the range a conformant server accepts, and the connection stays open.
+`a_server_volume_above_the_protocol_range_is_capped` pins the behaviour.
+
+**Why:** closing the connection would silence playback over a value the server got wrong, and the
+right audible outcome - full volume, no mute change - is unambiguous. The alternative, closing,
+belongs with the failure handling that `server/error` and typed protocol errors would introduce
+(entry 7); until then a cap is the failure mode that keeps the player usable.
+
+**Removing it:** give `clamp_volume` and `handle_command` a typed rejection path and close the
+connection with a protocol-error reason once that path exists, or reject the value at the parser
+with the same effect. Test the closed connection instead of the capped level.
+
+## 18. A transport command before the controller state is not checked
+
+**Spec:** `roles/controller/v1.md`, `client/command` controller object. `command` MUST be one of
+the values listed in `supported_commands` from the latest controller state the client received in
+`server/state`.
+
+**What we do:** the session records `controller.supported_commands` whenever a controller state
+arrives and refuses a transport command outside that set (`check_control`,
+`a_transport_command_must_be_advertised_by_the_server`). Before the first controller state the set
+is unknown, so a command is sent instead of refused; the server ignores a command it does not
+accept, so the observable outcome is the same, but the client has broken the MUST in that window.
+
+**Why:** a host may offer a play button before the first `server/state` arrives - it has no other
+source of truth - and refusing there would make the button dead for an unbounded time. The window
+closes with the first controller state, which the server sends promptly after activation.
+
+**Removing it:** expose the known commands on the connection (an `Event::State` snapshot or a
+`ControlHandle` query) and let the host disable its buttons until the first state arrives, then
+refuse every command while the set is unknown.
 
 ## How to update this file
 

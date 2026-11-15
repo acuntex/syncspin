@@ -171,6 +171,8 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         player_name: "Test player".to_owned(),
         identity: Identity::generate(),
         audio_mode: mode,
+        volume: 100,
+        muted: false,
         max_backoff: Duration::from_secs(1),
     }
 }
@@ -281,6 +283,16 @@ async fn wait_for_client_state(server: &mut FakeServer) -> ClientState {
         .await
         .expect("the client must report its state")
         .expect("the connection must not close before the state report")
+}
+
+/// Asserts that a transient failure left the connection reconnecting instead of ending it.
+async fn assert_still_reconnecting(handle: ClientHandle) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), handle.finished())
+            .await
+            .is_err(),
+        "a transient failure must not end the connection"
+    );
 }
 
 /// Current wall clock in microseconds, the domain of server timestamps.
@@ -591,10 +603,7 @@ async fn malformed_known_message_closes_the_connection() {
         }
         other => panic!("expected Disconnected, got {other:?}"),
     }
-    let outcome = tokio::time::timeout(Duration::from_secs(5), handle.finished())
-        .await
-        .expect("the session must not hang after a protocol error");
-    assert!(outcome.is_err(), "a malformed message must end the session");
+    assert_still_reconnecting(handle).await;
 }
 
 #[tokio::test]
@@ -617,10 +626,7 @@ async fn a_short_audio_chunk_without_a_stream_is_a_protocol_error() {
         }
         other => panic!("expected Disconnected, got {other:?}"),
     }
-    let outcome = tokio::time::timeout(Duration::from_secs(5), handle.finished())
-        .await
-        .expect("the session must not hang after a protocol error");
-    assert!(outcome.is_err());
+    assert_still_reconnecting(handle).await;
 }
 
 #[tokio::test]
@@ -645,13 +651,7 @@ async fn a_server_that_never_starts_the_handshake_is_refused() {
         }
         other => panic!("expected Disconnected, got {other:?}"),
     }
-    let outcome = tokio::time::timeout(Duration::from_secs(2), handle.finished())
-        .await
-        .expect("the session must not hang");
-    assert!(
-        outcome.is_err(),
-        "a server without a handshake must be an error, not a downgrade"
-    );
+    assert_still_reconnecting(handle).await;
     assert!(
         recordings.opened().is_empty(),
         "nothing may be played without an encrypted handshake"
@@ -750,10 +750,7 @@ async fn a_stored_key_for_another_server_is_refused() {
         }
         other => panic!("expected Disconnected, got {other:?}"),
     }
-    let outcome = tokio::time::timeout(Duration::from_secs(2), handle.finished())
-        .await
-        .expect("the session must not hang");
-    assert!(outcome.is_err());
+    assert_still_reconnecting(handle).await;
 }
 
 #[tokio::test]
@@ -780,10 +777,7 @@ async fn malformed_psk_metadata_closes_without_a_second_handshake_message() {
         matches!(observed, Some(Observation::ClosedBeforeMessage2) | None),
         "message 2 must never be sent after malformed metadata"
     );
-    let outcome = tokio::time::timeout(Duration::from_secs(2), handle.finished())
-        .await
-        .expect("the session must not hang");
-    assert!(outcome.is_err());
+    assert_still_reconnecting(handle).await;
 }
 
 #[tokio::test]
@@ -864,7 +858,8 @@ async fn the_initial_state_is_sent_after_a_single_time_reply() {
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
-    // The burst has a single deadline, so the unanswered requests cost one short wait, not seven.
+    // The burst carries one answered request and times the rest out, so the filter's first sample
+    // lands when the burst ends. The state is reported then, never on an individual reply.
     let state = wait_for_client_state(&mut server).await;
     assert!(state.available);
 }
@@ -881,6 +876,8 @@ async fn the_initial_state_is_sent_after_two_time_replies() {
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
+    // Two answered requests still leave the burst short of its full eight, so the report follows
+    // the burst's last timeout.
     let state = wait_for_client_state(&mut server).await;
     assert!(state.available);
 }
@@ -962,20 +959,43 @@ async fn a_mute_command_does_not_report_a_volume() {
 
 #[tokio::test]
 async fn an_invalid_configuration_is_rejected_before_connecting() {
-    let (_recordings, sink) = recording_sink();
-    let config = ClientConfig {
+    let base = |name: &str| ClientConfig {
         server: "127.0.0.1:1".to_owned(),
-        player_name: String::new(),
+        player_name: name.to_owned(),
         identity: Identity::generate(),
         audio_mode: syncspin_client::AudioMode::Passthrough,
+        volume: 100,
+        muted: false,
         max_backoff: Duration::from_secs(1),
     };
-    match connect(config, sink).await {
-        Ok(_) => panic!("an empty player name must be rejected"),
-        Err(error) => assert!(
-            format!("{error:#}").contains("player_name"),
-            "the error should name the field, got: {error:#}"
+
+    for (label, config, field) in [
+        ("an empty name", base(""), "player_name"),
+        (
+            "a level above the range",
+            ClientConfig {
+                volume: 101,
+                ..base("Test player")
+            },
+            "volume",
         ),
+        (
+            "a zero backoff",
+            ClientConfig {
+                max_backoff: Duration::ZERO,
+                ..base("Test player")
+            },
+            "max_backoff",
+        ),
+    ] {
+        let (_recordings, sink) = recording_sink();
+        match connect(config, sink).await {
+            Ok(_) => panic!("{label} must be rejected"),
+            Err(error) => assert!(
+                format!("{error:#}").contains(field),
+                "{label}: the error should name {field}, got: {error:#}"
+            ),
+        }
     }
 }
 

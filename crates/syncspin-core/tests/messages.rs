@@ -6,11 +6,12 @@ use syncspin_core::framing::{
     FRAGMENT_FLAG_LAST, MAX_PLAINTEXT_LEN, MAX_REASSEMBLED_LEN,
 };
 use syncspin_core::messages::{
-    AudioChunkHeader, ClientHello, ClientInit, ClientState, ClientTime, DecodeError, DeviceInfo,
-    Incoming, NoiseHandshake, PairingPskMethod, PlayerState, PlayerSupport, ServerActivate,
-    ServerCommand, ServerHello, ServerInit, ServerState, ServerTime, StreamClear, StreamEnd,
-    StreamStart, StreamStartPlayer, SupportedFormat, SupportedPairMethods, UnpairedAccess,
-    AUDIO_CHUNK_ID, NOISE_SUITE, PROTOCOL_VERSION,
+    AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientState, ClientTime,
+    ControllerCommand, DecodeError, DeviceInfo, Incoming, NoiseHandshake, PairingPskMethod,
+    PlayerState, PlayerSupport, ServerActivate, ServerCommand, ServerHello, ServerInit,
+    ServerState, ServerTime, StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
+    SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
+    PROTOCOL_VERSION,
 };
 
 /// A payload whose first bytes differ, so a reassembled message is easy to verify.
@@ -244,6 +245,57 @@ fn server_activate_and_player_state_roundtrip() {
 }
 
 #[test]
+fn client_command_roundtrips_on_the_wire() {
+    let play = ClientCommand {
+        controller: Some(ControllerCommand {
+            command: "play".to_owned(),
+            ..ControllerCommand::default()
+        }),
+    };
+    let json = serde_json::to_string(&Incoming::ClientCommand(play.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/command",
+            "payload": { "controller": { "command": "play" } }
+        }),
+        "a parameterless command carries only its name"
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientCommand(play)
+    );
+
+    // A parameter belongs to its command and the other fields stay absent rather than null.
+    let seek = ClientCommand {
+        controller: Some(ControllerCommand {
+            command: "seek".to_owned(),
+            position_ms: Some(1_500),
+            ..ControllerCommand::default()
+        }),
+    };
+    let json = serde_json::to_string(&Incoming::ClientCommand(seek.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "client/command",
+            "payload": { "controller": { "command": "seek", "position_ms": 1_500 } }
+        })
+    );
+    assert_eq!(
+        serde_json::from_str::<Incoming>(&json).unwrap(),
+        Incoming::ClientCommand(seek)
+    );
+
+    // A command aimed at another role parses, because a future revision may define one.
+    let empty = Incoming::parse(r#"{"type":"client/command","payload":{}}"#).unwrap();
+    assert_eq!(
+        empty,
+        Some(Incoming::ClientCommand(ClientCommand::default()))
+    );
+}
+
+#[test]
 fn stream_start_and_audio_chunk_header_roundtrip() {
     let start = StreamStart {
         server_transmitted: 1_760_000_000_000_000,
@@ -449,11 +501,12 @@ fn parse_accepts_every_message_this_revision_implements() {
         }),
         Incoming::ServerState(ServerState::default()),
         Incoming::ServerCommand(ServerCommand::default()),
+        Incoming::ClientCommand(ClientCommand::default()),
         Incoming::StreamStart(StreamStart::default()),
         Incoming::StreamClear(StreamClear::default()),
         Incoming::StreamEnd(StreamEnd::default()),
     ];
-    assert_eq!(messages.len(), 14, "one instance per message type");
+    assert_eq!(messages.len(), 15, "one instance per message type");
     for message in messages {
         let text = serde_json::to_string(&message).unwrap();
         assert_eq!(

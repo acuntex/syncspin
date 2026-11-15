@@ -32,10 +32,7 @@ const DEFAULT_NAME: &str = "syncspin-pipe";
 /// Identity file used when `--identity` is absent.
 const DEFAULT_IDENTITY: &str = "./identity.key";
 
-/// First delay between reconnects; doubles up to [`MAX_BACKOFF`].
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-
-/// Longest delay between reconnects, also handed to [`ClientConfig::max_backoff`].
+/// Longest delay between reconnects, handed to [`ClientConfig::max_backoff`].
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 fn main() -> Result<()> {
@@ -66,7 +63,7 @@ fn play(options: Options) -> Result<()> {
     result
 }
 
-/// Connects, reconnects with backoff and returns when the user interrupts.
+/// Connects and prints one status line per event until the user interrupts.
 async fn run(options: Options) -> Result<()> {
     let identity = load_or_create_identity(&options.identity)?;
     eprintln!(
@@ -83,88 +80,29 @@ async fn run(options: Options) -> Result<()> {
         // This example has no decoder, so it asks for raw samples. A host that wants encoded
         // frames selects `AudioMode::Passthrough` and brings its own decoder.
         audio_mode: AudioMode::Decode,
+        // Nothing is restored across restarts, so the output starts at full scale and unmuted.
+        volume: 100,
+        muted: false,
         max_backoff: MAX_BACKOFF,
     };
 
-    let mut delay = INITIAL_BACKOFF;
+    // The client owns the reconnect loop: a dropped session is reported on the stream and retried
+    // with the same sink and identity, so this example only prints what it sees.
+    let (_handle, mut events) = Client::connect(config, Box::new(PipeSink::new())).await?;
     loop {
-        let (reason, retry_in) = match serve(&config).await {
-            Ok(Ending::Interrupted) => return Ok(()),
-            Ok(Ending::Disconnected {
-                reason,
-                retry_in,
-                connected,
-            }) => {
-                if connected {
-                    // The address and the handshake worked, so a later failure is more likely
-                    // transient than a reason to keep waiting longer.
-                    delay = INITIAL_BACKOFF;
-                }
-                (reason, retry_in)
-            }
-            Err(error) => (
-                format!("cannot connect to {}: {error}", config.server),
-                Duration::ZERO,
-            ),
-        };
-
-        // The session recommends a delay and the player keeps its own growing sequence, so the
-        // larger of the two is honoured, up to the configured cap.
-        let wait = retry_in.max(delay).min(config.max_backoff);
-        eprintln!(
-            "disconnected: {reason}; retrying in {}s",
-            wait.as_secs_f32()
-        );
         tokio::select! {
             interrupted = signal::ctrl_c() => {
                 interrupted.context("failed to wait for Ctrl-C")?;
                 eprintln!("stopped on Ctrl-C");
                 return Ok(());
             }
-            () = tokio::time::sleep(wait) => {}
-        }
-        delay = delay.saturating_mul(2).min(MAX_BACKOFF);
-    }
-}
-
-/// How one connection ended.
-enum Ending {
-    /// The connection ended; the caller waits and connects again.
-    Disconnected {
-        /// Why the connection ended, without key material.
-        reason: String,
-        /// Delay the session recommends before the next attempt.
-        retry_in: Duration,
-        /// Whether the session reached [`Event::Connected`] before it ended.
-        connected: bool,
-    },
-    /// The user asked the player to stop.
-    Interrupted,
-}
-
-/// Connects once, prints one status line per event and returns how the connection ended.
-async fn serve(config: &ClientConfig) -> Result<Ending> {
-    let (_handle, mut events) = Client::connect(config.clone(), Box::new(PipeSink::new())).await?;
-    let mut connected = false;
-
-    loop {
-        tokio::select! {
-            interrupted = signal::ctrl_c() => {
-                interrupted.context("failed to wait for Ctrl-C")?;
-                eprintln!("stopped on Ctrl-C");
-                return Ok(Ending::Interrupted);
-            }
             event = events.next() => {
                 let Some(event) = event else {
-                    return Ok(Ending::Disconnected {
-                        reason: "the event stream ended without a disconnect event".to_owned(),
-                        retry_in: Duration::ZERO,
-                        connected,
-                    });
+                    eprintln!("the connection ended");
+                    return Ok(());
                 };
                 match event {
                     Event::Connected { server_id, encrypted } => {
-                        connected = true;
                         let security = if encrypted { "encrypted" } else { "not encrypted" };
                         eprintln!("connected: server {server_id}, {security}");
                     }
@@ -208,9 +146,10 @@ async fn serve(config: &ClientConfig) -> Result<Ending> {
                             eprintln!("state: {}", parts.join(", "));
                         }
                     }
-                    Event::Disconnected { reason, retry_in } => {
-                        return Ok(Ending::Disconnected { reason, retry_in, connected });
-                    }
+                    Event::Disconnected { reason, retry_in } => eprintln!(
+                        "disconnected: {reason}; retrying in {}s",
+                        retry_in.as_secs_f32()
+                    ),
                     // A later revision can add events; this example only prints the ones it knows.
                     _ => {}
                 }

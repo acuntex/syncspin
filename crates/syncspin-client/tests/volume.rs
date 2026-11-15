@@ -13,7 +13,10 @@ use syncspin_client::{
     clamp_volume, connect, AudioFormat, AudioFrame, AudioMode, ClientConfig, ClientHandle,
     ControlHandle, Event, EventStream, Identity, Sink,
 };
-use syncspin_core::messages::{ClientState, Incoming, PlayerCommand, ServerCommand};
+use syncspin_core::messages::{
+    ClientState, ControllerCommand, ControllerState, Incoming, PlayerCommand, ServerCommand,
+    ServerState,
+};
 
 use fake_server::{FakeServer, ServerOptions};
 
@@ -41,6 +44,8 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         player_name: "Test player".to_owned(),
         identity: Identity::generate(),
         audio_mode: AudioMode::Passthrough,
+        volume: 100,
+        muted: false,
         max_backoff: Duration::from_secs(30),
     }
 }
@@ -126,24 +131,33 @@ fn mute_command(muted: bool) -> String {
     .expect("the command must encode")
 }
 
-/// Waits for the next `client/command` and returns its controller object.
-async fn next_controller_command(server: &mut FakeServer) -> serde_json::Value {
-    let body = tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_command())
+/// Builds the `server/state` that advertises the controller commands the server accepts.
+fn controller_state(commands: &[&str]) -> String {
+    serde_json::to_string(&Incoming::ServerState(ServerState {
+        metadata: None,
+        controller: Some(ControllerState {
+            supported_commands: commands
+                .iter()
+                .map(|command| (*command).to_owned())
+                .collect(),
+            volume: Some(100),
+            muted: Some(false),
+            repeat: None,
+            shuffle: None,
+        }),
+    }))
+    .expect("the state must encode")
+}
+
+/// Waits for the next client command and returns its controller object.
+async fn next_controller_command(server: &mut FakeServer) -> ControllerCommand {
+    let command = tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_command())
         .await
         .expect("the client must send a command")
         .expect("the connection must not close before the command");
-    let value: serde_json::Value = serde_json::from_str(&body).expect("the command must be JSON");
-    assert_eq!(
-        value["type"], "client/command",
-        "a controller command uses the client command envelope: {body}"
-    );
-    let controller = value["payload"]["controller"].clone();
-    assert_eq!(
-        controller.as_object().map(|object| object.len()),
-        Some(1),
-        "a transport command carries only its name: {body}"
-    );
-    controller
+    command
+        .controller
+        .expect("a controller command carries a controller object")
 }
 
 #[test]
@@ -174,6 +188,18 @@ fn above_forty_a_single_request_raises_by_at_most_twenty() {
     assert_eq!(clamp_volume(50, 80), 70);
     assert_eq!(clamp_volume(100, 100), 100);
     assert_eq!(clamp_volume(0, 41), 20);
+}
+
+#[test]
+fn a_level_outside_the_protocol_range_is_capped() {
+    assert_eq!(clamp_volume(100, 101), 100);
+    assert_eq!(clamp_volume(100, 150), 100);
+    assert_eq!(clamp_volume(255, 255), 100);
+    assert_eq!(
+        clamp_volume(255, 10),
+        10,
+        "an impossible current level still allows a request within the range"
+    );
 }
 
 #[tokio::test]
@@ -208,34 +234,32 @@ async fn control_commands_reach_the_server() {
         .await
         .expect("the command must reach the server");
     assert_eq!(
-        next_controller_command(&mut server).await["command"],
-        "play"
+        next_controller_command(&mut server).await,
+        ControllerCommand {
+            command: "play".to_owned(),
+            ..ControllerCommand::default()
+        },
+        "a transport command carries only its name"
     );
 
     control
         .pause()
         .await
         .expect("the command must reach the server");
-    assert_eq!(
-        next_controller_command(&mut server).await["command"],
-        "pause"
-    );
+    assert_eq!(next_controller_command(&mut server).await.command, "pause");
 
     control
         .next()
         .await
         .expect("the command must reach the server");
-    assert_eq!(
-        next_controller_command(&mut server).await["command"],
-        "next"
-    );
+    assert_eq!(next_controller_command(&mut server).await.command, "next");
 
     control
         .previous()
         .await
         .expect("the command must reach the server");
     assert_eq!(
-        next_controller_command(&mut server).await["command"],
+        next_controller_command(&mut server).await.command,
         "previous"
     );
 }
@@ -254,19 +278,27 @@ async fn a_volume_request_above_the_clamp_reports_the_applied_value() {
         Some(100)
     );
 
-    control
-        .set_volume(40)
-        .await
-        .expect("the level must be applied");
+    assert_eq!(
+        control
+            .set_volume(40)
+            .await
+            .expect("the level must be applied"),
+        40,
+        "the call returns the level that was applied"
+    );
     assert_eq!(
         player(next_client_state(&mut server).await).volume,
         Some(40)
     );
 
-    control
-        .set_volume(100)
-        .await
-        .expect("the request must be applied");
+    assert_eq!(
+        control
+            .set_volume(100)
+            .await
+            .expect("the request must be applied"),
+        60,
+        "the call returns the limited level"
+    );
     assert_eq!(
         player(next_client_state(&mut server).await).volume,
         Some(60),
@@ -366,6 +398,25 @@ async fn supported_commands_are_advertised_in_the_initial_state() {
 }
 
 #[tokio::test]
+async fn the_configured_level_and_mute_are_reported_in_the_initial_state() {
+    // A host that restored a level passes it in the configuration; the first report must carry it
+    // instead of an invented baseline.
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let mut config = config_for(&server);
+    config.volume = 30;
+    config.muted = true;
+    let (handle, mut events) = connect(config, Box::new(NullSink))
+        .await
+        .expect("the client must connect to the fake server");
+    expect_connected(&mut events, &server).await;
+
+    assert_eq!(handle.control().volume(), 30);
+    let state = player(next_client_state(&mut server).await);
+    assert_eq!(state.volume, Some(30));
+    assert_eq!(state.muted, Some(true));
+}
+
+#[tokio::test]
 async fn mute_is_reported_without_changing_the_level() {
     let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let (handle, mut events) = connect_to(&server).await;
@@ -437,6 +488,34 @@ async fn a_level_reported_before_the_first_state_reaches_the_server() {
 }
 
 #[tokio::test]
+async fn a_host_mute_before_the_initial_report_is_carried_by_it() {
+    let options = ServerOptions {
+        answer_time_limit: Some(1),
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (handle, mut events) = connect_to(&server).await;
+    let control = handle.control();
+    control
+        .set_muted(true)
+        .await
+        .expect("the mute must be applied");
+    expect_connected(&mut events, &server).await;
+
+    let state = player(next_client_state(&mut server).await);
+    assert_eq!(
+        state.muted,
+        Some(true),
+        "a change made before the first report belongs to that report"
+    );
+    assert_eq!(
+        state.volume,
+        Some(100),
+        "a mute must not change the level it reports"
+    );
+}
+
+#[tokio::test]
 async fn a_command_for_an_inactive_role_is_refused() {
     let options = ServerOptions {
         active_roles: vec!["metadata@v1".to_owned()],
@@ -494,5 +573,96 @@ async fn a_server_volume_command_reports_the_limited_value() {
         player(next_client_state(&mut server).await).volume,
         Some(60),
         "the server sees the level that was applied"
+    );
+    assert_no_further_state(&mut server).await;
+}
+
+#[tokio::test]
+async fn a_server_volume_above_the_protocol_range_is_capped() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_handle, mut events) = connect_to(&server).await;
+    expect_connected(&mut events, &server).await;
+
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(100)
+    );
+
+    // The wire field is a u8, so a level of 200 decodes; the protocol only allows 0-100, and the
+    // client keeps its own report valid rather than closing the connection.
+    server.json(volume_command(200));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::Volume {
+            level: Some(100),
+            muted: None
+        },
+        "a level above the protocol range is capped at 100"
+    );
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(100),
+        "the report stays inside the range the server accepts"
+    );
+}
+
+#[tokio::test]
+async fn a_transport_command_must_be_advertised_by_the_server() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (handle, mut events) = connect_to(&server).await;
+    expect_connected(&mut events, &server).await;
+    let control = handle.control();
+
+    // Before the server reports its controller state nothing is known, so the command is sent.
+    control
+        .play()
+        .await
+        .expect("the window before the first controller state is open");
+    assert_eq!(next_controller_command(&mut server).await.command, "play");
+
+    server.json(controller_state(&["play"]));
+    assert!(
+        matches!(next_event(&mut events).await, Event::State(_)),
+        "the controller state must reach the host"
+    );
+
+    assert!(
+        control.next().await.is_err(),
+        "a command the server does not advertise must not be sent"
+    );
+    control
+        .play()
+        .await
+        .expect("an advertised command still goes out");
+    assert_eq!(next_controller_command(&mut server).await.command, "play");
+}
+
+#[tokio::test]
+async fn set_volume_after_the_session_ended_is_an_error() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (handle, mut events) = connect_to(&server).await;
+    expect_connected(&mut events, &server).await;
+    let control = handle.control();
+
+    server.close();
+    loop {
+        match next_event(&mut events).await {
+            Event::Disconnected { .. } => break,
+            _ => continue,
+        }
+    }
+
+    let error = control
+        .set_volume(50)
+        .await
+        .expect_err("no session can carry the request");
+    assert!(
+        format!("{error:#}").contains("no connection"),
+        "the error should say that no session is established, got: {error:#}"
+    );
+    assert_eq!(
+        control.volume(),
+        100,
+        "a refused request leaves the level in force alone"
     );
 }

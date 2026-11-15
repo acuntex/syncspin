@@ -6,6 +6,8 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use syncspin_core::noise::Identity;
 
+use crate::client::MAX_VOLUME;
+
 /// Longest player name the protocol allows, in bytes of UTF-8.
 pub const MAX_PLAYER_NAME_LEN: usize = 64;
 
@@ -98,12 +100,21 @@ pub struct ClientConfig {
     pub identity: Identity,
     /// Whether the sink receives samples or encoded frames.
     pub audio_mode: AudioMode,
+    /// Output level to start from, in the protocol's 0-100 range.
+    ///
+    /// The session reports this level in its first `client/state` and applies the volume limit
+    /// against it, so a host passes the level it restored instead of an invented one. A host
+    /// without a stored level passes 100, which neither attenuates nor limits an incoming request.
+    pub volume: u8,
+    /// Mute state to start from.
+    ///
+    /// Reported in the first `client/state`; a host without a stored state passes `false`.
+    pub muted: bool,
     /// Upper bound for the delay between reconnects.
     ///
-    /// The session reports a recommended delay in
-    /// [`Event::Disconnected`](crate::Event::Disconnected) but schedules no retry itself; a host
-    /// that reconnects applies its own backoff, using the value from
-    /// [`next_backoff`](crate::next_backoff) and this as the cap.
+    /// The connection reports a recommended delay in
+    /// [`Event::Disconnected`](crate::Event::Disconnected) and waits it before the next attempt;
+    /// [`next_backoff`](crate::next_backoff) never returns more than this.
     pub max_backoff: Duration,
 }
 
@@ -122,6 +133,15 @@ impl ClientConfig {
                  protocol allows",
                 self.player_name.len()
             );
+        }
+        if self.volume > MAX_VOLUME {
+            bail!(
+                "ClientConfig::volume is {}, outside the 0-{MAX_VOLUME} the protocol defines",
+                self.volume
+            );
+        }
+        if self.max_backoff.is_zero() {
+            bail!("ClientConfig::max_backoff must not be zero");
         }
         Ok(())
     }

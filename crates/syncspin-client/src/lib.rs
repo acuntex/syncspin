@@ -5,16 +5,20 @@
 //! application that owns the speakers implements [`Sink`] and decides what playout means.
 //!
 //! A connection always ends in Noise: the client refuses a server that does not complete the
-//! handshake and never falls back to cleartext. A successful connection reports
-//! [`Event::Connected`] and then one event per change on the connection, ending with at most one
-//! [`Event::Disconnected`].
+//! handshake and never falls back to cleartext. A successful attempt reports [`Event::Connected`]
+//! and then one event per change; an attempt that ends reports [`Event::Disconnected`] with the
+//! delay before the next one, and the crate reconnects on its own with the same sink and identity.
 //!
-//! [`connect`] validates the configuration and opens the WebSocket; everything after that runs in
-//! a spawned task and reaches the caller through the [`EventStream`]. The [`ClientHandle`] waits
-//! for the task's outcome and hands out a [`ControlHandle`] for transport commands, the volume
-//! level and mute state. The level follows a fixed limit - see [`clamp_volume`] - and the value
-//! the server receives is the applied one. A connection that ends reports a delay from
-//! [`next_backoff`]; the crate schedules no retry, so the host owns the reconnect loop.
+//! [`connect`] validates the configuration and opens the first WebSocket; everything after that
+//! runs in a spawned task and reaches the caller through the [`EventStream`]. The [`ClientHandle`]
+//! waits for the connection to end and hands out a [`ControlHandle`] for transport commands, the
+//! volume level and mute state. The level follows a fixed limit - see [`clamp_volume`] - and the
+//! value the server receives is the applied one. [`ClientConfig::volume`] and
+//! [`ClientConfig::muted`] are the level and mute state the first report carries, so a host passes
+//! the values it restored instead of letting the server see a baseline the output is not at.
+//!
+//! The connection keeps running until the audio sink fails, which the host has to repair, or until
+//! the handle or the event stream is dropped.
 
 mod client;
 mod config;

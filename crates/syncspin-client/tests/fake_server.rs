@@ -25,8 +25,9 @@ use tokio_tungstenite::{accept_async, WebSocketStream};
 
 use syncspin_core::framing::{split_binary, MAX_PLAINTEXT_LEN};
 use syncspin_core::messages::{
-    ClientHello, ClientState, ClientTime, Incoming, Metadata, NoiseHandshake, ServerActivate,
-    ServerHello, ServerState, ServerTime, StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
+    ClientCommand, ClientHello, ClientState, ClientTime, Incoming, Metadata, NoiseHandshake,
+    ServerActivate, ServerHello, ServerState, ServerTime, StreamClear, StreamEnd, StreamStart,
+    StreamStartPlayer,
 };
 use syncspin_core::noise::{MAX_MESSAGE_LEN, NOISE_PARAMS, SENTINEL_PSK, SENTINEL_PSK_ID};
 
@@ -53,6 +54,10 @@ pub struct ServerOptions {
     pub answer_time_limit: Option<usize>,
     /// Whether `client/time` requests are reported but not answered until the test asks.
     pub manual_time: bool,
+    /// How many connections the server accepts before it stops listening.
+    ///
+    /// The client reconnects on its own, so a test that exercises that sets this above one.
+    pub connections: usize,
 }
 
 impl Default for ServerOptions {
@@ -70,6 +75,7 @@ impl Default for ServerOptions {
             ],
             answer_time_limit: None,
             manual_time: false,
+            connections: 1,
         }
     }
 }
@@ -123,8 +129,8 @@ pub enum Observation {
     ClientHello(Box<ClientHello>),
     /// The client reported its state.
     ClientState(Box<ClientState>),
-    /// The client sent a `client/command`, carrying its raw JSON body.
-    ClientCommand(String),
+    /// The client sent a command for one of its active roles.
+    ClientCommand(Box<ClientCommand>),
     /// The server answered the nth `client/time` request.
     TimeReply(usize),
     /// A `client/time` request arrived and is waiting for a manual answer.
@@ -316,11 +322,11 @@ impl FakeServer {
         }
     }
 
-    /// Waits until the client sends a `client/command` and returns its raw JSON body.
-    pub async fn wait_for_client_command(&mut self) -> Option<String> {
+    /// Waits until the client sends a command for one of its active roles.
+    pub async fn wait_for_client_command(&mut self) -> Option<ClientCommand> {
         loop {
             match self.observation().await {
-                Some(Observation::ClientCommand(body)) => return Some(body),
+                Some(Observation::ClientCommand(command)) => return Some(*command),
                 Some(_) => continue,
                 None => return None,
             }
@@ -344,7 +350,7 @@ impl FakeServer {
     }
 }
 
-/// Accepts one connection and serves it until it closes.
+/// Accepts the configured number of connections and serves each until it closes.
 async fn serve(
     listener: TcpListener,
     keypair: Keypair,
@@ -352,14 +358,27 @@ async fn serve(
     mut commands: UnboundedReceiver<Command>,
     observations: UnboundedSender<Observation>,
 ) -> Result<()> {
-    let (tcp, _peer) = listener
-        .accept()
-        .await
-        .context("the client never connected")?;
-    let mut socket = accept_async(tcp)
-        .await
-        .context("the WebSocket upgrade failed")?;
+    for _ in 0..options.connections {
+        let (tcp, _peer) = listener
+            .accept()
+            .await
+            .context("the client never connected")?;
+        let socket = accept_async(tcp)
+            .await
+            .context("the WebSocket upgrade failed")?;
+        serve_connection(socket, &keypair, &options, &mut commands, &observations).await?;
+    }
+    Ok(())
+}
 
+/// Serves one accepted WebSocket until it closes.
+async fn serve_connection(
+    mut socket: Socket,
+    keypair: &Keypair,
+    options: &ServerOptions,
+    commands: &mut UnboundedReceiver<Command>,
+    observations: &UnboundedSender<Observation>,
+) -> Result<()> {
     // 1. client/init, whose exact bytes start the Noise prologue.
     let client_init_text = read_text(&mut socket).await?;
     let client_init = match Incoming::parse(&client_init_text)? {
@@ -493,9 +512,9 @@ async fn serve(
                     &plaintext,
                     &mut socket,
                     &mut noise,
-                    &options,
+                    options,
                     &mut answered_time,
-                    &observations,
+                    observations,
                 )
                 .await?;
             }
@@ -656,22 +675,13 @@ async fn handle_client_message(
         Some(Incoming::ClientState(state)) => {
             let _ = observations.send(Observation::ClientState(Box::new(state)));
         }
-        // `client/command` is a client message the shared message set does not model yet, so it is
-        // recorded from the raw body; everything else here is `client/hello`, `client/time` while
-        // answers are disabled, and future types.
-        _ => {
-            if let Some(body) = client_command(text) {
-                let _ = observations.send(Observation::ClientCommand(body));
-            }
+        Some(Incoming::ClientCommand(command)) => {
+            let _ = observations.send(Observation::ClientCommand(Box::new(command)));
         }
+        // `client/hello`, `client/time` while answers are disabled, and future types.
+        _ => {}
     }
     Ok(())
-}
-
-/// Returns the raw body of a `client/command`, or `None` for any other message.
-fn client_command(text: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    (value.get("type")?.as_str()? == "client/command").then(|| text.to_owned())
 }
 
 /// Builds a `server/time` reply whose two server timestamps read the local clock.
