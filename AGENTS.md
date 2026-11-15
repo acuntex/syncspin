@@ -13,9 +13,11 @@ This file is for agents and contributors working in this repository.
 | `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
 | `crates/syncspin-client/` | Client session loop, `Sink` trait, event stream.                                |
 | `crates/syncspin-server/` | Server listener, streams, roles, pairing (`0.2`, `publish = false`).            |
+| `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr.               |
 | `docs/`                   | Design, spec deviations and the testing handbook.                               |
 
-An `examples/` directory is planned (a pipe player and a fake server) but does not exist yet.
+A fake server under `examples/` is planned but does not exist yet. `player-pipe` is the reference
+`Sink`: it shows the event loop, the identity file and the reconnect policy without device code.
 
 **Layering rule:** `syncspin-core` never imports `syncspin-client` or `syncspin-server`, and it
 never knows a transport. A dependency pointing from core towards a crate is a bug, not a shortcut.

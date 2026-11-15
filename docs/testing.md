@@ -84,11 +84,10 @@ does not build for this target; it is an opt-in feature and stays out of the ARM
 Not part of CI: it needs a server, a shared audio output and ears. Run it before a release and after
 any change to the handshake, the session loop or the sink contract.
 
-The workspace still has no runnable client binary: the example player (`examples/player-pipe`, PCM to
-stdout) is planned, and `syncspin-client` now contains the guest session but ships no binary. This
-section is therefore a checklist for the first build that depends on `syncspin-client` and implements
-its `Sink` — the example player when it lands, or a consumer build before that. Read each item as an
-acceptance criterion and tick it against the running server.
+`examples/player-pipe` is a runnable client: it implements `Sink`, writes PCM to stdout and keeps
+its identity in a file. This section is the acceptance checklist for that player; a consumer build
+that replaces the sink is checked the same way. Read each item as an acceptance criterion and tick
+it against the running server.
 
 ### What to start
 

@@ -32,23 +32,17 @@ decision lives in one place.
 
 ## Example
 
-The API is still being shaped, so this sketch is what the client is meant to look like - it does
-not compile against `0.1` yet:
+[`examples/player-pipe`](examples/player-pipe) is a runnable player: it connects to a server,
+implements the `Sink` trait and writes the raw samples to stdout, with one status line per event on
+stderr.
 
-```rust,ignore
-use syncspin_client::{Client, ClientConfig, Event};
-
-let config = ClientConfig::new("wss://music-assistant.local:8927/sendspin");
-let mut client = Client::connect(config, PipeSink::new()).await?; // any `Sink`
-
-while let Some(event) = client.next_event().await? {
-    match event {
-        Event::NowPlaying { title, artist, .. } => println!("{artist} - {title}"),
-        Event::Volume { percent } => println!("volume: {percent}"),
-        _ => {}
-    }
-}
+```sh
+cargo run -p player-pipe -- --server music-assistant.local:8927 | aplay -f S16_LE -r 48000 -c 2
 ```
+
+Run `cargo run -p player-pipe -- --help` for the player name, identity file and passthrough flags.
+The source is small and meant to be read: `src/main.rs` holds the event loop and the identity
+handling, `src/pipe_sink.rs` the `Sink` implementation.
 
 ## Requirements
 
