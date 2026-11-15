@@ -29,6 +29,28 @@ project; the name describes only the protocol the code speaks.
 `syncspin-core` never depends on `syncspin-client` or `syncspin-server`; every protocol and crypto
 decision lives in one place.
 
+## Getting started
+
+The crates are not on crates.io yet, so depend on the tag:
+
+```toml
+[dependencies]
+syncspin-client = { git = "https://github.com/acuntex/syncspin", tag = "v0.1.0" }
+```
+
+The example player needs a Sendspin server to talk to:
+
+```sh
+cargo run -p player-pipe -- --server music-assistant.local:8927 | aplay -f S16_LE -r 48000 -c 2
+```
+
+Run `cargo run -p player-pipe -- --help` for the player name and identity file. The first run writes
+`./identity.key` with owner-only permissions and prints the public key the server sees; later runs
+reuse it. The server must allow unpaired access, because this revision has no pairing yet.
+
+The example's source is meant to be read: `src/main.rs` holds the event loop and the identity
+handling, `src/pipe_sink.rs` the `Sink` implementation.
+
 ## What works today
 
 A connection reconnects on its own: when an attempt ends, the crate flushes the sink, reports
@@ -81,28 +103,6 @@ where `1000` is normal speed.
 Pairing, discovery, `group/update` and the other departures from the specification are tracked with
 their reasons and the work that closes them in [docs/spec-deviations.md](docs/spec-deviations.md).
 The server half is not a deviation — it is staged work for 0.2.
-
-## Getting started
-
-The crates are not on crates.io yet, so depend on the tag:
-
-```toml
-[dependencies]
-syncspin-client = { git = "https://github.com/acuntex/syncspin", tag = "v0.1.0" }
-```
-
-The example player needs a Sendspin server to talk to:
-
-```sh
-cargo run -p player-pipe -- --server music-assistant.local:8927 | aplay -f S16_LE -r 48000 -c 2
-```
-
-Run `cargo run -p player-pipe -- --help` for the player name and identity file. The first run writes
-`./identity.key` with owner-only permissions and prints the public key the server sees; later runs
-reuse it. The server must allow unpaired access, because this revision has no pairing yet.
-
-The example's source is meant to be read: `src/main.rs` holds the event loop and the identity
-handling, `src/pipe_sink.rs` the `Sink` implementation.
 
 ## Integrating a client
 
