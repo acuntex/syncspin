@@ -29,10 +29,22 @@ request may raise the level by at most 20. `clamp_volume_with` takes a policy, f
 a different guard. `Event::Volume` carries both the requested and the applied level, and the
 `client/state` report carries the applied one.
 
+`ControlHandle::report_volume` is the other direction: a host that reads the level its output is
+actually at - because the device applied one at its own control, or because another process changed
+it - reports it, and the next `client/state` carries it unchanged. The policy limits requests, not
+the level the device is at, so a device the user raised to 70 while the threshold is 40 reports 70.
+A level above the protocol maximum of 100 is refused and nothing is recorded or sent.
+
+`ClientConfig::device_info` describes the machine the client runs on - product name, manufacturer,
+software version and MAC address - and is announced in `client/hello`, so the server can show the
+hardware rather than only the player name. A host that describes no device passes `None`.
+
 The stream lifecycle is visible on the event stream: `Event::StreamStart` announces a new format,
 `Event::StreamEnd` reports a pause or a removed player role, and `Event::StreamClear` reports a seek
 with its timestamp. The end and clear events arrive before the client flushes the sink, so a host can
-mute, stop or restart its output first; a reconnect flush produces no stream event.
+mute, stop or restart its output first; a reconnect flush produces no stream event. `Event::Track`
+carries the now-playing metadata with the position, the duration and the playback speed in per-mille,
+where `1000` is normal speed.
 
 ## Layout
 

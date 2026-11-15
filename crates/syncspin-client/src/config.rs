@@ -114,6 +114,24 @@ impl fmt::Debug for StoredPsk {
     }
 }
 
+/// What the client announces about the device it runs on.
+///
+/// The server shows these values to the operator, so they name the hardware rather than the
+/// protocol: a product name and a manufacturer are always sent, and the software version and MAC
+/// address are sent when the host knows them. The fields are plain text; the crate sends them as
+/// the host provides them, so their content and length belong to the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// Device model or product name.
+    pub product_name: String,
+    /// Device manufacturer.
+    pub manufacturer: String,
+    /// Software version of the host application, not the protocol version.
+    pub software_version: Option<String>,
+    /// Network interface MAC address as lowercase colon-separated bytes.
+    pub mac_address: Option<String>,
+}
+
 /// Everything the client needs to open a session.
 ///
 /// The identity is the client's long-lived X25519 keypair. It also becomes the `client_id` the
@@ -128,6 +146,11 @@ pub struct ClientConfig {
     pub server: String,
     /// Friendly name announced to the server, non-empty and at most [`MAX_PLAYER_NAME_LEN`] bytes.
     pub player_name: String,
+    /// Description of the device the client runs on, announced in `client/hello`.
+    ///
+    /// The server displays it to the operator. A host that does not know the hardware passes
+    /// `None` and no `device_info` object is sent, so the server shows only the player name.
+    pub device_info: Option<DeviceInfo>,
     /// Long-lived keypair that identifies this client.
     ///
     /// Restore a stored keypair with [`Identity::from_secret_base64`]; generating a fresh one

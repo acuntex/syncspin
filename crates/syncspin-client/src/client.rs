@@ -21,6 +21,12 @@ pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Highest level the protocol defines, in its 0-100 volume range.
 pub(crate) const MAX_VOLUME: u8 = 100;
 
+/// Playback speed the protocol defines as normal, in per-mille.
+///
+/// A metadata message that carries no speed plays at this rate, so the track event always names
+/// one.
+pub const NORMAL_PLAYBACK_SPEED: u32 = 1_000;
+
 /// Returns the volume level to apply for `requested` while `current` is in force.
 ///
 /// This is [`clamp_volume_with`] with [`VolumePolicy::default`]: a request to 40 or below is
@@ -79,6 +85,22 @@ pub fn clamp_volume_with(policy: VolumePolicy, current: u8, requested: u8) -> u8
     } else {
         applied
     }
+}
+
+/// Rejects a level outside the protocol's 0-100 range.
+///
+/// A reported level is not a request, so [`clamp_volume_with`] never sees it: a value the protocol
+/// cannot carry is refused instead of being capped, and nothing is recorded or sent.
+///
+/// # Errors
+/// Returns an error naming the value when it is above [`MAX_VOLUME`].
+pub(crate) fn check_reported_level(level: u8) -> Result<()> {
+    if level > MAX_VOLUME {
+        bail!(
+            "the reported level {level} is outside the 0-{MAX_VOLUME} range the protocol defines"
+        );
+    }
+    Ok(())
 }
 
 /// Returns the delay to wait before the next connection attempt.
@@ -202,6 +224,11 @@ pub enum Event {
         progress_ms: Option<u64>,
         /// Track length in milliseconds, when the server reports one.
         duration_ms: Option<u64>,
+        /// Playback speed per mille: `1000` is normal speed, `500` half speed and `0` paused.
+        ///
+        /// Reported as [`NORMAL_PLAYBACK_SPEED`] when the server sends no speed, because a track
+        /// without the field plays at normal speed.
+        playback_speed: u32,
     },
     /// The server's view of playback state changed.
     State(PlaybackState),
@@ -329,6 +356,28 @@ impl ControlHandle {
         self.send(ControlAction::Volume(level)).await
     }
 
+    /// Reports the level the device is actually at, without applying the volume policy.
+    ///
+    /// [`ControlHandle::set_volume`] treats its argument as a request, so the policy may lower it
+    /// and above the threshold it limits one step. A host that knows the level its output is
+    /// really at - because the device applied a level at its own control, or because another
+    /// process raised it - reports that level with this call instead: it becomes the level in
+    /// force, [`ControlHandle::volume`] returns it, and the next `client/state` carries it
+    /// unchanged, so the server's view matches the output.
+    ///
+    /// The protocol's range still applies. A level above 100 is refused with an error before
+    /// anything is recorded or sent; the policy is not consulted and does not clamp the value.
+    ///
+    /// # Errors
+    /// Returns an error for a level above 100, for a connection that has ended, and when the
+    /// server did not activate `player@v1`.
+    pub async fn report_volume(&self, level: u8) -> Result<()> {
+        check_reported_level(level)?;
+        self.send(ControlAction::ReportVolume(level))
+            .await
+            .map(|_level| ())
+    }
+
     /// Sets the mute state without changing the level.
     ///
     /// The reported level therefore stays what it was, and the server sees the mute in the
@@ -373,6 +422,8 @@ pub(crate) enum ControlAction {
     Transport(&'static str),
     /// Set the output level, subject to the volume limit.
     Volume(u8),
+    /// Record the level the output is actually at, without the volume limit.
+    ReportVolume(u8),
     /// Set the mute state, keeping the level.
     Mute(bool),
 }

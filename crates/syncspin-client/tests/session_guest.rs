@@ -16,6 +16,7 @@ use base64::Engine as _;
 use syncspin_client::{
     connect, connect_with_psks, AudioFormat, AudioFrame, ClientConfig, ClientHandle, Codec, Event,
     EventStream, PskCategory, Sink, StoredPsk, StreamEndReason, VolumePolicy,
+    NORMAL_PLAYBACK_SPEED,
 };
 use syncspin_core::messages::{
     ClientState, ControllerState, Incoming, PlayerCommand, Progress, ServerCommand, ServerState,
@@ -239,6 +240,7 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
     ClientConfig {
         server: server.endpoint(),
         player_name: "Test player".to_owned(),
+        device_info: None,
         identity: Identity::generate(),
         audio_mode: mode,
         volume: 100,
@@ -414,6 +416,7 @@ async fn stream_start_opens_the_sink_with_the_announced_format() {
             artwork_url,
             progress_ms,
             duration_ms,
+            playback_speed,
         } => {
             assert_eq!(title, "A title");
             assert_eq!(artist, "An artist");
@@ -422,6 +425,7 @@ async fn stream_start_opens_the_sink_with_the_announced_format() {
             assert_eq!(artwork_url, "");
             assert_eq!(progress_ms, None);
             assert_eq!(duration_ms, None);
+            assert_eq!(playback_speed, NORMAL_PLAYBACK_SPEED);
         }
         other => panic!("expected Track, got {other:?}"),
     }
@@ -749,27 +753,42 @@ async fn unknown_message_types_are_ignored() {
 }
 
 #[tokio::test]
-async fn malformed_known_message_closes_the_connection() {
+async fn a_malformed_control_message_is_ignored() {
     let server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let (_recordings, sink) = recording_sink();
-    let (mut events, handle) =
+    let (mut events, _handle) =
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
-    // `codec` is a string in stream/start; a number makes the known message malformed.
-    server.json(r#"{"type":"stream/start","payload":{"player":{"codec":42}}}"#);
+    // A known type whose payload does not deserialize: `volume` is an integer on the wire, so 300
+    // does not fit. A value in 101-255 decodes and stays capped by the volume policy
+    // (`docs/spec-deviations.md`, entry 17), which is not a decode failure.
+    server.json(
+        r#"{"type":"server/command","payload":{"player":{"command":"volume","volume":300}}}"#,
+    );
+    // A truncated body: the JSON object never closes.
+    server.json(r#"{"type":"server/state","payload":{"metadata":{"title":"#);
 
+    // Both are dropped. The first message that decodes still arrives, so the session survived
+    // them and the stream stayed usable.
+    server.metadata("Still here", "An artist");
     match next_event(&mut events).await {
-        Event::Disconnected { reason, .. } => {
-            assert!(reason.contains("malformed"), "unexpected reason: {reason}");
+        Event::Track { title, artist, .. } => {
+            assert_eq!(title, "Still here");
+            assert_eq!(artist, "An artist");
         }
-        other => panic!("expected Disconnected, got {other:?}"),
+        other => panic!("a malformed control message must not close the connection, got {other:?}"),
     }
-    assert_still_reconnecting(handle).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
 }
 
 #[tokio::test]
-async fn a_short_audio_chunk_without_a_stream_is_a_protocol_error() {
+async fn a_malformed_audio_header_is_a_protocol_error() {
     let server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let (_recordings, sink) = recording_sink();
     let (mut events, handle) =
@@ -1126,6 +1145,7 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
     let base = |name: &str| ClientConfig {
         server: "127.0.0.1:1".to_owned(),
         player_name: name.to_owned(),
+        device_info: None,
         identity: Identity::generate(),
         audio_mode: syncspin_client::AudioMode::Passthrough,
         volume: 100,
@@ -1210,6 +1230,42 @@ async fn the_client_announces_the_player_role_and_the_requested_format() {
     assert_eq!(support.supported_formats[0].codec, "flac");
     assert_eq!(support.supported_formats[0].sample_rate, 48_000);
     assert!(hello.unpaired_access.enabled);
+    assert_eq!(
+        hello.device_info, None,
+        "a host that describes no device announces none"
+    );
+}
+
+#[tokio::test]
+async fn device_info_is_announced_in_the_hello() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.device_info = Some(syncspin_client::DeviceInfo {
+        product_name: "A110".to_owned(),
+        manufacturer: "Acme Audio".to_owned(),
+        software_version: Some("1.4.2".to_owned()),
+        mac_address: Some("02:00:5e:10:00:01".to_owned()),
+    });
+    let (_handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect to the fake server");
+    expect_connected(&mut events, &server).await;
+
+    let hello = tokio::time::timeout(Duration::from_secs(2), server.wait_for_client_hello())
+        .await
+        .expect("the fake server must see client/hello")
+        .expect("the connection must not close before client/hello");
+    assert_eq!(
+        hello.device_info,
+        Some(syncspin_core::messages::DeviceInfo {
+            product_name: Some("A110".to_owned()),
+            manufacturer: Some("Acme Audio".to_owned()),
+            software_version: Some("1.4.2".to_owned()),
+            mac_address: Some("02:00:5e:10:00:01".to_owned()),
+        }),
+        "the configured device must reach the server unchanged"
+    );
 }
 
 #[tokio::test]
@@ -1317,6 +1373,7 @@ async fn metadata_fields_are_reported() {
             artwork_url,
             progress_ms,
             duration_ms,
+            playback_speed,
         } => {
             assert_eq!(title, "A title");
             assert_eq!(artist, "An artist");
@@ -1325,6 +1382,63 @@ async fn metadata_fields_are_reported() {
             assert_eq!(artwork_url, "https://example.test/art.png");
             assert_eq!(progress_ms, Some(1_500));
             assert_eq!(duration_ms, Some(240_000));
+            assert_eq!(playback_speed, NORMAL_PLAYBACK_SPEED);
+        }
+        other => panic!("expected Track, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_track_event_carries_the_playback_speed() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // The metadata role's progress carries the speed in per-mille; 1500 is one and a half times
+    // normal speed.
+    let state = serde_json::to_string(&Incoming::ServerState(ServerState {
+        metadata: Some(syncspin_core::messages::Metadata {
+            title: Some("A title".to_owned()),
+            progress: Some(Progress {
+                track_progress: Some(1_500),
+                track_duration: Some(240_000),
+                playback_speed: Some(1_500),
+            }),
+            ..Default::default()
+        }),
+        controller: None,
+    }))
+    .unwrap();
+    server.json(state);
+
+    match next_event(&mut events).await {
+        Event::Track {
+            playback_speed,
+            progress_ms,
+            ..
+        } => {
+            assert_eq!(
+                playback_speed, 1_500,
+                "the reported speed must reach the host unchanged"
+            );
+            assert_eq!(progress_ms, Some(1_500));
+        }
+        other => panic!("expected Track, got {other:?}"),
+    }
+
+    // A metadata message without a progress object plays at normal speed, and the host still sees
+    // a speed rather than a missing value.
+    server.metadata("No progress", "An artist");
+    match next_event(&mut events).await {
+        Event::Track {
+            playback_speed,
+            progress_ms,
+            ..
+        } => {
+            assert_eq!(playback_speed, NORMAL_PLAYBACK_SPEED);
+            assert_eq!(progress_ms, None);
         }
         other => panic!("expected Track, got {other:?}"),
     }

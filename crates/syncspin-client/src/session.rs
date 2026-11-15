@@ -26,17 +26,18 @@ use syncspin_core::framing::{
 };
 use syncspin_core::messages::{
     AudioChunkHeader, ClientCommand, ClientHello, ClientInit, ClientState, ClientTime,
-    ControllerCommand, Incoming, NoiseHandshake, PairingPskMethod, PlayerState, PlayerSupport,
-    ServerActivate, ServerCommand, ServerState, ServerTime, StreamClear, StreamStart,
-    SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
-    PROTOCOL_VERSION,
+    ControllerCommand, DeviceInfo, Incoming, NoiseHandshake, PairingPskMethod, PlayerState,
+    PlayerSupport, ServerActivate, ServerCommand, ServerState, ServerTime, StreamClear,
+    StreamStart, SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID,
+    NOISE_SUITE, PROTOCOL_VERSION,
 };
 use syncspin_core::noise::{
     psk_id_for, Responder, TransportState as NoiseTransport, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
 
 use crate::client::{
-    clamp_volume_with, ControlAction, ControlRequest, Event, PlaybackState, StreamEndReason,
+    check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, PlaybackState,
+    StreamEndReason, NORMAL_PLAYBACK_SPEED,
 };
 use crate::config::{AudioMode, ClientConfig, PskCategory, StoredPsk};
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
@@ -225,6 +226,31 @@ enum Wakeup {
     Socket(Result<SocketMessage>),
     /// The clock deadline elapsed.
     Clock,
+}
+
+/// The kind of one decrypted transport message, decided by its binary message id.
+///
+/// The kind decides how strict the session is: a control message that does not decode is ignored,
+/// while a malformed audio chunk stays a protocol error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageKind {
+    /// A control or state message: a JSON body under [`BINARY_MESSAGE_ID_JSON`].
+    Control,
+    /// A player audio chunk under [`AUDIO_CHUNK_ID`].
+    Audio,
+    /// A message id this revision does not implement.
+    Unknown,
+}
+
+impl MessageKind {
+    /// Classifies one binary message by its id byte.
+    fn of(id: u8) -> MessageKind {
+        match id {
+            BINARY_MESSAGE_ID_JSON => MessageKind::Control,
+            AUDIO_CHUNK_ID => MessageKind::Audio,
+            _ => MessageKind::Unknown,
+        }
+    }
 }
 
 /// A running session.
@@ -512,36 +538,54 @@ impl Session<'_> {
         let Some((id, body)) = self.reassembler.push(&plaintext)? else {
             return Ok(());
         };
-        match id {
-            BINARY_MESSAGE_ID_JSON => {
-                let text =
-                    std::str::from_utf8(&body).context("decrypted JSON is not valid UTF-8")?;
-                self.handle_json(text).await
-            }
-            AUDIO_CHUNK_ID => self.handle_audio(&body),
+        // The kind of the message decides how strict the dispatch is: a control message that does
+        // not decode is ignored, while a malformed audio chunk stays a protocol error.
+        match MessageKind::of(id) {
+            MessageKind::Control => self.handle_control_message(&body).await,
+            MessageKind::Audio => self.handle_audio(&body),
             // A message id belongs to a role this client does not implement.
-            _ => Ok(()),
+            MessageKind::Unknown => Ok(()),
         }
     }
 
-    /// Dispatches one decrypted control message.
-    async fn handle_json(&mut self, text: &str) -> Result<()> {
-        match Incoming::parse(text)? {
-            None => Ok(()), // A type this revision does not implement is ignored.
-            Some(Incoming::ServerActivate(activate)) => self.apply_activate(activate).await,
-            Some(Incoming::ServerTime(time)) => self.handle_server_time(time).await,
-            Some(Incoming::ServerState(state)) => {
+    /// Dispatches one decrypted control or state message.
+    ///
+    /// A `type` this revision does not implement is ignored, as the protocol requires. A message
+    /// that does not decode is ignored as well, with a line on stderr, instead of ending the
+    /// session: one malformed field must not silence playback, and a message the client cannot
+    /// decode carries nothing it could act on. The audio path keeps the strict rule - a malformed
+    /// chunk header is a protocol error. See `docs/spec-deviations.md`, entry 20.
+    ///
+    /// A body that is not valid UTF-8 is a framing error and still closes the connection.
+    async fn handle_control_message(&mut self, body: &[u8]) -> Result<()> {
+        let text = std::str::from_utf8(body).context("decrypted JSON is not valid UTF-8")?;
+        match Incoming::parse(text) {
+            Ok(None) => Ok(()), // A type this revision does not implement is ignored.
+            Ok(Some(message)) => self.dispatch(message).await,
+            Err(error) => {
+                eprintln!("ignoring a malformed control message: {error}");
+                Ok(())
+            }
+        }
+    }
+
+    /// Acts on one decoded control message.
+    async fn dispatch(&mut self, message: Incoming) -> Result<()> {
+        match message {
+            Incoming::ServerActivate(activate) => self.apply_activate(activate).await,
+            Incoming::ServerTime(time) => self.handle_server_time(time).await,
+            Incoming::ServerState(state) => {
                 self.handle_state(state);
                 Ok(())
             }
-            Some(Incoming::ServerCommand(command)) => self.handle_command(command).await,
-            Some(Incoming::StreamStart(start)) => self.handle_stream_start(start),
-            Some(Incoming::StreamEnd(end)) if !affects_player(end.roles.as_deref()) => Ok(()),
-            Some(Incoming::StreamEnd(_)) => self.stop_stream(StreamEndReason::End),
-            Some(Incoming::StreamClear(clear)) if !affects_player(clear.roles.as_deref()) => Ok(()),
-            Some(Incoming::StreamClear(clear)) => self.handle_stream_clear(clear),
+            Incoming::ServerCommand(command) => self.handle_command(command).await,
+            Incoming::StreamStart(start) => self.handle_stream_start(start),
+            Incoming::StreamEnd(end) if !affects_player(end.roles.as_deref()) => Ok(()),
+            Incoming::StreamEnd(_) => self.stop_stream(StreamEndReason::End),
+            Incoming::StreamClear(clear) if !affects_player(clear.roles.as_deref()) => Ok(()),
+            Incoming::StreamClear(clear) => self.handle_stream_clear(clear),
             // A message for a role or direction this client does not act on.
-            Some(_) => Ok(()),
+            _ => Ok(()),
         }
     }
 
@@ -788,9 +832,14 @@ impl Session<'_> {
     fn handle_state(&mut self, state: ServerState) {
         if self.role_active(METADATA_ROLE) {
             if let Some(metadata) = state.metadata {
-                let (progress_ms, duration_ms) = match metadata.progress {
-                    Some(progress) => (progress.track_progress, progress.track_duration),
-                    None => (None, None),
+                let (progress_ms, duration_ms, playback_speed) = match metadata.progress {
+                    Some(progress) => (
+                        progress.track_progress,
+                        progress.track_duration,
+                        progress.playback_speed.unwrap_or(NORMAL_PLAYBACK_SPEED),
+                    ),
+                    // Without a progress object the track is at its start, at normal speed.
+                    None => (None, None, NORMAL_PLAYBACK_SPEED),
                 };
                 self.emit(Event::Track {
                     title: metadata.title.unwrap_or_default(),
@@ -800,6 +849,7 @@ impl Session<'_> {
                     artwork_url: metadata.artwork_url.unwrap_or_default(),
                     progress_ms,
                     duration_ms,
+                    playback_speed,
                 });
             }
         }
@@ -878,6 +928,9 @@ impl Session<'_> {
                 .await
                 .map(|()| self.volume),
             ControlAction::Volume(level) => self.apply_volume(level).await,
+            ControlAction::ReportVolume(level) => {
+                self.apply_report_volume(level).await.map(|()| self.volume)
+            }
             ControlAction::Mute(muted) => self.apply_mute(muted).await.map(|()| self.volume),
         };
         match result {
@@ -897,7 +950,8 @@ impl Session<'_> {
     /// Transport commands need the controller role, and once the server reported the commands it
     /// accepts, a command outside that set is refused as well: a server ignores what it did not
     /// advertise, so sending it would only look like it worked. The window before the first
-    /// controller state is left open, because nothing is known yet.
+    /// controller state is left open, because nothing is known yet. A level the host reports above
+    /// the protocol range is refused here as well, since `client/state` cannot carry it.
     fn check_control(&self, action: &ControlAction) -> Result<()> {
         match action {
             ControlAction::Transport(command) => {
@@ -912,6 +966,15 @@ impl Session<'_> {
                 Ok(())
             }
             ControlAction::Volume(_) | ControlAction::Mute(_) => {
+                if !self.player_active() {
+                    bail!("the server did not activate {PLAYER_ROLE}");
+                }
+                Ok(())
+            }
+            ControlAction::ReportVolume(level) => {
+                // The handle refuses an out-of-range level before it queues the request; the
+                // check stays here so a refused value can never reach `client/state`.
+                check_reported_level(*level)?;
                 if !self.player_active() {
                     bail!("the server did not activate {PLAYER_ROLE}");
                 }
@@ -940,6 +1003,18 @@ impl Session<'_> {
         ));
         self.report_state().await?;
         Ok(self.volume)
+    }
+
+    /// Records a level the host reports as the one the output is actually at, and reports it.
+    ///
+    /// The policy guards requests, not the measured state: a device the user raised to 70 while
+    /// the policy would have limited a request to 60 is recorded and sent as 70, so the server's
+    /// view matches what is audible. The protocol's range still applies, but
+    /// [`check_reported_level`] refuses an out-of-range value before this runs, so nothing
+    /// impossible can be recorded or written.
+    async fn apply_report_volume(&mut self, level: u8) -> Result<()> {
+        self.record_volume(level);
+        self.report_state().await
     }
 
     /// Applies a mute state the host asked for, leaving the level untouched.
@@ -1096,7 +1171,12 @@ fn client_hello(config: &ClientConfig) -> Incoming {
     };
     Incoming::ClientHello(ClientHello {
         name: config.player_name.clone(),
-        device_info: None,
+        device_info: config.device_info.as_ref().map(|info| DeviceInfo {
+            product_name: Some(info.product_name.clone()),
+            manufacturer: Some(info.manufacturer.clone()),
+            software_version: info.software_version.clone(),
+            mac_address: info.mac_address.clone(),
+        }),
         supported_roles: vec![
             PLAYER_ROLE.to_owned(),
             CONTROLLER_ROLE.to_owned(),

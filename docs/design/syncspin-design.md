@@ -132,7 +132,8 @@ pub enum Event {
     StreamStart { format: AudioFormat },
     StreamEnd { reason: StreamEndReason },     // End | RoleRemoved, before the sink flush
     StreamClear { from_timestamp: Option<i64> }, // seek, before the sink flush
-    Track { title: String, artist: String, album: Option<String>, duration: Option<Duration> },
+    Track { title: String, artist: String, album: Option<String>, duration: Option<Duration>,
+            playback_speed: u32 },                            // per-mille, 1000 = normal
     State(PlaybackState),
     Volume { requested: u8, applied: u8, muted: Option<bool> },
     Artwork { mime: String, bytes: Bytes },                  // feature "artwork"

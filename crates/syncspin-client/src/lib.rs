@@ -18,11 +18,18 @@
 //! default - and the value the server receives is the applied one. [`ClientConfig::volume`] and
 //! [`ClientConfig::muted`] are the level and mute state the first report carries, so a host passes
 //! the values it restored instead of letting the server see a baseline the output is not at.
+//! [`ControlHandle::report_volume`] is the other direction: a level the host reads from its own
+//! output is recorded and sent unchanged, because the policy limits requests rather than the level
+//! the device is at.
+//!
+//! [`ClientConfig::device_info`] describes the device the client runs on and is announced in
+//! `client/hello`; a host without an answer passes `None` and the server sees only the player name.
 //!
 //! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
 //! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
-//! [`Event::StreamClear`] for a seek. The end and clear events arrive before the sink is flushed,
-//! so the host can mute, stop or restart its output first.
+//! [`Event::StreamClear`] for a seek, plus [`Event::Track`] for the now-playing metadata with its
+//! position, duration and playback speed. The end and clear events arrive before the sink is
+//! flushed, so the host can mute, stop or restart its output first.
 //!
 //! The connection keeps running until the audio sink fails, which the host has to repair, or until
 //! the handle or the event stream is dropped.
@@ -35,10 +42,10 @@ mod sink;
 pub use client::{
     clamp_volume, clamp_volume_with, connect, connect_with_psks, next_backoff, Client,
     ClientHandle, ControlHandle, Event, EventStream, PlaybackState, StreamEndReason,
-    INITIAL_BACKOFF,
+    INITIAL_BACKOFF, NORMAL_PLAYBACK_SPEED,
 };
 pub use config::{
-    AudioMode, ClientConfig, PskCategory, StoredPsk, VolumePolicy, MAX_PLAYER_NAME_LEN,
+    AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, MAX_PLAYER_NAME_LEN,
 };
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};
 

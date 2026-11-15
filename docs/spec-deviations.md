@@ -10,27 +10,28 @@ harmless.
 
 ## Summary
 
-| #   | Area                                                            | Spec section                                                                                                                                                                      | Status                        |
-| --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
-| 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Closes in 0.2                 |
-| 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                      |
-| 3   | No version-0 pairing-token export                               | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Closes with pairing (stage 2) |
-| 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Closes with pairing (stage 2) |
-| 5   | No code pairing (PAKE)                                          | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Stage 4                       |
-| 6   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Stage 1b                      |
-| 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                      |
-| 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                 |
-| 9   | No `client/goodbye` writer                                      | [`messaging.md` — `client/goodbye`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clientgoodbye)                                                         | Stage 1b                      |
-| 10  | Transport-mode re-handshake ignored                             | [`connection.md` — Re-handshake](https://github.com/Sendspin/spec/blob/main/connection.md#re-handshake)                                                                           | Stage 2                       |
-| 11  | `pairing_psk` advertised without the Pairing PSK flow           | [`messaging.md` — `client/hello`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clienthello)                                                             | Stage 2                       |
-| 12  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                      |
-| 13  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                      |
-| 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                      |
-| 15  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                      |
-| 16  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                    |
-| 17  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with` |
-| 18  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`     |
-| 19  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`         |
+| #   | Area                                                            | Spec section                                                                                                                                                                      | Status                             |
+| --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Closes in 0.2                      |
+| 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
+| 3   | No version-0 pairing-token export                               | [`pairing.md` — Pairing Token](https://github.com/Sendspin/spec/blob/main/pairing.md#pairing-token)                                                                               | Closes with pairing (stage 2)      |
+| 4   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Closes with pairing (stage 2)      |
+| 5   | No code pairing (PAKE)                                          | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Stage 4                            |
+| 6   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Stage 1b                           |
+| 7   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                           |
+| 8   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
+| 9   | No `client/goodbye` writer                                      | [`messaging.md` — `client/goodbye`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clientgoodbye)                                                         | Stage 1b                           |
+| 10  | Transport-mode re-handshake ignored                             | [`connection.md` — Re-handshake](https://github.com/Sendspin/spec/blob/main/connection.md#re-handshake)                                                                           | Stage 2                            |
+| 11  | `pairing_psk` advertised without the Pairing PSK flow           | [`messaging.md` — `client/hello`](https://github.com/Sendspin/spec/blob/main/messaging.md#client--server-clienthello)                                                             | Stage 2                            |
+| 12  | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
+| 13  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
+| 14  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
+| 15  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                           |
+| 16  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                         |
+| 17  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`      |
+| 18  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
+| 19  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
+| 20  | A malformed control message is ignored, not fatal               | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
 
 ## 1. Client-initiated connections only
 
@@ -429,6 +430,33 @@ is exactly when a silent player is hardest to notice.
 **Removing it:** treat an omitted first `active_roles` as empty, as the spec says, and wait for the
 server to send a conformant activation; test that no `client/state` and no audio follow until it
 does.
+
+## 20. A malformed control message is ignored, not fatal
+
+**Spec:** `messaging.md`, _Communication_ and _Binary Message ID Structure_. A field value in a
+recognized message that is outside the fixed range or length limit its definition gives is a
+protocol error: the receiver MUST close the connection. A binary message with id `0` whose body is
+not a valid UTF-8 JSON object with a `type` string and a `payload` object is a protocol error too.
+
+**What we do:** `Session::receive` classifies a completed transport message by its binary id and
+hands the control kind - id `0` - to `Session::handle_control_message`, which parses it with
+`Incoming::parse`. A body that does not decode is written to stderr and dropped: a truncated
+envelope, JSON that is not an object, and a known `type` whose payload does not deserialize, such as
+`server/command` with `volume: 300`. The session, its clock and its audio continue. Every framing
+rule stays strict: a body that is not valid UTF-8, an empty plaintext, a malformed audio chunk
+header, a bad fragment sequence and an oversize reassembly all end the connection.
+`a_malformed_control_message_is_ignored` pins the lenient path; `a_malformed_audio_header_is_a_protocol_error`
+and the fragmentation tests pin the strict ones.
+
+**Why:** the extracted consumer depended on the leniency: one bad field from the server should not
+silence playback, and closing turns a single message into a gap plus a reconnect. A message the
+client cannot decode carries nothing it could act on, so dropping it loses no information the
+client could have used. The stderr line is the only trace, and it names the parse error, never key
+material.
+
+**Removing it:** decode every control message against a typed error and close the connection with a
+protocol-error reason once the close path carries one (`server/error`, entry 7); turn the lenient
+branch into a typed protocol error and flip both tests.
 
 ## How to update this file
 

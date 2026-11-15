@@ -108,6 +108,7 @@ fn config_for(server: &FakeServer) -> ClientConfig {
     ClientConfig {
         server: server.endpoint(),
         player_name: "Test player".to_owned(),
+        device_info: None,
         identity: Identity::generate(),
         audio_mode: AudioMode::Passthrough,
         volume: 100,
@@ -268,6 +269,7 @@ async fn an_unreachable_server_is_an_event_and_not_an_error() {
     let config = ClientConfig {
         server: address.to_string(),
         player_name: "Test player".to_owned(),
+        device_info: None,
         identity: Identity::generate(),
         audio_mode: AudioMode::Passthrough,
         volume: 100,
@@ -528,6 +530,7 @@ async fn the_retry_delay_is_awaited_before_the_next_attempt() {
     let config = ClientConfig {
         server: address.to_string(),
         player_name: "Test player".to_owned(),
+        device_info: None,
         identity: Identity::generate(),
         audio_mode: AudioMode::Passthrough,
         volume: 100,

@@ -78,6 +78,9 @@ async fn run(options: Options) -> Result<()> {
     let config = ClientConfig {
         server: options.server,
         player_name: options.name,
+        // A pipe on a general-purpose host has no hardware to describe; a host that runs on a
+        // device passes the product name, manufacturer and version here so the server shows it.
+        device_info: None,
         identity,
         // This example has no decoder, so it asks for raw samples. A host that wants encoded
         // frames selects `AudioMode::Passthrough` and brings its own decoder.

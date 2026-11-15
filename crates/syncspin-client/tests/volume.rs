@@ -42,6 +42,7 @@ fn config_for(server: &FakeServer) -> ClientConfig {
     ClientConfig {
         server: server.endpoint(),
         player_name: "Test player".to_owned(),
+        device_info: None,
         identity: Identity::generate(),
         audio_mode: AudioMode::Passthrough,
         volume: 100,
@@ -362,6 +363,80 @@ async fn a_volume_request_above_the_clamp_reports_the_applied_value() {
         "a request above 40 raises the level by at most 20"
     );
     assert_no_further_state(&mut server).await;
+}
+
+#[tokio::test]
+async fn report_volume_bypasses_the_policy() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let mut config = config_for(&server);
+    // The policy would limit a request for 70 from 20 to 40, so a report that reaches 70 proves
+    // the policy was not consulted.
+    config.volume = 20;
+    config.volume_policy = VolumePolicy {
+        threshold: 40,
+        max_step: 20,
+        threshold_floor: false,
+    };
+    let (handle, mut events) = connect(config, Box::new(NullSink))
+        .await
+        .expect("the client must connect to the fake server");
+    expect_connected(&mut events, &server).await;
+    let control = handle.control();
+
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(20)
+    );
+
+    control
+        .report_volume(70)
+        .await
+        .expect("the reported level must be accepted");
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(70),
+        "the reported level goes out unchanged, above the policy threshold"
+    );
+    assert_eq!(
+        control.volume(),
+        70,
+        "the handle follows the reported level"
+    );
+    assert_no_further_state(&mut server).await;
+}
+
+#[tokio::test]
+async fn report_volume_rejects_over_one_hundred() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (handle, mut events) = connect_to(&server).await;
+    expect_connected(&mut events, &server).await;
+    let control = handle.control();
+
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(100)
+    );
+
+    let error = control
+        .report_volume(101)
+        .await
+        .expect_err("a level above the protocol range must be refused");
+    assert!(
+        format!("{error:#}").contains("101"),
+        "the error names the refused value: {error:#}"
+    );
+    assert_eq!(control.volume(), 100, "a refused report changes nothing");
+    assert_no_further_state(&mut server).await;
+
+    // The refusal belongs to the call, not to the session: a level inside the range still works.
+    control
+        .report_volume(99)
+        .await
+        .expect("a level inside the range must be accepted");
+    assert_eq!(
+        player(next_client_state(&mut server).await).volume,
+        Some(99)
+    );
 }
 
 #[tokio::test]
