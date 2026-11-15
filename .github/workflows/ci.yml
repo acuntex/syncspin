@@ -126,20 +126,31 @@ jobs:
 
   secrets:
     name: secrets
+    # Not `if: always()`: a cancelled run should stay cancelled, but a failed
+    # sibling job must not hide a leaked-secret finding.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           # Full history: `gitleaks git` scans every commit, not just the tip.
           fetch-depth: 0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: gitleaks
-      # gitleaks needs no token and reads only the local clone, so this works on
-      # fork pull requests without `pull_request_target`. `--redact` keeps a
-      # finding out of the public build log; the exit code still fails the job.
-      - name: gitleaks
-        run: gitleaks git --redact --verbose
+      # gitleaks is not on crates.io and `taiki-e/install-action` has no manifest
+      # for it, so the release tarball is the install path. Pinned here; Renovate
+      # does not follow release URLs, so bump GITLEAKS_VERSION by hand.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      # No token and no `pull_request_target`: the scan reads only the local
+      # clone, so it also works on fork pull requests. `--redact` keeps a finding
+      # out of the public build log; the exit code still fails the job.
+      - name: Scan the full history
+        run: gitleaks git --redact --verbose --no-banner
 
   # `semver` is deliberately absent. `cargo-semver-checks`
   # (`taiki-e/install-action@v2` with `tool: cargo-semver-checks`) needs a
