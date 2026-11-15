@@ -50,6 +50,19 @@ impl PskCategory {
             _ => None,
         }
     }
+
+    /// Encodes the category the way the wire and a stored record spell it.
+    ///
+    /// The inverse of [`from_wire`](PskCategory::from_wire), so a backend this crate ships can
+    /// write a record it reads back with the same meaning.
+    #[cfg(feature = "storage-file")]
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            PskCategory::LongTerm => "lt",
+            PskCategory::Pairing => "pr",
+            PskCategory::Sentinel => "sn",
+        }
+    }
 }
 
 /// Limits the session applies to a volume request.

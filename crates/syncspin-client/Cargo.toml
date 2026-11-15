@@ -12,6 +12,11 @@ keywords.workspace = true
 categories.workspace = true
 include = ["src/**", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
+[features]
+# The optional JSON file backend for pairing records. Off by default so a build that does not ask
+# for it does no file I/O: records belong to the host, which implements `Storage` itself.
+storage-file = []
+
 [dependencies]
 syncspin-core = { version = "0.1.0", path = "../syncspin-core" }
 anyhow.workspace = true
@@ -23,5 +28,6 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 snow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

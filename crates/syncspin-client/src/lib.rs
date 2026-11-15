@@ -25,6 +25,11 @@
 //! [`ClientConfig::device_info`] describes the device the client runs on and is announced in
 //! `client/hello`; a host without an answer passes `None` and the server sees only the player name.
 //!
+//! Pairing records and the long-lived pairing PSK belong to the host: it implements
+//! [`storage::Storage`] and the client keeps what it restores, so a paired server is recognised
+//! across restarts. The crate does no file I/O of its own; `storage::FileStorage` is an optional
+//! JSON backend behind the `storage-file` feature for a host that wants one.
+//!
 //! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
 //! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
 //! [`Event::StreamClear`] for a seek, plus [`Event::Track`] for the now-playing metadata with its
@@ -38,6 +43,8 @@ mod client;
 mod config;
 mod session;
 mod sink;
+
+pub mod storage;
 
 pub use client::{
     clamp_volume, clamp_volume_with, connect, connect_with_psks, next_backoff, Client,
