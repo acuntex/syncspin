@@ -204,10 +204,23 @@ it against the running server.
   playback resumes without a restart; only a failed sink, a dropped event stream or a dropped handle
   ends the loop.
 
-### Pairing (not yet performed)
+### Pairing (performed 2026-11-16)
 
-**No pairing run against a real server has been performed in this revision.** The path is verified
-against the fake server only; the steps below are the checklist to run, not a result.
+**Run against a real Music Assistant server with the Sendspin provider enabled.** Observed:
+
+1. The client connected as an unpaired guest, completed the Noise handshake and received
+   `server/activate` with the controller state.
+2. The operator entered the token from `player-pipe --pairing-token` in the provider after starting
+   the client. The client printed `paired: record stored for server <id>`, which means the server's
+   `server/pair-finalize` arrived — the server had persisted its half.
+3. `./pairing.json` then held one long-term record (`category: lt`) beside the pairing PSK.
+4. A second start, same identity and store, connected without a second pairing and without a
+   credential-mismatch event, so the stored record was the one the handshake used.
+
+Not covered by that run: the server-side UI state after pairing, unpairing through the server, and
+both code flows — the example offers only the static one and neither has met a real server.
+
+Steps, for the next run:
 
 1. Print the token and enter it in the server:
 
