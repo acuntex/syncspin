@@ -73,6 +73,10 @@ are configured in [`.pre-commit-config.yaml`](.pre-commit-config.yaml); install 
 | `docs`    | `cargo doc` without warnings, so a broken doc link cannot merge.                                                                                              |
 | `secrets` | No credential in the history, scanned with gitleaks.                                                                                                          |
 
+Three more jobs report without blocking: `coverage` (line coverage with every feature, floor 96.5),
+`package` (`cargo package -p syncspin-core`) and `mutants` (weekly, `syncspin-core`). Making them
+required would gate pull requests on numbers that move with a refactor, not with a defect.
+
 ## Hard rules
 
 - **No unencrypted path.** A peer that does not complete the Noise handshake is refused. No flag, no

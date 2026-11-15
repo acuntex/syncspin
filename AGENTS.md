@@ -27,10 +27,14 @@ never knows a transport. A dependency pointing from core towards a crate is a bu
 ```sh
 cargo test --workspace --locked
 cargo test --workspace --features pairing-code,storage-file --locked
-cargo clippy --all-targets --all-features -- -D warnings
-cargo fmt --check
-cargo zigbuild --target armv7-unknown-linux-gnueabihf   # once the player/controller features land
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo fmt --all -- --check
+cargo package -p syncspin-core --locked                 # publishability, before a release
+cargo check -p syncspin-core -p syncspin-client --all-features \
+  --target armv7-unknown-linux-gnueabihf --locked       # the ARM guard, as CI runs it
+cargo zigbuild --target armv7-unknown-linux-gnueabihf  # once the player/controller features land
 cargo deny check                                       # licences, advisories, sources
+scripts/coverage.sh                                    # coverage, all features, advisory
 ```
 
 The ARMv7 build is the one that decides whether this library is usable where it is needed: it must
