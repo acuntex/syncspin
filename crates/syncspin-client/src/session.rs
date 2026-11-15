@@ -82,6 +82,12 @@ const SYNC_MESSAGES: usize = 8;
 /// The spec allows the client to move on without a reply after a timeout of its choosing.
 const SYNC_REPLY_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// How long a `client/goodbye` may take before the connection is closed anyway.
+///
+/// The message is a courtesy that belongs to a graceful close: a peer that does not read its
+/// window must not be able to hold a deliberate shutdown open.
+const GOODBYE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Overall cap on one burst, so a peer that stalls cannot hold the session loop.
 const SYNC_BURST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -509,11 +515,23 @@ pub(crate) async fn attempt(
         }
     };
 
-    let handshake = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        handshake(transport, config, &candidates, &carried.active_roles),
-    )
-    .await;
+    let handshake = tokio::select! {
+        result = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake(transport, config, &candidates, &carried.active_roles),
+        ) => result,
+        // The host closed while the handshake was running. There is no session to say goodbye on
+        // yet, and the attempt must not report a failure or schedule a reconnect.
+        reason = &mut *shutdown => {
+            let _ = reason;
+            return Attempt {
+                carried,
+                connected: false,
+                sink_failed: false,
+                ending: Ending::Shutdown,
+            };
+        }
+    };
     let ready = match handshake {
         Ok(result) => result,
         Err(_elapsed) => Err(anyhow!("timed out during the Noise handshake")),
@@ -2066,17 +2084,18 @@ impl Session<'_> {
         let _ = self.events.send(event);
     }
 
-    /// Sends `client/goodbye` with `reason`, best effort.
+    /// Sends `client/goodbye` with `reason`, best effort and time-bounded.
     ///
-    /// The message belongs to a graceful close. A write that fails is ignored: the connection is
-    /// ending anyway, and reporting the failure would turn a deliberate shutdown into an error or
-    /// a reconnect. A goodbye during a re-handshake is refused by [`Self::send_json`] and ignored
-    /// for the same reason - there is no application-message window to use.
+    /// The message belongs to a graceful close. A write that fails or does not complete within
+    /// [`GOODBYE_TIMEOUT`] is ignored: the connection is ending anyway, and turning either into an
+    /// error or a reconnect would punish a deliberate shutdown for a courtesy. A goodbye during a
+    /// re-handshake is refused by [`Self::send_json`] and ignored for the same reason - there is no
+    /// application-message window to use.
     async fn send_goodbye(&mut self, reason: GoodbyeReason) {
         let goodbye = Incoming::ClientGoodbye(ClientGoodbye {
             reason: reason.as_str().to_owned(),
         });
-        let _ = self.send_json(&goodbye).await;
+        let _ = tokio::time::timeout(GOODBYE_TIMEOUT, self.send_json(&goodbye)).await;
     }
 
     /// Encrypts and sends one control message.

@@ -1091,7 +1091,17 @@ async fn serve_until_dropped(
     let mut delay = INITIAL_BACKOFF;
 
     loop {
-        let transport = match open(&connection.endpoint).await {
+        // A close that arrives while the attempt is still connecting has no session to say
+        // goodbye on, so the loop ends as soon as it fires instead of waiting out the connect
+        // timeout and reporting a failure the host did not cause.
+        let transport = tokio::select! {
+            result = open(&connection.endpoint) => result,
+            reason = &mut shutdown => {
+                let _ = reason;
+                return Ok(());
+            }
+        };
+        let transport = match transport {
             Ok(transport) => transport,
             Err(error) => {
                 delay = next_backoff(delay, false, connection.config.max_backoff);
@@ -1525,6 +1535,47 @@ mod tests {
             outcome.is_ok(),
             "a host that dropped the stream ends the connection cleanly"
         );
+    }
+
+    /// A close that arrives while the socket is still opening ends the loop at once, without an
+    /// `Event::Disconnected` for a failure the host did not cause.
+    #[tokio::test]
+    async fn a_close_during_the_connect_ends_without_a_disconnected_event() {
+        // A loopback listener that never accepts: the TCP connection is queued by the kernel and
+        // the WebSocket handshake answers nothing, so the open stays in flight.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a loopback port");
+        let address = listener.local_addr().expect("the bound address");
+        let url = format!("ws://{address}/sendspin");
+
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let connection = connection_at(&url, events);
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(serve_until_dropped(
+            connection,
+            empty_carried(None),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown
+            .send(GoodbyeReason::UserRequest)
+            .expect("the connection loop is still waiting");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the close must not wait out the connect timeout")
+            .expect("the connection task panicked");
+        assert!(
+            outcome.is_ok(),
+            "a close during the connect is clean: {outcome:?}"
+        );
+        if let Ok(event) = receiver.try_recv() {
+            panic!(
+                "no failure event may be reported for a close the host asked for, got {event:?}"
+            );
+        }
     }
 
     #[tokio::test]
