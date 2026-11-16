@@ -19,8 +19,8 @@ use syncspin_client::{
     DEFAULT_PAIRING_TIMEOUT, NORMAL_PLAYBACK_SPEED,
 };
 use syncspin_core::messages::{
-    ClientState, ControllerState, GroupUpdate, Incoming, PlayerCommand, Progress, ServerCommand,
-    ServerState,
+    ClientState, ControllerState, GroupUpdate, Incoming, PairingActivation, PlayerCommand,
+    Progress, ServerActivate, ServerCommand, ServerState,
 };
 use syncspin_core::noise::{psk_id_for, Identity};
 
@@ -2459,4 +2459,159 @@ async fn dropping_the_event_stream_ends_a_live_session() {
         .await
         .expect("a dropped event stream must end the connection");
     outcome.expect("a host that stopped listening is not an error");
+}
+
+// ---------------------------------------------------------------------------
+// The unpaired-access switch
+// ---------------------------------------------------------------------------
+
+/// Waits for the client's goodbye, failing instead of hanging when none arrives.
+///
+/// A regression here means the client silently kept a connection open, which no assertion can
+/// observe if the wait itself never returns.
+async fn goodbye_from(server: &mut FakeServer) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(5), server.wait_for_goodbye())
+        .await
+        .expect("the client must say goodbye before closing the connection")
+}
+
+#[tokio::test]
+async fn a_guest_refuses_playback_when_unpaired_access_is_off() {
+    // The server's first activation is the harness default: activities ['playback'] with roles.
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+
+    expect_connected(&mut events, &server).await;
+    match next_event(&mut events).await {
+        Event::PairingRequired { server_id, reason } => {
+            assert_eq!(server_id, server.server_id());
+            assert_eq!(
+                reason,
+                syncspin_client::PairingRequiredReason::UnpairedAccessDisabled
+            );
+        }
+        other => panic!("expected PairingRequired, got {other:?}"),
+    }
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("pairing_required"),
+        "the switch closes the connection with the spec's reason"
+    );
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => {
+            assert!(reason.contains("does not admit"), "got: {reason}")
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    drop(handle);
+}
+
+#[tokio::test]
+async fn a_guest_that_refuses_unpaired_access_can_still_pair() {
+    // `['pairing']` with no roles is admissible under the Sentinel key whatever the setting. The
+    // pairing PSK method is not admissible on a Sentinel-keyed connection, and that refusal is an
+    // abort - the connection stays open, which is what proves the switch did not close it.
+    let options = ServerOptions {
+        first_activate: Some(ServerActivate {
+            activities: vec!["pairing".to_owned()],
+            active_roles: Some(Vec::new()),
+            pairing: Some(PairingActivation {
+                method: "pairing_psk".to_owned(),
+                format: None,
+            }),
+        }),
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+
+    expect_connected(&mut events, &server).await;
+    assert_eq!(
+        server.wait_for_pairing_abort().await.as_deref(),
+        Some("method_not_supported"),
+        "the activation reached the pairing layer instead of closing the connection"
+    );
+    assert_still_reconnecting(handle).await;
+}
+
+#[tokio::test]
+async fn a_paired_session_keeps_playback_when_unpaired_access_is_off() {
+    let psk: [u8; 32] = std::array::from_fn(|index| (index as u8) ^ 0x5a);
+    let options = ServerOptions {
+        psk_id: psk_id_for(&psk),
+        psk_category: "lt".to_owned(),
+        psk,
+        ..ServerOptions::default()
+    };
+    let server = FakeServer::start(options).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let stored = StoredPsk {
+        category: PskCategory::LongTerm,
+        psk,
+        server_id: server.server_id().to_owned(),
+    };
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (_handle, mut events) = syncspin_client::connect_with_psks(config, sink, vec![stored])
+        .await
+        .expect("the client must connect");
+
+    expect_connected(&mut events, &server).await;
+    // The sink opening is the proof that the session is a playback session, not just a handshake.
+    server.stream_start("pcm", 48_000, 2, 16);
+    wait_for_open(&recordings).await;
+}
+
+#[tokio::test]
+async fn an_unoffered_role_closes_the_connection_as_unauthorized() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+    server.json(
+        r#"{"type":"server/activate","payload":{"activities":["playback"],"active_roles":["source@v1"]}}"#,
+    );
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("unauthorized")
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_activity_closes_the_connection_as_unauthorized() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+    server.json(r#"{"type":"server/activate","payload":{"activities":["playback","kiosk"]}}"#);
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("unauthorized")
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_activity_closes_the_connection_as_unauthorized() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+    server.json(r#"{"type":"server/activate","payload":{"activities":["playback","playback"]}}"#);
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("unauthorized")
+    );
 }

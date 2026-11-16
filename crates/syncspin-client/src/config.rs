@@ -303,11 +303,12 @@ pub struct ClientConfig {
     pub strict_group_id: bool,
     /// Whether this client admits a server with no pairing record.
     ///
-    /// The value is advertised in `client/hello` as `unpaired_access.enabled`, and nothing else
-    /// currently reads it. It carries the host's decision that a session not keyed by a long-term
-    /// PSK must not be activated for playback and is refused with `client/goodbye` reason
-    /// `pairing_required`. Pairing is unaffected: both pairing flows run over a Sentinel-keyed
-    /// session and stay admissible.
+    /// The value is advertised in `client/hello` as `unpaired_access.enabled` and both sides act on
+    /// it. With `false` this client refuses to activate a session that is not keyed by a long-term
+    /// PSK for playback: such a `server/activate` ends the connection with `client/goodbye` reason
+    /// `pairing_required`. A server that honours the advertisement grants no roles to an unpaired
+    /// client whose hello says `false`. Pairing is unaffected: both pairing flows run over a
+    /// Sentinel-keyed session and stay admissible.
     ///
     /// `pairing.md` leaves the default to the manufacturer and recommends `false` for a client whose
     /// input a stranger could reach, such as a microphone. The default here is `true`, which is what

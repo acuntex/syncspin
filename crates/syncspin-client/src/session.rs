@@ -11,6 +11,7 @@
 //! clock estimate, and changes nothing but the keys and the pairing index. See
 //! `Session::begin_rehandshake`.
 
+use std::collections::BTreeSet;
 use std::future::pending;
 #[cfg(feature = "pairing-code")]
 use std::sync::atomic::AtomicU32;
@@ -107,8 +108,8 @@ const CONTROLLER_ROLE: &str = "controller@v1";
 
 /// The roles this client advertises in `client/hello`.
 ///
-/// The list is written here once, so the roles the client announces cannot drift apart from each
-/// other.
+/// The list is written here once, so the roles the client announces cannot drift apart from the
+/// roles its activation check admits: both read this constant.
 const SUPPORTED_ROLES: [&str; 3] = [PLAYER_ROLE, CONTROLLER_ROLE, METADATA_ROLE];
 
 /// Largest output delay reported to the server, in milliseconds.
@@ -380,10 +381,8 @@ pub(crate) enum Ending {
     /// The server dropped this client's pairing record, so the client ended the connection.
     Unpaired,
     /// The server wanted an unpaired session and this client does not admit one.
-    #[allow(dead_code)] // Constructed once the activation rules land (Task 4).
     PairingRequired,
     /// The server's activation is not allowed for the key that sealed this connection.
-    #[allow(dead_code)] // Constructed once the activation rules land (Task 4).
     Unauthorized,
     /// The host closed the connection deliberately, after saying why.
     Shutdown,
@@ -731,8 +730,8 @@ impl Session<'_> {
             if self.events.is_closed() {
                 return Ok(Ending::Closed);
             }
-            // A handler that ends the connection - `server/unpair` is the only one today - set the
-            // reason while the frame was dispatched; the connection is closed here.
+            // A handler that ends the connection - `server/unpair` and a refused activation - set
+            // the reason while the frame was dispatched; the connection is closed here.
             if let Some(ending) = self.ending.take() {
                 return Ok(ending);
             }
@@ -1115,6 +1114,13 @@ impl Session<'_> {
     /// cancels the attempt in progress and persists nothing, which is how the spec lets a server
     /// end a pairing without finalizing it.
     async fn apply_activate(&mut self, activate: ServerActivate) -> Result<()> {
+        // A refused activation ends the connection, so it is decided before anything is changed:
+        // an activation this client will not honour must leave no half-applied state behind.
+        match admit_activation(self.matched, self.config.unpaired_access, &activate) {
+            Admitted::Admissible => {}
+            refusal => return self.refuse_activation(refusal).await,
+        }
+
         // Every activation starts a new regime: messages from an attempt that ended before it are
         // stale, and a new attempt has not started yet.
         self.discarding_pairing_messages = false;
@@ -1156,6 +1162,28 @@ impl Session<'_> {
             self.pairing_index = self.pairing_index.saturating_add(1);
             self.start_pairing(activation).await?;
         }
+        Ok(())
+    }
+
+    /// Ends a connection whose `server/activate` this client will not honour.
+    ///
+    /// `messaging.md` orders the two reasons: `pairing_required` when enabling unpaired access would
+    /// have made the activation admissible, `unauthorized` for everything else. The goodbye goes out
+    /// before the close so the server can tell "pair against me" from "you sent something I forbid".
+    async fn refuse_activation(&mut self, refusal: Admitted) -> Result<()> {
+        let (goodbye, ending) = match refusal {
+            Admitted::Admissible => return Ok(()),
+            Admitted::PairingRequired => (GoodbyeReason::PairingRequired, Ending::PairingRequired),
+            Admitted::Unauthorized => (GoodbyeReason::Unauthorized, Ending::Unauthorized),
+        };
+        if refusal == Admitted::PairingRequired {
+            self.emit(Event::PairingRequired {
+                server_id: self.server_id.clone(),
+                reason: PairingRequiredReason::UnpairedAccessDisabled,
+            });
+        }
+        self.send_goodbye(goodbye).await;
+        self.ending = Some(ending);
         Ok(())
     }
 
@@ -2597,6 +2625,136 @@ impl PskMetadata {
     }
 }
 
+/// The activity a session declares to play audio.
+const PLAYBACK: &str = "playback";
+
+/// The activity a session declares to run a pairing attempt.
+const PAIRING: &str = "pairing";
+
+/// The verdict of `messaging.md`'s admissibility rules for one `server/activate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admitted {
+    /// The matched key and the setting allow the activation.
+    Admissible,
+    /// Unpaired access is off, and enabling it is the only thing that would admit the activation.
+    PairingRequired,
+    /// No setting makes the activation admissible on this connection.
+    Unauthorized,
+}
+
+/// Reads the activities of a `server/activate` as the set the rules are written against.
+///
+/// `messaging.md` names the members of a set, so an unknown member and a repeated one are equally
+/// malformed. `None` is that malformed case, and no rule admits it.
+fn normalise(activities: &[String]) -> Option<BTreeSet<&str>> {
+    let mut set = BTreeSet::new();
+    for activity in activities {
+        if activity != PLAYBACK && activity != PAIRING {
+            return None;
+        }
+        if !set.insert(activity.as_str()) {
+            return None;
+        }
+    }
+    Some(set)
+}
+
+/// Whether the key that sealed this connection carries a pairing record.
+fn is_paired(matched: MatchedPsk) -> bool {
+    matched == MatchedPsk::Stored(PskCategory::LongTerm)
+}
+
+/// Whether an activity set is allowed for the key that sealed the connection.
+///
+/// The set is one [`normalise`] produced, so every member is a known activity.
+fn allowed(activities: Option<&BTreeSet<&str>>, paired: bool, unpaired_access: bool) -> bool {
+    let Some(activities) = activities else {
+        return false;
+    };
+    if paired {
+        // A paired connection plays or does nothing: `pairing` belongs to the guest path, and the
+        // spec gives a connection keyed by a long-term PSK no reason to run one.
+        return activities.is_empty() || (activities.len() == 1 && activities.contains(PLAYBACK));
+    }
+    // A guest may always pair - that is what keeps the switch from locking the client out of a
+    // server for good - and plays only while the host admits unpaired access.
+    !activities.contains(PLAYBACK) || unpaired_access
+}
+
+/// Whether `activities` plus `playback` is an allowed set.
+///
+/// `messaging.md` calls a connection playback-capable exactly when its activity set with `playback`
+/// added is admissible, which is why roles use this rather than the set the server sent.
+fn capable_of_playback(
+    activities: Option<&BTreeSet<&str>>,
+    paired: bool,
+    unpaired_access: bool,
+) -> bool {
+    let Some(activities) = activities else {
+        return false;
+    };
+    let mut with_playback = activities.clone();
+    with_playback.insert(PLAYBACK);
+    allowed(Some(&with_playback), paired, unpaired_access)
+}
+
+/// Whether a `server/activate`'s activity list leaves the connection playback-capable.
+pub(crate) fn playback_capable_for(
+    matched: MatchedPsk,
+    unpaired_access: bool,
+    activities: &[String],
+) -> bool {
+    capable_of_playback(
+        normalise(activities).as_ref(),
+        is_paired(matched),
+        unpaired_access,
+    )
+}
+
+/// Applies all three admissibility rules for one setting.
+fn activation_admissible(
+    matched: MatchedPsk,
+    unpaired_access: bool,
+    activate: &ServerActivate,
+) -> bool {
+    let paired = is_paired(matched);
+    let activities = normalise(&activate.activities);
+    if !allowed(activities.as_ref(), paired, unpaired_access) {
+        return false;
+    }
+    let roles = activate.active_roles.as_deref().unwrap_or_default();
+    if !roles
+        .iter()
+        .all(|role| SUPPORTED_ROLES.contains(&role.as_str()))
+    {
+        return false;
+    }
+    roles.is_empty() || playback_capable_for(matched, unpaired_access, &activate.activities)
+}
+
+/// Decides whether this client honours a `server/activate`.
+///
+/// The two refusal reasons are ordered as `messaging.md` orders them. Rule 1 asks whether the
+/// setting is the only obstacle, rule 2 covers everything else; reversing them turns every guest
+/// refusal into `unauthorized` and leaves a server unable to tell "pair with me" from "you sent
+/// something I forbid", which is the whole point of the switch.
+pub(crate) fn admit_activation(
+    matched: MatchedPsk,
+    unpaired_access: bool,
+    activate: &ServerActivate,
+) -> Admitted {
+    if activation_admissible(matched, unpaired_access, activate) {
+        return Admitted::Admissible;
+    }
+    // Rule 1: unpaired access is off, and turning it on would have admitted this activation.
+    if !unpaired_access && !is_paired(matched) && activation_admissible(matched, true, activate) {
+        return Admitted::PairingRequired;
+    }
+    // Rule 2: no setting admits it - the activity set is wrong for the key, or a role was never
+    // offered, or roles are declared on a connection that cannot play.
+    Admitted::Unauthorized
+}
+
 /// The pairing attempt a `server/activate` admits, if it declares the pairing activity.
 ///
 /// An activation that declares `pairing` without its parameters is malformed: no conformant server
@@ -2606,7 +2764,7 @@ fn admits_pairing(activate: &ServerActivate) -> Result<Option<PairingActivation>
     if !activate
         .activities
         .iter()
-        .any(|activity| activity == "pairing")
+        .any(|activity| activity == PAIRING)
     {
         return Ok(None);
     }
@@ -3348,6 +3506,175 @@ mod tests {
         assert!(
             format!("{error:#}").contains("pairing parameters"),
             "got: {error:#}"
+        );
+    }
+
+    /// Builds a `server/activate` with the given activities and roles.
+    fn activation(activities: &[&str], roles: Option<&[&str]>) -> ServerActivate {
+        ServerActivate {
+            activities: activities.iter().map(|a| (*a).to_owned()).collect(),
+            active_roles: roles.map(|roles| roles.iter().map(|r| (*r).to_owned()).collect()),
+            pairing: None,
+        }
+    }
+
+    /// A long-term-keyed connection, the only kind `messaging.md` leaves fully paired.
+    const LONG_TERM: MatchedPsk = MatchedPsk::Stored(PskCategory::LongTerm);
+
+    #[test]
+    fn a_paired_session_admits_playback_with_roles_whatever_the_setting() {
+        let activate = activation(
+            &["playback"],
+            Some(&["player@v1", "controller@v1", "metadata@v1"]),
+        );
+        for unpaired_access in [true, false] {
+            assert_eq!(
+                admit_activation(LONG_TERM, unpaired_access, &activate),
+                Admitted::Admissible
+            );
+        }
+    }
+
+    #[test]
+    fn a_paired_session_may_not_declare_the_pairing_activity() {
+        assert_eq!(
+            admit_activation(LONG_TERM, true, &activation(&["pairing"], None)),
+            Admitted::Unauthorized,
+            "a connection keyed by a long-term PSK has nothing left to pair"
+        );
+    }
+
+    #[test]
+    fn a_paired_session_may_not_declare_an_unknown_activity() {
+        assert_eq!(
+            admit_activation(LONG_TERM, true, &activation(&["playback", "kiosk"], None)),
+            Admitted::Unauthorized
+        );
+    }
+
+    #[test]
+    fn a_repeated_activity_is_not_a_set() {
+        assert_eq!(
+            admit_activation(
+                LONG_TERM,
+                true,
+                &activation(&["playback", "playback"], None)
+            ),
+            Admitted::Unauthorized,
+            "the spec calls the activities a set, so a repeat is not a member"
+        );
+    }
+
+    #[test]
+    fn an_empty_activation_is_admissible_for_every_psk() {
+        let activate = activation(&[], None);
+        for matched in [MatchedPsk::Sentinel, MatchedPsk::PairingPsk, LONG_TERM] {
+            for unpaired_access in [true, false] {
+                assert_eq!(
+                    admit_activation(matched, unpaired_access, &activate),
+                    Admitted::Admissible,
+                    "{matched:?} with unpaired access {unpaired_access}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_guest_may_pair_with_unpaired_access_off() {
+        assert_eq!(
+            admit_activation(MatchedPsk::Sentinel, false, &activation(&["pairing"], None)),
+            Admitted::Admissible,
+            "both pairing flows run over a Sentinel-keyed session"
+        );
+    }
+
+    #[test]
+    fn a_guest_may_not_play_with_unpaired_access_off() {
+        assert_eq!(
+            admit_activation(
+                MatchedPsk::Sentinel,
+                false,
+                &activation(&["playback"], Some(&["player@v1"]))
+            ),
+            Admitted::PairingRequired
+        );
+    }
+
+    #[test]
+    fn a_guest_with_roles_and_no_activity_still_needs_unpaired_access() {
+        assert_eq!(
+            admit_activation(
+                MatchedPsk::Sentinel,
+                false,
+                &activation(&[], Some(&["player@v1"]))
+            ),
+            Admitted::PairingRequired,
+            "roles alone make the connection playback-capable"
+        );
+    }
+
+    #[test]
+    fn an_unoffered_role_is_unauthorized_not_pairing_required() {
+        assert_eq!(
+            admit_activation(
+                MatchedPsk::Sentinel,
+                false,
+                &activation(&["playback"], Some(&["source@v1"]))
+            ),
+            Admitted::Unauthorized,
+            "enabling unpaired access would not have made this role admissible"
+        );
+    }
+
+    #[test]
+    fn a_pairing_psk_session_behaves_like_a_sentinel_one() {
+        assert_eq!(
+            admit_activation(
+                MatchedPsk::PairingPsk,
+                false,
+                &activation(&["playback"], Some(&["player@v1"]))
+            ),
+            Admitted::PairingRequired
+        );
+    }
+
+    #[test]
+    fn unpaired_access_makes_roles_admissible_without_an_activity() {
+        assert_eq!(
+            admit_activation(
+                MatchedPsk::Sentinel,
+                true,
+                &activation(&[], Some(&["player@v1"]))
+            ),
+            Admitted::Admissible
+        );
+    }
+
+    #[test]
+    fn a_paired_session_keeps_roles_without_the_playback_activity() {
+        assert_eq!(
+            admit_activation(LONG_TERM, false, &activation(&[], Some(&["player@v1"]))),
+            Admitted::Admissible
+        );
+    }
+
+    #[test]
+    fn playback_capable_for_follows_the_key_and_the_setting() {
+        assert!(
+            playback_capable_for(LONG_TERM, false, &[]),
+            "a paired connection is playback-capable whatever the setting"
+        );
+        assert!(
+            playback_capable_for(MatchedPsk::Sentinel, true, &[]),
+            "unpaired access alone makes a guest playback-capable"
+        );
+        assert!(
+            !playback_capable_for(MatchedPsk::Sentinel, false, &[]),
+            "a guest without unpaired access is not playback-capable"
+        );
+        assert!(
+            !playback_capable_for(MatchedPsk::Sentinel, false, &["pairing".to_owned()]),
+            "declaring pairing does not add playback capability"
         );
     }
 
