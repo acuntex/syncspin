@@ -128,8 +128,8 @@ the conventional commits; do not edit it by hand.
 One command prepares a release:
 
 ```sh
-scripts/release.sh 0.2.0            # bump, changelog, gates, commit
-scripts/release.sh 0.2.0 --dry-run  # show what it would change
+scripts/release.sh <version>            # bump, changelog, gates, commit
+scripts/release.sh <version> --dry-run  # show what it would change
 ```
 
 Before the tag, read the documents as a stranger would. The script enforces the version; nothing
@@ -152,7 +152,7 @@ renders exactly the new section, so the script prepends it and leaves the histor
 Merge the resulting branch, then push the tag and let the pipeline do the rest:
 
 ```sh
-git tag -a v0.2.0 -m "syncspin 0.2.0" && git push origin v0.2.0
+git tag -a v<version> -m "syncspin <version>" && git push origin v<version>
 ```
 
 [`release.yml`](.github/workflows/release.yml) verifies the commit under the tag, refuses a tag that

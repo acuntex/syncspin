@@ -5,8 +5,8 @@ handshake. A weakness in that path is worth reporting privately, not in a public
 
 ## Supported versions
 
-Only the 0.2 line is supported. `syncspin-core`, `syncspin-client` and `syncspin-server` are published
-on crates.io, and the `v0.2.0` tag is the reference. Older releases, commits, forks and downstream
+Only the 0.3 line is supported. `syncspin-core`, `syncspin-client` and `syncspin-server` are published
+on crates.io, and the `v0.3.0` tag is the reference. Older releases, commits, forks and downstream
 copies are not supported here.
 
 ## Reporting a vulnerability
