@@ -379,6 +379,22 @@ pub enum Event {
     },
     /// The server's view of playback state changed.
     State(PlaybackState),
+    /// The server sent a `group_id` the spec does not allow, and the client accepted it.
+    ///
+    /// `messaging.md` gives `group_id` as 32 server-chosen bytes in 43 base64url characters and
+    /// calls any other value a protocol error. The default configuration tolerates a well-formed
+    /// value instead - one that is non-empty, at most 128 bytes and free of control characters -
+    /// because a real server sends a UUID. The event reports the departure so a host can log it or
+    /// surface it to the operator; it never carries the identifier itself.
+    ///
+    /// Reported at most once per connection, however many non-canonical updates arrive. It is not
+    /// reported for a canonical identifier, and it does not exist when
+    /// [`ClientConfig::strict_group_id`] is set, because that configuration closes the connection
+    /// instead. An empty, oversized or control-character value is a protocol error in both modes.
+    GroupIdNotCanonical {
+        /// Length of the value in bytes, which is all a log line needs.
+        len: usize,
+    },
     /// The server asked this player to change its volume or mute state.
     ///
     /// The session applies the [`VolumePolicy`] from its configuration and reports the applied
@@ -529,6 +545,10 @@ impl fmt::Debug for Event {
                 .field("playback_speed", playback_speed)
                 .finish(),
             Self::State(state) => formatter.debug_tuple("State").field(state).finish(),
+            Self::GroupIdNotCanonical { len } => formatter
+                .debug_struct("GroupIdNotCanonical")
+                .field("len", len)
+                .finish(),
             Self::Volume {
                 requested,
                 applied,
@@ -586,7 +606,11 @@ pub struct PlaybackState {
     /// `playing` and `stopped` are the values this revision defines; a paused group reports
     /// `stopped`. A value this revision does not name is carried verbatim.
     pub playback_state: Option<String>,
-    /// Identifier of the group as 43 unpadded base64url characters, once a `group/update` arrived.
+    /// Identifier of the group, once a `group/update` arrived.
+    ///
+    /// The spec gives it as 43 unpadded base64url characters; the default configuration also
+    /// carries a well-formed foreign value such as a UUID, because a real server sends one. See
+    /// [`ClientConfig::strict_group_id`] and [`Event::GroupIdNotCanonical`].
     pub group_id: Option<String>,
     /// Friendly name of the group, once a `group/update` arrived.
     pub group_name: Option<String>,
@@ -1338,6 +1362,13 @@ mod tests {
         );
     }
 
+    /// The tolerance event reports the length and never the identifier itself.
+    #[test]
+    fn the_group_id_tolerance_event_formats_its_length() {
+        let text = format!("{:?}", Event::GroupIdNotCanonical { len: 36 });
+        assert_eq!(text, "GroupIdNotCanonical { len: 36 }");
+    }
+
     /// Every other event keeps the fields a log line needs.
     #[test]
     fn an_event_still_formats_its_readable_fields() {
@@ -1465,6 +1496,7 @@ mod tests {
                 muted: false,
                 volume_policy: VolumePolicy::default(),
                 max_backoff: Duration::from_secs(30),
+                strict_group_id: false,
                 pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
                 #[cfg(feature = "discovery")]
                 inbound: None,

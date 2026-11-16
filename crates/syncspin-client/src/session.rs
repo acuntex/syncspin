@@ -132,6 +132,12 @@ const PSK_ID_LEN: usize = 43;
 /// Length of a canonical unpadded base64url group identifier.
 const GROUP_ID_LEN: usize = 43;
 
+/// Longest non-canonical group identifier the tolerance accepts, in bytes of UTF-8.
+///
+/// The spec does not define a length for a foreign value, so this bound keeps an absurd identifier
+/// from filling memory while leaving room for the UUID a real server sends.
+const MAX_GROUP_ID_LEN: usize = 128;
+
 /// How many failed key confirmations one pairing window admits.
 ///
 /// `pairing.md`: the window closes on its fifth failed attempt, where a failure is the client's
@@ -471,6 +477,11 @@ pub(crate) struct Session<'a> {
     muted: bool,
     /// Whether a sink call failed, which the host has to repair before another attempt.
     sink_failed: bool,
+    /// Whether this connection already reported a non-canonical `group_id`.
+    ///
+    /// The tolerance reports the departure once per connection, so a server that repeats the same
+    /// foreign identifier does not produce a stream of events.
+    group_id_tolerance_reported: bool,
     /// Controller commands the server last advertised, or `None` before its first controller
     /// state.
     controller_commands: Option<Vec<String>>,
@@ -625,6 +636,7 @@ pub(crate) async fn attempt(
         volume: carried.volume,
         muted: carried.muted,
         sink_failed: false,
+        group_id_tolerance_reported: false,
         controller_commands: None,
         playback: PlaybackState::default(),
         server_id: ready.server_id.clone(),
@@ -1940,15 +1952,34 @@ impl Session<'_> {
     ///
     /// The message is a core one and valid whatever roles are active, so it is not gated on a role.
     /// Its fields complete the picture `server/state` fills in for the roles: the group fields are
-    /// replaced, the controller fields stay. `group_id` is 32 bytes as 43 unpadded base64url
-    /// characters; any other value is a protocol error, so the connection closes as the spec
-    /// requires. A `playback_state` this revision does not name is carried to the host verbatim.
+    /// replaced, the controller fields stay. The spec gives `group_id` as 32 bytes in 43 unpadded
+    /// base64url characters and calls any other value a protocol error. By default this client
+    /// tolerates a well-formed foreign value instead, because a real server sends a UUID: it
+    /// reports [`Event::GroupIdNotCanonical`] once per connection and keeps the identifier as an
+    /// opaque string. An empty, oversized or control-character value is still an error, and
+    /// [`ClientConfig::strict_group_id`] restores the spec's close for any non-canonical value. A
+    /// `playback_state` this revision does not name is carried to the host verbatim.
     fn handle_group_update(&mut self, update: GroupUpdate) -> Result<()> {
-        if !is_canonical_group_id(&update.group_id) {
+        let canonical = is_canonical_group_id(&update.group_id);
+        if self.config.strict_group_id {
+            if !canonical {
+                bail!(
+                    "group/update carries a group_id that is not a canonical {GROUP_ID_LEN}-character \
+                     base64url identifier"
+                );
+            }
+        } else if !is_tolerable_group_id(&update.group_id) {
             bail!(
-                "group/update carries a group_id that is not a canonical {GROUP_ID_LEN}-character \
-                 base64url identifier"
+                "group/update carries a group_id that is empty, longer than {MAX_GROUP_ID_LEN} \
+                 bytes or contains a control character"
             );
+        } else if !canonical && !self.group_id_tolerance_reported {
+            // Once per connection: the departure is a property of the server, not of this message,
+            // and a repeating update must not flood the host's log.
+            self.group_id_tolerance_reported = true;
+            self.emit(Event::GroupIdNotCanonical {
+                len: update.group_id.len(),
+            });
         }
         self.playback.playback_state = Some(update.playback_state);
         self.playback.group_id = Some(update.group_id);
@@ -2651,6 +2682,16 @@ fn is_canonical_group_id(value: &str) -> bool {
     }
 }
 
+/// Whether a non-canonical group id is still safe to carry as an opaque string.
+///
+/// The tolerance keeps the shape a host can log and compare - non-empty, at most
+/// [`MAX_GROUP_ID_LEN`] bytes, valid UTF-8 without control characters - while dropping the
+/// base64url and length rules the spec imposes. A `String` is always valid UTF-8; the check is
+/// named here so the rule stands on its own. An empty or absurd value stays a protocol error.
+fn is_tolerable_group_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_GROUP_ID_LEN && !value.chars().any(char::is_control)
+}
+
 /// The key that seals a handshake, and what kind of key it is.
 struct Selected {
     /// The 32-byte key the responder seals message 2 with.
@@ -3017,6 +3058,7 @@ mod tests {
             muted: false,
             volume_policy: crate::config::VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
+            strict_group_id: false,
             pairing_timeout: crate::client::DEFAULT_PAIRING_TIMEOUT,
             #[cfg(feature = "discovery")]
             inbound: None,
@@ -3072,6 +3114,7 @@ mod tests {
             volume: 50,
             muted: false,
             sink_failed: false,
+            group_id_tolerance_reported: false,
             controller_commands: None,
             playback: PlaybackState::default(),
             server_id: SERVER_ID.to_owned(),

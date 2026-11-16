@@ -46,9 +46,7 @@ use anyhow::{anyhow, bail, Context, Result};
 #[cfg(feature = "storage-file")]
 use syncspin_client::storage::{FileStorage, Storage};
 #[cfg(feature = "discovery")]
-use syncspin_client::{
-    discover_servers, DiscoveredServer, Discovery, Inbound, MdnsDiscovery, SERVER_SERVICE_TYPE,
-};
+use syncspin_client::{discover_reachable_endpoint, Discovery, Inbound, MdnsDiscovery};
 use syncspin_client::{
     AudioMode, Client, ClientConfig, Event, Identity, VolumePolicy, DEFAULT_PAIRING_TIMEOUT,
     MAX_PLAYER_NAME_LEN,
@@ -175,7 +173,7 @@ async fn run(options: Options) -> Result<()> {
     let server = if options.discover {
         let discovery =
             MdnsDiscovery::new().context("failed to start the mDNS daemon to discover a server")?;
-        let server = discovered_endpoint(&discovery)?;
+        let server = discovered_endpoint(&discovery).await?;
         eprintln!("discovered a server at {server}");
         server
     } else {
@@ -337,6 +335,10 @@ async fn run(options: Options) -> Result<()> {
                     Event::Disconnected { reason, retry_in } => eprintln!(
                         "disconnected: {reason}; retrying in {}s",
                         retry_in.as_secs_f32()
+                    ),
+                    Event::GroupIdNotCanonical { len } => eprintln!(
+                        "note: the server sends a {len}-byte group id that is not 43 base64url \
+                         characters; accepting it as an opaque string"
                     ),
                     // A later revision can add events; this example only prints the ones it knows.
                     _ => {}
@@ -641,23 +643,16 @@ fn check_server(server: &str) -> Result<()> {
     Ok(())
 }
 
-/// Returns the endpoint of the first server discovery reports.
+/// Returns the first endpoint discovery reports that accepts a connection.
 ///
 /// A browse is a snapshot, so the caller starts the server first or retries; this example keeps the
-/// command line one-shot instead of hiding a retry loop behind it. A record that cannot name a
-/// `ws://` endpoint is skipped rather than guessed at.
+/// command line one-shot instead of hiding a retry loop behind it. One service can resolve to
+/// several addresses - a dual-stack host publishes IPv4 and IPv6 - so the client tries them IPv4
+/// first and moves on when one refuses, instead of dialling the same dead address on every retry.
+/// A record that cannot name a `ws://` endpoint is skipped rather than guessed at.
 #[cfg(feature = "discovery")]
-fn discovered_endpoint(discovery: &dyn Discovery) -> Result<String> {
-    let servers = discover_servers(discovery)?;
-    servers
-        .iter()
-        .find_map(DiscoveredServer::endpoint)
-        .ok_or_else(|| {
-            anyhow!(
-                "no server advertised {SERVER_SERVICE_TYPE}; start one with `server-demo --mdns` \
-                 or pass --server"
-            )
-        })
+async fn discovered_endpoint(discovery: &dyn Discovery) -> Result<String> {
+    discover_reachable_endpoint(discovery).await
 }
 
 /// Puts the client in the server-initiated mode over `discovery`.
@@ -780,6 +775,8 @@ Ctrl-C.
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "discovery")]
+    use syncspin_client::DiscoveredServer;
 
     /// Parses a command line given as string slices.
     fn parse(args: &[&str]) -> Result<Parse> {
@@ -1096,28 +1093,35 @@ mod tests {
         assert_eq!(inbound.path, syncspin_client::DEFAULT_SENDSPIN_PATH);
     }
 
-    /// The discover mode turns the first reported record into the address the config dials.
+    /// The discover mode turns a record into `ws://` targets; the client tries them IPv4 first.
     #[cfg(feature = "discovery")]
     #[test]
-    fn the_discover_mode_builds_a_ws_dial_target_from_the_first_server() {
-        let discovery = MemoryDiscovery {
-            servers: vec![DiscoveredServer {
-                addresses: vec!["192.0.2.7:8927".to_owned()],
-                path: "/sendspin".to_owned(),
-                name: Some("A server".to_owned()),
-            }],
+    fn the_discover_mode_builds_ws_dial_targets_from_a_server_record() {
+        let server = DiscoveredServer {
+            addresses: vec!["[fd41::1]:8927".to_owned(), "192.0.2.7:8927".to_owned()],
+            path: "/sendspin".to_owned(),
+            name: Some("A server".to_owned()),
         };
         assert_eq!(
-            discovered_endpoint(&discovery).expect("a server is advertised"),
-            "ws://192.0.2.7:8927/sendspin"
+            server.endpoints(),
+            vec![
+                "ws://192.0.2.7:8927/sendspin".to_owned(),
+                "ws://[fd41::1]:8927/sendspin".to_owned(),
+            ],
+            "a dual-stack record is dialled IPv4 first"
         );
+    }
 
+    /// A browse that reports nothing names the service type it looked for.
+    #[cfg(feature = "discovery")]
+    #[tokio::test]
+    async fn the_discover_mode_reports_an_empty_browse() {
         let empty = MemoryDiscovery::default();
-        let Err(error) = discovered_endpoint(&empty) else {
+        let Err(error) = discovered_endpoint(&empty).await else {
             panic!("an empty browse must not name an endpoint");
         };
         assert!(
-            format!("{error}").contains(SERVER_SERVICE_TYPE),
+            format!("{error}").contains(syncspin_client::SERVER_SERVICE_TYPE),
             "the error should name what was looked for, got: {error}"
         );
     }

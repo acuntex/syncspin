@@ -116,6 +116,7 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
+        strict_group_id: false,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -291,6 +292,7 @@ async fn an_unreachable_server_is_an_event_and_not_an_error() {
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
+        strict_group_id: false,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -566,6 +568,7 @@ async fn the_retry_delay_is_awaited_before_the_next_attempt() {
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: retry,
+        strict_group_id: false,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
