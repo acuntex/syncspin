@@ -92,6 +92,14 @@ A connection reconnects on its own: when an attempt ends, the crate flushes the 
 same sink, identity, volume and mute state. It stops only when the audio sink fails or when the
 handle or event stream is dropped.
 
+A silent link is detected instead of staying "connected" forever: after 15 s without receiving any
+WebSocket frame the client sends a ping, and when nothing arrives in the 10 s after it the attempt
+ends as a disconnect so the reconnect above runs. The ping appears only when nothing has arrived for
+15 s, so a link that keeps carrying audio, metadata or clock replies sees none, and a ping from the
+server is answered as before. The ping is a transport control frame with an 8-byte nonce, not a
+protocol message and not application data; the client depends on the peer answering pings or sending
+something else within that window.
+
 `ClientConfig::volume` and `ClientConfig::muted` are the level and mute state the first `client/state`
 carries. A host passes the values it restored, so the server never sees an invented baseline; a host
 without stored values passes `100` and `false`. `ControlHandle::set_volume` returns the level that
@@ -135,6 +143,14 @@ stamps every chunk from the configured format and fans it out without decoding. 
 `player@v1` only when its `player@v1_support` lists that exact format, so nobody is sent a stream it
 cannot play. Volume, mute and play/pause/stop belong to the group. The active roles are the three v1
 roles a player needs: `player@v1`, `controller@v1` and `metadata@v1`.
+
+The server pings a silent link just as the client does: after 15 s without receiving any WebSocket
+frame it sends a ping, and a peer that sends nothing in the 10 s after it - not even a pong - is
+dropped and reported as `Event::ClientLeft` naming the keepalive. Any received frame counts as the
+answer, so a link that keeps carrying clock requests, state reports or commands sees no ping, and a
+client's own ping is answered as before. The ping is a transport control frame with an 8-byte nonce,
+not application data; a client that vanished without closing its socket is noticed within 25 s
+instead of only when the server next writes and TCP fails.
 
 The server has its own pairing: `PairingStore` holds one record per `client_id`, an unpaired client
 is held at empty activities until the operator approves it, and `pair`, `start_pairing`,

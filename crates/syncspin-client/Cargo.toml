@@ -49,7 +49,9 @@ zeroize = { workspace = true, optional = true }
 [dev-dependencies]
 base64.workspace = true
 snow.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+# `test-util` is for the paused clock: the keepalive suite runs the shipped 15 s and 10 s windows
+# without waiting for them. It is a test-only feature, so the library build carries neither.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 
 [package.metadata.docs.rs]
 all-features = true

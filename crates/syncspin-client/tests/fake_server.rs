@@ -22,7 +22,7 @@ use snow::{Builder, HandshakeState, Keypair, TransportState as SnowTransport};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use tokio_tungstenite::tungstenite::{protocol::Role, Error as WsError, Message};
 use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
 
 use syncspin_core::framing::{split_binary, MAX_PLAINTEXT_LEN};
@@ -70,6 +70,13 @@ pub struct ServerOptions {
     pub active_roles: Vec<String>,
     /// How many `client/time` requests to answer; `None` answers all, `Some(0)` none.
     pub answer_time_limit: Option<usize>,
+    /// Whether a WebSocket ping from the client is answered with a pong.
+    ///
+    /// With `false` the harness records the ping and answers nothing: no pong leaves this side
+    /// (tungstenite's automatic one included), so the client sees the silence a half-open link
+    /// produces. The socket stays open until the client closes it, and a test can still send JSON
+    /// frames afterwards, which is how one proves that a non-pong frame also keeps the session.
+    pub answer_pings: bool,
     /// Whether `client/time` requests are reported but not answered until the test asks.
     pub manual_time: bool,
     /// How many connections the server accepts before it stops listening.
@@ -168,6 +175,7 @@ impl Default for ServerOptions {
             ],
             answer_time_limit: None,
             manual_time: false,
+            answer_pings: true,
             connections: 1,
             omit_active_roles_after_the_first: false,
             server_init_override: None,
@@ -324,6 +332,10 @@ pub enum Observation {
     PairingAborted(String),
     /// The client said why it is closing the connection.
     Goodbye(String),
+    /// The client sent a WebSocket ping; the payload is its keepalive nonce.
+    Ping(Vec<u8>),
+    /// The client answered a WebSocket ping; the payload is the one it received.
+    Pong(Vec<u8>),
     /// The connection closed.
     Closed,
 }
@@ -807,6 +819,28 @@ impl FakeServer {
         }
     }
 
+    /// Waits until the client sends a WebSocket ping and returns its payload.
+    pub async fn wait_for_ping(&mut self) -> Option<Vec<u8>> {
+        loop {
+            match self.observation().await {
+                Some(Observation::Ping(payload)) => return Some(payload),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client answers a WebSocket ping and returns the payload it echoed.
+    pub async fn wait_for_pong(&mut self) -> Option<Vec<u8>> {
+        loop {
+            match self.observation().await {
+                Some(Observation::Pong(payload)) => return Some(payload),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     /// Waits until the client says goodbye and returns the reason it sent.
     pub async fn wait_for_goodbye(&mut self) -> Option<String> {
         loop {
@@ -871,6 +905,35 @@ async fn serve(
         .await?;
     }
     Ok(())
+}
+
+/// Keeps a link whose keepalive ping stays unanswered, still able to send application frames.
+///
+/// Reading the client's ping made tungstenite queue the pong it answers with automatically, and both
+/// the next read and the next write on that socket would flush it. The transport is therefore
+/// wrapped in a fresh WebSocket whose queue is empty: the ping is never answered, while a test can
+/// still put JSON on the link. The hold ends when the client closes the connection, so the accept
+/// loop can serve the reconnect that follows a session the keepalive ended.
+async fn hold_unanswered_ping(
+    socket: Socket,
+    mut noise: SnowTransport,
+    commands: &mut UnboundedReceiver<Command>,
+) -> Result<()> {
+    let mut socket =
+        WebSocketStream::from_raw_socket(socket.into_inner(), Role::Server, None).await;
+    loop {
+        tokio::select! {
+            message = socket.next() => match message {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Ok(()),
+                Some(Ok(_)) => {}
+            },
+            command = commands.recv() => match command {
+                Some(Command::Json(body)) => send_raw_json(&mut socket, &mut noise, &body).await?,
+                Some(Command::Close) | None => return Ok(()),
+                Some(_) => bail!("a link with an unanswered ping serves only JSON frames"),
+            }
+        }
+    }
 }
 
 /// Serves one accepted WebSocket until it closes.
@@ -1095,7 +1158,19 @@ async fn serve_connection(
                 .await?;
             }
             LinkEvent::Socket(Some(Ok(Message::Ping(payload)))) => {
-                socket.send(Message::Pong(payload)).await?;
+                let _ = observations.send(Observation::Ping(payload.to_vec()));
+                if options.answer_pings {
+                    socket.send(Message::Pong(payload)).await?;
+                } else {
+                    // The ping stays unanswered, but the socket stays open. Reading it made
+                    // tungstenite queue the pong it answers with automatically, so the link is held
+                    // through a fresh WebSocket that starts with an empty queue; otherwise the next
+                    // read or write would flush that pong.
+                    return hold_unanswered_ping(socket, noise, commands).await;
+                }
+            }
+            LinkEvent::Socket(Some(Ok(Message::Pong(payload)))) => {
+                let _ = observations.send(Observation::Pong(payload.to_vec()));
             }
             LinkEvent::Socket(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => {
                 let _ = observations.send(Observation::Closed);
