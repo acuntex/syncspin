@@ -131,13 +131,15 @@ the server, so the release order is core → client → server. All three crates
 library crate is `publish = false`.
 
 `CHANGELOG.md` is generated with [git-cliff](https://github.com/orhun/git-cliff) from the tags and
-the conventional commits; do not edit it by hand.
+the conventional commits; do not edit it by hand. The exception is a release whose only content is
+documentation, which prepends a hand-written section instead — see below.
 
 One command prepares a release:
 
 ```sh
-scripts/release.sh <version>            # bump, changelog, gates, commit
-scripts/release.sh <version> --dry-run  # show what it would change
+scripts/release.sh <version>                            # bump, changelog, gates, commit
+scripts/release.sh <version> --dry-run                  # show what it would change
+scripts/release.sh <version> --section docs/release.md  # prepend a hand-written section
 ```
 
 Before the tag, read the documents as a stranger would. The script enforces the version; nothing
@@ -152,6 +154,13 @@ last tag, and refuses to continue
 if the previous version is still named anywhere outside `CHANGELOG.md` and the lock file — that check
 exists because a published README once advertised the release before it. Then it runs the format and
 test gates and commits `chore(release): <version>`.
+
+`--section <file>` prepends that file instead of a rendered section, for a release whose only content
+is documentation: `git cliff` skips `docs` commits, so it renders an empty section and the script
+aborts. A curated sentence beats an empty section, and the release then needs no `git-cliff` on PATH.
+The file's first non-blank line must be `## [<version>]` or `## [<version>] - <date>`, and it must
+carry at least one bullet. Its prose must not name the previous release: the release check greps the
+whole tree for it (the section file included) and refuses the release while it is still named.
 
 The script does not use `git cliff --tag` on its own: that renders every section from the tags, and a
 tag created out of order is dropped, folding its commits into the previous release. `--unreleased`

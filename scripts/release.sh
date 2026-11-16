@@ -4,8 +4,9 @@
 # prepend the changelog section for it, and refuse to leave the previous version
 # anywhere but the changelog and the tag list.
 #
-#   scripts/release.sh 0.2.0            # prepare and commit
-#   scripts/release.sh 0.2.0 --dry-run  # print what would change
+#   scripts/release.sh 0.2.0                 # prepare and commit
+#   scripts/release.sh 0.2.0 --dry-run       # print what would change
+#   scripts/release.sh 0.2.0 --section docs/0.2.0.md   # hand-written section
 #
 # Then push the branch, merge, and push the tag; `.github/workflows/release.yml`
 # publishes and writes the GitHub release from the section this script added.
@@ -15,19 +16,56 @@
 # dropped, folding its commits into the previous release. `--unreleased` renders
 # exactly the commits since the latest tag, which is the section a release needs,
 # so this script prepends it and leaves history untouched.
+#
+# `--section <file>` prepends that file instead of rendering one. It exists for a
+# release whose only content is documentation: `git cliff` skips `docs` commits
+# (Keep a Changelog has no section for them), so a docs-only release renders an
+# empty section and aborts. A curated sentence beats an empty section, and the
+# release then needs no `git-cliff` on PATH. The file's first non-blank line must
+# be `## [<version>]` or `## [<version>] - <date>`, and it must carry at least one
+# `- ` bullet.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [ $# -lt 1 ] || [ $# -gt 2 ]; then
-  printf 'usage: %s <version> [--dry-run]\n' "$0" >&2
+usage() {
+  printf 'usage: %s <version> [--dry-run] [--section <file>]\n' "$0" >&2
   exit 2
-fi
+}
 
-version="$1"
+version=""
 dry_run=false
-if [ "${2:-}" = "--dry-run" ]; then
-  dry_run=true
+section_file=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)
+      dry_run=true
+      shift
+      ;;
+    --section)
+      if [ $# -lt 2 ] || [ "${2#-}" != "$2" ]; then
+        printf '%s needs a file argument\n' "$1" >&2
+        usage
+      fi
+      section_file="$2"
+      shift 2
+      ;;
+    -*)
+      usage
+      ;;
+    *)
+      if [ -n "$version" ]; then
+        usage
+      fi
+      version="$1"
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$version" ]; then
+  usage
 fi
 
 if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -41,9 +79,47 @@ if [ "$version" = "$previous" ]; then
   exit 2
 fi
 
-if ! command -v git-cliff >/dev/null; then
-  printf 'git-cliff is not on PATH; install it as CONTRIBUTING.md describes\n' >&2
-  exit 2
+# The section is produced and checked before anything is written, so a failure on
+# either path leaves the tree untouched and the user can fix it and re-run. The
+# rendered section does not depend on the version bump - `git cliff --unreleased
+# --tag v${version}` takes the tag as an argument - so producing it first is safe.
+section=""
+if [ -n "$section_file" ]; then
+  # A hand-written section: its first non-blank line must be the heading for this
+  # release - `## [<version>]` or `## [<version>] - <date>` - and it must carry at
+  # least one bullet.
+  if [ ! -f "$section_file" ]; then
+    printf 'section file does not exist: %s\n' "$section_file" >&2
+    exit 1
+  fi
+  heading=$(awk 'NF { sub(/[[:space:]]+$/, ""); print; exit }' "$section_file")
+  # Escape the version's dots so the `.` in the pattern matches a literal dot, not
+  # any character; `[` and `]` are literals. `.+` keeps the date non-empty, so a
+  # heading that stops at ` - ` is refused.
+  version_re=$(printf '%s' "$version" | sed 's/\./\\./g')
+  if ! printf '%s\n' "$heading" | grep -Eq "^## \\[${version_re}\\]( - .+)?$"; then
+    printf 'section must start with "## [%s]" or "## [%s] - <date>"; first non-blank line is: %s\n' \
+      "$version" "$version" "$heading" >&2
+    exit 1
+  fi
+  if ! grep -q '^- ' "$section_file"; then
+    printf 'section has no "- " bullet\n' >&2
+    exit 1
+  fi
+  section=$(cat "$section_file")
+else
+  # Rendering needs git-cliff; a hand-written section does not, so a docs-only
+  # release works without it.
+  if ! command -v git-cliff >/dev/null; then
+    printf 'git-cliff is not on PATH; install it as CONTRIBUTING.md describes\n' >&2
+    exit 2
+  fi
+  section=$(git cliff --unreleased --tag "v${version}" | sed -n '/^## \[/,$p')
+  if [ -z "$section" ] || ! printf '%s' "$section" | grep -q '^- '; then
+    printf 'git-cliff produced an empty section; is HEAD already tagged?\n' >&2
+    printf 'if this release is documentation only, pass --section <file> with a hand-written section\n' >&2
+    exit 1
+  fi
 fi
 
 run() {
@@ -71,13 +147,7 @@ done
 # manifest before the gates run under --locked.
 run cargo update --workspace --offline --quiet
 
-# 2. The changelog section, from the commits since the latest tag.
-section=$(git cliff --unreleased --tag "v${version}" | sed -n '/^## \[/,$p')
-if [ -z "$section" ] || ! printf '%s' "$section" | grep -q '^- '; then
-  printf 'git-cliff produced an empty section; is HEAD already tagged?\n' >&2
-  exit 1
-fi
-
+# Prepend the section produced above, or print it in a dry run.
 if $dry_run; then
   printf '+ prepend this to CHANGELOG.md:\n%s\n' "$section"
 else
@@ -93,7 +163,7 @@ path.write_text(f"{text[: marker + 1]}{section}\n\n{text[marker + 1 :]}")
 PY
 fi
 
-# 3. Nothing outside the changelog and the lock file may still name the previous
+# 2. Nothing outside the changelog and the lock file may still name the previous
 #    version: that is how a published README advertised 0.1.0 while the crate was
 #    0.1.1.
 # `-F`: a version is a literal, and a bare regex would also match hex such as
@@ -121,7 +191,7 @@ if ! $dry_run; then
   fi
 fi
 
-# 4. Gates before the commit exists.
+# 3. Gates before the commit exists.
 run cargo fmt --all -- --check
 run cargo test --workspace --locked
 
