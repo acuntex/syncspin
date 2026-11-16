@@ -591,6 +591,17 @@ fn transport_rejects_oversized_plaintext() {
         "error should explain the Noise maximum, got: {message}"
     );
 
+    // A message of exactly the maximum is not oversized: it reaches the cipher, which rejects it
+    // for its tag. The size limit is inclusive, and an off-by-one would report the wrong fault.
+    let err = responder
+        .decrypt(&vec![0u8; MAX_MESSAGE_LEN])
+        .expect_err("a ciphertext of zeros cannot authenticate");
+    let message = format!("{err:#}").to_lowercase();
+    assert!(
+        !message.contains("maximum"),
+        "a message of exactly MAX_MESSAGE_LEN must not be rejected as oversized, got: {message}"
+    );
+
     // ... and must carry at least the authentication tag.
     let err = responder
         .decrypt(&[0u8; 15])
