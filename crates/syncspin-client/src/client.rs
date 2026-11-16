@@ -299,7 +299,9 @@ pub enum Event {
     /// before the next attempt, one step of the reconnect policy: it is two seconds after an
     /// attempt that never reached [`Event::Connected`], doubles with every further failed attempt
     /// up to [`ClientConfig::max_backoff`], and drops to one second again after a session that
-    /// connected. It is [`Duration::ZERO`] when no attempt follows, because the audio sink failed.
+    /// connected. It is [`Duration::ZERO`] when no attempt follows, because the audio sink failed,
+    /// and for every connection of an advertising client, which does not dial at all and waits for
+    /// the next server instead.
     Disconnected {
         /// Why the attempt ended.
         reason: String,
@@ -591,9 +593,9 @@ pub struct PlaybackState {
 /// waits without ending it.
 #[derive(Debug)]
 pub struct ClientHandle {
-    task: Option<JoinHandle<Result<()>>>,
-    control: ControlHandle,
-    shutdown: Option<oneshot::Sender<GoodbyeReason>>,
+    pub(crate) task: Option<JoinHandle<Result<()>>>,
+    pub(crate) control: ControlHandle,
+    pub(crate) shutdown: Option<oneshot::Sender<GoodbyeReason>>,
 }
 
 impl ClientHandle {
@@ -652,9 +654,9 @@ impl Drop for ClientHandle {
 /// server accepts.
 #[derive(Debug, Clone)]
 pub struct ControlHandle {
-    commands: mpsc::UnboundedSender<ControlRequest>,
-    volume: Arc<AtomicU8>,
-    pairing_token: Option<PairingToken>,
+    pub(crate) commands: mpsc::UnboundedSender<ControlRequest>,
+    pub(crate) volume: Arc<AtomicU8>,
+    pub(crate) pairing_token: Option<PairingToken>,
 }
 
 /// The version-0 pairing token, held as the credential it is.
@@ -662,7 +664,7 @@ pub struct ControlHandle {
 /// [`Debug`] prints `<redacted>`, so a log line that formats a [`ControlHandle`] never carries the
 /// token, which would let anyone holding that line pair a server with this client.
 #[derive(Clone)]
-struct PairingToken(String);
+pub(crate) struct PairingToken(pub(crate) String);
 
 impl fmt::Debug for PairingToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -850,7 +852,7 @@ pub(crate) struct ControlRequest {
 /// instead.
 #[derive(Debug)]
 pub struct EventStream {
-    events: mpsc::UnboundedReceiver<Event>,
+    pub(crate) events: mpsc::UnboundedReceiver<Event>,
 }
 
 impl EventStream {
@@ -884,6 +886,17 @@ impl Client {
         psks: Vec<StoredPsk>,
     ) -> Result<(ClientHandle, EventStream)> {
         connect_with_psks(config, sink, psks).await
+    }
+
+    /// Advertises this client and serves the servers that connect to it.
+    ///
+    /// See [`advertise`](crate::advertise) for the details.
+    #[cfg(feature = "discovery")]
+    pub async fn advertise(
+        config: ClientConfig,
+        sink: Box<dyn Sink>,
+    ) -> Result<(ClientHandle, EventStream)> {
+        crate::advertise(config, sink).await
     }
 }
 
@@ -937,6 +950,17 @@ pub async fn connect_with_psks(
     sink: Box<dyn Sink>,
     psks: Vec<StoredPsk>,
 ) -> Result<(ClientHandle, EventStream)> {
+    // connection.md, _Server Initiated Connections_: "Clients MUST NOT manually connect to servers
+    // while advertising `_sendspin._tcp`." A client uses one of the two methods at a time, so a
+    // configuration that advertises is refused here rather than connected on the side.
+    #[cfg(feature = "discovery")]
+    if config.inbound.is_some() {
+        bail!(
+            "this configuration advertises _sendspin._tcp, so it waits for a server to connect; \
+             a manual connection is refused while advertising, as connection.md requires. Clear \
+             ClientConfig::inbound to dial a server instead"
+        );
+    }
     config.validate()?;
     let endpoint = endpoint(&config.server)?;
     // The pairing PSK is settled before the first attempt, so a store that cannot hold it is
@@ -968,7 +992,7 @@ pub async fn connect_with_psks(
         muted: config.muted,
         active_roles: Vec::new(),
         #[cfg(feature = "pairing-code")]
-        failed_rounds: Arc::clone(&failed_rounds),
+        failed_rounds,
     };
     let connection = Connection {
         endpoint,
@@ -977,8 +1001,6 @@ pub async fn connect_with_psks(
         pairing,
         events: events.clone(),
         reported_volume: Arc::clone(&reported_volume),
-        #[cfg(feature = "pairing-code")]
-        failed_rounds,
     };
 
     let task = tokio::spawn(serve_until_dropped(connection, carried, shutdown_rx));
@@ -1012,10 +1034,6 @@ struct Connection {
     events: mpsc::UnboundedSender<Event>,
     /// Level shared with every [`ControlHandle`].
     reported_volume: Arc<AtomicU8>,
-    /// Failed dynamic rounds since the last verified `server_kc`, shared with every session this
-    /// connection runs and with [`ControlHandle::release_holdback`].
-    #[cfg(feature = "pairing-code")]
-    failed_rounds: Arc<AtomicU32>,
 }
 
 impl Connection {
@@ -1038,22 +1056,17 @@ enum Wakeup {
 /// Answers a request that arrived while no session was established.
 ///
 /// A pairing window belongs to a connection and is refused; releasing the round hold-back belongs
-/// to the process and is honoured, so an operator gesture made during a reconnect is not lost.
-#[cfg(feature = "pairing-code")]
-fn refuse(connection: &Connection, carried: &Carried, request: ControlRequest) {
+/// to the process and is honoured, so an operator gesture made between connections is not lost.
+pub(crate) fn answer_without_session(carried: &Carried, request: ControlRequest) {
+    #[cfg(feature = "pairing-code")]
     if matches!(request.action, ControlAction::ReleaseHoldback) {
-        connection.failed_rounds.store(0, Ordering::SeqCst);
+        carried.failed_rounds.store(0, Ordering::SeqCst);
         let _ = request.reply.send(Ok(carried.volume));
         return;
     }
-    let _ = request
-        .reply
-        .send(Err(anyhow!("no connection is established")));
-}
-
-/// Answers a request that arrived while no session was established.
-#[cfg(not(feature = "pairing-code"))]
-fn refuse(request: ControlRequest) {
+    // Without the feature there is no hold-back to release: every request is refused.
+    #[cfg(not(feature = "pairing-code"))]
+    let _ = carried;
     let _ = request
         .reply
         .send(Err(anyhow!("no connection is established")));
@@ -1091,12 +1104,7 @@ async fn wait_before_retry(
             () = connection.events.closed() => Wakeup::Closed,
         };
         match wakeup {
-            Wakeup::Control(Some(request)) => {
-                #[cfg(feature = "pairing-code")]
-                refuse(connection, carried, request);
-                #[cfg(not(feature = "pairing-code"))]
-                refuse(request);
-            }
+            Wakeup::Control(Some(request)) => answer_without_session(carried, request),
             Wakeup::Control(None) => *control = None,
             Wakeup::Deadline => return true,
             Wakeup::Closed => return false,
@@ -1452,6 +1460,8 @@ mod tests {
                 volume_policy: VolumePolicy::default(),
                 max_backoff: Duration::from_secs(30),
                 pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+                #[cfg(feature = "discovery")]
+                inbound: None,
                 #[cfg(feature = "pairing-code")]
                 static_pairing_code: None,
                 #[cfg(feature = "pairing-code")]
@@ -1467,8 +1477,6 @@ mod tests {
             pairing: None,
             events,
             reported_volume: Arc::new(AtomicU8::new(42)),
-            #[cfg(feature = "pairing-code")]
-            failed_rounds: Arc::new(AtomicU32::new(0)),
         }
     }
 

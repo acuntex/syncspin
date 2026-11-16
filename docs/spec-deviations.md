@@ -12,7 +12,7 @@ harmless.
 
 | #   | Area                                                            | Spec section                                                                                                                                                                      | Status                             |
 | --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Closes in 0.2                      |
+| 1   | Server-initiated connections: one at a time, no admission arbitration | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Partly closed in 0.2               |
 | 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
 | 3   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
 | 4   | Code pairing behind a feature; CPace layer unaudited            | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
@@ -33,29 +33,35 @@ harmless.
 | 19  | The server's stream start lead is one fixed value               | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline              |
 | 20  | The server does not try the Sentinel key after a record fails   | [`connection.md` — Sentinel Fallback](https://github.com/Sendspin/spec/blob/main/connection.md#sentinel-fallback)                                                                 | Accepted, `snow` state             |
 
-## 1. Client-initiated connections only
+## 1. Server-initiated connections: one at a time, no admission arbitration
 
-**Spec:** `connection.md`, _Establishing a Connection_ and _Client Initiated Connections_. The spec
+**Spec:** `connection.md`, _Establishing a Connection_ and _Server Initiated Connections_. The spec
 RECOMMENDS server-initiated connections, requires servers to support both methods and requires a
-client to use exactly one of them. A client using client-initiated connections MUST NOT advertise
-`_sendspin._tcp`.
+client to use exactly one of them. A client that advertises `_sendspin._tcp` MUST advertise the port
+and the `path` TXT record, reject an upgrade carrying an `Origin` header and MUST NOT also connect
+manually. The _Multiple servers_ section then arbitrates several connections: at most one with
+`playback` and one with `pairing`, a provisional connection that never activates is dropped after 30
+seconds, and a displaced or rejected connection gets `client/goodbye`.
 
-**What we do:** `ClientConfig` takes a WebSocket URL (`ws://<server>:8927/sendspin`; a bare address
-gets the default endpoint) and `connect` opens one connection to it. There is no advertisement, no
-listening socket and no discovery: the client never owns a `_sendspin._tcp` service, so it also never
-arbitrates competing servers.
+**What we do:** with the `discovery` feature the client implements the server-initiated half:
+`advertise` publishes `_sendspin._tcp` with the bound port and the `path` and `name` TXT records
+through a host-supplied `Discovery`, accepts the inbound upgrade, answers any request carrying an
+`Origin` header with a 403, and runs the same session as a dialled connection. A configuration that
+advertises refuses to dial, so the two methods never run side by side. What is missing is the
+arbitration: the client serves one connection at a time, so a second server's upgrade waits in the
+TCP backlog until the first session ends instead of being rejected with `client/goodbye` reason
+`concurrent_attempt`, and the last-playback server is not persisted. The 30-second provisional
+timeout is not applied either, because no connection is ever held provisional.
 
-**Why:** 0.1 is a client only. An advertisement obliges the advertiser to accept inbound upgrades,
-reject requests carrying `Origin`, arbitrate `playback`/`pairing` activities across connections and
-persist a last-playback server — all of which belong to the multi-server work in 0.2. Adding a
-listening socket and an mDNS dependency for a mode nobody consumes yet would enlarge the surface
-without a test that can hold it.
+**Why:** capping the client at one connection is what `connection.md` allows ("A client MAY cap how
+many connections it admits at once"), and one group per server makes several simultaneous sessions
+useless for playback. The rejection protocol still has to be written for the case that cap creates;
+it is staged work, not a claim that queuing is equivalent.
 
-**Removing it:** implement the server-initiated half — advertise with the `path` (and optional
-`name`) TXT records, accept the upgrade on that path, reject any request with an `Origin` header,
-apply the admission rules, send `client/goodbye` with `another_server` / `concurrent_attempt` when
-displacing or rejecting, and expose a switch so a caller never advertises and connects manually at
-the same time. Then delete this entry.
+**Removing it:** implement the admission rules for a second connection - decide the arbitration from
+the activation, answer the loser with `client/goodbye` (`another_server` for a displaced connection,
+`concurrent_attempt` for a rejected one) and drop a provisional connection after 30 seconds - and
+persist the last-playback server. Then delete this entry.
 
 ## 2. No `activities` admissibility handling
 

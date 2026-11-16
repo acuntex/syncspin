@@ -20,6 +20,10 @@ storage-file = []
 # builds on in `syncspin-core`. Off by default so the default build advertises no method whose
 # PAKE it does not carry.
 pairing-code = ["syncspin-core/pairing-code"]
+# The server-initiated connection mode: advertise `_sendspin._tcp` through a host's `Discovery` and
+# accept the servers that connect. Off by default, so a build that does not ask for it opens no
+# listening socket and dials a server as before. The mDNS backend is the host's.
+discovery = []
 
 [dependencies]
 syncspin-core = { version = "0.1.0", path = "../syncspin-core" }

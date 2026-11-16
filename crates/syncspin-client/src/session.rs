@@ -171,7 +171,20 @@ const PAIRING_MESSAGE_TYPES: [&str; 5] = [
 /// message per binary frame afterwards. Control frames are answered here so the session only sees
 /// application messages.
 pub(crate) struct Transport {
-    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    socket: Socket,
+}
+
+/// The WebSocket a session runs on, and which side opened it.
+///
+/// The connection mode changes who dials, not who starts the Noise handshake: the server is the
+/// initiator either way (`connection.md`, _Encryption_). Only the socket type differs, so the
+/// session above this sees one transport.
+enum Socket {
+    /// The client dialled a server it found, the client-initiated mode.
+    Dialled(WebSocketStream<MaybeTlsStream<TcpStream>>),
+    /// A server dialled the endpoint this client advertised, the server-initiated mode.
+    #[cfg(feature = "discovery")]
+    Accepted(WebSocketStream<TcpStream>),
 }
 
 /// One application message read from the socket.
@@ -190,28 +203,36 @@ impl Transport {
         let (socket, _response) = tokio_tungstenite::connect_async(url)
             .await
             .with_context(|| format!("failed to connect to the server at {url}"))?;
-        Ok(Transport { socket })
+        Ok(Transport {
+            socket: Socket::Dialled(socket),
+        })
+    }
+
+    /// Wraps a WebSocket a server opened on this client's advertised endpoint.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn accept(socket: WebSocketStream<TcpStream>) -> Transport {
+        Transport {
+            socket: Socket::Accepted(socket),
+        }
     }
 
     /// Reads the next application message, answering pings on the way.
     pub(crate) async fn read(&mut self) -> Result<SocketMessage> {
         loop {
-            let message = self
-                .socket
-                .next()
-                .await
-                .transpose()
-                .context("the WebSocket read failed")?;
+            let message = match &mut self.socket {
+                Socket::Dialled(socket) => socket.next().await,
+                #[cfg(feature = "discovery")]
+                Socket::Accepted(socket) => socket.next().await,
+            }
+            .transpose()
+            .context("the WebSocket read failed")?;
             match message {
                 Some(Message::Text(text)) => {
                     return Ok(SocketMessage::Text(text.as_str().to_owned()))
                 }
                 Some(Message::Binary(bytes)) => return Ok(SocketMessage::Binary(bytes.to_vec())),
                 Some(Message::Ping(payload)) => {
-                    self.socket
-                        .send(Message::Pong(payload))
-                        .await
-                        .context("the WebSocket pong failed")?;
+                    self.send(Message::Pong(payload)).await?;
                 }
                 Some(Message::Pong(_)) | Some(Message::Frame(_)) => continue,
                 Some(Message::Close(_)) | None => return Ok(SocketMessage::Closed),
@@ -221,18 +242,22 @@ impl Transport {
 
     /// Sends one cleartext JSON text frame.
     pub(crate) async fn send_text(&mut self, text: &str) -> Result<()> {
-        self.socket
-            .send(Message::text(text))
-            .await
-            .context("the WebSocket send failed")
+        self.send(Message::text(text)).await
     }
 
     /// Sends one binary frame.
     pub(crate) async fn send_binary(&mut self, bytes: Vec<u8>) -> Result<()> {
-        self.socket
-            .send(Message::binary(bytes))
-            .await
-            .context("the WebSocket send failed")
+        self.send(Message::binary(bytes)).await
+    }
+
+    /// Writes one WebSocket message on whichever socket this connection runs on.
+    async fn send(&mut self, message: Message) -> Result<()> {
+        match &mut self.socket {
+            Socket::Dialled(socket) => socket.send(message).await,
+            #[cfg(feature = "discovery")]
+            Socket::Accepted(socket) => socket.send(message).await,
+        }
+        .context("the WebSocket send failed")
     }
 }
 
@@ -2943,6 +2968,8 @@ mod tests {
             volume_policy: crate::config::VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             pairing_timeout: crate::client::DEFAULT_PAIRING_TIMEOUT,
+            #[cfg(feature = "discovery")]
+            inbound: None,
             #[cfg(feature = "pairing-code")]
             static_pairing_code: None,
             #[cfg(feature = "pairing-code")]
@@ -3046,7 +3073,9 @@ mod tests {
             .expect("the socket accepts SO_LINGER");
         drop(server_socket);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        Transport { socket }
+        Transport {
+            socket: Socket::Dialled(socket),
+        }
     }
 
     /// Runs a complete Noise handshake locally and returns the responder's transport.

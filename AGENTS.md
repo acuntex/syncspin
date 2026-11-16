@@ -48,9 +48,9 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
   Noise handshake hashes - not at `trace`, not in `Debug` output, not in error strings.
 - **When the role feature flags land, the defaults stay `player`, `controller`, `metadata`.**
   `artwork`, `visualizer`, `color` and `source` stay off unless a caller opts in. The role features
-  do not exist yet: the only tables today are `storage-file` and `pairing-code`. `storage-file` is
-  off in `syncspin-client` but on in `player-pipe`, so a workspace build enables it through feature
-  unification; `pairing-code` is off unless requested.
+  do not exist yet: the only tables today are `storage-file`, `pairing-code` and `discovery`.
+  `storage-file` is off in `syncspin-client` but on in `player-pipe`, so a workspace build enables it
+  through feature unification; `pairing-code` and `discovery` are off unless requested.
 - **MSRV 1.85.** A dependency that demands more is pinned or replaced, not silently accepted; the
   `msrv` CI job is the gate.
 - **Names and licence are fixed:** crates `syncspin-core`, `syncspin-client` and `syncspin-server`;

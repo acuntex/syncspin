@@ -44,6 +44,8 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "discovery")]
+        inbound: None,
         #[cfg(feature = "pairing-code")]
         static_pairing_code: None,
         #[cfg(feature = "pairing-code")]

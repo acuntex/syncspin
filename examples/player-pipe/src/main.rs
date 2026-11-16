@@ -172,6 +172,8 @@ async fn run(options: Options) -> Result<()> {
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "discovery")]
+        inbound: None,
         #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
         static_pairing_code: options.static_code.clone(),
         #[cfg(all(feature = "pairing-code", not(feature = "storage-file")))]

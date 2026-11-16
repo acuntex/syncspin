@@ -335,6 +335,17 @@ pub struct ClientConfig {
     /// client emits the code through [`Event::PairingCode`](crate::Event::PairingCode).
     #[cfg(feature = "pairing-code")]
     pub code_out_channels: Vec<CodeOutChannel>,
+    /// The server-initiated half of the connection mode, or `None` for client-initiated
+    /// connections.
+    ///
+    /// Setting it makes [`advertise`](crate::advertise) publish `_sendspin._tcp` and accept the
+    /// servers that connect, and makes a manual [`connect`](crate::connect) fail: `connection.md`
+    /// lets a client use one of the two methods at a time, never both. [`Inbound::new`] fills the
+    /// listen address and the path with the values the spec recommends.
+    ///
+    /// [`Inbound::new`]: crate::Inbound::new
+    #[cfg(feature = "discovery")]
+    pub inbound: Option<crate::Inbound>,
 }
 
 impl fmt::Debug for ClientConfig {
@@ -368,6 +379,10 @@ impl fmt::Debug for ClientConfig {
             .field("pairing_pending_text", &self.pairing_pending_text)
             .field("code_formats", &self.code_formats)
             .field("code_out_channels", &self.code_out_channels);
+        // The backend's own `Debug` belongs to the host, so it is named rather than delegated to;
+        // `Inbound`'s format does the same for the backend it holds.
+        #[cfg(feature = "discovery")]
+        debug.field("inbound", &self.inbound);
         debug.finish()
     }
 }
@@ -409,14 +424,27 @@ impl ClientConfig {
             code_formats: Vec::new(),
             #[cfg(feature = "pairing-code")]
             code_out_channels: Vec::new(),
+            // The client-initiated mode is the default: nothing is advertised and nothing listens.
+            #[cfg(feature = "discovery")]
+            inbound: None,
         }
     }
 
     /// Rejects a configuration that would put invalid fields on the wire.
     pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_common()?;
         if self.server.trim().is_empty() {
             bail!("ClientConfig::server must not be empty");
         }
+        Ok(())
+    }
+
+    /// Rejects the fields both connection modes share.
+    ///
+    /// A server that advertises and accepts connections names no server address, so the address
+    /// check belongs to [`validate`](ClientConfig::validate) alone and the inbound listener
+    /// validates without it.
+    pub(crate) fn validate_common(&self) -> Result<()> {
         if self.player_name.trim().is_empty() {
             bail!("ClientConfig::player_name must not be empty");
         }
@@ -488,6 +516,18 @@ impl ClientConfig {
                 );
             }
         }
+        // The path becomes TXT record content and the endpoint the listener serves, so it has to be
+        // a `path-absolute` (RFC 3986) the other side can append to an authority: a leading slash,
+        // and not the `//authority` form.
+        #[cfg(feature = "discovery")]
+        if let Some(inbound) = &self.inbound {
+            if !inbound.path.starts_with('/') || inbound.path.starts_with("//") {
+                bail!(
+                    "ClientConfig::inbound.path must be an absolute path such as \
+                     \"/sendspin\", not a relative one and not one starting with //"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -510,6 +550,8 @@ mod tests {
             volume_policy: VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
+            #[cfg(feature = "discovery")]
+            inbound: None,
             #[cfg(feature = "pairing-code")]
             static_pairing_code: None,
             #[cfg(feature = "pairing-code")]
@@ -536,12 +578,18 @@ mod tests {
         assert_eq!(config.pairing_timeout, crate::DEFAULT_PAIRING_TIMEOUT);
         assert!(config.storage.is_none());
         assert!(config.device_info.is_none());
+        // The client-initiated mode is what a host gets without asking: nothing advertises and no
+        // socket listens until it sets an `Inbound`.
+        #[cfg(feature = "discovery")]
+        assert!(config.inbound.is_none());
     }
 
     #[test]
     fn the_pairing_timeout_must_be_positive() {
         let config = ClientConfig {
             pairing_timeout: Duration::ZERO,
+            #[cfg(feature = "discovery")]
+            inbound: None,
             ..valid()
         };
         let error = config

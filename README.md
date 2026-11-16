@@ -128,6 +128,22 @@ pairing window the host opens or by the process-wide round limit. The dynamic fl
 a six-digit code or a version-1 token; both flows deliver the long-term key sealed under the CPace
 output. The CPace layer is unaudited — see [Status](#status).
 
+## Server-initiated connections
+
+With the `discovery` feature the client can take the other half of
+[`connection.md`](https://github.com/Sendspin/spec/blob/main/connection.md#server-initiated-connections):
+instead of dialling a server it advertises `_sendspin._tcp` through a host-supplied `Discovery` and
+accepts the server that connects. `Inbound` carries the backend, the listen address (every interface
+on 8928 by default) and the path (`/sendspin` by default); `advertise` publishes the record with the
+bound port and the `path` and `name` TXT records, then serves the inbound WebSocket. An upgrade that
+carries an `Origin` header is refused with a 403, as the spec requires, and the Noise handshake is
+unchanged: the server is its initiator in both directions.
+
+One server is served at a time. While `ClientConfig::inbound` is set the client does not dial, and
+`connect` refuses: the spec lets a client use one of the two methods at a time, never both. The mDNS
+library itself stays outside the crate — `Discovery` is the seam, so a test drives advertising with a
+fake and no multicast socket is opened.
+
 ## What does not work yet
 
 - **Unpaired access.** The client always admits it: `client/hello` carries
@@ -137,7 +153,11 @@ output. The CPace layer is unaudited — see [Status](#status).
   detect (`unauthorized`, `concurrent_attempt`) are never sent.
 - **Server.** `syncspin-server` is a stub; the listener, streams, roles and pairing server arrive in
   0.2.
-- **Discovery.** Clients do not advertise over mDNS and do not accept server-initiated connections.
+- **Discovery.** With the `discovery` feature the client advertises `_sendspin._tcp` and accepts
+  server-initiated connections, one server at a time. The mDNS backend belongs to the host, so this
+  crate ships no implementation, and the multi-server admission rules of `connection.md` (several
+  connections, `playback`/`pairing` arbitration, the last-playback server) are not implemented: a
+  second server waits until the first is gone.
 - **Group state.** `group/update`, the spec's authoritative source of the playback state, is not
   handled.
 - **TLS.** No TLS stack: a `wss://` address is rejected when the client is configured, and nothing
