@@ -45,14 +45,14 @@ reviewed elsewhere or are not cryptography.
 
 ## What pins it
 
-| Property                                            | Pinned by                                                    |
-| --------------------------------------------------- | ------------------------------------------------------------ |
-| `prepend_len`, `lv_cat`, `generator_string`         | draft §A.1.4, §A.3.5, §A.3.7 vectors                         |
-| Generator, shares, both transcripts, ISK, `Ta`/`Tb` | draft §B.1.2–§B.1.7 vectors                                  |
-| Low-order and non-canonical rejections              | draft §B.1.10, all twelve cases                              |
-| The Elligator 2 adapter                             | six independent RFC 9380 §J.4 vectors, bit 254 set and clear |
-| Token encoding                                      | both specification reference vectors, v0 and v1              |
-| `K_wrap` and sealing                                | known-answer tests computed outside this code                |
+| Property                                            | Pinned by                                                                                                                        |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `prepend_len`, `lv_cat`, `generator_string`         | draft §A.1.4, §A.3.5, §A.3.7 vectors                                                                                             |
+| Generator, shares, both transcripts, ISK, `Ta`/`Tb` | draft §B.1.2–§B.1.7 vectors                                                                                                      |
+| Low-order and non-canonical rejections              | draft §B.1.10, all twelve cases                                                                                                  |
+| The Elligator 2 adapter                             | five RFC 9380 §J.4.2 vectors (two with bit 254 set, three clear), plus `map(u) == map(p − u)` and the reduction of `p … 2^255−1` |
+| Token encoding                                      | both specification reference vectors, v0 and v1                                                                                  |
+| `K_wrap` and sealing                                | known-answer tests computed outside this code                                                                                    |
 
 ## What is **not** pinned, and why that matters
 
@@ -65,6 +65,13 @@ reviewed elsewhere or are not cryptography.
   It is derived — Elligator 2 depends on `r²`, so `r` and `−r` share an image, and the representative
   domain requires the high bits clear — and it is checked against RFC 9380 vectors rather than the
   draft's single generator vector. It is still the first thing to attack.
+- **The draft's own coverage of the map is one vector deep.** §B.1.1 is the only generator vector the
+  specification publishes, so in the draft's terms the Elligator 2 adapter rests on a single input.
+  RFC 9380 §J.4.2 supplies the breadth (both bit-254 branches, values either side of the
+  representative domain), but it pins the map, not the draft's use of it. The representative
+  convention is a property of `elligator2` 0.1.0, which is why that dependency is pinned exactly
+  (`=0.1.0`): a `0.1.x` that moved the convention would map a negated input to the other point, and
+  every vector would still pass, because that point is a valid group element too.
 
 ## Questions, ranked
 
@@ -72,8 +79,9 @@ reviewed elsewhere or are not cryptography.
    a representative?** Does it cover every `decodeUCoordinate` output, including the twist cases?
 2. **Is the transcript byte-exact** for a dialer that is not this code — an independent
    implementation of the draft, given the same `PRS` and `sid`?
-3. **What breaks if `elligator2` changes?** The crate is 0.1.0. Would a different representative
-   convention silently change the generator, or fail the vectors?
+3. **What breaks if `elligator2` changes?** The crate is pinned to `=0.1.0`, because a change to the
+   representative convention would silently change the generator without failing a vector. Is the
+   pin the right response, or is vendoring the map the only defensible one?
 4. **Is the constant-time posture adequate** for the values that depend on `PRS`: the conditional
    negation, the `select` helper, the tag comparison, and `x25519-dalek`'s clamping?
 5. **Does the re-handshake change `h` in a way that lets two attempts share a `sid`?** `pairing_index`

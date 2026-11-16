@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 use snow::params::CipherChoice;
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::types::Cipher;
+use zeroize::Zeroizing;
 
 use crate::noise::Suite;
 
@@ -106,7 +107,14 @@ pub fn wrap(suite: Suite, key: &[u8; 32], value: &[u8; 32]) -> Result<[u8; SEALE
     // below the maximum, so sealing cannot fail.
     let mut sealed = [0u8; SEALED_LEN];
     let written = cipher.encrypt(WRAP_NONCE, &[], value, &mut sealed);
-    debug_assert_eq!(written, SEALED_LEN, "the AEAD appends a {TAG_LEN}-byte tag");
+    if written != SEALED_LEN {
+        // A short write would return the buffer's zero padding as if it were tag bytes, and the
+        // peer would receive a field that opens under no key. Refuse instead of shipping it, and
+        // do not fall back to an implausible success.
+        return Err(anyhow!(
+            "the cipher wrote {written} of {SEALED_LEN} sealed bytes"
+        ));
+    }
     Ok(sealed)
 }
 
@@ -121,11 +129,20 @@ pub fn wrap(suite: Suite, key: &[u8; 32], value: &[u8; 32]) -> Result<[u8; SEALE
 pub fn unwrap(suite: Suite, key: &[u8; 32], sealed: &[u8; SEALED_LEN]) -> Result<[u8; 32]> {
     let cipher = cipher(suite, key)?;
 
-    let mut value = [0u8; VALUE_LEN];
-    cipher
-        .decrypt(WRAP_NONCE, &[], sealed, &mut value)
+    // A failed authentication may still have written unauthenticated plaintext into the buffer
+    // before the tag check, so the buffer scrubs itself on every exit; only the value that
+    // authenticated is copied out, and that copy belongs to the caller.
+    let mut value = Zeroizing::new([0u8; VALUE_LEN]);
+    let written = cipher
+        .decrypt(WRAP_NONCE, &[], sealed, &mut value[..])
         .map_err(|_| anyhow!("the wrapped pairing value does not authenticate"))?;
-    Ok(value)
+    if written != VALUE_LEN {
+        // A short read would hand back zero padding as if it were the value.
+        return Err(anyhow!(
+            "the cipher returned {written} of {VALUE_LEN} value bytes"
+        ));
+    }
+    Ok(*value)
 }
 
 /// Builds the suite's AEAD for `key`.
@@ -134,6 +151,10 @@ pub fn unwrap(suite: Suite, key: &[u8; 32], sealed: &[u8; SEALED_LEN]) -> Result
 /// suite for Noise has it here as well. A missing cipher is an error and not a reason to seal
 /// under the other suite. The panic messages and error strings carry no key material: `set`
 /// cannot fail on a 32-byte key.
+///
+/// The cipher keeps its own copy of `key` and has no way to scrub it, so the key is dropped with
+/// the cipher rather than zeroized here. What this crate can scrub is its own copy: callers wrap
+/// `K_wrap` in [`Zeroizing`] so it is wiped as soon as the seal is made or opened.
 fn cipher(suite: Suite, key: &[u8; 32]) -> Result<Box<dyn Cipher>> {
     let choice = match suite {
         Suite::ChaChaPoly => CipherChoice::ChaChaPoly,
