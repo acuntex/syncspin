@@ -15,6 +15,6 @@ publish = false
 mdns = ["syncspin-server/mdns"]
 
 [dependencies]
-syncspin-server = { version = "0.3.0", path = "../../crates/syncspin-server" }
+syncspin-server = { version = "0.3.1", path = "../../crates/syncspin-server" }
 anyhow.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }

@@ -24,10 +24,10 @@ pairing-code = ["syncspin-client/pairing-code"]
 discovery = ["syncspin-client/discovery", "syncspin-client/mdns"]
 
 [dependencies]
-syncspin-client = { version = "0.3.0", path = "../../crates/syncspin-client" }
+syncspin-client = { version = "0.3.1", path = "../../crates/syncspin-client" }
 # The example builds its own version-0 pairing token, which the client has no accessor for yet:
 # the encoder is the pairing token module, so the example depends on the protocol crate directly.
-syncspin-core = { version = "0.3.0", path = "../../crates/syncspin-core" }
+syncspin-core = { version = "0.3.1", path = "../../crates/syncspin-core" }
 anyhow.workspace = true
 getrandom.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
