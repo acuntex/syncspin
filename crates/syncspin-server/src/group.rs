@@ -11,11 +11,15 @@
 //! reading cannot block the host that pushes audio. A queue that grows without bound is the price;
 //! bounding it, and deciding which chunks a slow client loses, is the next milestone's problem.
 //!
-//! Two rules the specification states that this milestone does not yet keep: a stream is announced
-//! without waiting for the `client/state` that declares the client available, and the start lead is
-//! one fixed value instead of each player's reported buffer and lead time. Both need a session that
-//! reads `client/state`, which arrives with the multi-client milestone; until then the group is
-//! honest about what it sends but not about when a given player is ready to hear it.
+//! Two rules the specification states govern when a member hears anything. A stream is announced
+//! only to a member whose `client/state` reports both the `player` object the activation requires
+//! and `available: true`; a member that reports itself unavailable keeps its group but receives no
+//! audio until it reports again. And `stream/start` carrying the `player` object requires the
+//! `playback` activity on the connection, so the group declares it on every member while the group
+//! plays and drops it when playback stops.
+//!
+//! One rule this milestone does not keep: the start lead is one fixed value instead of each
+//! player's reported buffer and lead time (see `docs/spec-deviations.md`).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -23,8 +27,8 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use syncspin_core::messages::{
-    AudioChunkHeader, ControllerCommand, ControllerState, GroupUpdate, Incoming, Metadata,
-    Progress, ServerState, StreamClear, StreamEnd, StreamStart,
+    AudioChunkHeader, ClientState, ControllerCommand, ControllerState, GroupUpdate, Incoming,
+    Metadata, Progress, ServerActivate, ServerState, StreamClear, StreamEnd, StreamStart,
 };
 use tokio::sync::mpsc;
 
@@ -43,12 +47,19 @@ pub(crate) const METADATA_ROLE: &str = "metadata@v1";
 /// Role name the stream messages carry in their `roles` array.
 const PLAYER_STREAM: &str = "player";
 
+/// The `server/activate` activity that says the group of this connection is playing.
+///
+/// The specification forbids a `stream/start` that carries the `player` object on a connection
+/// without it, whatever roles are active, so the group declares it on every member while it plays
+/// and drops it once playback stops.
+const PLAYBACK_ACTIVITY: &str = "playback";
+
 /// How far ahead of now the first sample of a stream is scheduled.
 ///
-/// The specification requires a lead large enough for each player's buffer and lead-time report;
-/// the server learns those from `client/state`, which this milestone does not consume yet, so it
-/// uses one fixed lead for every player. It is generous enough for a LAN player to start cleanly
-/// and is replaced once the per-client reports are read.
+/// The specification derives this lead from each player's `required_lead_time_ms` and
+/// `min_buffer_ms`; the group schedules one shared timeline for every member, so it uses one fixed
+/// lead for all of them. Doing better means announcing the stream at the slowest ready player's
+/// reported lead, which is the change `docs/spec-deviations.md` names.
 pub(crate) const START_LEAD: Duration = Duration::from_millis(200);
 
 /// The controller commands the group acts on itself.
@@ -78,12 +89,38 @@ struct Member {
     roles: Vec<String>,
     /// The connection task's queue.
     sender: mpsc::UnboundedSender<Outbound>,
+    /// Whether the latest `client/state` of this member reports it available for playback.
+    ///
+    /// A member starts unavailable: nothing may be announced to it before it has spoken.
+    available: bool,
+    /// Whether the member reported the `player` object its activation requires.
+    ///
+    /// The specification forbids starting the stream of a role with a `client/state` object before
+    /// that object has arrived, because the stream configuration is derived from it.
+    player_reported: bool,
+    /// Whether a player stream is currently announced to this member.
+    ///
+    /// It is set by `stream/start` and cleared by `stream/end`, so the group never sends audio,
+    /// a clear or an end for a stream the member does not have.
+    stream_announced: bool,
+    /// Whether this member's activation carries the `playback` activity in force.
+    playback_declared: bool,
 }
 
 impl Member {
     /// Whether the connection may use `role`.
     fn has(&self, role: &str) -> bool {
         self.roles.iter().any(|held| held == role)
+    }
+
+    /// Whether a player stream may be started for this member.
+    fn plays(&self) -> bool {
+        self.has(PLAYER_ROLE) && self.available && self.player_reported
+    }
+
+    /// Whether this member's player stream is open and may carry audio.
+    fn streams(&self) -> bool {
+        self.plays() && self.stream_announced
     }
 }
 
@@ -172,9 +209,11 @@ impl Group {
 
     /// Adds a connection to the group and sends it everything it needs to start.
     ///
-    /// The snapshot - `server/state`, `group/update` and, for a player joining a running stream,
-    /// `stream/start` - goes into the member's queue before it becomes visible to broadcasts, and
-    /// the lock keeps a change from slipping between the snapshot and the join.
+    /// The snapshot - `server/state`, `group/update` and, while the group plays, the `playback`
+    /// activity - goes into the member's queue before it becomes visible to broadcasts, and the
+    /// lock keeps a change from slipping between the snapshot and the join. The stream itself
+    /// waits for the `client/state` that declares the member ready; [`Group::report_client_state`]
+    /// announces it then.
     pub(crate) fn join(&self, roles: Vec<String>, sender: mpsc::UnboundedSender<Outbound>) -> u64 {
         let now = self.clock.now_us();
         let mut inner = self.lock();
@@ -193,13 +232,39 @@ impl Group {
         }
         send_to(&sender, Incoming::GroupUpdate(inner.group_update()));
 
-        let streaming = inner.stream.as_ref().is_some_and(|stream| stream.active);
-        if roles.iter().any(|role| role == PLAYER_ROLE) && streaming {
-            send_to(&sender, inner.stream_start(now));
-        }
-
-        inner.members.push(Member { id, roles, sender });
+        inner.members.push(Member {
+            id,
+            roles,
+            sender,
+            available: false,
+            player_reported: false,
+            stream_announced: false,
+            playback_declared: false,
+        });
+        let index = inner.members.len() - 1;
+        inner.declare_playback(index);
         id
+    }
+
+    /// Records the `client/state` one member reported.
+    ///
+    /// A report is not a command: volume, mute and playback belong to the server, so a member's
+    /// numbers describe its own output and never change the group. What the group takes from the
+    /// report is the two facts the specification requires before a stream may be announced -
+    /// whether the member is available and whether its `player` object has arrived - and a member
+    /// that becomes ready while a stream runs receives that stream from here.
+    pub(crate) fn report_client_state(&self, member: u64, state: &ClientState) {
+        let now = self.clock.now_us();
+        let mut inner = self.lock();
+        let Some(index) = inner.members.iter().position(|held| held.id == member) else {
+            return;
+        };
+        let held = &mut inner.members[index];
+        held.available = state.available;
+        if state.player.is_some() {
+            held.player_reported = true;
+        }
+        inner.start_member_stream(index, now);
     }
 
     /// Removes a connection from the group.
@@ -207,6 +272,22 @@ impl Group {
     /// Its role reports are gone with it; the group state itself is the server's and survives.
     pub(crate) fn leave(&self, member: u64) {
         self.lock().members.retain(|held| held.id != member);
+    }
+
+    /// Returns the group's clock reading in microseconds.
+    ///
+    /// It is the one timestamp every message of this server carries: stream playout, metadata and
+    /// the `server/time` replies a client measures its offset with.
+    pub(crate) fn now_us(&self) -> i64 {
+        self.clock.now_us()
+    }
+
+    /// Converts an instant of this machine's monotonic clock into the group's microseconds.
+    ///
+    /// A `server/time` reply is stamped when the request arrived, not when the task got around to
+    /// answering it, so the connection hands over the instant its WebSocket delivered the frame.
+    pub(crate) fn server_us(&self, at: Instant) -> i64 {
+        self.clock.at(at)
     }
 
     /// Sets the volume of the group, clamped to the range the protocol allows.
@@ -243,8 +324,11 @@ impl Group {
                 stream.active = true;
                 stream.next_us = now.saturating_add(lead_us());
             }
-            inner.send_stream_start(now);
+            inner.start_streams(now);
             let _ = self.events.send(Event::StreamStarted);
+        } else {
+            // No stream to announce, but the members still have to learn that the group plays.
+            inner.declare_playback_for_all();
         }
         inner.send_metadata(now);
         inner.send_group_update();
@@ -258,8 +342,11 @@ impl Group {
     pub(crate) fn pause(&self) {
         let now = self.clock.now_us();
         let mut inner = self.lock();
+        // The stream ends before the activity does: the specification requires `stream/end` for an
+        // active player stream before `server/activate` drops `playback`.
         let running = inner.end_player_stream(now);
         inner.playing = false;
+        inner.declare_playback_for_all();
         if running {
             let _ = self.events.send(Event::StreamEnded);
         }
@@ -273,6 +360,7 @@ impl Group {
         let mut inner = self.lock();
         let running = inner.end_player_stream(now);
         inner.playing = false;
+        inner.declare_playback_for_all();
         if let Some(stream) = inner.stream.as_mut() {
             stream.position = Duration::ZERO;
             stream.next_us = now;
@@ -334,6 +422,9 @@ impl Group {
         let mut inner = self.lock();
         if inner.stream.as_ref().is_some_and(|stream| stream.active) {
             inner.send_stream_clear(now);
+            // The players keep their stream open across the clear, but the new track announces its
+            // format again, so every ready player is told once more.
+            inner.forget_stream_starts();
         }
         let was_playing = inner.playing;
         inner.playing = true;
@@ -346,7 +437,7 @@ impl Group {
         if !was_playing {
             inner.send_group_update();
         }
-        inner.send_stream_start(now);
+        inner.start_streams(now);
         inner.send_metadata(now);
         let _ = self.events.send(Event::StreamStarted);
     }
@@ -524,27 +615,94 @@ impl Inner {
         self.send(&Incoming::GroupUpdate(self.group_update()), |_| true);
     }
 
-    /// Sends `stream/start` for the current format to every player.
-    fn send_stream_start(&self, now_us: i64) {
-        self.send(&self.stream_start(now_us), |member| member.has(PLAYER_ROLE));
+    /// Declares the playback activity and announces the running stream to every ready player.
+    ///
+    /// A member whose activation is older than the playback state gets a `server/activate` first,
+    /// because a `stream/start` carrying the `player` object is only allowed on a connection that
+    /// declares `playback`. The caller has already set [`Inner::playing`].
+    fn start_streams(&mut self, now_us: i64) {
+        for index in 0..self.members.len() {
+            self.start_member_stream(index, now_us);
+        }
     }
 
-    /// Sends a `stream/clear` for the player stream to every player.
+    /// Announces the running stream to one member, if that member may receive it now.
+    fn start_member_stream(&mut self, index: usize, now_us: i64) {
+        if !self.playing {
+            return;
+        }
+        self.declare_playback(index);
+        let start = self.stream_start(now_us);
+        let member = &mut self.members[index];
+        if member.stream_announced || !member.plays() {
+            return;
+        }
+        member.stream_announced = true;
+        let _ = member.sender.send(Outbound::Message(Box::new(start)));
+    }
+
+    /// Drops the announced stream of every player without ending it.
+    ///
+    /// A track jump clears the buffers and then announces the new format again, which is an update
+    /// of the stream the players still have open.
+    fn forget_stream_starts(&mut self) {
+        for member in self.members.iter_mut() {
+            member.stream_announced = false;
+        }
+    }
+
+    /// Brings the activation of every member in line with the playback state of the group.
+    fn declare_playback_for_all(&mut self) {
+        for index in 0..self.members.len() {
+            self.declare_playback(index);
+        }
+    }
+
+    /// Tells one member whether the group is playing, when that changed for it.
+    fn declare_playback(&mut self, index: usize) {
+        let playing = self.playing;
+        let member = &mut self.members[index];
+        if member.playback_declared == playing {
+            return;
+        }
+        member.playback_declared = playing;
+        let activate = Incoming::ServerActivate(ServerActivate {
+            activities: if playing {
+                vec![PLAYBACK_ACTIVITY.to_owned()]
+            } else {
+                Vec::new()
+            },
+            // The roles of the initial activation stay in force.
+            active_roles: None,
+            pairing: None,
+        });
+        let _ = member.sender.send(Outbound::Message(Box::new(activate)));
+    }
+
+    /// Sends a `stream/clear` for the player stream to every player that has one.
     fn send_stream_clear(&self, now_us: i64) {
         let message = Incoming::StreamClear(StreamClear {
             server_transmitted: now_us,
             from_timestamp: None,
             roles: Some(vec![PLAYER_STREAM.to_owned()]),
         });
-        self.send(&message, |member| member.has(PLAYER_ROLE));
+        self.send(&message, |member| member.stream_announced);
     }
 
-    /// Sends a `stream/end` for the player stream to every player.
-    fn send_stream_end(&self) {
+    /// Sends a `stream/end` for the player stream to every player that has one.
+    fn send_stream_end(&mut self) {
         let message = Incoming::StreamEnd(StreamEnd {
             roles: Some(vec![PLAYER_STREAM.to_owned()]),
         });
-        self.send(&message, |member| member.has(PLAYER_ROLE));
+        for member in self.members.iter_mut() {
+            if !member.stream_announced {
+                continue;
+            }
+            member.stream_announced = false;
+            let _ = member
+                .sender
+                .send(Outbound::Message(Box::new(message.clone())));
+        }
     }
 
     /// Sends one control message to every member `wanted` selects.
@@ -556,9 +714,12 @@ impl Inner {
         }
     }
 
-    /// Sends one framed audio chunk to every player.
+    /// Sends one framed audio chunk to every player with an announced stream.
+    ///
+    /// The chunk is the same for every member: one timeline, one set of timestamps. Each client
+    /// translates them with its own clock estimate.
     fn send_audio(&self, chunk: &[u8]) {
-        for member in self.members.iter().filter(|member| member.has(PLAYER_ROLE)) {
+        for member in self.members.iter().filter(|member| member.streams()) {
             let _ = member.sender.send(Outbound::Audio(chunk.to_vec()));
         }
     }
@@ -633,9 +794,14 @@ impl Clock {
         }
     }
 
+    /// Returns the clock reading in microseconds for `at`.
+    fn at(&self, at: Instant) -> i64 {
+        i64::try_from(at.saturating_duration_since(self.start).as_micros()).unwrap_or(i64::MAX)
+    }
+
     /// Returns the server clock reading in microseconds.
     fn now_us(&self) -> i64 {
-        i64::try_from(self.start.elapsed().as_micros()).unwrap_or(i64::MAX)
+        self.at(Instant::now())
     }
 }
 

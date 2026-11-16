@@ -92,7 +92,8 @@ pub use client::{
     INITIAL_BACKOFF, NORMAL_PLAYBACK_SPEED,
 };
 pub use config::{
-    AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, MAX_PLAYER_NAME_LEN,
+    AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, DEFAULT_MAX_BACKOFF,
+    MAX_PLAYER_NAME_LEN,
 };
 #[cfg(feature = "pairing-code")]
 pub use config::{

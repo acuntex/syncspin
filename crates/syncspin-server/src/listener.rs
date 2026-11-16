@@ -11,6 +11,7 @@
 //! later failure is silent, which is why the handshake paths here close without a message.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -21,7 +22,7 @@ use syncspin_core::framing::{
 };
 use syncspin_core::messages::{
     ClientHello, Incoming, NoiseHandshake, ServerActivate, ServerError, ServerHello, ServerInit,
-    PROTOCOL_VERSION,
+    ServerTime, PROTOCOL_VERSION,
 };
 use syncspin_core::noise::{Initiator, Suite, TransportState, SENTINEL_PSK_ID};
 use tokio::net::{TcpListener, TcpStream};
@@ -221,9 +222,9 @@ async fn converse(
 
     // 5. `server/activate`, which declares the roles this connection may use.
     //
-    // `activities` stays empty until there is a group to report: `playback` says the client's group
-    // is playing, and a paused group reports `stopped` without it. The roles are active all the
-    // same, which the specification allows on a playback-capable connection.
+    // `activities` stays empty here: the group declares `playback` as soon as it plays, which may
+    // be before this client joined, and the join sends that activation. The roles are active all
+    // the same, which the specification allows on a playback-capable connection.
     let (roles, withheld) = active_roles(&client_hello, &config.format);
     let activate = ServerActivate {
         activities: Vec::new(),
@@ -246,7 +247,8 @@ async fn converse(
     }
 
     // 6. The connection joins the group, which hands it the current `server/state`,
-    // `group/update` and, for a player, the format of a stream that is already running.
+    // `group/update` and, while the group plays, the `playback` activity. The stream itself arrives
+    // once the client has reported the `client/state` its activation requires.
     let controller = roles.iter().any(|role| role == CONTROLLER_ROLE);
     let (sender, mut outbound) = mpsc::unbounded_channel();
     let member = group.join(roles, sender);
@@ -273,7 +275,7 @@ async fn converse(
                 }
             },
             frame = connection.read_encrypted(&mut noise) => {
-                let frame = match frame {
+                let (frame, arrived) = match frame {
                     Ok(frame) => frame,
                     // A link that fails here is a dropped connection, not a message the peer sent.
                     Err(_) => break "connection lost".to_owned(),
@@ -281,6 +283,26 @@ async fn converse(
                 match frame {
                     Encrypted::Json(text) => match Incoming::parse(&text) {
                         Ok(Some(Incoming::ClientGoodbye(goodbye))) => break goodbye.reason,
+                        // Every request gets its own reply: one timeline is what a client measures
+                        // its offset against, so the two stamps are the receive time of this frame
+                        // and the moment before the answer leaves.
+                        Ok(Some(Incoming::ClientTime(time))) => {
+                            let reply = Incoming::ServerTime(ServerTime {
+                                client_transmitted: time.client_transmitted,
+                                server_received: group.server_us(arrived),
+                                server_transmitted: group.now_us(),
+                            });
+                            if connection.send_json(&mut noise, &reply).await.is_err() {
+                                break "connection lost".to_owned();
+                            }
+                            continue;
+                        }
+                        // A `client/state` is a report: the group records what it says about the
+                        // member and keeps its own volume, mute and playback.
+                        Ok(Some(Incoming::ClientState(state))) => {
+                            group.report_client_state(member, &state);
+                            continue;
+                        }
                         // The group owns volume, mute and playback, so a controller command for one
                         // of them needs no trip through the host.
                         Ok(Some(Incoming::ClientCommand(command))) => {
@@ -334,7 +356,15 @@ fn encode(message: &Incoming) -> Result<String> {
 }
 
 /// One frame read from the socket.
-enum Frame {
+struct Frame {
+    /// What the frame carried.
+    body: FrameBody,
+    /// When the WebSocket delivered it, for the receive stamp of a `server/time` reply.
+    arrived: Instant,
+}
+
+/// The payload of one [`Frame`].
+enum FrameBody {
     /// A cleartext text frame.
     Text(String),
     /// One binary frame, a Noise transport message once the handshake is done.
@@ -397,16 +427,29 @@ impl Connection {
             };
             match message {
                 Some(Ok(Message::Text(text))) => {
-                    return Ok(Some(Frame::Text(text.as_str().to_owned())))
+                    return Ok(Some(Frame {
+                        body: FrameBody::Text(text.as_str().to_owned()),
+                        arrived: Instant::now(),
+                    }))
                 }
-                Some(Ok(Message::Binary(bytes))) => return Ok(Some(Frame::Binary(bytes.to_vec()))),
+                Some(Ok(Message::Binary(bytes))) => {
+                    return Ok(Some(Frame {
+                        body: FrameBody::Binary(bytes.to_vec()),
+                        arrived: Instant::now(),
+                    }))
+                }
                 Some(Ok(Message::Ping(payload))) => self
                     .socket
                     .send(Message::Pong(payload))
                     .await
                     .context("the WebSocket pong failed")?,
                 Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => continue,
-                Some(Ok(Message::Close(_))) | None => return Ok(Some(Frame::Closed)),
+                Some(Ok(Message::Close(_))) | None => {
+                    return Ok(Some(Frame {
+                        body: FrameBody::Closed,
+                        arrived: Instant::now(),
+                    }))
+                }
                 Some(Err(error)) => return Err(error).context("the WebSocket read failed"),
             }
         }
@@ -417,11 +460,13 @@ impl Connection {
     /// A binary frame before the transport carries nothing, which the client side skips as well.
     async fn read_cleartext(&mut self) -> Result<Cleartext> {
         loop {
-            match self.read().await? {
-                None => return Ok(Cleartext::Shutdown),
-                Some(Frame::Closed) => return Ok(Cleartext::Closed),
-                Some(Frame::Text(text)) => return Ok(Cleartext::Text(text)),
-                Some(Frame::Binary(_)) => continue,
+            let Some(frame) = self.read().await? else {
+                return Ok(Cleartext::Shutdown);
+            };
+            match frame.body {
+                FrameBody::Closed => return Ok(Cleartext::Closed),
+                FrameBody::Text(text) => return Ok(Cleartext::Text(text)),
+                FrameBody::Binary(_) => continue,
             }
         }
     }
@@ -443,22 +488,25 @@ impl Connection {
         }
     }
 
-    /// Waits for the next transport-mode message.
-    async fn read_encrypted(&mut self, noise: &mut TransportState) -> Result<Encrypted> {
-        let ciphertext = match self.read().await? {
-            None => return Ok(Encrypted::Shutdown),
-            Some(Frame::Closed) => return Ok(Encrypted::Closed),
-            Some(Frame::Text(_)) => return Ok(Encrypted::Cleartext),
-            Some(Frame::Binary(ciphertext)) => ciphertext,
+    /// Waits for the next transport-mode message, with the instant of its frame.
+    async fn read_encrypted(&mut self, noise: &mut TransportState) -> Result<(Encrypted, Instant)> {
+        let Some(frame) = self.read().await? else {
+            return Ok((Encrypted::Shutdown, Instant::now()));
+        };
+        let arrived = frame.arrived;
+        let ciphertext = match frame.body {
+            FrameBody::Closed => return Ok((Encrypted::Closed, arrived)),
+            FrameBody::Text(_) => return Ok((Encrypted::Cleartext, arrived)),
+            FrameBody::Binary(ciphertext) => ciphertext,
         };
         let plaintext = match noise.decrypt(&ciphertext) {
             Ok(plaintext) => plaintext,
-            Err(_) => return Ok(Encrypted::Refused),
+            Err(_) => return Ok((Encrypted::Refused, arrived)),
         };
         match decode_frame(&plaintext) {
-            Ok(PlaintextFrame::Json(text)) => Ok(Encrypted::Json(text.to_owned())),
-            Ok(PlaintextFrame::Binary { .. }) => Ok(Encrypted::Other),
-            Err(_) => Ok(Encrypted::Refused),
+            Ok(PlaintextFrame::Json(text)) => Ok((Encrypted::Json(text.to_owned()), arrived)),
+            Ok(PlaintextFrame::Binary { .. }) => Ok((Encrypted::Other, arrived)),
+            Err(_) => Ok((Encrypted::Refused, arrived)),
         }
     }
 
@@ -470,7 +518,7 @@ impl Connection {
         noise: &mut TransportState,
     ) -> Result<Option<ClientHello>> {
         loop {
-            match self.read_encrypted(noise).await? {
+            match self.read_encrypted(noise).await?.0 {
                 Encrypted::Json(text) => match Incoming::parse(&text) {
                     Ok(Some(Incoming::ClientHello(hello))) => return Ok(Some(hello)),
                     // Another message, or one this revision does not have, is not `client/hello`;

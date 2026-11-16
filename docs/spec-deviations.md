@@ -29,6 +29,8 @@ harmless.
 | 15  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
 | 16  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
 | 17  | A malformed control message is ignored, not fatal               | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
+| 18  | A server keeps an unavailable client in the group               | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                        | Open, one group                     |
+| 19  | The server's stream start lead is one fixed value               | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                              | Open, shared timeline              |
 
 ## 1. Client-initiated connections only
 
@@ -452,6 +454,52 @@ material.
 **Removing it:** decode every control message against a typed error and close the connection with a
 protocol-error reason once the close path carries one (`server/error`, entry 6); turn the lenient
 branch into a typed protocol error and flip both tests.
+
+## 18. A server keeps an unavailable client in the group
+
+**Spec:** `messaging.md`, _`client/state`_ and _Server behavior when a client becomes unavailable
+(`available: false`)_. A client that reports `available: false` is moved to a new solo group with
+`group/update`, and `stream/end` is sent for every active stream; it rejoins its previous group only
+through an explicit `switch`, never automatically.
+
+**What we do:** the server has one group. A member that reports `available: false` stays in it; the
+group stops sending it audio, and `Group::report_client_state` records the report without touching
+group volume, mute or playback. No `group/update` and no `stream/end` follow, and a member that
+reports `available: true` again receives the running stream without an announcement, because its
+stream was never ended. `a_member_that_reports_itself_unavailable_receives_no_audio` pins the
+withheld audio, and `group_state_applies_to_every_member_and_a_report_is_not_a_command` pins that a
+report never becomes a command.
+
+**Why:** a solo group and the `switch` command cycle need several groups per server, which this
+milestone does not have; the one thing that must not happen - audio to a client that says it will
+not play it - is kept, and the rest of the rule cannot be followed without the groups it names.
+
+**Removing it:** add solo groups, move an unavailable member into one, send the `group/update` and
+`stream/end` the spec requires in that order, and serve the controller's `switch` command; then flip
+the first test so an unavailable member ends in a stopped solo group.
+
+## 19. The server's stream start lead is one fixed value
+
+**Spec:** `messaging.md`, _`stream/start`_. After a role that defines a `client/state` object is
+added to `active_roles`, the server MUST wait for that update before starting the role's stream, and
+each role's stream configuration is derived from what the client reports - for the player, its
+`required_lead_time_ms` and `min_buffer_ms`.
+
+**What we do:** the stream waits for the update (the group announces nothing to a member without its
+`player` object) but schedules the first sample at `START_LEAD`, 200 ms after the stream opens, for
+every member. The reported lead and buffer are read but not used. The group fans one timeline out to
+every member, so all of them share the timestamps; the tests
+`two_players_receive_the_same_frames` and `a_player_hears_nothing_before_it_reports_its_state` pin
+that.
+
+**Why:** a stream is one timeline: starting it at each member's own reported lead would give the
+members different timestamps for the same audio, which the server fan-out and the group design do
+not allow. The honest fixes are a lead derived from the slowest ready player, or a per-member
+announcement ahead of the shared first sample.
+
+**Removing it:** schedule a new stream at the largest `required_lead_time_ms` among the players that
+are ready when it opens, wait for a late member's report before announcing to it, and test a stream
+with two members whose reported leads differ.
 
 ## How to update this file
 

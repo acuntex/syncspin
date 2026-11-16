@@ -13,6 +13,12 @@ use crate::storage::Storage;
 /// Longest player name the protocol allows, in bytes of UTF-8.
 pub const MAX_PLAYER_NAME_LEN: usize = 64;
 
+/// Longest delay between reconnect attempts a configuration starts with.
+///
+/// [`ClientConfig::new`] uses it; a host that wants a longer or shorter ceiling sets
+/// [`ClientConfig::max_backoff`] itself.
+pub const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
 /// Number of digits in a static pairing code.
 ///
 /// The protocol fixes the length at eight decimal digits, so a configured code is exactly this
@@ -367,6 +373,45 @@ impl fmt::Debug for ClientConfig {
 }
 
 impl ClientConfig {
+    /// Builds a configuration for `server` with the crate's defaults.
+    ///
+    /// Everything a host rarely changes starts at a documented value: no device description, no
+    /// pairing store, [`AudioMode::Decode`], volume 100 and unmuted, [`VolumePolicy::default`],
+    /// [`DEFAULT_MAX_BACKOFF`] and [`DEFAULT_PAIRING_TIMEOUT`](crate::DEFAULT_PAIRING_TIMEOUT). A
+    /// host that restores a level or a mute state sets [`ClientConfig::volume`] and
+    /// [`ClientConfig::muted`] on the value this returns.
+    ///
+    /// The fields stay public, so a host can also build the struct itself and name every field.
+    pub fn new(
+        server: impl Into<String>,
+        player_name: impl Into<String>,
+        identity: Identity,
+    ) -> ClientConfig {
+        ClientConfig {
+            server: server.into(),
+            player_name: player_name.into(),
+            device_info: None,
+            identity,
+            storage: None,
+            audio_mode: AudioMode::Decode,
+            volume: 100,
+            muted: false,
+            volume_policy: VolumePolicy::default(),
+            max_backoff: DEFAULT_MAX_BACKOFF,
+            pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
+            #[cfg(feature = "pairing-code")]
+            static_pairing_code: None,
+            #[cfg(feature = "pairing-code")]
+            pairing_window: DEFAULT_PAIRING_WINDOW,
+            #[cfg(feature = "pairing-code")]
+            pairing_pending_text: None,
+            #[cfg(feature = "pairing-code")]
+            code_formats: Vec::new(),
+            #[cfg(feature = "pairing-code")]
+            code_out_channels: Vec::new(),
+        }
+    }
+
     /// Rejects a configuration that would put invalid fields on the wire.
     pub(crate) fn validate(&self) -> Result<()> {
         if self.server.trim().is_empty() {
@@ -476,6 +521,21 @@ mod tests {
             #[cfg(feature = "pairing-code")]
             code_out_channels: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_constructor_fills_a_configuration_that_validates() {
+        let config = ClientConfig::new("127.0.0.1:8927", "Test player", Identity::generate());
+        config.validate().expect("the defaults are valid");
+        assert_eq!(config.server, "127.0.0.1:8927");
+        assert_eq!(config.player_name, "Test player");
+        assert_eq!(config.audio_mode, AudioMode::Decode);
+        assert_eq!(config.volume, 100);
+        assert!(!config.muted);
+        assert_eq!(config.max_backoff, DEFAULT_MAX_BACKOFF);
+        assert_eq!(config.pairing_timeout, crate::DEFAULT_PAIRING_TIMEOUT);
+        assert!(config.storage.is_none());
+        assert!(config.device_info.is_none());
     }
 
     #[test]

@@ -24,6 +24,9 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite.workspace = true
 
 [dev-dependencies]
+# The round-trip test in `tests/roundtrip.rs` runs the real client crate against this server. A
+# dev-dependency does not change the client's public behaviour or the server's published surface.
+syncspin-client = { version = "0.1.0", path = "../syncspin-client" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [package.metadata.docs.rs]

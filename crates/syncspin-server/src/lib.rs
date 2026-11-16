@@ -5,12 +5,17 @@
 //! has audio to distribute drives the handle [`Server::start`] returns and follows the connections
 //! through the [`Event`] stream.
 //!
-//! What exists today: the listener, the three roles a player needs, and one stream. A client
-//! connects, `client/init` is answered with `server/init` and Noise message 1, the handshake
+//! What exists today: the listener, the three roles a player needs, one group and one stream. A
+//! client connects, `client/init` is answered with `server/init` and Noise message 1, the handshake
 //! completes, and the server sends `server/hello`, `server/activate` with the roles that
-//! connection may use, `server/state` and `group/update`. The host pushes audio into a
-//! [`StreamWriter`]; the server stamps every chunk with the server-clock playout timestamp and
-//! sends it to the players of its group. Pairing, several groups and discovery do not exist yet.
+//! connection may use, `server/state` and `group/update`. Every member of the group receives the
+//! same stream frames with the same playout timestamps, and each one measures its own offset by
+//! sending `client/time`, which the server answers with the receive and transmit stamps of the
+//! request. The host pushes audio into a [`StreamWriter`]; the server stamps every chunk with the
+//! server-clock playout timestamp and fans it out. Volume, mute and playback belong to the group,
+//! and a member's `client/state` is a report rather than a command: the group takes from it only
+//! whether the member is available and has reported the `player` object its activation requires,
+//! which is what a stream waits for. Pairing, several groups and discovery do not exist yet.
 //!
 //! Every connection is encrypted. A client that does not complete the Noise handshake is refused
 //! and there is no plaintext path, not behind a flag, not in a test. A `client/init` the server
