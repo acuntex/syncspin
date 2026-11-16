@@ -112,8 +112,10 @@ jobs:
       # `cargo zigbuild --target armv7-unknown-linux-gnueabihf` (installing
       # `cargo-zigbuild` and a `zig` binary) so the glibc 2.24 baseline is
       # actually exercised.
+      # The server is a published crate from 0.2 on, so it belongs in the guard:
+      # an ARM-only consumer must be able to build a server too.
       - name: cargo check (armv7)
-        run: cargo check -p syncspin-core -p syncspin-client --all-features --target armv7-unknown-linux-gnueabihf --locked
+        run: cargo check -p syncspin-core -p syncspin-client -p syncspin-server --all-features --target armv7-unknown-linux-gnueabihf --locked
 
   coverage:
     runs-on: ubuntu-latest
@@ -188,9 +190,10 @@ jobs:
     name: package
     runs-on: ubuntu-latest
     # Publishing is the only moment a broken manifest, a missing README, a licence
-    # path or an unused dependency is noticed today. `syncspin-client` cannot be
-    # packaged until `syncspin-core` is on crates.io, so only core is checked here;
-    # that is the crate the client depends on.
+    # path or an unused dependency is noticed today. `syncspin-client` and
+    # `syncspin-server` cannot be packaged until `syncspin-core` is on crates.io,
+    # so only core is checked here; the release workflow packages the other two
+    # once core is published.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
