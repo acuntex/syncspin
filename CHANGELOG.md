@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 
+## [0.2.0] - 2026-11-16
+
+### Added
+
+- **core:** Both cipher suites — `25519_ChaChaPoly_SHA256` and `25519_AESGCM_SHA256`, chosen by the
+  suite the peer announces, with no downgrade
+- **core:** The Noise initiator, so the server no longer copies the test harness
+- **core:** `group/update` and `server/error`
+- **server:** Listener, handshake and activation over both suites
+- **server:** Roles and a stream: `StreamWriter`, player/controller/metadata, format gate
+- **server:** One group with several clients, per-client clock, group volume
+- **server:** Pairing as the server — token, static and dynamic codes — and the approval gate
+- **client:** Advertising and inbound connections behind `discovery`
+- **examples:** `server-demo`, a host that streams a tone to a connected player
+
+### Changed
+
+- **client:** `group/update` is the authoritative playback state; `server/error` reaches the host as an event
+- **client:** A second inbound server is refused with `client/goodbye` reason `concurrent_attempt`
+
+### Fixed
+
+- **server:** Published on crates.io together with core and the client
+
 ## [0.1.2] - 2026-11-16
 
 ### Fixed

@@ -30,7 +30,7 @@ discovery = []
 mdns = ["dep:mdns-sd"]
 
 [dependencies]
-syncspin-core = { version = "0.1.0", path = "../syncspin-core" }
+syncspin-core = { version = "0.2.0", path = "../syncspin-core" }
 anyhow.workspace = true
 base64.workspace = true
 futures-util.workspace = true

@@ -22,7 +22,7 @@ pairing-code = ["syncspin-core/pairing-code"]
 mdns = ["dep:mdns-sd"]
 
 [dependencies]
-syncspin-core = { version = "0.1.0", path = "../syncspin-core" }
+syncspin-core = { version = "0.2.0", path = "../syncspin-core" }
 anyhow.workspace = true
 base64.workspace = true
 futures-util.workspace = true
@@ -38,7 +38,7 @@ tokio-tungstenite.workspace = true
 # The round-trip test in `tests/roundtrip.rs` runs the real client crate against this server. A
 # dev-dependency does not change the client's public behaviour or the server's published surface.
 # `discovery` is on only for the server-initiated test, which lets a real client advertise.
-syncspin-client = { version = "0.1.0", path = "../syncspin-client", features = ["discovery"] }
+syncspin-client = { version = "0.2.0", path = "../syncspin-client", features = ["discovery"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [package.metadata.docs.rs]
