@@ -1137,6 +1137,18 @@ impl Session<'_> {
         }
 
         let had_player = self.player_active();
+        // The spec re-evaluates playback capability against the persisted roles instead of rejecting
+        // a later activation for them: a connection that can no longer carry playback loses its
+        // roles, and `had_player` above is what turns that loss into `StreamEnd` below.
+        if activate.active_roles.is_none()
+            && !playback_capable_for(
+                self.matched,
+                self.config.unpaired_access,
+                &activate.activities,
+            )
+        {
+            self.active_roles.clear();
+        }
         if let Some(roles) = activate.active_roles {
             self.active_roles = roles;
         }
@@ -3676,6 +3688,27 @@ mod tests {
             !playback_capable_for(MatchedPsk::Sentinel, false, &["pairing".to_owned()]),
             "declaring pairing does not add playback capability"
         );
+    }
+
+    #[test]
+    fn playback_capability_follows_the_setting_and_the_psk() {
+        let pairing_only = vec!["pairing".to_owned()];
+        assert!(!playback_capable_for(
+            MatchedPsk::Sentinel,
+            false,
+            &pairing_only
+        ));
+        assert!(playback_capable_for(
+            MatchedPsk::Sentinel,
+            true,
+            &pairing_only
+        ));
+        assert!(playback_capable_for(
+            MatchedPsk::Stored(PskCategory::LongTerm),
+            false,
+            &[]
+        ));
+        assert!(!playback_capable_for(MatchedPsk::Sentinel, false, &[]));
     }
 
     #[test]
