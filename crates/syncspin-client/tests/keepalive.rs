@@ -190,17 +190,61 @@ async fn a_silent_session_pings_once_and_stays_connected() {
         "the ping carries the 8-byte keepalive nonce"
     );
 
-    // The harness answered. A frame after the ping proves the session is still processing the
-    // link, so exchange it on the real clock; the paused clock is only for the idle waits.
+    // The harness answered, and the ping is on the wire. Five virtual seconds later - still inside
+    // the 10 s pong window - the server sends a frame the client has to count: the idle timer
+    // restarts from that frame, not from the ping. Exchange it on the real clock; the paused clock
+    // is only for the idle waits.
+    tokio::time::advance(Duration::from_secs(5)).await;
     tokio::time::resume();
     group_update(&server, "After the ping");
     assert_eq!(expect_group(&mut events).await, "After the ping");
 
-    // Twelve seconds after that frame - still inside the idle window - there must be no second
-    // ping. A client that pinged on a fixed schedule instead of on silence would send one here.
+    // Ten more virtual seconds put the clock at about 30 s, where a client that pinged on a fixed
+    // 15 s schedule sends its second ping. A client that pings on silence waits until the frame
+    // above plus 15 s (about 35 s), so only the fixed-schedule one has anything to send in the
+    // second measured here.
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(12)).await;
+    tokio::time::advance(Duration::from_secs(10)).await;
     expect_no_ping(&mut server, Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn a_frame_other_than_a_pong_answers_the_keepalive_ping() {
+    // No role, so the link is silent in both directions and the keepalive is the only traffic.
+    let options = ServerOptions {
+        active_roles: Vec::new(),
+        answer_pings: false,
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (mut events, _handle) = connect_to(&server).await;
+    expect_connected(&mut events, &server).await;
+
+    tokio::time::pause();
+    let payload = expect_ping(&mut server).await;
+    assert_eq!(
+        payload.len(),
+        8,
+        "the ping carries the 8-byte keepalive nonce"
+    );
+
+    // The harness never answers that ping. Five virtual seconds later - still inside the 10 s pong
+    // window - a normal group update arrives, and it is the answer: the client asks whether the link
+    // delivers anything, not whether it delivers the pong. Only the wait is virtual; the exchange
+    // itself runs on the real clock.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::resume();
+    group_update(&server, "Inside the pong window");
+    assert_eq!(expect_group(&mut events).await, "Inside the pong window");
+
+    // The answer counts only if the session is still there once the bail would have fired: about 28
+    // s, with the ping 13 s old. A client that only accepted a pong ended the session at 25 s, so
+    // this frame could not be delivered at all.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(8)).await;
+    tokio::time::resume();
+    group_update(&server, "After the pong window");
+    assert_eq!(expect_group(&mut events).await, "After the pong window");
 }
 
 #[tokio::test]

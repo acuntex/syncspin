@@ -93,8 +93,11 @@ const GOODBYE_TIMEOUT: Duration = Duration::from_millis(500);
 ///
 /// The protocol has no application-level liveness message: `client/time` flows only while a player
 /// role is active, so an idle session sends nothing, and a server that dropped the session leaves
-/// the local socket "open" forever. The ping is the only traffic this adds, and a link that carries
-/// audio, metadata or clock replies never sees one.
+/// the local socket "open" forever. The ping is the only traffic this adds, and it appears only
+/// when nothing has arrived for this window. A pairing wait is silence too - the dynamic-code flow
+/// waits up to 120 s for an operator - so the client pings every 15 s during one, and a peer that
+/// answers nothing at all is diagnosed as a dead link at 25 s rather than reaching the pairing
+/// timeout.
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 
 /// How long the link may stay silent after a keepalive ping before the session is treated as dead.

@@ -94,10 +94,11 @@ handle or event stream is dropped.
 
 A silent link is detected instead of staying "connected" forever: after 15 s without receiving any
 WebSocket frame the client sends a ping, and when nothing arrives in the 10 s after it the attempt
-ends as a disconnect so the reconnect above runs. A link that carries audio, metadata or clock
-replies never sees a ping, and a ping from the server is answered as before. The ping is a
-transport control frame with an 8-byte nonce, not a protocol message and not application data;
-the client depends on the peer answering pings or sending something else within that window.
+ends as a disconnect so the reconnect above runs. The ping appears only when nothing has arrived for
+15 s, so a link that keeps carrying audio, metadata or clock replies sees none, and a ping from the
+server is answered as before. The ping is a transport control frame with an 8-byte nonce, not a
+protocol message and not application data; the client depends on the peer answering pings or sending
+something else within that window.
 
 `ClientConfig::volume` and `ClientConfig::muted` are the level and mute state the first `client/state`
 carries. A host passes the values it restored, so the server never sees an invented baseline; a host
