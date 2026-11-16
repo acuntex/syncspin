@@ -106,6 +106,28 @@ Roughly: an hour to read the four files, an hour to re-derive one vector by hand
 transcribed from the draft and cross-checked twice; the risk is in what they do not cover, not in
 what they assert.
 
+## What an internal pass found (2026-11-16)
+
+Three reviewers read this layer against the draft, each with a different part, and were told to
+recompute rather than trust the vectors. The construction held:
+
+- The generator adapter is equivalent to `map_to_curve_elligator2` for every input class — checked
+  over 519 inputs including `u ≥ p`, `u ∈ {0, 1}` and the twist cases, against a transcription of
+  RFC 9380 §6.7.1 and five §J.4.2 vectors.
+- The transcript is byte-exact against §B.1.5 and Appendix A.2, the `sid` is identical on both sides,
+  and a re-handshake replaces `h` and resets the index on both ends, so two attempts cannot share one.
+- The MCF tags were recomputed independently from the draft's ISK and shares and match.
+
+Seven things were wrong or fragile, and are fixed: `wrap` did not check how much the AEAD wrote; key
+material was not zeroized; the tag comparison was a hand-rolled fold; `elligator2` was caret-ranged;
+the generator had a single vector, all of it in one branch; a zero round was silently coerced to one;
+and the pairing index saturated on one side only. The generator now also carries the RFC 9380 vectors
+with bit 254 clear, a `map(u) = map(p−u)` property, and the boundary inputs.
+
+**This is not the external review.** The reviewers were asked by the project and share its reading of
+the draft. What it cannot rule out is a misreading both sides made — that is what the request above is
+for, and the sentence in the README stands until someone outside answers.
+
 ## What this repository claims today
 
 [The README](../README.md) says the CPace layer has not been reviewed externally and is unaudited. That
