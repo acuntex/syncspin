@@ -192,7 +192,9 @@ credential-mismatch signal, and the client is expected to surface the mismatch t
 the Sentinel key although the server named another credential, and `session::attempt` reports
 `Event::PairingRequired { server_id, reason: CredentialMismatch }` once per connection, after
 `Event::Connected` and before the first activation; a plain Sentinel announcement, a matched record
-and the pairing PSK all report nothing, and `Event::PairingRequired` is never sent twice.
+and the pairing PSK all report nothing. The event fires at most once per connection for this
+handshake decision; an activation the switch refuses reports it once more, with reason
+`UnpairedAccessDisabled`, immediately before the `pairing_required` goodbye.
 `Incoming::ServerUnpair` is decoded as `server/unpair`, and `Session::handle_unpair` removes the
 record through `Storage::remove_pairing`, emits `Event::Unpaired { server_id }`, sends
 `client/goodbye` with reason `unpaired` and ends the connection with the disconnect reason

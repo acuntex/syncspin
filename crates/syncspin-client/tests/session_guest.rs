@@ -22,7 +22,7 @@ use syncspin_core::messages::{
     ClientState, ControllerState, GroupUpdate, Incoming, PairingActivation, PlayerCommand,
     Progress, ServerActivate, ServerCommand, ServerState,
 };
-use syncspin_core::noise::{psk_id_for, Identity};
+use syncspin_core::noise::{psk_id_for, Identity, SENTINEL_PSK};
 
 use fake_server::{FakeServer, Observation, ServerOptions};
 
@@ -2475,6 +2475,15 @@ async fn goodbye_from(server: &mut FakeServer) -> Option<String> {
         .expect("the client must say goodbye before closing the connection")
 }
 
+/// Asserts that the client kept the connection open, by waiting for a goodbye it must not send.
+async fn assert_no_goodbye(server: &mut FakeServer) {
+    if let Ok(observed) =
+        tokio::time::timeout(Duration::from_millis(300), server.wait_for_goodbye()).await
+    {
+        panic!("the client must keep the connection open, the server observed {observed:?}");
+    }
+}
+
 #[tokio::test]
 async fn a_guest_refuses_playback_when_unpaired_access_is_off() {
     // The server's first activation is the harness default: activities ['playback'] with roles.
@@ -2614,4 +2623,82 @@ async fn a_repeated_activity_closes_the_connection_as_unauthorized() {
         goodbye_from(&mut server).await.as_deref(),
         Some("unauthorized")
     );
+}
+
+#[tokio::test]
+async fn a_credential_mismatch_does_not_hide_the_refused_activation() {
+    // The server announces a long-term key this client never held and seals with the Sentinel key,
+    // so the handshake reports the mismatch; the harness's default playback activation is then
+    // refused because the setting is off. Both reasons belong to the same connection.
+    let foreign: [u8; 32] = std::array::from_fn(|index| index as u8 ^ 0xa5);
+    let mut server = FakeServer::start(ServerOptions {
+        psk_id: psk_id_for(&foreign),
+        psk_category: "lt".to_owned(),
+        psk: SENTINEL_PSK,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+
+    expect_connected(&mut events, &server).await;
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::PairingRequired {
+            server_id: server.server_id().to_owned(),
+            reason: syncspin_client::PairingRequiredReason::CredentialMismatch,
+        }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::PairingRequired {
+            server_id: server.server_id().to_owned(),
+            reason: syncspin_client::PairingRequiredReason::UnpairedAccessDisabled,
+        },
+        "the refusal is a second reason on the same connection, not a suppressed one"
+    );
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => {
+            assert!(reason.contains("does not admit"), "got: {reason}")
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("pairing_required"),
+        "the refused activation still closes with the spec's reason"
+    );
+    drop(handle);
+}
+
+#[tokio::test]
+async fn an_empty_activation_leaves_an_unpaired_session_open() {
+    // `[]` with no roles is admissible for a guest whatever the setting, so it is the first
+    // activation here: the switch closes only a session whose activation needs unpaired access.
+    let options = ServerOptions {
+        activate_override: Some(
+            r#"{"type":"server/activate","payload":{"activities":[]}}"#.to_owned(),
+        ),
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (_handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+
+    expect_connected(&mut events, &server).await;
+    assert_no_goodbye(&mut server).await;
+    match tokio::time::timeout(Duration::from_millis(300), events.next()).await {
+        Ok(Some(event)) => panic!("an empty activation must not end the session, got {event:?}"),
+        Ok(None) => panic!("the event stream ended after an empty activation"),
+        Err(_) => {}
+    }
 }

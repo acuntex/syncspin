@@ -459,15 +459,24 @@ pub enum Event {
     },
     /// A server needs a pairing this client cannot complete with what it holds.
     ///
-    /// Reported once per connection, never once per message: the situation is decided by the
-    /// Noise handshake, so the event fires after [`Event::Connected`] and before the session acts
-    /// on its first message, and never again while that connection lasts. A plain guest handshake -
-    /// an unpaired connection whose server announced the Sentinel key - is not a mismatch and
-    /// reports nothing.
+    /// Two situations report it, each with its own [`PairingRequiredReason`].
     ///
-    /// Nothing is removed or replaced on either side, and the session continues as an ordinary
-    /// unpaired one. A server that holds a record for this client will keep the connection in
-    /// pairing or idle until the host offers pairing again.
+    /// The handshake reports a credential mismatch once per connection, never once per message: the
+    /// situation is decided by the Noise handshake, so the event fires after [`Event::Connected`]
+    /// and before the session acts on its first message, and never again for that reason while the
+    /// connection lasts. A plain guest handshake - an unpaired connection whose server announced the
+    /// Sentinel key - is not a mismatch and reports nothing.
+    ///
+    /// The second situation is a refused activation: [`ClientConfig::unpaired_access`] is off and
+    /// the server sent a `server/activate` that would be admissible if it were on. That report fires
+    /// at most once, immediately before the client closes the connection with `client/goodbye`
+    /// reason `pairing_required`, and never for a session whose setting admits unpaired access. One
+    /// connection can therefore report this event twice, once per reason, when the handshake found a
+    /// credential mismatch and the activation is then refused.
+    ///
+    /// In the credential-mismatch case nothing is removed or replaced on either side, and the
+    /// session continues as an ordinary unpaired one. A server that holds a record for this client
+    /// will keep the connection in pairing or idle until the host offers pairing again.
     PairingRequired {
         /// Static public key of the server that announced the unknown credential.
         server_id: String,
