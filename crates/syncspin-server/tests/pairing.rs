@@ -507,7 +507,8 @@ async fn unpair_removes_the_record_and_disconnects() -> Result<()> {
 
 #[tokio::test]
 async fn a_client_that_cannot_use_its_record_is_refused() -> Result<()> {
-    // `docs/spec-deviations.md`, entry 20: the server announces the record it holds and refuses a
+    // `docs/spec-deviations.md`, "The server does not try the Sentinel key after a record fails":
+    // the server announces the record it holds and refuses a
     // message that does not authenticate under it. It cannot retry the same message with the
     // Sentinel key, so a client that lost its record does not get an unpaired session from this
     // server; the record stays, and re-pairing is the way back.

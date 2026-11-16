@@ -972,7 +972,8 @@ impl Session<'_> {
     /// that does not decode is ignored as well, with a line on stderr, instead of ending the
     /// session: one malformed field must not silence playback, and a message the client cannot
     /// decode carries nothing it could act on. The audio path keeps the strict rule - a malformed
-    /// chunk header is a protocol error. See `docs/spec-deviations.md`, entry 17.
+    /// chunk header is a protocol error. See `docs/spec-deviations.md`, "A malformed control
+    /// message is ignored, not fatal".
     ///
     /// A body that is not valid UTF-8 is a framing error and still closes the connection.
     async fn handle_control_message(&mut self, body: &[u8]) -> Result<()> {
