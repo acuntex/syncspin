@@ -1,7 +1,7 @@
 # Publishing on a tag, so a release is a reproducible pipeline step and not a
 # hand-typed sequence on one machine.
 #
-#   git tag -a v0.2.0 -m "…" && git push origin v0.2.0
+#   git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z
 #
 # The job order is not cosmetic: `syncspin-client` and `syncspin-server` depend
 # on `syncspin-core` through the registry, so the index must list core's version
