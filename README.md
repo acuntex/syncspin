@@ -20,7 +20,8 @@ directions. Its suites use a fake client that walks the specification, and one t
 client against the real server so the two halves cannot agree on a bug unnoticed. 0.2 publishes
 `syncspin-server` beside `syncspin-core` and `syncspin-client` from the same tag. The API may change
 before 1.0. The CPace layer behind the code flows has not been reviewed externally, so it is
-unaudited code until it has been.
+unaudited code until it has been; what a reviewer would look at is written down in
+[the review package](docs/cpace-review.md).
 
 `syncspin` is not an official Sendspin implementation and is not affiliated with the Sendspin
 project; the name describes only the protocol the code speaks.

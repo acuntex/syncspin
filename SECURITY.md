@@ -39,6 +39,13 @@ that shows it, and what an attacker gains. A working test is worth more than a d
 - The absence of a feature that is documented as missing, such as several groups per server, role
   versions beyond `@v1`, or `wss://`.
 
+## The pairing PAKE
+
+The CPace layer behind the pairing code flows is written here rather than taken from a crate, is
+pinned to the draft's vectors, and has not been reviewed externally. A review is wanted: the
+[review package](docs/cpace-review.md) records what it implements, what pins it and which
+questions are open. A finding there is a security report like any other.
+
 ## What must never be in a report
 
 No private key, PSK, pairing record, identity file or Noise handshake hash. These are the values an
