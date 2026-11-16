@@ -537,6 +537,57 @@ async fn the_psk_flow_stores_one_record_and_pairs_the_next_connection() {
     }
 }
 
+/// The switch governs playback on a guest connection, not the pairing flow itself.
+///
+/// A device that has never paired is a guest, so refusing `['pairing']` here would leave it no way
+/// to become paired: the setting would be a one-way door.
+#[tokio::test]
+async fn a_pairing_completes_with_unpaired_access_off() {
+    let pairing_psk = [0x5b; 32];
+    let storage = MemoryStorage::holding(pairing_psk);
+    let mut server = FakeServer::start(ServerOptions {
+        first_activate: Some(pairing_activation()),
+        ..pairing_options(pairing_psk)
+    })
+    .await
+    .unwrap();
+    let mut config = config_for(&server, Some(storage.clone()));
+    config.unpaired_access = false;
+    let (_handle, mut events) = connect(config, Box::new(NullSink))
+        .await
+        .expect("the client must connect to the fake server");
+    expect_connected(&mut events, &server).await;
+
+    let long_term_psk =
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_pair_finalize())
+            .await
+            .expect("the client must send client/pair-finalize")
+            .expect("the connection must not close before the finalize")
+            .0;
+
+    let paired = match next_event(&mut events).await {
+        Event::PairingRequired { .. } => {
+            panic!("an activation that only declares pairing must not be refused by the setting")
+        }
+        Event::Paired { server_id } => server_id,
+        other => panic!("expected Paired, got {other:?}"),
+    };
+    assert_eq!(paired, server.server_id());
+
+    let records = storage.records();
+    assert_eq!(records.len(), 1, "one pairing produces exactly one record");
+    assert_eq!(records[0].category, PskCategory::LongTerm);
+    assert_eq!(
+        records[0].psk, long_term_psk,
+        "the record holds the key the client sent"
+    );
+    assert_eq!(
+        storage.pairing_psk(),
+        Some(pairing_psk),
+        "a successful pairing does not consume the pairing PSK"
+    );
+}
+
 #[tokio::test]
 async fn a_matched_sentinel_key_cannot_pair() {
     let pairing_psk = [0x11; 32];
