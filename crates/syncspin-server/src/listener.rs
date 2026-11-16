@@ -10,6 +10,8 @@
 //! A failure decided from `client/init` alone is answered with `server/error` and a close; every
 //! later failure is silent, which is why the handshake paths here close without a message.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -30,16 +32,9 @@ use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{accept_hdr_async, WebSocketStream};
 
+use crate::group::{Group, Outbound, CONTROLLER_ROLE, METADATA_ROLE, PLAYER_ROLE};
+use crate::stream::AudioFormat;
 use crate::{Event, ServerConfig};
-
-/// The role a client outputs audio with.
-const PLAYER_ROLE: &str = "player@v1";
-
-/// The role a client controls the group with.
-const CONTROLLER_ROLE: &str = "controller@v1";
-
-/// The role a client displays text metadata with.
-const METADATA_ROLE: &str = "metadata@v1";
 
 /// The category the server announces when it mixes in the published Sentinel key.
 ///
@@ -57,6 +52,7 @@ const KEY_CHARS: usize = 43;
 pub(crate) async fn run(
     listener: TcpListener,
     config: ServerConfig,
+    group: Arc<Group>,
     events: mpsc::UnboundedSender<Event>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -71,9 +67,10 @@ pub(crate) async fn run(
             accepted = listener.accept() => {
                 let (stream, _address) = accepted.context("failed to accept a connection")?;
                 let config = config.clone();
+                let group = group.clone();
                 let events = events.clone();
                 let shutdown = shutdown.clone();
-                connections.spawn(serve(stream, config, events, shutdown));
+                connections.spawn(serve(stream, config, group, events, shutdown));
             }
             joined = connections.join_next(), if !connections.is_empty() => {
                 // A task that failed has already reported what the host has to know through the
@@ -93,6 +90,7 @@ pub(crate) async fn run(
 async fn serve(
     stream: TcpStream,
     config: ServerConfig,
+    group: Arc<Group>,
     events: mpsc::UnboundedSender<Event>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -100,7 +98,7 @@ async fn serve(
         return Ok(());
     };
     let mut connection = Connection { socket, shutdown };
-    converse(&mut connection, &config, &events).await
+    converse(&mut connection, &config, &group, &events).await
 }
 
 /// Upgrades `stream` to a WebSocket if it asks for the endpoint the server serves.
@@ -135,6 +133,7 @@ async fn upgrade(stream: TcpStream, path: &str) -> Result<Option<WebSocketStream
 async fn converse(
     connection: &mut Connection,
     config: &ServerConfig,
+    group: &Arc<Group>,
     events: &mpsc::UnboundedSender<Event>,
 ) -> Result<()> {
     // 1. `client/init`, the first message of every connection and cleartext.
@@ -214,17 +213,18 @@ async fn converse(
     let Some(client_hello) = connection.read_client_hello(&mut noise).await? else {
         return Ok(());
     };
+    let client_id = accepted.client_id.clone();
     let _ = events.send(Event::ClientConnected {
-        client_id: accepted.client_id,
+        client_id: client_id.clone(),
         name: client_hello.name.clone(),
     });
 
     // 5. `server/activate`, which declares the roles this connection may use.
     //
     // `activities` stays empty until there is a group to report: `playback` says the client's group
-    // is playing, and this milestone has no stream. The roles are active all the same, which the
-    // specification allows on a playback-capable connection.
-    let roles = active_roles(&client_hello);
+    // is playing, and a paused group reports `stopped` without it. The roles are active all the
+    // same, which the specification allows on a playback-capable connection.
+    let (roles, withheld) = active_roles(&client_hello, &config.format);
     let activate = ServerActivate {
         activities: Vec::new(),
         active_roles: Some(roles.clone()),
@@ -233,46 +233,94 @@ async fn converse(
     connection
         .send_json(&mut noise, &Incoming::ServerActivate(activate))
         .await?;
-    let _ = events.send(Event::ClientActivated { roles });
+    let _ = events.send(Event::ClientActivated {
+        roles: roles.clone(),
+    });
+    // The host has to know why a client it can reach will never play its stream, and the reason is
+    // about the format rather than about the client's connection.
+    if let Some(reason) = withheld {
+        let _ = events.send(Event::PlayerRoleWithheld {
+            client_id: client_id.clone(),
+            reason,
+        });
+    }
 
-    // 6. The connection runs until it ends. Clock, roles and streams are handled by the session
-    // layer; everything this revision does not act on is ignored, as an unknown message must be.
+    // 6. The connection joins the group, which hands it the current `server/state`,
+    // `group/update` and, for a player, the format of a stream that is already running.
+    let controller = roles.iter().any(|role| role == CONTROLLER_ROLE);
+    let (sender, mut outbound) = mpsc::unbounded_channel();
+    let member = group.join(roles, sender);
+
+    // 7. The connection runs until it ends: messages from the socket and the group's state and
+    // audio travel in one task, because the transport keys are one state and cannot be split.
     let reason = loop {
-        let frame = match connection.read_encrypted(&mut noise).await {
-            Ok(frame) => frame,
-            // A link that fails here is a dropped connection, not a message the peer sent.
-            Err(_) => break "connection lost".to_owned(),
-        };
-        match frame {
-            Encrypted::Json(text) => match Incoming::parse(&text) {
-                Ok(Some(Incoming::ClientGoodbye(goodbye))) => break goodbye.reason,
-                // A message of the cleartext phase has no place under the transport keys. The one
-                // a peer reaches by accident is a second `client/init`.
-                Ok(Some(Incoming::ClientInit(_)))
-                | Ok(Some(Incoming::ServerInit(_)))
-                | Ok(Some(Incoming::ServerError(_)))
-                | Ok(Some(Incoming::NoiseHandshake(_))) => {
-                    let _ = connection.close().await;
-                    break "protocol error".to_owned();
+        tokio::select! {
+            outgoing = outbound.recv() => match outgoing {
+                Some(Outbound::Message(message)) => {
+                    if connection.send_json(&mut noise, &message).await.is_err() {
+                        break "connection lost".to_owned();
+                    }
                 }
-                Ok(_) => continue,
-                Err(_) => {
+                Some(Outbound::Audio(chunk)) => {
+                    if connection.send_plaintext(&mut noise, chunk).await.is_err() {
+                        break "connection lost".to_owned();
+                    }
+                }
+                // The group is dropped only when the server is, so this is the shutdown path.
+                None => {
                     let _ = connection.close().await;
-                    break "protocol error".to_owned();
+                    break "server shutdown".to_owned();
                 }
             },
-            Encrypted::Other => continue,
-            Encrypted::Cleartext | Encrypted::Refused => {
-                let _ = connection.close().await;
-                break "protocol error".to_owned();
-            }
-            Encrypted::Closed => break "connection closed".to_owned(),
-            Encrypted::Shutdown => {
-                let _ = connection.close().await;
-                break "server shutdown".to_owned();
+            frame = connection.read_encrypted(&mut noise) => {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    // A link that fails here is a dropped connection, not a message the peer sent.
+                    Err(_) => break "connection lost".to_owned(),
+                };
+                match frame {
+                    Encrypted::Json(text) => match Incoming::parse(&text) {
+                        Ok(Some(Incoming::ClientGoodbye(goodbye))) => break goodbye.reason,
+                        // The group owns volume, mute and playback, so a controller command for one
+                        // of them needs no trip through the host.
+                        Ok(Some(Incoming::ClientCommand(command))) => {
+                            if controller {
+                                if let Some(controller_command) = &command.controller {
+                                    group.apply_controller_command(controller_command);
+                                }
+                            }
+                            continue;
+                        }
+                        // A message of the cleartext phase has no place under the transport keys. The
+                        // one a peer reaches by accident is a second `client/init`.
+                        Ok(Some(Incoming::ClientInit(_)))
+                        | Ok(Some(Incoming::ServerInit(_)))
+                        | Ok(Some(Incoming::ServerError(_)))
+                        | Ok(Some(Incoming::NoiseHandshake(_))) => {
+                            let _ = connection.close().await;
+                            break "protocol error".to_owned();
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {
+                            let _ = connection.close().await;
+                            break "protocol error".to_owned();
+                        }
+                    },
+                    Encrypted::Other => continue,
+                    Encrypted::Cleartext | Encrypted::Refused => {
+                        let _ = connection.close().await;
+                        break "protocol error".to_owned();
+                    }
+                    Encrypted::Closed => break "connection closed".to_owned(),
+                    Encrypted::Shutdown => {
+                        let _ = connection.close().await;
+                        break "server shutdown".to_owned();
+                    }
+                }
             }
         }
     };
+    group.leave(member);
     // A client that said goodbye closes next; every other ending has already been closed above, so
     // this is the one place that makes the connection end with a close frame in every case.
     let _ = connection.close().await;
@@ -459,7 +507,17 @@ impl Connection {
     /// Sends one transport-mode message under the current keys.
     async fn send_json(&mut self, noise: &mut TransportState, message: &Incoming) -> Result<()> {
         let text = encode(message)?;
-        let ciphertext = noise.encrypt(&encode_binary(BINARY_MESSAGE_ID_JSON, text.as_bytes()))?;
+        let plaintext = encode_binary(BINARY_MESSAGE_ID_JSON, text.as_bytes());
+        self.send_plaintext(noise, plaintext).await
+    }
+
+    /// Encrypts one plaintext and sends it as a binary WebSocket message.
+    async fn send_plaintext(
+        &mut self,
+        noise: &mut TransportState,
+        plaintext: Vec<u8>,
+    ) -> Result<()> {
+        let ciphertext = noise.encrypt(&plaintext)?;
         self.socket
             .send(Message::binary(ciphertext))
             .await
@@ -564,29 +622,46 @@ fn client_key(client_id: &str) -> Option<[u8; 32]> {
     bytes.try_into().ok()
 }
 
-/// The roles a connection may use, drawn from what the client offers.
+/// The roles a connection may use, drawn from what the client offers and what the server streams.
 ///
 /// The Sentinel-keyed session this milestone runs may carry active roles only when the client
 /// admits unpaired access (`messaging.md`, `server/activate`); with unpaired access off, roles would
 /// make an activation the client has to reject, so it gets none until pairing exists.
 ///
-/// `player@v1` is activated only with its support object, because without it the server could not
-/// know which formats to send.
-fn active_roles(hello: &ClientHello) -> Vec<String> {
+/// `player@v1` is activated only when the client's support object lists the configured format. A
+/// client that offers the role without it is activated without the role, so the server never sends
+/// it a stream it cannot decode, and the `Some` reason tells the host why.
+fn active_roles(hello: &ClientHello, format: &AudioFormat) -> (Vec<String>, Option<String>) {
     if !hello.unpaired_access.enabled {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let offers = |role: &str| hello.supported_roles.iter().any(|offered| offered == role);
     let mut roles = Vec::new();
-    if offers(PLAYER_ROLE) && hello.player_support.is_some() {
-        roles.push(PLAYER_ROLE.to_owned());
+    let mut withheld = None;
+    if offers(PLAYER_ROLE) {
+        match &hello.player_support {
+            None => {
+                withheld = Some(
+                    "the client offered `player@v1` without its support object, so the server \
+                     cannot tell which formats it plays"
+                        .to_owned(),
+                );
+            }
+            Some(support) if !format.supported_by(support) => {
+                withheld = Some(format!(
+                    "the client's `player@v1_support` does not list the configured stream format \
+                     ({format})"
+                ));
+            }
+            Some(_) => roles.push(PLAYER_ROLE.to_owned()),
+        }
     }
     for role in [CONTROLLER_ROLE, METADATA_ROLE] {
         if offers(role) {
             roles.push(role.to_owned());
         }
     }
-    roles
+    (roles, withheld)
 }
 
 #[cfg(test)]
@@ -607,7 +682,12 @@ mod tests {
             device_info: None,
             supported_roles: roles.iter().map(|role| (*role).to_owned()).collect(),
             player_support: player_support.then(|| syncspin_core::messages::PlayerSupport {
-                supported_formats: Vec::new(),
+                supported_formats: vec![syncspin_core::messages::SupportedFormat {
+                    codec: "pcm".to_owned(),
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bit_depth: 16,
+                }],
                 buffer_capacity: 1,
             }),
             supported_pair_methods: SupportedPairMethods::default(),
@@ -615,6 +695,11 @@ mod tests {
                 enabled: unpaired_access,
             },
         }
+    }
+
+    /// The format the tests configure, which [`hello`] lists when it offers player support.
+    fn format() -> AudioFormat {
+        AudioFormat::pcm(48_000, 2, 16)
     }
 
     #[test]
@@ -693,20 +778,53 @@ mod tests {
     #[test]
     fn the_roles_come_from_what_the_client_offers() {
         let all = ["player@v1", "controller@v1", "metadata@v1"];
-        assert_eq!(active_roles(&hello(&all, true, true)), all.to_vec());
         assert_eq!(
-            active_roles(&hello(&all, false, true)),
-            vec!["controller@v1".to_owned(), "metadata@v1".to_owned()],
+            active_roles(&hello(&all, true, true), &format()),
+            (all.map(str::to_owned).to_vec(), None)
+        );
+        assert_eq!(
+            active_roles(&hello(&all, false, true), &format()),
+            (
+                vec!["controller@v1".to_owned(), "metadata@v1".to_owned()],
+                Some(
+                    "the client offered `player@v1` without its support object, so the server \
+                     cannot tell which formats it plays"
+                        .to_owned()
+                )
+            ),
             "player@v1 without its support object must not be activated"
         );
         assert_eq!(
-            active_roles(&hello(&["artwork@v1", "player@v1"], true, true)),
-            vec!["player@v1".to_owned()],
+            active_roles(&hello(&["artwork@v1", "player@v1"], true, true), &format()),
+            (vec!["player@v1".to_owned()], None),
             "a role this server does not serve is not activated"
         );
         assert!(
-            active_roles(&hello(&all, true, false)).is_empty(),
+            active_roles(&hello(&all, true, false), &format())
+                .0
+                .is_empty(),
             "a client that admits no unpaired access gets no roles on a Sentinel-keyed session"
+        );
+    }
+
+    #[test]
+    fn a_client_without_the_configured_format_gets_no_player_role() {
+        let mut hello = hello(&["player@v1", "controller@v1"], true, true);
+        hello.player_support = Some(syncspin_core::messages::PlayerSupport {
+            supported_formats: vec![syncspin_core::messages::SupportedFormat {
+                codec: "opus".to_owned(),
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+            }],
+            buffer_capacity: 1,
+        });
+        let (roles, withheld) = active_roles(&hello, &format());
+        assert_eq!(roles, vec!["controller@v1".to_owned()]);
+        let reason = withheld.expect("the host is told why the player role is missing");
+        assert!(
+            reason.contains("pcm, 48000 Hz, 2 channel(s), 16 bit"),
+            "the reason names the format the server would have sent: {reason}"
         );
     }
 }

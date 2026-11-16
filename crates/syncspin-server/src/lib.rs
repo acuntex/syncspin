@@ -5,9 +5,12 @@
 //! has audio to distribute drives the handle [`Server::start`] returns and follows the connections
 //! through the [`Event`] stream.
 //!
-//! The listener is the part that exists: a client connects, `client/init` is answered with
-//! `server/init` and Noise message 1, the handshake completes, and the server sends `server/hello`
-//! and `server/activate`. Roles, streams, pairing and discovery follow in `0.2`.
+//! What exists today: the listener, the three roles a player needs, and one stream. A client
+//! connects, `client/init` is answered with `server/init` and Noise message 1, the handshake
+//! completes, and the server sends `server/hello`, `server/activate` with the roles that
+//! connection may use, `server/state` and `group/update`. The host pushes audio into a
+//! [`StreamWriter`]; the server stamps every chunk with the server-clock playout timestamp and
+//! sends it to the players of its group. Pairing, several groups and discovery do not exist yet.
 //!
 //! Every connection is encrypted. A client that does not complete the Noise handshake is refused
 //! and there is no plaintext path, not behind a flag, not in a test. A `client/init` the server
@@ -16,18 +19,25 @@
 //!
 //! The crate is published as `publish = false` until the server half has stabilised.
 
+mod group;
 mod listener;
+mod stream;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::group::Group;
+
 // The identity is part of [`ServerConfig`], so a host that builds a configuration needs it. A
 // re-export keeps a consumer from having to depend on the protocol crate directly.
 pub use syncspin_core::noise::Identity;
+
+pub use crate::stream::{AudioFormat, Codec, StreamWriter, TrackInfo};
 
 /// The address the listener binds when the configuration does not narrow it.
 ///
@@ -43,9 +53,9 @@ pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 /// Everything a server needs to listen and identify itself.
 ///
-/// [`ServerConfig::new`] fills in the defaults for the address and the endpoint path; the identity
-/// belongs to the host, which stores it and keeps it across restarts because the public half is
-/// the `server_id` every client associates its pairing record with.
+/// [`ServerConfig::new`] fills in the defaults for the address, the endpoint path and the stream
+/// format; the identity belongs to the host, which stores it and keeps it across restarts because
+/// the public half is the `server_id` every client associates its pairing record with.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Friendly name the server announces in `server/hello`.
@@ -56,20 +66,28 @@ pub struct ServerConfig {
     pub path: String,
     /// Static keypair of the server. The public half is the `server_id`.
     pub identity: Identity,
+    /// Format of every stream this server sends.
+    ///
+    /// The host picks one; a client is activated as a player only when its `player@v1_support`
+    /// lists this exact format. [`ServerConfig::new`] defaults to stereo 48 kHz 16-bit PCM, the
+    /// format the specification requires every player to support.
+    pub format: AudioFormat,
 }
 
 impl ServerConfig {
-    /// Builds a configuration with the default address and endpoint path.
+    /// Builds a configuration with the default address, endpoint path and stream format.
     pub fn new(name: impl Into<String>, identity: Identity) -> ServerConfig {
         ServerConfig {
             name: name.into(),
             bind: DEFAULT_BIND,
             path: DEFAULT_PATH.to_owned(),
             identity,
+            format: AudioFormat::pcm(48_000, 2, 16),
         }
     }
 
-    /// Rejects a name `server/hello` may not carry and a path that is not a `path-absolute`.
+    /// Rejects a name `server/hello` may not carry, a path that is not a `path-absolute`, and a
+    /// stream format the server cannot schedule.
     fn validate(self) -> Result<ServerConfig> {
         if self.name.len() > MAX_SERVER_NAME_LEN {
             bail!(
@@ -92,14 +110,16 @@ impl ServerConfig {
                 self.path
             );
         }
+        self.format.validate()?;
         Ok(self)
     }
 }
 
 /// One change the host has to know about.
 ///
-/// The stream carries the lifecycle of a connection, not its content: a client is reported once it
-/// has said who it is, again once the server has decided its roles, and once when it leaves.
+/// The stream carries the lifecycle of a connection and of the stream, not its content: a client is
+/// reported once it has said who it is, again once the server has decided its roles, and once when
+/// it leaves; a stream is reported when it starts and when it ends, whoever ended it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A client completed the handshake and sent `client/hello`.
@@ -117,12 +137,27 @@ pub enum Event {
         /// Versioned roles the connection may use; empty when it may use none.
         roles: Vec<String>,
     },
+    /// A client offered `player@v1` but the server did not grant it, so it receives no stream.
+    ///
+    /// Sent right after the [`Event::ClientActivated`] of the same connection. The usual cause is a
+    /// `player@v1_support` that does not list the configured [`AudioFormat`]; the host may change
+    /// the configuration or leave the client as a controller.
+    PlayerRoleWithheld {
+        /// Static public key of the client.
+        client_id: String,
+        /// Why the role is missing, in a sentence the host can show.
+        reason: String,
+    },
     /// The connection ended.
     ClientLeft {
         /// Why it ended: the `reason` of a `client/goodbye`, or a short description of a close
         /// the server observed, such as `connection closed` or `server shutdown`.
         reason: String,
     },
+    /// A stream was announced to the group.
+    StreamStarted,
+    /// The stream ended: by the host, or because the group paused or stopped.
+    StreamEnded,
 }
 
 /// The receiving end of a server's [`Event`] stream.
@@ -155,8 +190,9 @@ impl Server {
     ///
     /// # Errors
     /// Returns an error for a configuration the protocol forbids - a name longer than
-    /// [`MAX_SERVER_NAME_LEN`], a path that is not a `path-absolute` - and for an address this
-    /// build cannot bind.
+    /// [`MAX_SERVER_NAME_LEN`], a path that is not a `path-absolute`, a stream format that has no
+    /// sample rate or channels - when an address cannot be bound, and when the group identifier
+    /// cannot be drawn from the operating system's CSPRNG.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime, because the listener is spawned.
@@ -170,27 +206,37 @@ impl Server {
             .context("failed to read the listener's address")?;
         let (events, event_stream) = mpsc::unbounded_channel();
         let (shutdown, shutdown_signal) = watch::channel(false);
-        let task = tokio::spawn(listener::run(bound, config, events, shutdown_signal));
+        let group = Group::new(config.name.clone(), config.format.clone(), events.clone())?;
+        let task = tokio::spawn(listener::run(
+            bound,
+            config,
+            group.clone(),
+            events,
+            shutdown_signal,
+        ));
         Ok(ServerHandle {
             task: Some(task),
             event_stream: Some(event_stream),
             shutdown,
             local_addr,
+            group,
         })
     }
 }
 
 /// A running server.
 ///
-/// The handle owns the listener task and the event stream. [`ServerHandle::events`] hands the
-/// stream out once; [`ServerHandle::shutdown`] ends the server, and dropping the handle does the
-/// same without waiting for it.
+/// The handle owns the listener task, the event stream and the group. [`ServerHandle::events`]
+/// hands the stream out once; the group operations are what a host calls while it plays;
+/// [`ServerHandle::shutdown`] ends the server, and dropping the handle does the same without
+/// waiting for it.
 #[derive(Debug)]
 pub struct ServerHandle {
     task: Option<JoinHandle<Result<()>>>,
     event_stream: Option<mpsc::UnboundedReceiver<Event>>,
     shutdown: watch::Sender<bool>,
     local_addr: SocketAddr,
+    group: Arc<Group>,
 }
 
 impl ServerHandle {
@@ -214,6 +260,46 @@ impl ServerHandle {
             receiver
         });
         EventStream { events }
+    }
+
+    /// Opens a stream for `track` and returns the writer that feeds it.
+    ///
+    /// The group is told before the host writes anything: every player receives `stream/start` with
+    /// the configured format, the metadata role receives the track, and the writer's first chunk is
+    /// scheduled 200 ms ahead of now. A stream that is still running is cleared first, so opening a
+    /// track while another plays is a track jump rather than an in-place format change.
+    ///
+    /// A group with no player still accepts the writer: a stream that nobody hears is the host's
+    /// business, and its timestamps stay consistent for a player that joins later.
+    pub fn open_stream(&self, track: TrackInfo) -> StreamWriter {
+        self.group.open_stream(track);
+        StreamWriter::new(self.group.clone())
+    }
+
+    /// Sets the volume of the group and returns the level in force.
+    ///
+    /// A level above 100 is clamped rather than rejected. The new level reaches every client with
+    /// the controller role in a `server/state`; volume and mute are independent.
+    pub fn set_volume(&self, level: u8) -> u8 {
+        self.group.set_volume(level)
+    }
+
+    /// Starts or resumes playback and reports the new group state.
+    pub fn play(&self) {
+        self.group.play();
+    }
+
+    /// Pauses playback at the current position.
+    ///
+    /// A paused group ends its player stream, as the specification requires; a later
+    /// [`ServerHandle::play`] announces it again and continues from the paused position.
+    pub fn pause(&self) {
+        self.group.pause();
+    }
+
+    /// Stops playback and rewinds the position to the beginning.
+    pub fn stop(&self) {
+        self.group.stop();
     }
 
     /// Stops the listener and closes every live connection.
@@ -266,6 +352,18 @@ mod tests {
         assert_eq!(config.bind.port(), 8927);
         assert!(config.bind.ip().is_unspecified());
         assert_eq!(config.path, "/sendspin");
+        assert_eq!(
+            config.format,
+            AudioFormat::pcm(48_000, 2, 16),
+            "the default stream format is the one every player must support"
+        );
+    }
+
+    #[test]
+    fn a_stream_format_that_cannot_be_scheduled_is_rejected() {
+        let mut config = ServerConfig::new("a server", Identity::generate());
+        config.format = AudioFormat::pcm(0, 2, 16);
+        assert!(config.validate().is_err());
     }
 
     #[test]
