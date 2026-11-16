@@ -117,14 +117,26 @@ dependency is a path dependency that `cargo package` rewrites to a registry depe
 `syncspin-server` is `publish = false` and stays out of the release.
 
 `CHANGELOG.md` is generated with [git-cliff](https://github.com/orhun/git-cliff) from the tags and
-the conventional commits; do not edit it by hand. Regenerate it before the tag:
+the conventional commits; do not edit it by hand.
+
+One command prepares a release:
 
 ```sh
-git cliff --tag v0.2.0 --output CHANGELOG.md
-git commit -am "chore(release): add the 0.2.0 changelog section"
+scripts/release.sh 0.2.0            # bump, changelog, gates, commit
+scripts/release.sh 0.2.0 --dry-run  # show what it would change
 ```
 
-Then push the tag and let the pipeline do the rest:
+It bumps the workspace version and the three `version()` tripwires, refreshes `Cargo.lock`,
+prepends the changelog section rendered from the commits since the last tag, and refuses to continue
+if the previous version is still named anywhere outside `CHANGELOG.md` and the lock file — that check
+exists because a published README once advertised the release before it. Then it runs the format and
+test gates and commits `chore(release): <version>`.
+
+The script does not use `git cliff --tag` on its own: that renders every section from the tags, and a
+tag created out of order is dropped, folding its commits into the previous release. `--unreleased`
+renders exactly the new section, so the script prepends it and leaves the history alone.
+
+Merge the resulting branch, then push the tag and let the pipeline do the rest:
 
 ```sh
 git tag -a v0.2.0 -m "syncspin 0.2.0" && git push origin v0.2.0
