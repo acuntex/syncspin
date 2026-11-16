@@ -1106,8 +1106,9 @@ async fn a_pairing_message_without_an_attempt_is_a_protocol_error() -> Result<()
 #[tokio::test]
 async fn a_pair_token_for_a_client_that_did_not_offer_the_method_is_refused() -> Result<()> {
     let store = std::sync::Arc::new(MemoryStore::default());
-    let (server, port, _events) = start_with_config(config(store.clone())?).await?;
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
     let mut client = FakeClient::connect(port).await?;
+    let client_id = client.identity.public_base64();
     client.handshake(Suite::ChaChaPoly).await?;
     // The default `client/hello` offers no pairing method at all.
     client.activate().await?;
@@ -1123,7 +1124,36 @@ async fn a_pair_token_for_a_client_that_did_not_offer_the_method_is_refused() ->
     );
     assert!(store.records().is_empty(), "a refused token stores nothing");
 
-    drop(client);
+    // The refusal is the operator's mistake, not the client's: the connection survives and the
+    // operator can still approve the client.
+    server.approve(&client_id).await?;
+    let activate = client
+        .read_activate(|activities| activities.is_empty())
+        .await?;
+    assert!(
+        activate
+            .active_roles
+            .unwrap_or_default()
+            .contains(&"player@v1".to_owned()),
+        "the client is still on a healthy connection and receives its roles"
+    );
+
+    // The refusal must not have ended the connection: no leave is reported.
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    expect_no_event(&mut events, Duration::from_millis(200)).await;
+
+    client.goodbye("shutdown").await?;
     server.shutdown().await?;
     Ok(())
 }
