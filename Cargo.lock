@@ -950,6 +950,7 @@ dependencies = [
  "syncspin-core",
  "tokio",
  "tokio-tungstenite",
+ "zeroize",
 ]
 
 [[package]]
@@ -965,7 +966,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "snow",
+ "subtle",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -982,6 +985,7 @@ dependencies = [
  "syncspin-core",
  "tokio",
  "tokio-tungstenite",
+ "zeroize",
 ]
 
 [[package]]

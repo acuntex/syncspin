@@ -978,7 +978,10 @@ impl Session<'_> {
             let attempt = Attempt::code(
                 method,
                 format,
-                self.pairing_index + 1,
+                // Saturating on both sides: the client's counter saturates, so a server that
+                // wrapped would report an index the client cannot reach and the two would
+                // disagree about which activation is current.
+                self.pairing_index.saturating_add(1),
                 self.config.pairing_timeout,
             )?;
             self.pairing_index = attempt.index();

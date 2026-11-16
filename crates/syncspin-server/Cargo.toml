@@ -33,6 +33,10 @@ mdns-sd = { version = "0.21", optional = true, default-features = false }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite.workspace = true
+# Scrub of key material that passes through this crate: the long-term PSK every flow delivers, and
+# inside a code round the scalar, shared point, ISK and `K_wrap`. Already in the tree through
+# `x25519-dalek`; not optional because the Pairing PSK flow needs it in a default build too.
+zeroize.workspace = true
 
 [dev-dependencies]
 # The round-trip test in `tests/roundtrip.rs` runs the real client crate against this server. A

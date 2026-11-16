@@ -19,7 +19,10 @@ anyhow = "1.0.104"
 base64 = "0.23.1"
 # Only the Elligator 2 map is needed for CPace; the default `keygen` feature would add
 # curve25519-dalek, rand_core and zeroize for a key generator this workspace does not use.
-elligator2 = { version = "0.1.0", default-features = false }
+# Pinned exactly: a `0.1.x` may move the representative convention (which field elements count as
+# representatives, which bit selects the map's branch), and a negated input would then map to the
+# other point without failing a vector, because that point is still a valid group element.
+elligator2 = { version = "=0.1.0", default-features = false }
 # CPace's explicit key confirmation is HMAC-SHA-512 (§10.4 of the draft). The construction is
 # standard, so it comes from the RustCrypto crate rather than being written here.
 hmac = { version = "0.12.1", default-features = false }
@@ -36,3 +39,8 @@ futures-util = "0.3.34"
 # Draws the pairing PSK and each pairing's long-term PSK from the operating system's CSPRNG. Already
 # in the tree, and small enough that the client can depend on it directly rather than on `rand`.
 getrandom = "0.3.4"
+# Both are already in the tree through `x25519-dalek` and `snow`. The CPace layer names them
+# directly because it relies on their contracts - scrub on drop, compare without an early exit -
+# and a transitive dependency it does not declare is one it cannot rely on.
+zeroize = "1.9.1"
+subtle = { version = "2.6.1", default-features = false }

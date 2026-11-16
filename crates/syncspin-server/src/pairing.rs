@@ -35,6 +35,7 @@ use syncspin_core::messages::{
 };
 use syncspin_core::messages::{ClientPairFinalize, ClientPairInit, Incoming, ServerPairFinalize};
 use syncspin_core::noise::{Suite, SENTINEL_PSK};
+use zeroize::Zeroizing;
 
 /// How long one attempt may stay unfinished before the server cancels it.
 ///
@@ -325,12 +326,13 @@ enum Phase {
 struct CodeRound {
     /// The `sid` both sides derive the generator and the tags from.
     sid: Vec<u8>,
-    /// The server's scalar, which only it holds.
-    scalar: [u8; 32],
+    /// The server's scalar, which only it holds. It scrubs when the round is dropped, because a
+    /// leaked scalar would let anyone derive this round's key from the shares on the wire.
+    scalar: Zeroizing<[u8; 32]>,
     /// `Ya`, the server's public share.
     ya: [u8; 32],
     /// The intermediate session key, set once the client's share arrived.
-    isk: Option<[u8; 64]>,
+    isk: Option<Zeroizing<[u8; 64]>>,
     /// `Tb`, the tag the client's `client_kc` must equal.
     expected_client_tag: Option<[u8; 64]>,
 }
@@ -340,8 +342,8 @@ struct CodeRound {
 struct Verified {
     /// The round's `sid`, which the wrapping key depends on.
     sid: Vec<u8>,
-    /// The round's intermediate session key.
-    isk: [u8; 64],
+    /// The round's intermediate session key, scrubbed once the attempt is dropped.
+    isk: Zeroizing<[u8; 64]>,
 }
 
 /// One pairing attempt in progress.
@@ -426,7 +428,13 @@ impl Attempt {
             method,
             format,
             pairing_index,
-            round: 0,
+            // The static flow has exactly one round; the dynamic flow numbers its rounds as
+            // `server/pair-init` opens them, so it starts without one.
+            round: if method == PairingMethod::StaticCode {
+                STATIC_ROUND
+            } else {
+                0
+            },
             phase: Phase::AwaitInit,
             deadline: Instant::now() + timeout,
             nonce_a: None,
@@ -604,8 +612,12 @@ impl Attempt {
         let Some(prs) = self.code.as_deref() else {
             bail!("no pairing code was entered");
         };
-        let round = self.round.max(STATIC_ROUND);
-        let sid = pake_sid(handshake_hash, self.pairing_index, round);
+        if self.round == 0 {
+            // A zero round would put the round that never began's `sid` on the wire; the state
+            // machine sets the number before it gets here, so this is a sequence violation.
+            bail!("the CPace round has no round number");
+        }
+        let sid = pake_sid(handshake_hash, self.pairing_index, self.round);
         let generator = syncspin_core::pairing::pake::generator(prs, b"", &sid);
         let mut scalar = [0u8; 32];
         getrandom::fill(&mut scalar)
@@ -614,7 +626,9 @@ impl Attempt {
             .context("the CPace generator did not yield a group element")?;
         self.round_state = Some(CodeRound {
             sid,
-            scalar,
+            // The array is moved into the wrapper rather than copied, so the only copy of the
+            // scalar is the one that scrubs itself.
+            scalar: Zeroizing::new(scalar),
             ya,
             isk: None,
             expected_client_tag: None,
@@ -640,12 +654,17 @@ impl Attempt {
             bail!("client/pair-auth arrived before the CPace round began");
         };
         let yb: [u8; 32] = decode_fixed::<32>(&auth.pake_msg_2, KEY_CHARS, "pake_msg_2")?;
-        let point = syncspin_core::pairing::pake::scalar_mult_vfy(&round.scalar, &yb)
-            .context("the client's CPace share encodes a low-order point")?;
+        let point = Zeroizing::new(
+            syncspin_core::pairing::pake::scalar_mult_vfy(&round.scalar, &yb)
+                .context("the client's CPace share encodes a low-order point")?,
+        );
         let transcript =
             syncspin_core::pairing::pake::transcript_ir(&round.ya, AD_SERVER, &yb, AD_CLIENT);
-        let isk =
-            syncspin_core::pairing::pake::intermediate_session_key(&round.sid, &point, &transcript);
+        let isk = Zeroizing::new(syncspin_core::pairing::pake::intermediate_session_key(
+            &round.sid,
+            &point[..],
+            &transcript,
+        ));
         let server_tag = syncspin_core::pairing::pake::key_confirmation_tag(
             &round.sid, &isk, &round.ya, AD_SERVER,
         );
@@ -693,13 +712,15 @@ impl Attempt {
             };
             let sealed: [u8; SEALED_LEN] =
                 decode_fixed::<SEALED_LEN>(sealed, SEALED_CHARS, "wrapped_nonce_B")?;
-            let key = syncspin_core::pairing::wrap::k_wrap(
+            let key = Zeroizing::new(syncspin_core::pairing::wrap::k_wrap(
                 syncspin_core::pairing::wrap::NONCE_LABEL,
                 &round.sid,
                 &isk,
+            ));
+            let nonce_b = Zeroizing::new(
+                syncspin_core::pairing::wrap::unwrap(suite, &key, &sealed)
+                    .context("wrapped_nonce_B does not open under the round's key")?,
             );
-            let nonce_b = syncspin_core::pairing::wrap::unwrap(suite, &key, &sealed)
-                .context("wrapped_nonce_B does not open under the round's key")?;
             let Some(commit_b) = self.commit_b else {
                 bail!("the dynamic flow has no commit_B to check the revealed nonce against");
             };
@@ -786,7 +807,7 @@ impl Attempt {
                 let Some(encoded) = finalize.long_term_psk.as_deref() else {
                     bail!("the Pairing PSK flow's client/pair-finalize carries no long_term_psk");
                 };
-                decode_fixed::<32>(encoded, KEY_CHARS, "long_term_psk")?
+                decode_fixed::<32>(encoded, KEY_CHARS, "long_term_psk").map(Zeroizing::new)?
             }
             #[cfg(feature = "pairing-code")]
             PairingMethod::StaticCode | PairingMethod::DynamicCode => {
@@ -802,26 +823,30 @@ impl Attempt {
                     .verified
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("the CPace round never verified a tag"))?;
-                let wrap_key = syncspin_core::pairing::wrap::k_wrap(
+                let wrap_key = Zeroizing::new(syncspin_core::pairing::wrap::k_wrap(
                     syncspin_core::pairing::wrap::PSK_LABEL,
                     &verified.sid,
                     &verified.isk,
-                );
-                syncspin_core::pairing::wrap::unwrap(suite, &wrap_key, &sealed)
-                    .context("wrapped_psk does not open under the round's key")?
+                ));
+                // Both the `K_wrap` and the plaintext it opens are secret and live only inside
+                // this match arm; the copy returned below is the record the caller persists.
+                Zeroizing::new(
+                    syncspin_core::pairing::wrap::unwrap(suite, &wrap_key, &sealed)
+                        .context("wrapped_psk does not open under the round's key")?,
+                )
             }
             #[cfg(not(feature = "pairing-code"))]
             PairingMethod::StaticCode | PairingMethod::DynamicCode => {
                 bail!("this build has no `pairing-code` feature, so it cannot run a code flow")
             }
         };
-        if key == SENTINEL_PSK {
+        if *key == SENTINEL_PSK {
             bail!("the client delivered the published Sentinel key as a long-term PSK");
         }
-        if connection_psk == Some(key) {
+        if connection_psk == Some(*key) {
             bail!("the client delivered the pairing PSK the connection is keyed by");
         }
-        Ok(key)
+        Ok(*key)
     }
 
     /// Returns the `server/pair-finalize` acknowledgement.

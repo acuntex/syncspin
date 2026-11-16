@@ -44,6 +44,11 @@
 //! formats them: no `Debug`, no `Display`, no error string carries a value. [`key_confirmation_tag`]
 //! and [`verify_key_confirmation_tag`] are branch-free over the secret-derived tag.
 //!
+//! The intermediate buffers this module builds are `Zeroizing`: the hashed ISK input, the
+//! MAC-key input and the MAC key itself wipe when the call returns. The returned arrays belong to
+//! the caller, and this crate does not scrub memory it no longer owns - a caller that keeps a
+//! scalar or an ISK past the round should hold it in `Zeroizing` itself.
+//!
 //! # Not reviewed
 //!
 //! Neither this module nor `elligator2` 0.1 has had an external cryptographic review. The
@@ -52,6 +57,8 @@
 use anyhow::{bail, Result};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha512};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 /// `G_X25519.DSI`, the group's domain-separation identifier (§8.2).
 const DSI: &[u8] = b"CPace255";
@@ -116,9 +123,24 @@ pub fn generator(prs: &[u8], ci: &[u8], sid: &[u8]) -> [u8; 32] {
     // with bit 255 ignored.
     let mut field = [0u8; 32];
     field.copy_from_slice(&digest[..32]);
-    field[31] &= 0x7f;
 
-    elligator2::from_representative(&representative(field))
+    map_to_curve(&field)
+}
+
+/// Maps a field element to `G_X25519` with Elligator 2, the draft's `map_to_curve_elligator2`.
+///
+/// `field` is a 32-byte little-endian field element, the encoding `decodeUCoordinate` produces.
+/// Bit 255 is ignored here, as `decodeUCoordinate(_, 255)` ignores it, so the function is total
+/// over 32-byte strings rather than relying on every caller to mask first. Values at or above
+/// the modulus are reduced, so `map(u) == map(u mod p)`.
+///
+/// The image is a u-coordinate in the same little-endian encoding. The representative
+/// normalisation that `elligator2` needs is inside and branch-free: the element is reduced and,
+/// when it still has bit 254 set, replaced by its negation, which the map cannot distinguish.
+pub fn map_to_curve(field: &[u8; 32]) -> [u8; 32] {
+    let mut element = *field;
+    element[31] &= 0x7f;
+    elligator2::from_representative(&representative(element))
 }
 
 /// Computes `G_X25519.scalar_mult_vfy(scalar, u)`, the verified scalar multiplication.
@@ -230,9 +252,11 @@ pub fn intermediate_session_key(
     shared_point: &[u8],
     transcript: &[u8],
 ) -> [u8; ISK_LEN] {
-    let mut input = lv_cat(&[DSI_ISK, sid, shared_point]);
+    // The hashed input carries the shared point, which is the Diffie-Hellman secret of the
+    // round, so the buffer scrubs itself when the digest returns.
+    let mut input = Zeroizing::new(lv_cat(&[DSI_ISK, sid, shared_point]));
     input.extend_from_slice(transcript);
-    Sha512::digest(input).into()
+    Sha512::digest(&input[..]).into()
 }
 
 /// Computes the explicit key-confirmation tag of the sender's own message (§10.4).
@@ -248,12 +272,13 @@ pub fn key_confirmation_tag(
     share: &[u8],
     ad: &[u8],
 ) -> [u8; TAG_LEN] {
-    let mut key_input = Vec::from(MAC_LABEL);
+    // Both buffers hold the ISK, so both scrub themselves when the tag is finalised.
+    let mut key_input = Zeroizing::new(Vec::from(MAC_LABEL));
     key_input.extend_from_slice(sid);
     key_input.extend_from_slice(isk);
-    let mac_key = Sha512::digest(key_input);
+    let mac_key = Zeroizing::new(<[u8; 64]>::from(Sha512::digest(&key_input[..])));
 
-    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&mac_key)
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&mac_key[..])
         .expect("HMAC-SHA-512 accepts a key of any length");
     mac.update(&lv_cat(&[share, ad]));
     mac.finalize().into_bytes().into()
@@ -261,17 +286,15 @@ pub fn key_confirmation_tag(
 
 /// Returns whether a received tag equals the one this side derived.
 ///
-/// The comparison touches every byte of both tags and folds the differences into one value, so it
-/// does not stop at the first mismatch: the tags are derived from `ISK`, and an early exit would
-/// leak how many leading bytes an attacker guessed. Only the single final result depends on the
-/// data, and that result is public - it decides whether the round continues.
+/// The comparison is `subtle::ConstantTimeEq`, which folds every byte of both tags into one
+/// choice instead of stopping at the first mismatch: the tags are derived from `ISK`, and an
+/// early exit would leak how many leading bytes an attacker guessed. Only the single final
+/// result depends on the data, and that result is public - it decides whether the round
+/// continues. Going through the crate rather than an inline `==` is the point: a later edit
+/// cannot turn this into a short-circuiting comparison without deleting an import.
 #[must_use]
 pub fn verify_key_confirmation_tag(expected: &[u8; TAG_LEN], received: &[u8; TAG_LEN]) -> bool {
-    let difference = expected
-        .iter()
-        .zip(received)
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-    difference == 0
+    bool::from(expected[..].ct_eq(&received[..]))
 }
 
 /// Returns whether `left` is greater than `right` in the draft's lexicographical order (§A.3.1).

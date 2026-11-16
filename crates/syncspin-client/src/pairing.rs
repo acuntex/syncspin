@@ -47,6 +47,8 @@ use syncspin_core::pairing::code::DynamicCode;
 use syncspin_core::pairing::pake::{self, SHARE_LEN, TAG_LEN};
 #[cfg(feature = "pairing-code")]
 use syncspin_core::pairing::wrap::{self, NONCE_LABEL, PSK_LABEL};
+#[cfg(feature = "pairing-code")]
+use zeroize::Zeroizing;
 
 #[cfg(feature = "pairing-code")]
 use crate::config::CodeFormat;
@@ -533,11 +535,22 @@ impl PairingAttempt {
     }
 
     /// Returns the number of the round in progress: `1` for the static flow's only round.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a dynamic attempt whose first `server/pair-init` has not been accepted yet. That
+    /// attempt has no round number, and handing out `1` for it would derive the `sid` of a round
+    /// that never ran instead of reporting the sequence violation.
     #[cfg(feature = "pairing-code")]
-    pub(crate) fn round(&self) -> u32 {
+    pub(crate) fn round(&self) -> Result<u32> {
         match &self.flow {
-            Flow::Dynamic(state) => state.round.max(STATIC_CODE_ROUND),
-            _ => STATIC_CODE_ROUND,
+            Flow::Dynamic(state) => {
+                if state.round == 0 {
+                    bail!("the dynamic pairing attempt has no round number yet");
+                }
+                Ok(state.round)
+            }
+            _ => Ok(STATIC_CODE_ROUND),
         }
     }
 
@@ -657,24 +670,24 @@ impl PairingAttempt {
 
         let generator = pake::generator(prs, b"", sid);
         // A fresh scalar per round: reusing one would link rounds, and the draft samples a new one
-        // for every run.
-        let scalar = draw_key();
+        // for every run. It is scrubbed when the round's key material is derived.
+        let scalar = Zeroizing::new(draw_key());
         let share = pake::public_share(&scalar, &generator)
             .context("the CPace generator did not yield a group element")?;
 
         // The peer's share is verified before a transcript is built from it.
-        let point = pake::scalar_mult_vfy(&scalar, peer_share)?;
+        let point = Zeroizing::new(pake::scalar_mult_vfy(&scalar, peer_share)?);
         let transcript = pake::transcript_ir(peer_share, AD_SERVER, &share, AD_CLIENT);
-        let isk = pake::intermediate_session_key(sid, &point, &transcript);
+        let isk = Zeroizing::new(pake::intermediate_session_key(sid, &point[..], &transcript));
         let expected_server_tag = pake::key_confirmation_tag(sid, &isk, peer_share, AD_SERVER);
         let client_tag = pake::key_confirmation_tag(sid, &isk, &share, AD_CLIENT);
-        let wrapped_psk = wrap::wrap(suite, &wrap::k_wrap(PSK_LABEL, sid, &isk), &self.psk)?;
+        let psk_key = Zeroizing::new(wrap::k_wrap(PSK_LABEL, sid, &isk));
+        let wrapped_psk = wrap::wrap(suite, &psk_key, &self.psk)?;
         let wrapped_nonce_b = match &self.flow {
-            Flow::Dynamic(state) => Some(wrap::wrap(
-                suite,
-                &wrap::k_wrap(NONCE_LABEL, sid, &isk),
-                &state.nonce_b,
-            )?),
+            Flow::Dynamic(state) => {
+                let nonce_key = Zeroizing::new(wrap::k_wrap(NONCE_LABEL, sid, &isk));
+                Some(wrap::wrap(suite, &nonce_key, &state.nonce_b)?)
+            }
             _ => None,
         };
 
@@ -1278,6 +1291,34 @@ mod tests {
         assert!(static_attempt.begin_round(Some(NONCE_A), &HASH).is_err());
     }
 
+    /// A dynamic attempt before its first `server/pair-init` has no round number.
+    ///
+    /// Reporting `1` there would derive the `sid` of a round that never began; the call reports
+    /// the sequence violation instead.
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_dynamic_attempt_without_a_round_reports_a_protocol_error() {
+        let mut attempt = dynamic_attempt(CodeFormat::Digits);
+        assert!(
+            attempt.round().is_err(),
+            "an attempt with round 0 has no round number"
+        );
+
+        attempt
+            .begin_round(Some(NONCE_A), &HASH)
+            .expect("the first round is accepted");
+        assert_eq!(attempt.round().expect("the round has a number"), 1);
+
+        let static_attempt = PairingAttempt::static_code(1, Duration::from_secs(120), None);
+        assert_eq!(
+            static_attempt
+                .round()
+                .expect("the static flow has one round"),
+            STATIC_CODE_ROUND,
+            "the static flow's only round is round 1"
+        );
+    }
+
     /// Completes the client half of the round in progress against a server half built here.
     ///
     /// Returns the round's `sid`, the server's tag and the intermediate session key, so a test can
@@ -1285,7 +1326,11 @@ mod tests {
     #[cfg(feature = "pairing-code")]
     fn cross_the_round(attempt: &mut PairingAttempt) -> (Vec<u8>, [u8; 64], [u8; 64]) {
         let prs = attempt.prs().expect("the code was derived");
-        let sid = pake_sid(&HASH, attempt.pairing_index, attempt.round());
+        let sid = pake_sid(
+            &HASH,
+            attempt.pairing_index,
+            attempt.round().expect("the round has a number"),
+        );
         let generator = pake::generator(&prs, b"", &sid);
         let server_scalar = [0x44; 32];
         let peer_share = pake::public_share(&server_scalar, &generator).expect("a group element");

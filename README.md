@@ -281,8 +281,8 @@ handbook.
 - **MSRV 1.85**, edition 2021.
 - On the ARMv7 / glibc 2.24 target build with
   `cargo zigbuild --target armv7-unknown-linux-gnueabihf`. `openssl` and `ring` are out: the crypto
-  stack is `snow` — which resolves both cipher suites — `x25519-dalek`, `elligator2` and the
-  RustCrypto primitives (`sha2`, `hmac`) the pairing code flows need.
+  stack is `snow` — which resolves both cipher suites — `x25519-dalek`, `elligator2`, `subtle` and
+  the RustCrypto primitives (`sha2`, `hmac`, `zeroize`) the pairing code flows need.
 
 ## Licence
 

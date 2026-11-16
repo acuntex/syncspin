@@ -1500,7 +1500,7 @@ impl Session<'_> {
         let sid = pake_sid(
             self.noise.handshake_hash(),
             attempt.pairing_index,
-            attempt.round(),
+            attempt.round()?,
         );
         let share = attempt.accept_server_share(&prs, &sid, &peer_share, self.noise.suite())?;
         let reply = Incoming::ClientPairAuth(ClientPairAuth {

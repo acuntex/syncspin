@@ -7,9 +7,10 @@
 
 #![cfg(feature = "pairing-code")]
 
+use proptest::prelude::*;
 use sha2::{Digest, Sha512};
 use syncspin_core::pairing::pake::{
-    generator, intermediate_session_key, key_confirmation_tag, lv_cat, public_share,
+    generator, intermediate_session_key, key_confirmation_tag, lv_cat, map_to_curve, public_share,
     scalar_mult_vfy, transcript_ir, transcript_oc, verify_key_confirmation_tag,
 };
 
@@ -47,6 +48,145 @@ fn the_generator_matches_the_draft() {
         expected,
         "the generator for the draft's PRS, CI and sid"
     );
+}
+
+/// Decodes a 32-byte field element printed as hex and reverses it.
+///
+/// RFC 9380 prints the curve25519 vectors big-endian; [RFC 7748] and this crate encode field
+/// elements little-endian. Reversing here keeps the transcribed hex identical to the RFC.
+fn field_element(hex: &str) -> [u8; 32] {
+    let mut field = bytes::<32>(hex);
+    field.reverse();
+    field
+}
+
+/// The field modulus `p = 2^255 - 19`, little-endian.
+const P: [u8; 32] = [
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+];
+
+/// Reduces a value below `2^255` modulo `p`, which takes one conditional subtraction.
+fn reduce(field: [u8; 32]) -> [u8; 32] {
+    let mut difference = [0u8; 32];
+    let mut borrow = 0u8;
+    for index in 0..32 {
+        let (value, borrowed_a) = field[index].overflowing_sub(P[index]);
+        let (value, borrowed_b) = value.overflowing_sub(borrow);
+        difference[index] = value;
+        borrow = u8::from(borrowed_a) | u8::from(borrowed_b);
+    }
+    if borrow == 0 {
+        difference
+    } else {
+        field
+    }
+}
+
+/// Returns `p - field` for `field <= p`, in the same little-endian encoding.
+fn negate(field: [u8; 32]) -> [u8; 32] {
+    let mut difference = [0u8; 32];
+    let mut borrow = 0u8;
+    for index in 0..32 {
+        let (value, borrowed_a) = P[index].overflowing_sub(field[index]);
+        let (value, borrowed_b) = value.overflowing_sub(borrow);
+        difference[index] = value;
+        borrow = u8::from(borrowed_a) | u8::from(borrowed_b);
+    }
+    difference
+}
+
+/// The map against RFC 9380 §J.4.2, which lists `u` and the resulting `Q.x`.
+///
+/// The draft pins the map with one vector only (§B.1.1), and that vector's `u` has bit 254 set,
+/// which is the branch the code rewrites. RFC 9380 exercises both branches and values on either
+/// side of the representative domain, so the adapter is pinned by an independent document rather
+/// than by the one input it was derived from.
+#[test]
+fn the_map_matches_rfc_9380_j_4_2() {
+    // RFC 9380's `curve25519_XMD:SHA-512_ELL2_NU_` suite, the five published `(u[0], Q.x)` pairs.
+    const VECTORS: [(&str, &str); 5] = [
+        (
+            "608d892b641f0328523802a6603427c26e55e6f27e71a91a478148d45b5093cd",
+            "51125222da5e763d97f3c10fcc92ea6860b9ccbbd2eb1285728f566721c1e65b",
+        ),
+        (
+            "46f5b22494bfeaa7f232cc8d054be68561af50230234d7d1d63d1d9abeca8da5",
+            "7d56d1e08cb0ccb92baf069c18c49bb5a0dcd927eff8dcf75ca921ef7f3e6eeb",
+        ),
+        (
+            "235fe40c443766ce7e18111c33862d66c3b33267efa50d50f9e8e5d252a40aaa",
+            "3fbe66b9c9883d79e8407150e7c2a1c8680bee496c62fabe4619a72b3cabe90f",
+        ),
+        (
+            "001e92a544463bda9bd04ddbe3d6eed248f82de32f522669efc5ddce95f46f5b",
+            "227e0bb89de700385d19ec40e857db6e6a3e634b1c32962f370d26f84ff19683",
+        ),
+        (
+            "1a68a1af9f663592291af987203393f707305c7bac9c8d63d6a729bdc553dc19",
+            "3bcd651ee54d5f7b6013898aab251ee8ecc0688166fce6e9548d38472f6bd196",
+        ),
+    ];
+
+    let mut with_bit_254 = 0;
+    let mut without_bit_254 = 0;
+    for (u, q) in VECTORS {
+        let field = field_element(u);
+        assert_eq!(map_to_curve(&field), field_element(q), "map_to_curve({u})");
+        if field[31] & 0x40 != 0 {
+            with_bit_254 += 1;
+        } else {
+            without_bit_254 += 1;
+        }
+    }
+    // Both branches must stay covered: without these counts a future edit could drop every
+    // vector on one side and the test would still pass.
+    assert!(with_bit_254 >= 1, "no vector exercises bit 254 set");
+    assert!(without_bit_254 >= 1, "no vector exercises bit 254 clear");
+}
+
+/// The map depends on `u²`, so `u` and `p - u` must reach the same point.
+///
+/// That identity is what makes the bit-254 rewrite exact rather than a guess: negating an input
+/// with bit 254 set is only legitimate because the map cannot tell the two apart.
+#[test]
+fn the_map_agrees_for_negated_field_elements() {
+    proptest!(|(mut field in prop::array::uniform32(any::<u8>()))| {
+        // Bit 255 is not part of the field element; masking it puts the input in `[0, 2^255)`.
+        field[31] &= 0x7f;
+        let canonical = reduce(field);
+        let negated = negate(canonical);
+        prop_assert_eq!(
+            map_to_curve(&canonical),
+            map_to_curve(&negated),
+            "map({:?}) differs from map(p - u)", canonical
+        );
+    });
+}
+
+/// Encodings at or above `p` map like their reduction, including the encodings of `0` and `1`.
+#[test]
+fn an_element_at_or_above_the_modulus_maps_like_its_reduction() {
+    // `p` through `p + 18 == 2^255 - 1` are the 19 encodings of `0` through `18`. The low byte
+    // of `p` is `0xed`, so adding at most 18 cannot carry into the next byte.
+    for offset in 0u8..19 {
+        let mut non_canonical = P;
+        non_canonical[0] = P[0].wrapping_add(offset);
+        let mut reduced = [0u8; 32];
+        reduced[0] = offset;
+        assert_eq!(
+            map_to_curve(&non_canonical),
+            map_to_curve(&reduced),
+            "the encoding of {offset} at p + {offset}"
+        );
+    }
+
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    let mut p_one = P;
+    p_one[0] = P[0] + 1;
+    assert_eq!(map_to_curve(&P), map_to_curve(&[0u8; 32]), "p is 0");
+    assert_eq!(map_to_curve(&p_one), map_to_curve(&one), "p + 1 is 1");
 }
 
 #[test]
@@ -350,13 +490,17 @@ fn a_received_tag_verifies_only_when_every_byte_matches() {
     let tag = key_confirmation_tag(&sid, &isk, &ya, b"ADa");
 
     assert!(verify_key_confirmation_tag(&tag, &tag));
-    for index in [0, 31, 62, 63] {
-        let mut tampered = tag;
-        tampered[index] ^= 0x01;
-        assert!(
-            !verify_key_confirmation_tag(&tag, &tampered),
-            "a flipped bit at byte {index} must not verify"
-        );
+    // Every bit, not a sample: a comparison that stopped early would still pass a test that only
+    // flipped bytes near the start and the end.
+    for index in 0..64 {
+        for bit in 0..8 {
+            let mut tampered = tag;
+            tampered[index] ^= 1 << bit;
+            assert!(
+                !verify_key_confirmation_tag(&tag, &tampered),
+                "a flipped bit at byte {index}, bit {bit} must not verify"
+            );
+        }
     }
     assert!(
         !verify_key_confirmation_tag(&tag, &[0u8; 64]),
