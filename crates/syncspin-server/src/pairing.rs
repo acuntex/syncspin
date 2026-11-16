@@ -1308,4 +1308,143 @@ mod tests {
             Attempt::code(PairingMethod::DynamicCode, None, 1, DEFAULT_PAIRING_TIMEOUT).is_err()
         );
     }
+
+    #[test]
+    fn the_record_helpers_handle_a_missing_store() {
+        assert!(
+            store_record(None, "a-client", [0u8; 32]).is_err(),
+            "a server without a store cannot keep a record"
+        );
+        assert!(
+            remove_record(None, "a-client").is_ok(),
+            "a server without a store has nothing to remove"
+        );
+    }
+
+    #[test]
+    fn a_token_finalize_without_a_long_term_psk_is_refused() {
+        let mut attempt = Attempt::token(1, DEFAULT_PAIRING_TIMEOUT);
+        attempt
+            .on_pair_init(&pair_init(None), &[0x11; 32])
+            .expect("the init is accepted");
+        assert!(
+            attempt
+                .on_finalize(
+                    &ClientPairFinalize {
+                        long_term_psk: None,
+                        wrapped_psk: None,
+                    },
+                    Suite::ChaChaPoly,
+                    None,
+                )
+                .is_err(),
+            "the Pairing PSK flow must deliver a long-term PSK"
+        );
+    }
+
+    #[cfg(feature = "pairing-code")]
+    fn auth(share: &[u8; 32]) -> ClientPairAuth {
+        ClientPairAuth {
+            pake_msg_2: URL_SAFE_NO_PAD.encode(share),
+        }
+    }
+
+    #[cfg(feature = "pairing-code")]
+    fn confirm(client_kc: &[u8; 64]) -> ClientPairConfirm {
+        ClientPairConfirm {
+            client_kc: URL_SAFE_NO_PAD.encode(client_kc),
+            wrapped_nonce_b: None,
+        }
+    }
+
+    /// Returns the error of a refused attempt, without requiring the success type to be `Debug`.
+    #[cfg(feature = "pairing-code")]
+    fn refusal<T>(result: Result<T>) -> anyhow::Error {
+        match result {
+            Ok(_) => panic!("expected the attempt to refuse, but it accepted"),
+            Err(error) => error,
+        }
+    }
+
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_pair_auth_out_of_sequence_is_refused() {
+        let mut attempt = static_attempt();
+        let error = refusal(attempt.on_client_auth(&auth(&[0u8; 32])));
+        assert!(
+            format!("{error:#}").contains("out of sequence"),
+            "got: {error:#}"
+        );
+
+        attempt.phase = Phase::AwaitClientAuth;
+        let error = refusal(attempt.on_client_auth(&auth(&[0u8; 32])));
+        assert!(
+            format!("{error:#}").contains("before the CPace round began"),
+            "got: {error:#}"
+        );
+    }
+
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_pair_confirm_out_of_sequence_is_refused() {
+        let mut attempt = static_attempt();
+        let error = refusal(attempt.on_client_confirm(
+            &confirm(&[0u8; 64]),
+            &[0x11; 32],
+            Suite::ChaChaPoly,
+        ));
+        assert!(
+            format!("{error:#}").contains("out of sequence"),
+            "got: {error:#}"
+        );
+    }
+
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_pair_retry_out_of_sequence_is_refused() {
+        let mut attempt = static_attempt();
+        // In the phase the retry belongs to, so only the method clause can refuse.
+        attempt.phase = Phase::AwaitClientConfirm;
+        let error = refusal(attempt.on_client_retry());
+        assert!(
+            format!("{error:#}").contains("out of sequence"),
+            "got: {error:#}"
+        );
+    }
+
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_code_flow_finalize_must_carry_the_sealed_key() {
+        let mut attempt = static_attempt();
+        attempt.phase = Phase::AwaitFinalize;
+
+        // Both fields present: the sealed value is well-formed, so only the clear-key guard can
+        // refuse.
+        let error = refusal(attempt.on_finalize(
+            &ClientPairFinalize {
+                long_term_psk: Some(URL_SAFE_NO_PAD.encode([0x11u8; 32])),
+                wrapped_psk: Some(URL_SAFE_NO_PAD.encode([0u8; 48])),
+            },
+            Suite::ChaChaPoly,
+            None,
+        ));
+        assert!(
+            format!("{error:#}").contains("carries the long-term PSK in clear"),
+            "got: {error:#}"
+        );
+
+        // Neither field present: only the missing sealed key can refuse.
+        let error = refusal(attempt.on_finalize(
+            &ClientPairFinalize {
+                long_term_psk: None,
+                wrapped_psk: None,
+            },
+            Suite::ChaChaPoly,
+            None,
+        ));
+        assert!(
+            format!("{error:#}").contains("carries no wrapped_psk"),
+            "got: {error:#}"
+        );
+    }
 }
