@@ -21,6 +21,19 @@ const SPACING_US: i64 = 250_000;
 /// Local start time of the synthetic run, chosen well above zero like a monotonic clock.
 const START_US: i64 = 1_000_000_000;
 
+/// Drift of the synthetic server clock, in microseconds per microsecond (1000 ppm).
+///
+/// Large for a real crystal and deliberate: a filter that ignores the drift is off by a
+/// millisecond per second, which no tolerance below can hide.
+const DRIFT_PER_US: f64 = 1e-3;
+
+/// A drift the filter cannot yet separate from its own uncertainty, in µs per µs.
+///
+/// Three samples leave the drift variance around 8e-6, so the significance threshold sits near
+/// 2.8e-3 and 4e-3 falls below twice that. The protocol applies drift only while it is
+/// significant, so the conversion must leave it out and accept the growing error instead.
+const UNPROVEN_DRIFT_PER_US: f64 = 4e-3;
+
 /// Builds one round trip against a server clock `offset_us` ahead of the local clock.
 ///
 /// `up_us` and `down_us` are the delays of the two legs, so the measurement the filter derives
@@ -45,6 +58,30 @@ fn jittered_sample(index: i64, local_sent_us: i64) -> TimeSample {
         (BASE_DELAY_US - JITTER_US, BASE_DELAY_US + JITTER_US)
     };
     sample(local_sent_us, OFFSET_US, up_us, down_us)
+}
+
+/// Builds a round trip against a server clock whose offset grows by `drift_per_us` per
+/// microsecond.
+///
+/// Both legs carry the same delay, so the measurement is exactly the offset at `local_sent_us`
+/// and its error bound is [`BASE_DELAY_US`].
+fn drifting_sample(local_sent_us: i64, drift_per_us: f64) -> TimeSample {
+    sample(
+        local_sent_us,
+        offset_at(local_sent_us, drift_per_us),
+        BASE_DELAY_US,
+        BASE_DELAY_US,
+    )
+}
+
+/// Returns the offset a drifting server clock has at a local reading.
+fn offset_at(local_us: i64, drift_per_us: f64) -> i64 {
+    OFFSET_US + (drift_per_us * (local_us - START_US) as f64) as i64
+}
+
+/// Returns the server reading a drifting server clock shows at a local reading.
+fn true_server_us(local_us: i64, drift_per_us: f64) -> i64 {
+    local_us + offset_at(local_us, drift_per_us)
 }
 
 /// Feeds `count` jittered samples spaced [`SPACING_US`] apart into a fresh filter.
@@ -264,11 +301,119 @@ fn default_starts_from_the_same_empty_state_as_new() {
     );
 }
 
+#[test]
+fn an_unproven_drift_is_not_applied_to_a_conversion() {
+    // Three samples produce a drift estimate with a variance this large; the protocol applies
+    // drift only while it stands out from that uncertainty. The estimate below is real - four
+    // milliseconds per second - but the filter must not trust it yet: the conversion stays at the
+    // last offset and trails the truth by a quarter of a second over the minute. A filter that
+    // applied the drift anyway would land on the truth and hide the choice.
+    let mut filter = ClockFilter::new();
+    let mut local_sent_us = START_US;
+    let mut last_sample = drifting_sample(local_sent_us, UNPROVEN_DRIFT_PER_US);
+    for _ in 0..3 {
+        last_sample = drifting_sample(local_sent_us, UNPROVEN_DRIFT_PER_US);
+        filter.push(last_sample);
+        local_sent_us += SPACING_US;
+    }
+    assert_eq!(filter.sample_count(), 3);
+    assert!(filter.is_ready());
+
+    let later = last_sample.client_received_us + 60_000_000;
+    let estimate = filter
+        .now_us(later)
+        .expect("a ready filter reports an estimate");
+    let error = estimate - true_server_us(later, UNPROVEN_DRIFT_PER_US);
+    assert!(
+        error < -10_000,
+        "an unproven drift must not be extrapolated: the estimate should trail the truth by \
+         milliseconds, it was off by {error} µs"
+    );
+}
+
+#[test]
+fn adaptive_forgetting_needs_the_residual_to_beat_the_error_bound() {
+    // The cutoff is `ADAPTIVE_CUTOFF` times the error bound, not an absolute value: with a 100 µs
+    // bound the residual has to exceed 300 µs. A step just below it stays damped, one just above
+    // it is followed, so a cutoff that ignored the error bound would treat both alike.
+    let below = estimate_after_a_step_of(250, 100, 3);
+    let above = estimate_after_a_step_of(350, 100, 3);
+
+    assert!(
+        above > below * 3,
+        "a 350 µs residual must be followed further than a 250 µs one ({above} vs {below} µs)"
+    );
+}
+
+#[test]
+fn a_drifting_clock_is_extrapolated_with_its_drift() {
+    // A server clock that runs [`DRIFT_PER_US`] fast. Every sample is accepted, the offset grows
+    // with the run, and a filter that treated the drift as noise would be 60 ms off a minute after
+    // the last sample - the estimate's whole accuracy budget at that distance.
+    let mut filter = ClockFilter::new();
+    let mut local_sent_us = START_US;
+    let mut last_sample = drifting_sample(local_sent_us, DRIFT_PER_US);
+    for _ in 0..60 {
+        last_sample = drifting_sample(local_sent_us, DRIFT_PER_US);
+        filter.push(last_sample);
+        local_sent_us += SPACING_US;
+    }
+    assert_eq!(filter.sample_count(), 60);
+    assert!(filter.is_ready());
+    // Against the sample's own timestamp, not against the accessor: a `last_sample_us` that
+    // returned zero would otherwise agree with itself.
+    assert_eq!(filter.last_sample_us(), last_sample.client_received_us);
+
+    // At the last sample the estimate may be off by the wire delay, never by the drift.
+    let at_sample = filter
+        .now_us(last_sample.client_received_us)
+        .expect("a ready filter reports an estimate");
+    let expected_at_sample = true_server_us(last_sample.client_received_us, DRIFT_PER_US);
+    assert!(
+        (at_sample - expected_at_sample).abs() < 1_000,
+        "estimate {at_sample} is more than a delay away from {expected_at_sample}"
+    );
+
+    // A minute later only the drift term carries the estimate: 60 s at 1000 ppm is 60 ms.
+    let later = last_sample.client_received_us + 60_000_000;
+    let extrapolated = filter
+        .now_us(later)
+        .expect("a ready filter keeps reporting an estimate");
+    let expected_later = true_server_us(later, DRIFT_PER_US);
+    assert!(
+        (extrapolated - expected_later).abs() < 2_000,
+        "estimate {extrapolated} missed the drifting clock at {expected_later} by {} µs",
+        extrapolated - expected_later
+    );
+
+    // The inverse mapping has to return the same local reading, drift and rounding included.
+    for local_us in [last_sample.client_received_us, later, later + 3_600_000_000] {
+        let server_us = filter
+            .now_us(local_us)
+            .expect("a ready filter maps local time to server time");
+        let back = filter
+            .client_time_us(server_us)
+            .expect("a ready filter maps server time back");
+        assert!(
+            (back - local_us).abs() <= 2,
+            "round trip of {local_us} µs came back as {back} µs"
+        );
+    }
+}
+
 /// Feeds `prior` offset-zero samples, then `steps` samples whose server clock is one second
 /// ahead, and returns the resulting offset estimate.
 ///
 /// Every sample has an error bound of 100 µs and they are spaced [`SPACING_US`] apart.
 fn estimate_after_a_step(prior: usize, steps: usize) -> i64 {
+    estimate_after_a_step_of(1_000_000, prior, steps)
+}
+
+/// Feeds `prior` offset-zero samples, then `steps` samples whose server clock is `step_us` ahead,
+/// and returns the resulting offset estimate.
+///
+/// Every sample has an error bound of 100 µs and they are spaced [`SPACING_US`] apart.
+fn estimate_after_a_step_of(step_us: i64, prior: usize, steps: usize) -> i64 {
     let mut filter = ClockFilter::new();
     let mut local_sent_us = START_US;
     for _ in 0..prior {
@@ -277,7 +422,7 @@ fn estimate_after_a_step(prior: usize, steps: usize) -> i64 {
     }
     assert_eq!(filter.sample_count(), prior);
     for _ in 0..steps {
-        filter.push(sample(local_sent_us, 1_000_000, 100, 100));
+        filter.push(sample(local_sent_us, step_us, 100, 100));
         local_sent_us += SPACING_US;
     }
     filter
