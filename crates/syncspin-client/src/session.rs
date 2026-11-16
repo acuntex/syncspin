@@ -480,6 +480,13 @@ pub(crate) struct Session<'a> {
     reply_deadline: Option<Instant>,
     /// Transmit timestamp of the request on the wire, used to recognise its reply.
     outstanding_sent_us: Option<i64>,
+    /// Transmit timestamps of the `client/time` requests the current burst has sent.
+    ///
+    /// A reply is accepted for any of these, not only the request on the wire: a reply that arrives
+    /// after its per-message timeout is still a valid measurement of the burst, and the filter's
+    /// error bound decides how much weight it carries. A timestamp is removed when its reply is
+    /// consumed, so one request yields at most one sample even if the peer echoes it twice.
+    burst_sent_us: BTreeSet<i64>,
     /// When the current or last burst started, for periodic re-sync spacing.
     burst_started: Option<Instant>,
     /// Samples collected during the current burst; only the best one is pushed.
@@ -647,6 +654,7 @@ pub(crate) async fn attempt(
         burst_deadline: None,
         reply_deadline: None,
         outstanding_sent_us: None,
+        burst_sent_us: BTreeSet::new(),
         burst_started: None,
         burst_samples: Vec::new(),
         state_sent: false,
@@ -831,6 +839,7 @@ impl Session<'_> {
             let request = Incoming::ClientTime(ClientTime { client_transmitted });
             self.send_json(&request).await?;
             self.outstanding_sent_us = Some(client_transmitted);
+            self.burst_sent_us.insert(client_transmitted);
             self.sync_remaining -= 1;
             self.reply_deadline = Some(Instant::now() + SYNC_REPLY_TIMEOUT);
         }
@@ -860,16 +869,20 @@ impl Session<'_> {
         self.burst_deadline = Some(Instant::now() + SYNC_BURST_TIMEOUT);
         self.reply_deadline = None;
         self.outstanding_sent_us = None;
+        self.burst_sent_us.clear();
         self.burst_started = Some(Instant::now());
         self.burst_samples.clear();
     }
 
     /// Handles a deadline that fired while the session was waiting.
     ///
-    /// A per-message clock timeout moves the burst on to its next request; when the last request
-    /// has no reply, or the overall burst deadline elapsed, the burst ends with the measurements it
-    /// has. The pairing attempt's timeout is checked first, because it ends the attempt instead of
-    /// continuing it.
+    /// A per-message clock timeout moves the burst on to its next request. When the last request
+    /// times out the burst ends unless it holds no sample yet: in the usual case a late reply is
+    /// worse for the estimate, and finishing early saves the first state report's latency, which is
+    /// worth more than the chance of a better last sample. The next re-sync burst recovers whatever
+    /// this costs. A burst with nothing buffered has everything to gain from waiting for late replies
+    /// until its deadline. The pairing attempt's timeout is checked first, because it ends the
+    /// attempt instead of continuing it.
     async fn handle_clock_timeout(&mut self) -> Result<()> {
         if self
             .pairing_deadline()
@@ -883,10 +896,18 @@ impl Session<'_> {
         if burst_expired {
             return self.finish_burst().await;
         }
+        // A per-message timeout only releases the request on the wire so the next one can go out.
         self.reply_deadline = None;
         self.outstanding_sent_us = None;
         if self.sync_remaining == 0 {
-            self.finish_burst().await?;
+            // The last request just timed out. In the usual case a late reply is worse for the
+            // estimate, and ending the burst now saves the first state report's latency, which is
+            // worth more than the chance of a better last sample. The next re-sync burst recovers
+            // whatever this costs. With nothing buffered, a late reply is the only hope of a sample,
+            // so the burst stays open until its deadline.
+            if !self.burst_samples.is_empty() {
+                self.finish_burst().await?;
+            }
         }
         Ok(())
     }
@@ -897,6 +918,7 @@ impl Session<'_> {
         self.burst_deadline = None;
         self.reply_deadline = None;
         self.outstanding_sent_us = None;
+        self.burst_sent_us.clear();
         if let Some(sample) = best_sample(&self.burst_samples) {
             self.clock.push(sample);
         }
@@ -1106,6 +1128,7 @@ impl Session<'_> {
         self.burst_deadline = None;
         self.reply_deadline = None;
         self.outstanding_sent_us = None;
+        self.burst_sent_us.clear();
         self.burst_samples.clear();
     }
 
@@ -1781,27 +1804,38 @@ impl Session<'_> {
 
     /// Feeds one `server/time` reply into the current burst.
     ///
-    /// Only the reply to the request on the wire is used: its `client_transmitted` has to match
-    /// the request. An unsolicited, late or mis-echoed `server_time` is ignored, because the next
-    /// request may already be on the wire.
+    /// A reply is accepted when the current burst sent its request, not only when the request is
+    /// the one on the wire: a reply that arrives after its per-message timeout is still a valid
+    /// measurement of the burst, and the filter's error bound decides how much weight it carries.
+    /// An unsolicited or mis-echoed `server_time` - one whose `client_transmitted` the burst never
+    /// sent - is ignored. Consuming a timestamp removes it, so one request yields at most one
+    /// sample even if the peer echoes it twice.
     async fn handle_server_time(&mut self, time: ServerTime) -> Result<()> {
-        if self.reply_deadline.is_none()
-            || self.outstanding_sent_us != Some(time.client_transmitted)
-        {
+        if !self.burst_sent_us.remove(&time.client_transmitted) {
             return Ok(());
         }
-        self.outstanding_sent_us = None;
         self.burst_samples.push(TimeSample {
             client_sent_us: time.client_transmitted,
             server_received_us: time.server_received,
             server_sent_us: time.server_transmitted,
             client_received_us: now_us(),
         });
-        self.reply_deadline = None;
+
+        // Only the reply to the request on the wire ends its wait; a late reply for an earlier
+        // request of the same burst leaves the next request in flight, so its deadline stands.
+        if self.outstanding_sent_us == Some(time.client_transmitted) {
+            self.outstanding_sent_us = None;
+            self.reply_deadline = None;
+        }
 
         // The state is reported by `finish_burst`, once the filter has a measurement: the spec
-        // does not allow a player to report before its clock estimate has one.
-        if self.sync_remaining == 0 {
+        // does not allow a player to report before its clock estimate has one. The burst ends early
+        // only once every request it sent has been answered; a request that timed out keeps the set
+        // non-empty, so the burst stays open for late replies until its deadline.
+        if self.sync_remaining == 0
+            && self.reply_deadline.is_none()
+            && self.burst_sent_us.is_empty()
+        {
             self.finish_burst().await?;
         }
         Ok(())
@@ -3363,6 +3397,7 @@ mod tests {
             burst_deadline: None,
             reply_deadline: None,
             outstanding_sent_us: None,
+            burst_sent_us: BTreeSet::new(),
             burst_started: None,
             burst_samples: Vec::new(),
             state_sent: false,
@@ -4241,6 +4276,44 @@ mod tests {
         assert!(
             session.pairing.is_none(),
             "the attempt is consumed even when the record cannot be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_time_reply_yields_one_sample() {
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+        session.start_burst();
+        let transmitted = now_us();
+        session.burst_sent_us.insert(transmitted);
+
+        let reply = ServerTime {
+            client_transmitted: transmitted,
+            server_received: transmitted + 1,
+            server_transmitted: transmitted + 1,
+        };
+        session
+            .handle_server_time(reply)
+            .await
+            .expect("a reply for a request this burst sent is accepted");
+        session
+            .handle_server_time(reply)
+            .await
+            .expect("a duplicate reply is ignored, not an error");
+
+        assert_eq!(
+            session.burst_samples.len(),
+            1,
+            "one request yields at most one sample even if the peer echoes it twice"
         );
     }
 }

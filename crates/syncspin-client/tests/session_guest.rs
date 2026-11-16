@@ -1114,6 +1114,59 @@ async fn audio_is_delivered_before_the_clock_is_ready() {
 }
 
 #[tokio::test]
+async fn a_late_time_reply_still_forms_the_clock_estimate() {
+    let options = ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // Answer every `client/time` request, but only after the per-message timeout, so each reply is
+    // late. A reply that arrives after its request timed out is still a measurement of the burst,
+    // so the clock estimate forms and a later playout deadline moves into the future. The client
+    // stops asking only once the filter is ready, so keep answering until the next request fails
+    // to arrive within the quiet window.
+    let mut answered = 0usize;
+    loop {
+        if answered >= 40 {
+            break;
+        }
+        let transmitted =
+            match tokio::time::timeout(Duration::from_millis(1500), server.next_time_request())
+                .await
+            {
+                Ok(Some(transmitted)) => transmitted,
+                Ok(None) => panic!("the connection closed while the clock estimate was forming"),
+                Err(_) => break,
+            };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        server.answer_time(transmitted);
+        answered += 1;
+    }
+
+    // The estimate is ready, so a server timestamp ahead of now becomes a future playout deadline.
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    let timestamp = now_us() + 1_000_000;
+    server.audio(timestamp, 250_000, vec![0x33; 64]);
+
+    let written = wait_for_writes(&recordings, 1).await;
+    let due = written[0].due;
+    let now = Instant::now();
+    assert!(
+        due > now + Duration::from_millis(100),
+        "the deadline {due:?} must be ahead of now {now:?}"
+    );
+}
+
+#[tokio::test]
 async fn the_initial_state_is_sent_after_a_single_time_reply() {
     let options = ServerOptions {
         answer_time_limit: Some(1),
@@ -1147,6 +1200,42 @@ async fn the_initial_state_is_sent_after_two_time_replies() {
     // the burst's last timeout.
     let state = wait_for_client_state(&mut server).await;
     assert!(state.available);
+}
+
+#[tokio::test]
+async fn a_burst_with_a_sample_does_not_wait_for_a_lost_last_reply() {
+    let options = ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // Answer the first seven requests of the burst immediately, so the burst already holds a sample,
+    // and withhold the eighth. A reply for the eighth can never beat what is buffered, so the state
+    // report must follow the eighth request's timeout, not the two-second burst deadline.
+    for _ in 0..7 {
+        let transmitted = server
+            .next_time_request()
+            .await
+            .expect("the client must keep asking for time");
+        server.answer_time(transmitted);
+    }
+    assert!(
+        server.next_time_request().await.is_some(),
+        "the eighth request must arrive"
+    );
+    let withheld_at = Instant::now();
+
+    let state = wait_for_client_state(&mut server).await;
+    assert!(state.available);
+    assert!(
+        withheld_at.elapsed() < Duration::from_secs(1),
+        "the state report must follow the last request's timeout, not the two-second burst deadline"
+    );
 }
 
 #[tokio::test]
