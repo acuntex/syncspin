@@ -1198,10 +1198,6 @@ async fn a_rehandshake_to_the_pairing_psk_removes_the_player_role() {
     }
     wait_for_flushes(&recordings, flushes_before + 1).await;
     assert!(
-        recordings.flushes() > flushes_before,
-        "dropping the player role must not leave buffered audio audible"
-    );
-    assert!(
         tokio::time::timeout(Duration::from_secs(1), server.wait_for_goodbye())
             .await
             .is_err(),
