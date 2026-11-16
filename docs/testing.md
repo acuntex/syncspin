@@ -161,15 +161,27 @@ its identity in a file. This section is the acceptance checklist for that player
 that replaces the sink is checked the same way. Read each item as an acceptance criterion and tick
 it against the running server.
 
+**Performed 2026-11-16** against a Music Assistant 2.10 server with the Sendspin provider, and the
+chain held end to end: connection over Noise, `server/activate` with `player@v1`, `stream/start` with
+`pcm 48000 Hz, 2 channels, 16-bit`, track metadata, and audio frames reaching the sink. Two things the
+run taught that the checklist below did not know:
+
+- **That provider has no unpaired-access switch and no approval control.** Its only pairing input is a
+  token field, so a client must pair before the server will play to it. An unpaired client is listed
+  and receives state, but never a stream.
+- **It sends a `group_id` that is not 43 base64url characters** (a UUID), which the specification calls
+  a protocol error. The client accepts it as an opaque string and says so once — see
+  [`spec-deviations.md`](spec-deviations.md). Before that tolerance existed, every session against this
+  server closed and retried.
+
 ### What to start
 
 1. A Music Assistant server with the **Sendspin provider** enabled — the server side of the protocol.
-   Note the address and path it listens on (`ws://<server>:8927/sendspin` is the convention) and turn
-   on **unpaired access** (`unpaired_access`) in that provider's settings for the run. The guest
-   session announces `unpaired_access` with `enabled: true`; without the server-side setting an
-   unpaired session is kept out of playback, which is a configuration result, not a library failure.
-   Whether the provider implements the pairing activity is not assumed here: if it does not, the
-   pairing checklist below cannot run.
+   Note the address and path it listens on (`ws://<server>:8927/sendspin` is the convention). Where the
+   provider offers an **unpaired access** (`unpaired_access`) setting, a guest session reaches playback
+   without it; when it offers none, as Music Assistant 2.10 does, pair the client first — the server
+   lists an unpaired client but never streams to it. Whether the provider implements the pairing
+   activity is not assumed here: if it does not, the pairing checklist below cannot run.
 2. The example player, pointed at that address:
 
    ```sh
