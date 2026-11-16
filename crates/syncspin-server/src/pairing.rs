@@ -1403,6 +1403,8 @@ mod tests {
     #[test]
     fn a_pair_retry_out_of_sequence_is_refused() {
         let mut attempt = static_attempt();
+        // In the phase the retry belongs to, so only the method clause can refuse.
+        attempt.phase = Phase::AwaitClientConfirm;
         let error = refusal(attempt.on_client_retry());
         assert!(
             format!("{error:#}").contains("out of sequence"),
