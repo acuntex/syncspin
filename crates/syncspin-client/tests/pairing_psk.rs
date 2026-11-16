@@ -230,6 +230,19 @@ async fn wait_for_open(recordings: &Recordings) {
     }
 }
 
+/// Waits until the sink was flushed at least `count` times.
+async fn wait_for_flushes(recordings: &Recordings, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while recordings.flushes() < count {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} sink flushes, saw {}",
+            recordings.flushes()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Builds a configuration for `server` with the given store.
 fn config_for(server: &FakeServer, storage: Option<Arc<dyn Storage>>) -> ClientConfig {
     ClientConfig {
@@ -1171,6 +1184,9 @@ async fn a_rehandshake_to_the_pairing_psk_removes_the_player_role() {
     ));
     wait_for_open(&recordings).await;
 
+    // Losing the player role must not leave the audio it buffered audible, and the flush is what
+    // the clearing in `apply_activate` buys.
+    let flushes_before = recordings.flushes();
     server.rehandshake(pairing_psk, "pr");
     assert!(
         server.wait_for_rehandshake().await,
@@ -1180,6 +1196,11 @@ async fn a_rehandshake_to_the_pairing_psk_removes_the_player_role() {
         Event::StreamEnd { reason } => assert_eq!(reason, StreamEndReason::RoleRemoved),
         other => panic!("expected StreamEnd(RoleRemoved), got {other:?}"),
     }
+    wait_for_flushes(&recordings, flushes_before + 1).await;
+    assert!(
+        recordings.flushes() > flushes_before,
+        "dropping the player role must not leave buffered audio audible"
+    );
     assert!(
         tokio::time::timeout(Duration::from_secs(1), server.wait_for_goodbye())
             .await

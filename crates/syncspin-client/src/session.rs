@@ -3793,6 +3793,10 @@ mod tests {
             "unpaired access alone makes a guest playback-capable"
         );
         assert!(
+            playback_capable_for(MatchedPsk::Sentinel, true, &["pairing".to_owned()]),
+            "declaring pairing does not take playback capability away"
+        );
+        assert!(
             !playback_capable_for(MatchedPsk::Sentinel, false, &[]),
             "a guest without unpaired access is not playback-capable"
         );
@@ -3800,27 +3804,6 @@ mod tests {
             !playback_capable_for(MatchedPsk::Sentinel, false, &["pairing".to_owned()]),
             "declaring pairing does not add playback capability"
         );
-    }
-
-    #[test]
-    fn playback_capability_follows_the_setting_and_the_psk() {
-        let pairing_only = vec!["pairing".to_owned()];
-        assert!(!playback_capable_for(
-            MatchedPsk::Sentinel,
-            false,
-            &pairing_only
-        ));
-        assert!(playback_capable_for(
-            MatchedPsk::Sentinel,
-            true,
-            &pairing_only
-        ));
-        assert!(playback_capable_for(
-            MatchedPsk::Stored(PskCategory::LongTerm),
-            false,
-            &[]
-        ));
-        assert!(!playback_capable_for(MatchedPsk::Sentinel, false, &[]));
     }
 
     #[test]
