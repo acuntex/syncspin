@@ -110,17 +110,22 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
         }
     }
 
-    // 480 stereo frames of 16-bit PCM are 10 ms at 48 kHz. Frames that arrive while the clock
-    // estimate is still forming carry `now`, so the test keeps writing until the server's lead
-    // shows: that is the deadline the scheduling promise is about. Each write is paced at the
-    // playtime of the chunk, because a writer that ran ahead of the timeline would push the
-    // deadlines into the past and prove nothing.
+    // 480 stereo frames of 16-bit PCM are 10 ms at 48 kHz. The server seeds the stream timeline one
+    // start lead ahead of now and advances it by the chunk playtime, so the lead lasts twenty chunks
+    // of audio. The client schedules from its clock estimate only after three bursts; a machine that
+    // delays those bursts longer than the lead leaves the timeline permanently behind, and every
+    // later stamp lands in the past, which the client plays immediately. Seeking re-seeds the
+    // timeline at now plus the lead and gives the estimate a fresh window, so what this loop waits
+    // for is the estimate, not the writer's luck. Each write is paced at the playtime of the chunk,
+    // because a writer that ran ahead of the timeline would push the deadlines into the past and
+    // prove nothing.
     let chunk = [9u8; 480 * 4];
     let give_up = Instant::now() + TIMEOUT;
     let (arrival, due) = 'frames: loop {
         if Instant::now() >= give_up {
             bail!("no frame arrived with a playout deadline ahead of its arrival");
         }
+        writer.seek(Duration::ZERO);
         writer.write(&chunk);
         tokio::time::sleep(CHUNK).await;
         while let Ok((arrival, due, length)) = received.try_recv() {
