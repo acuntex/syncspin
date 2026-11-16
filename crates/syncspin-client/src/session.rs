@@ -1117,7 +1117,23 @@ impl Session<'_> {
     async fn apply_activate(&mut self, activate: ServerActivate) -> Result<()> {
         // A refused activation ends the connection, so it is decided before anything is changed:
         // an activation this client will not honour must leave no half-applied state behind.
-        match admit_activation(self.matched, self.config.unpaired_access, &activate) {
+        //
+        // Rule 1's counterfactual - "would enabling unpaired access admit this?" - needs the whole
+        // of admissibility, pairing method included, so the guard is told before it decides whether
+        // the declared method is acceptable on this connection. A malformed pairing activation
+        // (declares `pairing` without its parameters) stays `true` so the guard decides first and
+        // the protocol error still surfaces below.
+        let pairing_admissible = match admits_pairing(&activate) {
+            Ok(None) => true,
+            Ok(Some(activation)) => self.admitted_method(&activation).is_some(),
+            Err(_) => true,
+        };
+        match admit_activation(
+            self.matched,
+            self.config.unpaired_access,
+            pairing_admissible,
+            &activate,
+        ) {
             Admitted::Admissible => {}
             refusal => return self.refuse_activation(refusal).await,
         }
@@ -2748,6 +2764,12 @@ fn activation_admissible(
 
 /// Decides whether this client honours a `server/activate`.
 ///
+/// `pairing_admissible` is whether the declared pairing method is acceptable on this connection,
+/// `true` also when the activation declares no pairing activity. It belongs in rule 1's
+/// counterfactual because admissibility includes it: an activation whose method the matched key or
+/// this client would refuse stays refused whatever the setting, so answering `pairing_required`
+/// there would invite a host into a pairing flow no setting can admit.
+///
 /// The two refusal reasons are ordered as `messaging.md` orders them. Rule 1 asks whether the
 /// setting is the only obstacle, rule 2 covers everything else; reversing them turns every guest
 /// refusal into `unauthorized` and leaves a server unable to tell "pair with me" from "you sent
@@ -2755,13 +2777,19 @@ fn activation_admissible(
 pub(crate) fn admit_activation(
     matched: MatchedPsk,
     unpaired_access: bool,
+    pairing_admissible: bool,
     activate: &ServerActivate,
 ) -> Admitted {
     if activation_admissible(matched, unpaired_access, activate) {
         return Admitted::Admissible;
     }
-    // Rule 1: unpaired access is off, and turning it on would have admitted this activation.
-    if !unpaired_access && !is_paired(matched) && activation_admissible(matched, true, activate) {
+    // Rule 1: unpaired access is off, and turning it on would have admitted this activation -
+    // activity set, roles and pairing method together.
+    if !unpaired_access
+        && !is_paired(matched)
+        && pairing_admissible
+        && activation_admissible(matched, true, activate)
+    {
         return Admitted::PairingRequired;
     }
     // Rule 2: no setting admits it - the activity set is wrong for the key, or a role was never
@@ -3543,7 +3571,7 @@ mod tests {
         );
         for unpaired_access in [true, false] {
             assert_eq!(
-                admit_activation(LONG_TERM, unpaired_access, &activate),
+                admit_activation(LONG_TERM, unpaired_access, true, &activate),
                 Admitted::Admissible
             );
         }
@@ -3552,7 +3580,7 @@ mod tests {
     #[test]
     fn a_paired_session_may_not_declare_the_pairing_activity() {
         assert_eq!(
-            admit_activation(LONG_TERM, true, &activation(&["pairing"], None)),
+            admit_activation(LONG_TERM, true, true, &activation(&["pairing"], None)),
             Admitted::Unauthorized,
             "a connection keyed by a long-term PSK has nothing left to pair"
         );
@@ -3561,7 +3589,12 @@ mod tests {
     #[test]
     fn a_paired_session_may_not_declare_an_unknown_activity() {
         assert_eq!(
-            admit_activation(LONG_TERM, true, &activation(&["playback", "kiosk"], None)),
+            admit_activation(
+                LONG_TERM,
+                true,
+                true,
+                &activation(&["playback", "kiosk"], None)
+            ),
             Admitted::Unauthorized
         );
     }
@@ -3571,6 +3604,7 @@ mod tests {
         assert_eq!(
             admit_activation(
                 LONG_TERM,
+                true,
                 true,
                 &activation(&["playback", "playback"], None)
             ),
@@ -3585,7 +3619,7 @@ mod tests {
         for matched in [MatchedPsk::Sentinel, MatchedPsk::PairingPsk, LONG_TERM] {
             for unpaired_access in [true, false] {
                 assert_eq!(
-                    admit_activation(matched, unpaired_access, &activate),
+                    admit_activation(matched, unpaired_access, true, &activate),
                     Admitted::Admissible,
                     "{matched:?} with unpaired access {unpaired_access}"
                 );
@@ -3596,7 +3630,12 @@ mod tests {
     #[test]
     fn a_guest_may_pair_with_unpaired_access_off() {
         assert_eq!(
-            admit_activation(MatchedPsk::Sentinel, false, &activation(&["pairing"], None)),
+            admit_activation(
+                MatchedPsk::Sentinel,
+                false,
+                true,
+                &activation(&["pairing"], None)
+            ),
             Admitted::Admissible,
             "both pairing flows run over a Sentinel-keyed session"
         );
@@ -3608,6 +3647,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
+                true,
                 &activation(&["playback"], Some(&["player@v1"]))
             ),
             Admitted::PairingRequired
@@ -3620,6 +3660,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
+                true,
                 &activation(&[], Some(&["player@v1"]))
             ),
             Admitted::PairingRequired,
@@ -3633,6 +3674,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
+                true,
                 &activation(&["playback"], Some(&["source@v1"]))
             ),
             Admitted::Unauthorized,
@@ -3646,9 +3688,35 @@ mod tests {
             admit_activation(
                 MatchedPsk::PairingPsk,
                 false,
+                true,
                 &activation(&["playback"], Some(&["player@v1"]))
             ),
             Admitted::PairingRequired
+        );
+    }
+
+    #[test]
+    fn rule_1_requires_an_admissible_pairing_method() {
+        // The doubly-bad shape: `playback` needs unpaired access, and the declared method is not
+        // admissible on a Sentinel-keyed connection (it is the Pairing PSK method, and there is no
+        // store). Enabling unpaired access would still not admit it, so rule 1 must not answer.
+        let activate = ServerActivate {
+            activities: vec!["playback".to_owned(), "pairing".to_owned()],
+            active_roles: Some(vec!["player@v1".to_owned()]),
+            pairing: Some(PairingActivation {
+                method: "pairing_psk".to_owned(),
+                format: None,
+            }),
+        };
+        assert_eq!(
+            admit_activation(MatchedPsk::Sentinel, false, true, &activate),
+            Admitted::PairingRequired,
+            "with the method assumed acceptable, enabling unpaired access admits the activation"
+        );
+        assert_eq!(
+            admit_activation(MatchedPsk::Sentinel, false, false, &activate),
+            Admitted::Unauthorized,
+            "the wrong method keeps the activation refused whatever the setting"
         );
     }
 
@@ -3657,6 +3725,7 @@ mod tests {
         assert_eq!(
             admit_activation(
                 MatchedPsk::Sentinel,
+                true,
                 true,
                 &activation(&[], Some(&["player@v1"]))
             ),
@@ -3667,7 +3736,12 @@ mod tests {
     #[test]
     fn a_paired_session_keeps_roles_without_the_playback_activity() {
         assert_eq!(
-            admit_activation(LONG_TERM, false, &activation(&[], Some(&["player@v1"]))),
+            admit_activation(
+                LONG_TERM,
+                false,
+                true,
+                &activation(&[], Some(&["player@v1"]))
+            ),
             Admitted::Admissible
         );
     }

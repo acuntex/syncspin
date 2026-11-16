@@ -2632,6 +2632,42 @@ async fn a_repeated_activity_closes_the_connection_as_unauthorized() {
 }
 
 #[tokio::test]
+async fn a_wrong_pairing_method_closes_as_unauthorized_not_pairing_required() {
+    // `playback` needs unpaired access and the declared method is not admissible on a
+    // Sentinel-keyed connection without a store, so enabling the setting would not admit the
+    // activation: rule 1 must not fire, and no `Event::PairingRequired` may separate `Connected`
+    // from `Disconnected`.
+    let options = ServerOptions {
+        first_activate: Some(ServerActivate {
+            activities: vec!["playback".to_owned(), "pairing".to_owned()],
+            active_roles: Some(vec!["player@v1".to_owned()]),
+            pairing: Some(PairingActivation {
+                method: "pairing_psk".to_owned(),
+                format: None,
+            }),
+        }),
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (_handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+    expect_connected(&mut events, &server).await;
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("unauthorized"),
+        "the wrong method keeps the activation refused whatever the setting"
+    );
+    match next_event(&mut events).await {
+        Event::Disconnected { .. } => {}
+        other => panic!("expected Disconnected directly after Connected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_credential_mismatch_does_not_hide_the_refused_activation() {
     // The server announces a long-term key this client never held and seals with the Sentinel key,
     // so the handshake reports the mismatch; the harness's default playback activation is then
