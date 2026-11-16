@@ -257,8 +257,14 @@ Steps, for the next run:
      --static-code <8 digits> --open-window
    ```
 
-   The operator configures the same eight-digit code on both sides. This flow has not run against a
-   real server either.
+   The operator configures the same eight-digit code on both sides.
+
+   **Not exerciseable against Music Assistant 2.10.** Its Sendspin provider exposes three settings —
+   log level, manual discovery addresses and "allow legacy clients" — and no pairing method or code
+   entry; the provider's only pairing command in the API pairs Music Assistant's own web player. A
+   client that connects with `--static-code` and an open window is never sent a code activation: it
+   stays a guest, with the window open and nothing to answer. The flows remain verified against the
+   fake server only, and this is a server-side gap, not an untested client.
 
 If a step fails, the client's stderr names the event or the abort reason and the server log shows
 what it sent. Record both before filing an issue, with the token and all key material removed.
