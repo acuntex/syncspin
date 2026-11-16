@@ -9,9 +9,10 @@
 //! Without that feature the module is the trait and the records alone: nothing listens.
 //!
 //! The mDNS backend lives behind the `mdns` feature; without it, [`Discovery`] is the seam and the
-//! host supplies the implementation. No protocol logic here opens a socket or joins a multicast
-//! group, and the tests drive the advertising with a fake instead of a network. The listener itself
-//! binds a real address, because it has to: it is the endpoint the advertisement names.
+//! host supplies the implementation. The protocol logic here opens no socket of its own: a browse
+//! asks the host's backend, and [`discover_reachable_endpoint`] only probes an address the backend
+//! already reported. The tests drive the advertising with a fake instead of a network. The inbound
+//! listener binds a real address, because it has to: it is the endpoint the advertisement names.
 //!
 //! The inbound connection runs the same session as a dialled one. Only the WebSocket is different:
 //! the server opened it, so the client answers the upgrade instead of sending it, and it rejects
@@ -21,7 +22,11 @@
 //! cross-origin authorisation, not the protocol's. The Noise handshake is unchanged, because the
 //! server is its initiator in both directions.
 
-use anyhow::Result;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use tokio::net::TcpStream;
 
 /// Service type a client publishes when it waits for a server to connect.
 ///
@@ -76,7 +81,10 @@ impl ServiceAdvertisement {
 /// One server a browser reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredServer {
-    /// `host:port` addresses the browser resolved for the service, most suitable first.
+    /// `host:port` addresses the browser resolved for the service.
+    ///
+    /// [`endpoints`](DiscoveredServer::endpoints) orders them IPv4 first; the vector itself keeps
+    /// whatever order the backend reported.
     pub addresses: Vec<String>,
     /// The `path` TXT record the service published.
     pub path: String,
@@ -87,22 +95,118 @@ pub struct DiscoveredServer {
 impl DiscoveredServer {
     /// Returns the `ws://` endpoint to dial, or `None` when the record cannot name one.
     ///
+    /// This is the first of [`endpoints`](DiscoveredServer::endpoints), so it is the IPv4 address
+    /// when the record has one.
+    #[must_use]
+    pub fn endpoint(&self) -> Option<String> {
+        self.endpoints().into_iter().next()
+    }
+
+    /// Returns every `ws://` endpoint the record names, IPv4 addresses first.
+    ///
     /// The scheme is `ws://` even though the path is advertised: `connection.md` requires a
     /// connection to an advertised address to use plain `ws://`, with confidentiality and integrity
     /// provided by the Noise layer inside the payloads. An address that carries a scheme already,
-    /// a missing address and a path that is not `path-absolute` (RFC 3986) all yield `None`,
+    /// a missing address and a path that is not `path-absolute` (RFC 3986) all yield nothing,
     /// because dialling them would mean guessing what the advertiser meant.
+    ///
+    /// An mDNS record commonly resolves to several addresses for one service - a dual-stack host
+    /// publishes both. The IPv4 addresses come first so a server that listens on a single IPv4
+    /// wildcard is reached before a client spends a timeout on an IPv6 address nothing accepts; the
+    /// relative order within each family is kept. A record with no valid address yields an empty
+    /// list.
     #[must_use]
-    pub fn endpoint(&self) -> Option<String> {
-        let address = self.addresses.first()?;
-        if address.contains("://") {
-            return None;
-        }
-        if !self.path.starts_with('/') || self.path.starts_with("//") {
-            return None;
-        }
-        Some(format!("ws://{address}{}", self.path))
+    pub fn endpoints(&self) -> Vec<String> {
+        self.ordered_addresses()
+            .into_iter()
+            .map(|address| format!("ws://{address}{}", self.path))
+            .collect()
     }
+
+    /// Returns the usable addresses, IPv4 first.
+    ///
+    /// The path rule is part of the address rule because an endpoint is only dialable when both
+    /// hold; a record with a relative path yields no candidates at all.
+    fn ordered_addresses(&self) -> Vec<&str> {
+        if !self.path.starts_with('/') || self.path.starts_with("//") {
+            return Vec::new();
+        }
+        let mut addresses: Vec<&str> = self
+            .addresses
+            .iter()
+            .map(String::as_str)
+            .filter(|address| !address.contains("://"))
+            .collect();
+        // A stable sort keeps the browser's order inside each family. A host name that is not a
+        // literal socket address sorts with IPv6, after the addresses that are certainly IPv4.
+        addresses.sort_by_key(|address| match address.parse::<SocketAddr>() {
+            Ok(address) if address.is_ipv4() => 0u8,
+            _ => 1u8,
+        });
+        addresses
+    }
+}
+
+/// How long one advertised address gets to accept before the next one is tried.
+///
+/// A refused connection returns at once; the timeout only bounds an address that silently drops
+/// the attempt, such as a stale IPv6 entry on a network without a route to it.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Returns the first endpoint `discovery` reports that accepts a TCP connection.
+///
+/// A browse can report one service with several addresses, and a dual-stack host commonly does.
+/// Trying only the first means an IPv6 address the server does not listen on hides an IPv4 address
+/// it does, and the client retries the same unreachable one forever. This walks the candidates in
+/// the order [`DiscoveredServer::endpoints`] gives - IPv4 first - and stops at the first address
+/// that accepts. A failure moves to the next address immediately instead of waiting for a retry
+/// tick.
+///
+/// The probe is a TCP connection only: it decides reachability, and the session dials the returned
+/// endpoint itself. A host therefore sees one closed probe connection before the real one.
+///
+/// # Errors
+/// Returns the backend's error, an error when nothing advertises a dialable endpoint, and an error
+/// naming every attempt once all addresses refused or timed out. A backend error is not retried
+/// here; the caller decides whether to browse again.
+pub async fn discover_reachable_endpoint(discovery: &dyn Discovery) -> Result<String> {
+    let servers = discover_servers(discovery)?;
+    let candidates: Vec<(String, String)> = servers
+        .iter()
+        .flat_map(|server| {
+            server
+                .ordered_addresses()
+                .into_iter()
+                .map(|address| (address.to_owned(), format!("ws://{address}{}", server.path)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if candidates.is_empty() {
+        bail!(
+            "no server advertised {SERVER_SERVICE_TYPE} with a dialable address; start one with \
+             `server-demo --mdns` or pass --server"
+        );
+    }
+    let mut failures = Vec::new();
+    for (address, endpoint) in candidates {
+        match probe(&address).await {
+            Ok(()) => return Ok(endpoint),
+            Err(error) => failures.push(format!("{address}: {error:#}")),
+        }
+    }
+    bail!(
+        "none of the discovered servers accepted a connection ({})",
+        failures.join("; ")
+    )
+}
+
+/// Opens and immediately drops one TCP connection, to tell a reachable address from a dead one.
+async fn probe(address: &str) -> Result<()> {
+    // Dropping the stream closes the probe; it only decides reachability.
+    tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(address))
+        .await
+        .with_context(|| format!("no answer within {} s", PROBE_TIMEOUT.as_secs()))??;
+    Ok(())
 }
 
 /// How a service is published and how remote ones are found.
@@ -691,6 +795,108 @@ mod tests {
                 "a record that does not name a ws:// endpoint is not dialled"
             );
         }
+    }
+
+    /// A record with several addresses names the IPv4 ones first, keeping each family's order.
+    #[test]
+    fn a_dual_stack_record_lists_its_ipv4_addresses_first() {
+        let server = DiscoveredServer {
+            addresses: vec![
+                "[fd41::2]:8927".to_owned(),
+                "[fd41::1]:8927".to_owned(),
+                "192.0.2.8:8927".to_owned(),
+                "192.0.2.7:8927".to_owned(),
+            ],
+            path: "/sendspin".to_owned(),
+            name: None,
+        };
+        assert_eq!(
+            server.endpoints(),
+            vec![
+                "ws://192.0.2.8:8927/sendspin".to_owned(),
+                "ws://192.0.2.7:8927/sendspin".to_owned(),
+                "ws://[fd41::2]:8927/sendspin".to_owned(),
+                "ws://[fd41::1]:8927/sendspin".to_owned(),
+            ],
+            "IPv4 comes first and the browser's order within each family is kept"
+        );
+        assert_eq!(
+            server.endpoint().as_deref(),
+            Some("ws://192.0.2.8:8927/sendspin"),
+            "endpoint is the first of the ordered list"
+        );
+    }
+
+    /// An address that refuses does not consume the attempt: the next one is tried at once.
+    #[tokio::test]
+    async fn the_next_address_is_tried_when_the_first_refuses() {
+        // A listener that accepts the probe, so the second address is the one that works.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the loopback listener binds");
+        let accepting = listener
+            .local_addr()
+            .expect("the bound address is readable");
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        // A port nobody listens on: binding it and dropping the listener makes the connect refuse.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the second loopback listener binds");
+        let refusing = closed.local_addr().expect("the bound address is readable");
+        drop(closed);
+
+        let discovery = MemoryDiscovery {
+            servers: vec![DiscoveredServer {
+                addresses: vec![refusing.to_string(), accepting.to_string()],
+                path: "/sendspin".to_owned(),
+                name: Some("A server".to_owned()),
+            }],
+            ..MemoryDiscovery::default()
+        };
+        let endpoint = discover_reachable_endpoint(&discovery)
+            .await
+            .expect("the second address accepts");
+        assert_eq!(endpoint, format!("ws://{accepting}/sendspin"));
+        accept.await.expect("the accepting task finishes");
+    }
+
+    /// When every address refuses, the error names all of them instead of only the first.
+    #[tokio::test]
+    async fn an_error_names_every_address_that_refused() {
+        let first_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the first loopback listener binds");
+        let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the second loopback listener binds");
+        let first = first_listener
+            .local_addr()
+            .expect("the bound address is readable");
+        let second = second_listener
+            .local_addr()
+            .expect("the bound address is readable");
+        assert_ne!(first, second, "two ephemeral listeners get two ports");
+        // Releasing both makes every connect to them refuse.
+        drop(first_listener);
+        drop(second_listener);
+
+        let discovery = MemoryDiscovery {
+            servers: vec![DiscoveredServer {
+                addresses: vec![first.to_string(), second.to_string()],
+                path: "/sendspin".to_owned(),
+                name: None,
+            }],
+            ..MemoryDiscovery::default()
+        };
+        let Err(error) = discover_reachable_endpoint(&discovery).await else {
+            panic!("both addresses refuse");
+        };
+        let text = format!("{error:#}");
+        assert!(text.contains(&first.to_string()), "got: {text}");
+        assert!(text.contains(&second.to_string()), "got: {text}");
     }
 
     /// Browsing always asks for the server service type; the client never looks for clients.

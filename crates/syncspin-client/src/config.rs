@@ -289,6 +289,18 @@ pub struct ClientConfig {
     /// [`Event::Disconnected`](crate::Event::Disconnected) and waits it before the next attempt;
     /// [`next_backoff`](crate::next_backoff) never returns more than this.
     pub max_backoff: Duration,
+    /// Whether a `group_id` outside the spec's 43 base64url characters closes the connection.
+    ///
+    /// The spec makes such a value a protocol error, and with `true` the client behaves that way:
+    /// the attempt ends and [`Event::Disconnected`](crate::Event::Disconnected) reports why.
+    ///
+    /// The default is `false`. A non-canonical but well-formed identifier - non-empty, at most 128
+    /// bytes, valid UTF-8 without control characters - is then accepted as an opaque string and
+    /// reported once per connection as [`Event::GroupIdNotCanonical`](crate::Event::GroupIdNotCanonical).
+    /// That tolerance exists because a real server sends a UUID instead; see
+    /// `docs/spec-deviations.md`. A host that talks to a conformant server, or that wants the
+    /// spec's rule enforced, sets this to `true`.
+    pub strict_group_id: bool,
     /// How long one pairing attempt may run, measured from `client/pair-init`.
     ///
     /// On expiry the client sends `pair/abort` with reason `attempt_timeout` and reports
@@ -367,6 +379,7 @@ impl fmt::Debug for ClientConfig {
             .field("muted", &self.muted)
             .field("volume_policy", &self.volume_policy)
             .field("max_backoff", &self.max_backoff)
+            .field("strict_group_id", &self.strict_group_id)
             .field("pairing_timeout", &self.pairing_timeout);
         // The static code is a credential, so it is named but never printed.
         #[cfg(feature = "pairing-code")]
@@ -392,7 +405,8 @@ impl ClientConfig {
     ///
     /// Everything a host rarely changes starts at a documented value: no device description, no
     /// pairing store, [`AudioMode::Decode`], volume 100 and unmuted, [`VolumePolicy::default`],
-    /// [`DEFAULT_MAX_BACKOFF`] and [`DEFAULT_PAIRING_TIMEOUT`](crate::DEFAULT_PAIRING_TIMEOUT). A
+    /// [`DEFAULT_MAX_BACKOFF`], the tolerated foreign `group_id`, and
+    /// [`DEFAULT_PAIRING_TIMEOUT`](crate::DEFAULT_PAIRING_TIMEOUT). A
     /// host that restores a level or a mute state sets [`ClientConfig::volume`] and
     /// [`ClientConfig::muted`] on the value this returns.
     ///
@@ -413,6 +427,9 @@ impl ClientConfig {
             muted: false,
             volume_policy: VolumePolicy::default(),
             max_backoff: DEFAULT_MAX_BACKOFF,
+            // The documented tolerance is the default: a foreign group id does not close the
+            // connection unless the host asks for the spec's strictness.
+            strict_group_id: false,
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
             #[cfg(feature = "pairing-code")]
             static_pairing_code: None,
@@ -549,6 +566,7 @@ mod tests {
             muted: false,
             volume_policy: VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
+            strict_group_id: false,
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
             #[cfg(feature = "discovery")]
             inbound: None,
@@ -575,6 +593,10 @@ mod tests {
         assert_eq!(config.volume, 100);
         assert!(!config.muted);
         assert_eq!(config.max_backoff, DEFAULT_MAX_BACKOFF);
+        assert!(
+            !config.strict_group_id,
+            "the documented tolerance is the default; a host opts into the spec's strictness"
+        );
         assert_eq!(config.pairing_timeout, crate::DEFAULT_PAIRING_TIMEOUT);
         assert!(config.storage.is_none());
         assert!(config.device_info.is_none());

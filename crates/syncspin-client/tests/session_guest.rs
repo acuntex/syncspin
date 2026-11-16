@@ -293,6 +293,7 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
+        strict_group_id: false,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -1236,6 +1237,7 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
+        strict_group_id: false,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -1287,6 +1289,7 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
             "a zero backoff",
             ClientConfig {
                 max_backoff: Duration::ZERO,
+                strict_group_id: false,
                 ..base("Test player")
             },
             "max_backoff",
@@ -1527,16 +1530,120 @@ async fn a_group_update_needs_no_role() {
 }
 
 #[tokio::test]
-async fn a_group_update_with_a_malformed_group_id_is_a_protocol_error() {
-    // The identifier is 32 bytes as 43 unpadded base64url characters; both a wrong length and a
-    // character outside the alphabet are protocol errors that close the connection.
-    for group_id in ["B".repeat(42), format!("{}=", "B".repeat(42))] {
+async fn a_foreign_group_id_is_accepted_and_reported_once() {
+    // The spec requires 43 base64url characters, but a real server sends a UUID. The tolerance
+    // accepts it as an opaque string and reports the departure exactly once per connection.
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    let uuid = "123e4567-e89b-12d3-a456-426614174000";
+    let update = serde_json::to_string(&Incoming::GroupUpdate(GroupUpdate {
+        playback_state: "playing".to_owned(),
+        group_id: uuid.to_owned(),
+        group_name: "Living room".to_owned(),
+    }))
+    .unwrap();
+    server.json(update);
+
+    match next_event(&mut events).await {
+        Event::GroupIdNotCanonical { len } => {
+            assert_eq!(len, uuid.len(), "the event names the length, not the value");
+        }
+        other => panic!("expected GroupIdNotCanonical, got {other:?}"),
+    }
+    match next_event(&mut events).await {
+        Event::State(state) => {
+            assert_eq!(
+                state.group_id.as_deref(),
+                Some(uuid),
+                "the foreign identifier is carried as an opaque string"
+            );
+        }
+        other => panic!("expected State, got {other:?}"),
+    }
+
+    // A second non-canonical update must not report the departure again.
+    let update = serde_json::to_string(&Incoming::GroupUpdate(GroupUpdate {
+        playback_state: "stopped".to_owned(),
+        group_id: "another-foreign-id".to_owned(),
+        group_name: "Living room".to_owned(),
+    }))
+    .unwrap();
+    server.json(update);
+    match next_event(&mut events).await {
+        Event::State(state) => assert_eq!(state.group_id.as_deref(), Some("another-foreign-id")),
+        other => panic!("expected State without a second tolerance event, got {other:?}"),
+    }
+
+    // A canonical identifier reports nothing at all, which is the behaviour every server gets.
+    let canonical = "A".repeat(43);
+    let update = serde_json::to_string(&Incoming::GroupUpdate(GroupUpdate {
+        playback_state: "playing".to_owned(),
+        group_id: canonical.clone(),
+        group_name: "Living room".to_owned(),
+    }))
+    .unwrap();
+    server.json(update);
+    match next_event(&mut events).await {
+        Event::State(state) => assert_eq!(state.group_id.as_deref(), Some(canonical.as_str())),
+        other => panic!("a canonical group id must not be reported as a deviation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_absurd_group_id_is_a_protocol_error() {
+    // The tolerance drops the base64url and length rules, not the shape: an empty, oversized or
+    // control-character value stays a protocol error that closes the connection.
+    for group_id in [
+        String::new(),
+        "A".repeat(129),
+        "a\nb".to_owned(),
+        "a\tb".to_owned(),
+    ] {
         let server = FakeServer::start(ServerOptions::default()).await.unwrap();
         let (_recordings, sink) = recording_sink();
         let (mut events, _handle) =
             connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
         expect_connected(&mut events, &server).await;
 
+        let update = serde_json::to_string(&Incoming::GroupUpdate(GroupUpdate {
+            playback_state: "stopped".to_owned(),
+            group_id: group_id.clone(),
+            group_name: "Living room".to_owned(),
+        }))
+        .unwrap();
+        server.json(update);
+
+        match next_event(&mut events).await {
+            Event::Disconnected { reason, .. } => assert!(
+                reason.contains("group_id"),
+                "the reason should name the group_id rule, got: {reason}"
+            ),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_group_update_with_a_malformed_group_id_is_a_protocol_error_in_strict_mode() {
+    // `ClientConfig::strict_group_id` restores the spec's rule: any non-canonical value closes the
+    // connection. Both a wrong length and a character outside the alphabet count.
+    for group_id in [
+        "B".repeat(42),
+        format!("{}=", "B".repeat(42)),
+        "123e4567-e89b-12d3-a456-426614174000".to_owned(),
+    ] {
+        let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+        let (_recordings, sink) = recording_sink();
+        let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+        config.strict_group_id = true;
+        let (_handle, mut events) = connect(config, sink)
+            .await
+            .expect("the client must connect to the fake server");
+        expect_connected(&mut events, &server).await;
         let update = serde_json::to_string(&Incoming::GroupUpdate(GroupUpdate {
             playback_state: "stopped".to_owned(),
             group_id: group_id.clone(),

@@ -57,7 +57,8 @@ is wrong by construction.
 | `crates/syncspin-server/tests/pairing.rs`               | The server's pairing: a token pairs a real client and its next connection authenticates, another client's token is refused, an unapproved client gets no roles and no audio, revoking an approval takes both away, `unpair` removes the record and disconnects, a client that cannot use its record is refused without touching it, a malformed pairing message is a protocol error, and the static and dynamic code flows complete through CPace with the commitment and code binding; a wrong static code ends without a record.                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `crates/syncspin-server/tests/discovery.rs`             | A fake `Discovery` and a real advertising client: the server publishes its record, dials the advertised endpoint with no `Origin` header, and refuses an endpoint that is not `ws://`; the client's record carries the service, port, path and name. No multicast socket is opened.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `crates/syncspin-server/tests/roundtrip.rs`             | The two halves in one process: the real `syncspin-client` against the real server, with an encrypted connection, a `stream/start` the sink is opened for, the server's bytes arriving unchanged, and a playout deadline ahead of the frame's arrival.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `examples/player-pipe` (in-module tests)                | The example's command line: the default name, identity file and pairing store, `--flag=value` parsing, `--help` without a server, the token mode without a server and its refusal of one, the static-code and window pair (both flags required, eight digits), a bad code never echoed, the usage text naming the flags this build has, and rejection of incomplete, unknown, empty, dashed and over-long values as well as a TLS or non-`ws` server address.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `examples/player-pipe` (in-module tests)                | The example's command line: the default name, identity file and pairing store, `--flag=value` parsing, `--help` without a server, the token mode without a server and its refusal of one, the static-code and window pair (both flags required, eight digits), a bad code never echoed, the usage text naming the flags this build has, and rejection of incomplete, unknown, empty, dashed and over-long values as well as a TLS or non-`ws` server address. With `discovery`: `--advertise` and `--discover` as modes of their own, their mutual exclusion and the exclusion with `--server`, the token mode's refusal of them, the feature named when the build lacks it, and the advertise/discover wiring against a fake `Discovery` without a socket.                                                                                                                                                                                                    |
+| `examples/server-demo` (in-module tests)                | The example's command line: the default bind address and name, `--flag=value` parsing, `--help` without an address, `--mdns` accepted when the build has it and rejected with the feature named when it does not, the usage text naming the flags this build has, rejection of a missing, unknown, empty or dashed value, an over-long name and a bind that is not an `IP:port`, and the `--mdns` wiring installing a fake `Discovery` in the configuration without binding a socket.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | In-module unit tests (`crates/*/src`)                   | The per-crate `version()` test, the prologue parsing and identity-redaction tests beside `noise.rs`, the PSK-selection, endpoint and codec-name tests beside the client code, the server's defaults and configuration validation, the audio format's duration and format gate, and the discovery record constructors (the mDNS record tests run only with `mdns`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 A fake server, not a live Music Assistant, is the reference peer for anything that needs a peer.
@@ -332,8 +333,48 @@ bind loopback and use fake discovery.
    rule. The server leaves nothing behind; the player writes its identity and pairing store in its
    working directory as usual, so delete those if the run was throwaway.
 
-What this does not exercise: mDNS in either direction. `server-demo` has no `Discovery` backend and
-`player-pipe` does not advertise, so the two examples only cover the client-initiated connection.
-The server-initiated path needs hosts that supply a `Discovery` on each side; it is covered by the
-fake backend in `crates/syncspin-server/tests/discovery.rs` and the `mdns` unit tests, not by a LAN
-run.
+What this does not exercise: mDNS in either direction. `server-demo` runs without its `mdns`
+feature and `player-pipe` without `discovery` in the commands above, so that run covers only the
+client-initiated connection with a known address. The mDNS paths need the examples' features and are
+described in the section below; the suites drive them with a fake backend
+(`crates/syncspin-server/tests/discovery.rs` and the `mdns` unit tests), not with multicast.
+
+## Manual two-device discovery check (not yet performed)
+
+Not part of CI, and **not performed for 0.2**. It needs two machines on one LAN and a network that
+carries multicast between them. Run the server first: `--discover` takes one browse and fails if
+nothing answers.
+
+1. On the first device, start the demo server with its backend:
+
+   ```sh
+   cargo run -p server-demo --features mdns -- --mdns
+   ```
+
+   It prints the address it listens on, then one line:
+   `advertising _sendspin-server._tcp as syncspin-demo`.
+
+2. On the second device, let the player find it:
+
+   ```sh
+   cargo run -p player-pipe --features discovery -- --discover | aplay -f S16_LE -r 48000 -c 2
+   ```
+
+   The player prints one `discovered a server at ws://<address>/sendspin` line, then connects and
+   plays the tone. Stop the server: the player reports `Disconnected` and retries the address it
+   found, because a discovered address is a dialled one from then on.
+
+3. To test the other direction, start the player first:
+
+   ```sh
+   cargo run -p player-pipe --features discovery -- --advertise | aplay -f S16_LE -r 48000 -c 2
+   ```
+
+   It prints `advertising _sendspin._tcp as syncspin-pipe` and accepts a server. Then start the
+   server with `--features mdns -- --mdns`; it browses `_sendspin._tcp` and dials the advertised
+   endpoint. The server's log shows the approval and the tone, as in the address-based run.
+
+4. Limits of this check: both examples generate a fresh identity per run, so a restart is a new peer
+   and a paired client must pair again. `server-demo --mdns` dials every advertising client it
+   finds, so a LAN with several players exercises the first one only. Neither example keeps state,
+   and the player's working directory still gets an identity and pairing store.

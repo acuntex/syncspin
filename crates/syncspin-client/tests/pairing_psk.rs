@@ -231,6 +231,7 @@ fn config_for(server: &FakeServer, storage: Option<Arc<dyn Storage>>) -> ClientC
         muted: false,
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
+        strict_group_id: false,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,

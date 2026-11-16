@@ -9,6 +9,11 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Mirrors the server's mDNS backend, so `--mdns` can publish `_sendspin-server._tcp` and dial the
+# clients that advertise `_sendspin._tcp`. Off by default, exactly as in the crate.
+mdns = ["syncspin-server/mdns"]
+
 [dependencies]
 syncspin-server = { version = "0.2.0", path = "../../crates/syncspin-server" }
 anyhow.workspace = true

@@ -30,6 +30,7 @@ harmless.
 | 16  | A server keeps an unavailable client in the group                | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                      | Open, one group                    |
 | 17  | The server's stream start lead is one fixed value                | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline              |
 | 18  | The server does not try the Sentinel key after a record fails    | [`connection.md` — Sentinel Fallback](https://github.com/Sendspin/spec/blob/main/connection.md#sentinel-fallback)                                                                 | Accepted, `snow` state             |
+| 19  | A foreign `group_id` is accepted unless strict mode is set       | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Accepted, `strict_group_id`        |
 
 ## 1. Server-initiated connections: the last-playback server is not persisted
 
@@ -531,6 +532,40 @@ handshake state into `syncspin-core` itself), then verify message 2 against the 
 failure, against the Sentinel key, mark the session unpaired and report the mismatch to the host;
 or accept the client's fallback by starting the handshake with the Sentinel key when the client
 advertises that it lost the record, which the wire does not signal.
+
+## 19. A foreign `group_id` is accepted unless strict mode is set
+
+**Spec:** `messaging.md`, `group/update`. `group_id` is 32 server-chosen bytes encoded as 43
+unpadded base64url characters. A field value outside the fixed range or length its definition
+gives is a protocol error, and the receiver MUST close the connection.
+
+**What we do:** the default configuration treats a non-canonical `group_id` as an opaque string
+and keeps the connection open, provided it is non-empty, at most 128 bytes and free of control
+characters. A value that is empty, longer than 128 bytes or carries a control character is still a
+protocol error. The first tolerated value on a connection is reported as
+`Event::GroupIdNotCanonical { len }`; later non-canonical updates on the same connection are
+accepted silently, and a canonical identifier reports nothing.
+`a_foreign_group_id_is_accepted_and_reported_once` pins the acceptance, the event and the
+once-per-connection rule, and `an_absurd_group_id_is_a_protocol_error` pins the remaining bound.
+`ClientConfig::strict_group_id` restores the spec's behaviour: with it set, any value that is not
+43 base64url characters closes the connection and ends the attempt. That path is pinned by
+`a_group_update_with_a_malformed_group_id_is_a_protocol_error_in_strict_mode`.
+
+**Why:** Music Assistant 2.10, the real server this library is tested against, sends a standard
+UUID in `group_id` rather than the 43-character encoding. Closing the connection on it makes the
+client unusable against that server: it connects, receives `group/update`, closes and retries
+forever. Accepting the value keeps playback working while the server is not conformant; the
+identifier is public, not key material.
+
+**What it costs:** a host and any consumer cannot assume the identifier is 32 random bytes. Code
+that decodes it as base64url, compares it with a locally derived group, or uses its length as a key
+must handle the tolerated form. The crate itself only stores and reports it as a string, and the
+server side still generates the canonical 43-character form.
+
+**Removing it:** once Music Assistant sends a canonical `group_id`, delete the tolerance, the
+event, the `strict_group_id` field and this entry. Until then a deployment that needs the spec's
+strictness sets `strict_group_id: true`; a client compiled against a conformant server keeps the
+default and never sees the event.
 
 ## How to update this file
 
