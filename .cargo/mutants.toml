@@ -40,6 +40,10 @@ exclude_re = [
   # The accumulator holds fewer than five pending bits, so shifting it left by eight leaves its low
   # byte zero and the incoming byte cannot overlap it: `|` and `^` agree on every input.
   '^crates/syncspin-core/src/pairing/token\.rs:218:32: replace \| with \^ in ',
+  # In the LEB128 writer the low seven bits are already masked off, so the continuation bit cannot
+  # be set twice: `byte | 0x80` and `byte ^ 0x80` are the same byte. The neighbouring `&` mutant
+  # is a real bug for lengths above 127 and is caught by the unit test beside this function.
+  '^crates/syncspin-core/src/pairing/pake\.rs:346:23: replace \| with \^ in ',
   # The base64 decoder rejects non-canonical trailing bits itself, so by the time the re-encode
   # comparison runs, the value is either already rejected or canonical. `||` and `&&` agree on
   # every input that reaches it.

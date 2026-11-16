@@ -477,6 +477,31 @@ mod tests {
     }
 
     #[test]
+    fn a_length_prefix_is_leb128_above_a_single_byte() {
+        // `lv_cat` writes lengths as unsigned LEB128, so 127 fits in one byte and 128 needs two.
+        // Every length this transcript passes today is below 128 - a 32-byte field, a short DSI, a
+        // pad under the block size - so the multi-byte branch has no caller to reach it. The
+        // encoding still has to be right for the lengths the format allows: a pad or an identifier
+        // one byte longer would otherwise produce a transcript the peer cannot parse.
+        for (len, expected) in [
+            (0usize, vec![0x00]),
+            (127, vec![0x7f]),
+            (128, vec![0x80, 0x01]),
+            (300, vec![0xac, 0x02]),
+            (16_384, vec![0x80, 0x80, 0x01]),
+        ] {
+            let mut out = Vec::new();
+            push_len(&mut out, len);
+            assert_eq!(out, expected, "LEB128 encoding of {len}");
+            assert_eq!(
+                prepend_len_len(len),
+                expected.len(),
+                "prefix width for {len}"
+            );
+        }
+    }
+
+    #[test]
     fn a_field_element_above_the_representative_domain_is_negated() {
         // 2^254 + 1: bit 254 set, which `from_representative` would mask away. Negating it
         // gives a value the map reads unchanged, and the map is even, so both agree.
