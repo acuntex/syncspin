@@ -131,16 +131,14 @@ target ships. That is cheap to check and expensive to discover late:
 
 ```sh
 rustup target add armv7-unknown-linux-gnueabihf
-cargo check -p syncspin-core -p syncspin-client --all-features \
+cargo check -p syncspin-core -p syncspin-client -p syncspin-server --all-features \
   --target armv7-unknown-linux-gnueabihf --locked
 ```
 
-`--all-features` is what makes the guard cover the pairing stack: `elligator2`, `hmac` and the
-ChaCha20-Poly1305 wrapping are optional dependencies behind `pairing-code`, and without the flag they
-are not cross-compiled at all. The `arm` job runs this command, which covers `syncspin-core` and
-`syncspin-client`. `syncspin-server` builds under the same flags; add `-p syncspin-server` to include
-it. The job has not been widened to the server yet, so a server-only ARM regression would not turn CI
-red.
+`--all-features` is what makes the guard cover the pairing stack: `elligator2` and `hmac` sit behind
+`pairing-code`, and without the flag they are not cross-compiled at all; the AEADs come from `snow`,
+which resolves both cipher suites. The `arm` job runs this command over all three crates, so an ARM
+regression in the server turns CI red just as one in the core or the client does.
 
 This is a compile guard, not a release build: it catches a dependency that does not compile for the
 target, which is the failure that actually happens. Once the `player`/`controller` features exist,
