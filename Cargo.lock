@@ -893,7 +893,13 @@ dependencies = [
 name = "syncspin-server"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
+ "base64",
+ "futures-util",
+ "serde_json",
  "syncspin-core",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]
