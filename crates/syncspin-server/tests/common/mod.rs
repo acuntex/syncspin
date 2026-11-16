@@ -7,8 +7,8 @@
 //! client crate uses, so the responder side is not written twice.
 //!
 //! The module is shared by the test binaries, so a helper one of them does not use is not dead
-//! code.
-#![allow(dead_code)]
+//! code, and a re-export one of them does not need is not an unused import.
+#![allow(dead_code, unused_imports)]
 
 use std::time::Duration;
 
@@ -30,11 +30,18 @@ pub use syncspin_server::{
     AudioFormat, Event, EventStream, Server, ServerConfig, ServerHandle, TrackInfo, DEFAULT_PATH,
 };
 pub use tokio::net::TcpStream;
+pub use tokio_tungstenite::tungstenite::protocol::Role;
 pub use tokio_tungstenite::tungstenite::Message;
 pub use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 /// How long a test waits for anything at all.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the keepalive tests wait for the server's ping.
+///
+/// Far beyond the 15 s idle window, so the ping deadline is always reached first on a paused clock,
+/// while a server that never pings still fails the test instead of hanging.
+pub const KEEPALIVE_WAIT: Duration = Duration::from_secs(60);
 
 /// The name the fake client announces in `client/hello`.
 pub const CLIENT_NAME: &str = "A fake client";
@@ -528,6 +535,52 @@ impl FakeClient {
             _ => None,
         })
         .await
+    }
+
+    /// Waits for the server's keepalive ping and returns its payload, with the automatic pong
+    /// dropped.
+    ///
+    /// Reading the ping makes tungstenite queue the pong it answers with automatically, and both the
+    /// next read and the next write on the socket would flush it. The socket is therefore re-wrapped
+    /// in a fresh WebSocket whose queue is empty, so the ping stays unanswered until the test sends a
+    /// pong, a normal frame, or nothing at all.
+    pub async fn wait_for_ping(mut self) -> Result<(Self, Vec<u8>)> {
+        let payload = loop {
+            match tokio::time::timeout(KEEPALIVE_WAIT, self.socket.next()).await {
+                Err(_) => bail!("the server sent no ping within {KEEPALIVE_WAIT:?}"),
+                Ok(Some(Ok(Message::Ping(payload)))) => break payload.to_vec(),
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => {
+                    bail!("the server closed the connection before pinging")
+                }
+            }
+        };
+        let raw = self.socket.into_inner();
+        self.socket = WebSocketStream::from_raw_socket(raw, Role::Client, None).await;
+        Ok((self, payload))
+    }
+
+    /// Sends one WebSocket pong, echoing the ping payload.
+    pub async fn send_pong(&mut self, payload: &[u8]) -> Result<()> {
+        self.socket
+            .send(Message::Pong(payload.to_vec().into()))
+            .await?;
+        Ok(())
+    }
+
+    /// Holds the connection open while answering nothing, so the server sees the silence of a
+    /// half-open link.
+    ///
+    /// The automatic pong is already gone (see [`FakeClient::wait_for_ping`]); this loop reads and
+    /// discards whatever the server sends until it closes, so the socket stays open while no frame
+    /// leaves this side.
+    pub async fn hold_unanswered_ping(mut self) -> Result<()> {
+        loop {
+            match self.socket.next().await {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Ok(()),
+                Some(Ok(_)) => {}
+            }
+        }
     }
 
     /// Reads the next `group/update`.
