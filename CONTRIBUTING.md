@@ -132,6 +132,12 @@ scripts/release.sh 0.2.0            # bump, changelog, gates, commit
 scripts/release.sh 0.2.0 --dry-run  # show what it would change
 ```
 
+Before the tag, read the documents as a stranger would. The script enforces the version; nothing
+enforces the prose, and that is where this project has been wrong three times: a feature that never
+existed, a README pinned to a tag older than the features below it, and a server described as
+"planned" after it shipped. Grep for `planned`, `stub`, `publish = false`, `not implemented` and the
+previous version number, then check each hit against the code.
+
 It bumps the workspace version, the internal path-dependency requirements and the three `version()`
 tripwires, refreshes `Cargo.lock`, prepends the changelog section rendered from the commits since the
 last tag, and refuses to continue

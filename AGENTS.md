@@ -63,6 +63,12 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
   licence `MIT OR Apache-2.0`. Renames break downstream consumers and the published crates.
 - **Spec deviations are documented** in `docs/spec-deviations.md` and covered by a test. Where
   Music Assistant and the spec disagree, the spec wins.
+- **A capability claim is checked against the tree, not against memory.** The documents have drifted
+  three times: a `wss` feature that never existed, a README pinned to a tag older than the features
+  it described, and a server called "planned" after it shipped. When a change adds a capability,
+  removes one, or finishes a milestone, read `README.md`, `docs/spec-deviations.md`,
+  `docs/testing.md`, `SECURITY.md` and the doc comments for the sentences it just made false. Words
+  to grep first: `planned`, `stub`, `publish = false`, `not implemented`, and any release version.
 - **This repository is public.** No personal names, home-directory paths, device names, hostnames,
   IP addresses, account names or details of downstream or private projects may appear in code,
   comments, tests, commit messages or docs. When porting code from elsewhere, rewrite the comments
