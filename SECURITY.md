@@ -5,8 +5,9 @@ handshake. A weakness in that path is worth reporting privately, not in a public
 
 ## Supported versions
 
-Only the 0.1 line is supported. It is a pre-release: nothing is published on crates.io, and the
-`v0.1.0` tag is the reference. Older commits, forks and downstream copies are not supported here.
+Only the 0.2 line is supported. `syncspin-core`, `syncspin-client` and `syncspin-server` are published
+on crates.io, and the `v0.2.0` tag is the reference. Older releases, commits, forks and downstream
+copies are not supported here.
 
 ## Reporting a vulnerability
 
@@ -23,7 +24,10 @@ that shows it, and what an attacker gains. A working test is worth more than a d
   message parsing, the clock filter.
 - `syncspin-client`: session state handling, role handling, reconnect, volume bounds, how key
   material and identity are passed in and kept.
+- `syncspin-server`: the listener, the handshake as initiator, the approval gate, the pairing flows
+  and the store they read, group and stream handling, and discovery.
 - `examples/player-pipe`: identity handling and file permissions.
+- `examples/server-demo`: the approval gate it demonstrates and the connection it admits.
 
 ## What is out of scope
 
@@ -32,7 +36,8 @@ that shows it, and what an attacker gains. A working test is worth more than a d
 - A Sendspin server's behaviour, including Music Assistant. Report those to the server's project.
 - Anything that needs physical access to a device, or an attack that assumes the attacker already
   controls the host.
-- The absence of a feature that is documented as missing, such as pairing or the server side.
+- The absence of a feature that is documented as missing, such as several groups per server, role
+  versions beyond `@v1`, or `wss://`.
 
 ## What must never be in a report
 

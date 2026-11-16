@@ -10,9 +10,17 @@ CHANGELOG and every file under `docs/`. This document is kept in English for tha
 
 **This document describes the target, not the current tree.** It is the design the implementation is
 measured against: the API sketch, the feature flags (`wss`, `flac`, `opus`, `artwork`, `visualizer`,
-`color`, `source`), the pairing flows and the server half are planned work. What exists today is the
-README's "What works today" and "What does not work yet", and
+`color`, `source`), the pairing flows and the server half. What exists today is the README's "What
+works today" and "What does not work yet", and
 [`docs/spec-deviations.md`](../spec-deviations.md) for the departures from the specification.
+
+**Status as of 0.2.** The client half and the server half both exist and are published: the Noise
+handshake at either end, roles, the three pairing methods with their storage, the listener and its
+approval gate, one group with one stream, and discovery in both directions. So the pairing flows,
+the server half and bidirectional discovery below describe shipped code, not a plan. Still missing
+are several groups per server, role versions beyond `@v1`, the `artwork`, `visualizer`, `color` and
+`source` roles, the `flac`, `opus` and `wss` features, and a persisted last-playback server; those are
+listed with their reasons in [`docs/spec-deviations.md`](../spec-deviations.md).
 
 ## Intent
 
@@ -31,8 +39,8 @@ others, and so the consumer focuses on device integration.
   code pairing with CPace), reconnect, volume reporting — as a reusable crate.
 - Audio leaves the crate as **PCM through a `Sink` trait**; decoders (FLAC, optional Opus) are
   feature flags, output stays with the user (pipe, ALSA, cpal, GStreamer).
-- Later (0.2) a full server: accept clients, manage streams, serve roles, pairing as server, mDNS
-  for the client-initiated mode.
+- 0.2, now shipped: a full server that accepts clients, manages streams, serves roles, pairs as
+  server, and runs mDNS for both the client-initiated and the server-initiated mode.
 - The downstream application becomes a consumer of the crate; its behaviour (volume guard, platform
   integration, pause on app leave) stays unchanged.
 - Published on crates.io with docs.rs, MIT OR Apache-2.0, English README and API docs.
@@ -40,7 +48,7 @@ others, and so the consumer focuses on device integration.
 ## Non-Goals (0.1)
 
 - No unencrypted path, no legacy compatibility with pre-Noise clients.
-- No server functionality (arrives in 0.2).
+- No server functionality in the 0.1 client (the server half shipped in 0.2).
 - No multi-server arbitration (a client holds one server connection).
 - No UI, no playlist/queue handling, no music sources — that is higher-level Sendspin server work
   and stays in Music Assistant.
@@ -103,7 +111,7 @@ syncspin/
       sink.rs           # Sink trait, format changes, backpressure
       decode.rs         # feature "flac" (flac-codec), optional "opus"
       storage.rs        # identity + pairing records
-    syncspin-server/    # 0.2
+    syncspin-server/    # server half, from 0.2
       listener.rs, streams.rs, pairing_server.rs, mdns.rs
   examples/
     player-pipe/        # PCM to stdout, title/status to stderr — works everywhere
@@ -186,16 +194,17 @@ MCF and the spec's generator/`sid` layout. If not, the CPace wrapper is built ar
 
 ## Connection model
 
-- **0.1: client-initiated** as today (`ws://<server>:8927/sendspin`, optional server list in the
-  builder). Clients do not advertise over mDNS yet, which deviates from `connection.md`; the
-  deviation is tracked in [`docs/spec-deviations.md`](../spec-deviations.md).
-- **0.2: both directions.** The server advertises `_sendspin-server._tcp` and discovers clients via
-  `_sendspin._tcp`; the client advertises itself and accepts server-initiated connections. That
-  closes the 0.1 deviation. Spec rule to respect: a client that advertises MUST NOT additionally
-  connect manually, so `ClientConfig::inbound` selects the advertising mode and a configuration that
-  sets it refuses to dial; the manual path stays the fallback for setups where mDNS is filtered (as
-  in some consumer builds today).
-- `wss://` only as a feature for remote access, never the default.
+- **0.1: client-initiated** (`ws://<server>:8927/sendspin`, optional server list in the builder).
+  In 0.1 clients did not advertise over mDNS, which deviated from `connection.md`; 0.2 closed that
+  deviation.
+- **0.2: both directions, shipped.** The server advertises `_sendspin-server._tcp` and discovers
+  clients via `_sendspin._tcp`; the client advertises itself and accepts server-initiated
+  connections. Spec rule to respect: a client that advertises MUST NOT additionally connect
+  manually, so `ClientConfig::inbound` selects the advertising mode and a configuration that sets it
+  refuses to dial; the manual path stays the fallback for setups where mDNS is filtered (as in some
+  consumer builds today).
+- `wss://` only as a feature for remote access, never the default. Not implemented yet: the client
+  rejects a `wss://` address when it is configured.
 
 ## Repository layout (target)
 

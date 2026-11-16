@@ -5,8 +5,12 @@
 //! It knows no transport and no device integration, and it never depends on the
 //! `syncspin-client` or `syncspin-server` crates.
 //!
-//! This is a `0.1` work in progress: the Noise layer, the message types, the framing layer, the
-//! clock filter and the pairing token exist so far.
+//! Both halves use it: the Noise layer carries [`noise::Responder`] for the client and
+//! [`noise::Initiator`] for the server, over both cipher suites the specification names. Beyond
+//! that this crate holds the message types, the framing layer with fragmentation, the clock filter,
+//! and the pairing primitives — the token, the CPace code flow and the AEAD that seals its values
+//! behind `pairing-code`. It is the protocol and the crypto; the connection state machines live in
+//! the `syncspin-client` and `syncspin-server` crates.
 
 pub mod clock;
 pub mod framing;

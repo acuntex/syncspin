@@ -18,10 +18,10 @@
 //!
 //! This module carries both halves of the handshake - [`Responder`] for the client, [`Initiator`]
 //! for the server - plus the transport that follows it. It does not interpret handshake payloads;
-//! the session layer validates the `psk_id`/`psk_category` metadata. This milestone uses the
+//! the session layer validates the `psk_id`/`psk_category` metadata. A handshake starts with the
 //! published Sentinel PSK, which is what an unpaired client uses and which provides no
-//! authentication on its own; selecting a different PSK from message 1 arrives with the session
-//! layer.
+//! authentication on its own; the session layer reads the PSK metadata from message 1 and selects
+//! the matching key through [`Responder::set_psk`] or [`Initiator::set_psk`] before it answers.
 //!
 //! # Cipher suites
 //!
