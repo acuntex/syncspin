@@ -845,21 +845,24 @@ impl Session<'_> {
             Command::PairToken { pairing_psk, reply } => {
                 // The refusals a healthy connection survives are decided before anything is
                 // written; only a transport failure ends the connection.
-                let outcome = if self.attempt.is_some() {
-                    Err(anyhow::anyhow!("a pairing attempt is already in progress"))
+                let refused = if self.attempt.is_some() {
+                    Some("a pairing attempt is already in progress")
                 } else if self.hello.supported_pair_methods.pairing_psk.is_none() {
-                    Err(anyhow::anyhow!(
-                        "the client did not offer the Pairing PSK method"
-                    ))
+                    Some("the client did not offer the Pairing PSK method")
                 } else {
-                    self.begin_token_flow(noise, pairing_psk).await
+                    None
                 };
-                match outcome {
-                    Ok(()) => self.pending_pair_reply = Some(reply),
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        self.ending = Some("pairing failed".to_owned());
+                match refused {
+                    Some(reason) => {
+                        let _ = reply.send(Err(anyhow::anyhow!(reason)));
                     }
+                    None => match self.begin_token_flow(noise, pairing_psk).await {
+                        Ok(()) => self.pending_pair_reply = Some(reply),
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                            self.ending = Some("pairing failed".to_owned());
+                        }
+                    },
                 }
             }
             Command::RevokeApproval { reply } => {

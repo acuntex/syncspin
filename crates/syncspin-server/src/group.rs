@@ -856,4 +856,90 @@ mod tests {
             "a writer that fell behind does not extrapolate past the last chunk"
         );
     }
+
+    #[test]
+    fn bytes_are_dropped_without_a_running_stream() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let group = Group::new(
+            "a group".to_owned(),
+            AudioFormat::pcm(48_000, 2, 16),
+            events,
+        )
+        .expect("a group builds");
+        assert!(
+            !group.write_audio(&[]),
+            "an empty chunk has no playtime to schedule"
+        );
+        assert!(
+            !group.write_audio(&[0u8; 4]),
+            "no stream is open, so there is no timeline to place bytes on"
+        );
+
+        group.open_stream(TrackInfo::default());
+        group.pause();
+        assert!(
+            !group.write_audio(&[0u8; 4]),
+            "bytes written while the group is paused are dropped"
+        );
+    }
+
+    #[test]
+    fn a_controller_command_without_its_parameter_is_ignored() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let group = Group::new(
+            "a group".to_owned(),
+            AudioFormat::pcm(48_000, 2, 16),
+            events,
+        )
+        .expect("a group builds");
+
+        let volume = ControllerCommand {
+            command: "volume".to_owned(),
+            ..ControllerCommand::default()
+        };
+        assert!(
+            !group.apply_controller_command(&volume),
+            "a volume command without a level is refused"
+        );
+        let mute = ControllerCommand {
+            command: "mute".to_owned(),
+            ..ControllerCommand::default()
+        };
+        assert!(
+            !group.apply_controller_command(&mute),
+            "a mute command without a state is refused"
+        );
+        let next = ControllerCommand {
+            command: "next".to_owned(),
+            ..ControllerCommand::default()
+        };
+        assert!(
+            !group.apply_controller_command(&next),
+            "a queue command belongs to the host, not to the group"
+        );
+    }
+
+    #[test]
+    fn a_report_for_a_member_that_already_left_is_dropped() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let group = Group::new(
+            "a group".to_owned(),
+            AudioFormat::pcm(48_000, 2, 16),
+            events,
+        )
+        .expect("a group builds");
+
+        group.report_client_state(
+            123,
+            &ClientState {
+                available: true,
+                player: None,
+            },
+        );
+        group.open_stream(TrackInfo::default());
+        assert!(
+            group.write_audio(&[0u8; 4]),
+            "a stale report must not disturb the group's stream"
+        );
+    }
 }

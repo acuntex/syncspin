@@ -17,7 +17,7 @@ use syncspin_client::{
     PskCategory, Sink, StoredPsk,
 };
 use syncspin_core::messages::{
-    ClientPairAuth, ClientPairConfirm, ClientPairFinalize, ClientPairInit,
+    ClientPairAuth, ClientPairConfirm, ClientPairFinalize, ClientPairInit, ClientPairPending,
     DynamicPairingCodeMethod, PairAbort, PairingActivation, StaticPairingCodeMethod,
 };
 use syncspin_core::noise::psk_id_for;
@@ -1067,6 +1067,449 @@ async fn a_static_code_that_does_not_match_ends_the_attempt_without_a_record() -
     // The connection stays open after a key-confirmation failure.
     client.send_json(&player_state(true, 100, false)).await?;
     client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pairing_message_without_an_attempt_is_a_protocol_error() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let (server, port, mut events) = start_with_config(config(store)?).await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.handshake(Suite::ChaChaPoly).await?;
+    client.activate().await?;
+
+    // A pairing message when the server admitted no attempt is not answered.
+    client
+        .send_json(&Incoming::ClientPairInit(ClientPairInit {
+            pairing_index: 1,
+            commit_b: None,
+        }))
+        .await?;
+    client.expect_closed().await?;
+
+    let left = wait_for_event(&mut events, |event| {
+        matches!(event, Event::ClientLeft { .. })
+    })
+    .await;
+    assert_eq!(
+        left,
+        Event::ClientLeft {
+            reason: "protocol error".to_owned(),
+        },
+        "a client that pairs without being admitted is cut off"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pair_token_for_a_client_that_did_not_offer_the_method_is_refused() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let mut client = FakeClient::connect(port).await?;
+    let client_id = client.identity.public_base64();
+    client.handshake(Suite::ChaChaPoly).await?;
+    // The default `client/hello` offers no pairing method at all.
+    client.activate().await?;
+
+    let token = syncspin_core::pairing::token::encode_v0(&client.identity.public, &[0x42; 32]);
+    let error = server
+        .pair(&token)
+        .await
+        .expect_err("a token for a client that cannot pair is refused");
+    assert!(
+        format!("{error:#}").contains("did not offer the Pairing PSK method"),
+        "got: {error:#}"
+    );
+    assert!(store.records().is_empty(), "a refused token stores nothing");
+
+    // The refusal is the operator's mistake, not the client's: the connection survives and the
+    // operator can still approve the client.
+    server.approve(&client_id).await?;
+    let activate = client
+        .read_activate(|activities| activities.is_empty())
+        .await?;
+    assert!(
+        activate
+            .active_roles
+            .unwrap_or_default()
+            .contains(&"player@v1".to_owned()),
+        "the client is still on a healthy connection and receives its roles"
+    );
+
+    // The refusal must not have ended the connection: no leave is reported.
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(feature = "pairing-code")]
+#[tokio::test]
+async fn entering_a_code_without_a_pairing_attempt_is_refused() -> Result<()> {
+    let (server, port, _events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.handshake(Suite::ChaChaPoly).await?;
+    client.activate().await?;
+
+    let error = server
+        .submit_code(&client.identity.public_base64(), "12345678")
+        .await
+        .expect_err("no attempt is in progress");
+    assert!(
+        format!("{error:#}").contains("no pairing attempt"),
+        "got: {error:#}"
+    );
+
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(feature = "pairing-code")]
+#[tokio::test]
+async fn a_pairing_attempt_that_is_never_answered_times_out() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let (server, port, mut events) = start_with_config(ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("a literal address parses"),
+        storage: Some(store.clone()),
+        pairing_timeout: Duration::from_millis(200),
+        ..ServerConfig::new(SERVER_NAME, Identity::generate())
+    })
+    .await?;
+    let mut client = FakeClient::connect(port).await?;
+    let client_id = client.identity.public_base64();
+    client.handshake(Suite::ChaChaPoly).await?;
+    client
+        .activate_with(hello_with_pairing(PairingMethod::StaticCode, None))
+        .await?;
+    server.approve(&client_id).await?;
+    client.read_activate(|_| true).await?;
+
+    server
+        .start_pairing(&client_id, PairingMethod::StaticCode, None)
+        .await?;
+    read_pairing_activation(&mut client).await?;
+
+    // The operator never enters the code, so the attempt is cancelled at its deadline.
+    let failed = wait_for_event(&mut events, |event| {
+        matches!(event, Event::PairingFailed { .. })
+    })
+    .await;
+    match failed {
+        Event::PairingFailed { reason, .. } => {
+            assert!(reason.contains("timed out"), "got: {reason}")
+        }
+        other => bail!("expected PairingFailed, got {other:?}"),
+    }
+    let activate = client
+        .read_activate(|activities| activities.is_empty())
+        .await?;
+    assert!(
+        activate.pairing.is_none(),
+        "the cancellation drops the pairing activity"
+    );
+
+    // The connection and its roles survive a cancelled attempt.
+    client.send_json(&player_state(true, 100, false)).await?;
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(feature = "pairing-code")]
+#[tokio::test]
+async fn a_pairing_index_that_was_never_activated_is_a_protocol_error() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let (server, port, mut events) = start_with_config(config(store)?).await?;
+    let mut client = FakeClient::connect(port).await?;
+    let client_id = client.identity.public_base64();
+    client.handshake(Suite::ChaChaPoly).await?;
+    client
+        .activate_with(hello_with_pairing(PairingMethod::StaticCode, None))
+        .await?;
+    server.approve(&client_id).await?;
+    client.read_activate(|_| true).await?;
+
+    server
+        .start_pairing(&client_id, PairingMethod::StaticCode, None)
+        .await?;
+    read_pairing_activation(&mut client).await?;
+
+    // The client reports an activation the server never sent.
+    client
+        .send_json(&Incoming::ClientPairPending(ClientPairPending {
+            pairing_index: 999,
+            message: None,
+        }))
+        .await?;
+    client.expect_closed().await?;
+
+    let left = wait_for_event(&mut events, |event| {
+        matches!(event, Event::ClientLeft { .. })
+    })
+    .await;
+    assert_eq!(
+        left,
+        Event::ClientLeft {
+            reason: "protocol error".to_owned(),
+        },
+        "an activation the server never admitted is a protocol error"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(feature = "pairing-code")]
+#[tokio::test]
+async fn a_client_whose_gate_is_closed_reports_pair_pending_and_waits_for_the_code() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let (server, port, _events) = start_with_config(config(store)?).await?;
+    let mut client = FakeClient::connect(port).await?;
+    let client_id = client.identity.public_base64();
+    client.handshake(Suite::ChaChaPoly).await?;
+    client
+        .activate_with(hello_with_pairing(PairingMethod::StaticCode, None))
+        .await?;
+    server.approve(&client_id).await?;
+    client.read_activate(|_| true).await?;
+
+    server
+        .start_pairing(&client_id, PairingMethod::StaticCode, None)
+        .await?;
+    read_pairing_activation(&mut client).await?;
+
+    // A `pair-pending` with the admitted index holds the attempt back without an error, and the
+    // client then starts it properly.
+    client
+        .send_json(&Incoming::ClientPairPending(ClientPairPending {
+            pairing_index: 1,
+            message: None,
+        }))
+        .await?;
+    client
+        .send_json(&Incoming::ClientPairInit(ClientPairInit {
+            pairing_index: 1,
+            commit_b: None,
+        }))
+        .await?;
+    server.submit_code(&client_id, "12345678").await?;
+    // A `server/pair-auth` is the proof the attempt started after the pending report.
+    read_server_auth(&mut client).await?;
+
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(feature = "pairing-code")]
+#[tokio::test]
+async fn a_bad_client_key_confirmation_aborts_the_attempt() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let (server, port, mut events) = start_with_config(ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("a literal address parses"),
+        storage: Some(store.clone()),
+        pairing_timeout: Duration::from_secs(5),
+        ..ServerConfig::new(SERVER_NAME, Identity::generate())
+    })
+    .await?;
+    let mut client = FakeClient::connect(port).await?;
+    let client_id = client.identity.public_base64();
+    client.handshake(Suite::ChaChaPoly).await?;
+    client
+        .activate_with(hello_with_pairing(PairingMethod::StaticCode, None))
+        .await?;
+    server.approve(&client_id).await?;
+    client.read_activate(|_| true).await?;
+
+    server
+        .start_pairing(&client_id, PairingMethod::StaticCode, None)
+        .await?;
+    read_pairing_activation(&mut client).await?;
+    let handshake_hash = *client
+        .noise
+        .as_ref()
+        .expect("the handshake finished")
+        .handshake_hash();
+    client
+        .send_json(&Incoming::ClientPairInit(ClientPairInit {
+            pairing_index: 1,
+            commit_b: None,
+        }))
+        .await?;
+    server.submit_code(&client_id, "12345678").await?;
+    let ya = read_server_auth(&mut client).await?;
+    let round = answer_auth(b"12345678", &handshake_hash, 1, 1, &ya, [0x44; 32], None)?;
+    client
+        .send_json(&Incoming::ClientPairAuth(ClientPairAuth {
+            pake_msg_2: URL_SAFE_NO_PAD.encode(round.share),
+        }))
+        .await?;
+    read_server_confirm(&mut client, &round.expected_server_tag).await?;
+
+    // The client's tag does not verify: the server answers with `pair/abort`, stores nothing and
+    // keeps the connection open.
+    client
+        .send_json(&Incoming::ClientPairConfirm(ClientPairConfirm {
+            client_kc: URL_SAFE_NO_PAD.encode([0u8; 64]),
+            wrapped_nonce_b: None,
+        }))
+        .await?;
+    let abort = client
+        .read_until(|message| match message {
+            Incoming::PairAbort(abort) => Some(abort),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(abort.reason, "pairing_code_mismatch");
+
+    let failed = wait_for_event(&mut events, |event| {
+        matches!(event, Event::PairingFailed { .. })
+    })
+    .await;
+    match failed {
+        Event::PairingFailed { reason, .. } => {
+            assert!(reason.contains("pairing_code_mismatch"), "got: {reason}")
+        }
+        other => bail!("expected PairingFailed, got {other:?}"),
+    }
+    assert!(
+        store.records().is_empty(),
+        "a failed key confirmation stores nothing"
+    );
+
+    client.send_json(&player_state(true, 100, false)).await?;
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(feature = "pairing-code")]
+#[tokio::test]
+async fn a_record_is_stored_even_when_the_live_promotion_fails() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let server_identity = Identity::generate();
+    let (server, port, mut events) = start_with_config(ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("a literal address parses"),
+        storage: Some(store.clone()),
+        pairing_timeout: Duration::from_secs(5),
+        ..ServerConfig::new(SERVER_NAME, server_identity)
+    })
+    .await?;
+    let mut client = FakeClient::connect(port).await?;
+    let client_id = client.identity.public_base64();
+    client.handshake(Suite::ChaChaPoly).await?;
+    client
+        .activate_with(hello_with_pairing(PairingMethod::StaticCode, None))
+        .await?;
+    server.approve(&client_id).await?;
+    client.read_activate(|_| true).await?;
+
+    server
+        .start_pairing(&client_id, PairingMethod::StaticCode, None)
+        .await?;
+    read_pairing_activation(&mut client).await?;
+    let handshake_hash = *client
+        .noise
+        .as_ref()
+        .expect("the handshake finished")
+        .handshake_hash();
+    client
+        .send_json(&Incoming::ClientPairInit(ClientPairInit {
+            pairing_index: 1,
+            commit_b: None,
+        }))
+        .await?;
+    server.submit_code(&client_id, "12345678").await?;
+    let ya = read_server_auth(&mut client).await?;
+    let psk = [0x55; 32];
+    let round = answer_auth(b"12345678", &handshake_hash, 1, 1, &ya, psk, None)?;
+    client
+        .send_json(&Incoming::ClientPairAuth(ClientPairAuth {
+            pake_msg_2: URL_SAFE_NO_PAD.encode(round.share),
+        }))
+        .await?;
+    read_server_confirm(&mut client, &round.expected_server_tag).await?;
+    client
+        .send_json(&Incoming::ClientPairConfirm(ClientPairConfirm {
+            client_kc: URL_SAFE_NO_PAD.encode(round.client_tag),
+            wrapped_nonce_b: None,
+        }))
+        .await?;
+    client
+        .send_json(&Incoming::ClientPairFinalize(ClientPairFinalize {
+            long_term_psk: None,
+            wrapped_psk: Some(URL_SAFE_NO_PAD.encode(round.wrapped_psk)),
+        }))
+        .await?;
+    client
+        .read_pairing(|message| match message {
+            Incoming::ServerPairFinalize(_) => Some(()),
+            _ => None,
+        })
+        .await?;
+
+    // The record is stored before the re-handshake, so a client that abandons the promotion still
+    // leaves the pairing in place.
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the record outlives the promotion"
+    );
+    let paired = wait_for_event(&mut events, |event| matches!(event, Event::Paired { .. })).await;
+    assert_eq!(
+        paired,
+        Event::Paired {
+            client_id: client_id.clone()
+        }
+    );
+
+    // The client drops instead of answering the re-handshake: the connection ends as lost.
+    client.close().await?;
+    let left = wait_for_event(&mut events, |event| {
+        matches!(event, Event::ClientLeft { .. })
+    })
+    .await;
+    assert_eq!(
+        left,
+        Event::ClientLeft {
+            reason: "connection lost".to_owned(),
+        },
+        "a promotion that cannot finish is reported as a lost connection"
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unpair_removes_the_record_of_a_client_without_a_live_connection() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let client_id = Identity::generate().public_base64();
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk: [0x5a; 32],
+    })?;
+
+    let (server, _port, _events) = start_with_config(config(store.clone())?).await?;
+    server.unpair(&client_id).await?;
+    assert!(
+        store.record_for(&client_id).is_none(),
+        "unpairing a client that is offline still removes its record"
+    );
     server.shutdown().await?;
     Ok(())
 }
