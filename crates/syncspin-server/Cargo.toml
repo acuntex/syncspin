@@ -13,6 +13,11 @@ categories.workspace = true
 publish = false
 include = ["src/**", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
+[features]
+# The static and dynamic pairing code flows. Off by default, exactly as in `syncspin-client`: a
+# build that does not carry CPace must not advertise a method that needs it.
+pairing-code = ["syncspin-core/pairing-code"]
+
 [dependencies]
 syncspin-core = { version = "0.1.0", path = "../syncspin-core" }
 anyhow.workspace = true

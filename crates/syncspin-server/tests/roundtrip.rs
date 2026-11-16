@@ -66,14 +66,14 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
     };
     let server = Server::start(config).await?;
     let port = server.local_addr().port();
+    // The operator approves the client before it connects: approval belongs to the `client_id` and
+    // outlives the connection, so the first activation already carries the roles.
+    let identity = Identity::generate();
+    server.approve(&identity.public_base64()).await?;
 
     let (frames, mut received) = mpsc::unbounded_channel();
     // `ClientConfig::new` asks for PCM by default, which is the format this server streams.
-    let client_config = ClientConfig::new(
-        format!("127.0.0.1:{port}"),
-        "A test player",
-        Identity::generate(),
-    );
+    let client_config = ClientConfig::new(format!("127.0.0.1:{port}"), "A test player", identity);
     let (mut handle, mut events) =
         Client::connect(client_config, Box::new(ReportingSink { frames })).await?;
 

@@ -19,7 +19,7 @@ harmless.
 | 5   | `group/update` as the playback-state source                     | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Closed in 0.2                      |
 | 6   | `server/error` failure diagnostics                              | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Closed in 0.2                      |
 | 7   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
-| 8   | No unpaired-access switch                                       | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, config only                  |
+| 8   | No unpaired-access switch on the client                         | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, client config only           |
 | 9   | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
 | 10  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
 | 11  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
@@ -29,8 +29,9 @@ harmless.
 | 15  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
 | 16  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
 | 17  | A malformed control message is ignored, not fatal               | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
-| 18  | A server keeps an unavailable client in the group               | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                        | Open, one group                     |
-| 19  | The server's stream start lead is one fixed value               | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                              | Open, shared timeline              |
+| 18  | A server keeps an unavailable client in the group               | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                      | Open, one group                    |
+| 19  | The server's stream start lead is one fixed value               | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline              |
+| 20  | The server does not try the Sentinel key after a record fails   | [`connection.md` — Sentinel Fallback](https://github.com/Sendspin/spec/blob/main/connection.md#sentinel-fallback)                                                                 | Accepted, `snow` state             |
 
 ## 1. Client-initiated connections only
 
@@ -131,7 +132,9 @@ the client as `B` and the `MCF` generator, plus the wrapped-PSK exchange.
 and offered only when a `Storage` can persist the record they produce - and, for the dynamic flow,
 when the host advertises an emission format and an out-channel. The static flow is gated by the
 pairing window `ControlHandle::open_pairing_window` opens; the dynamic flow is gated by its
-20-round limit and `ControlHandle::release_holdback`. The CPace layer is built here - `x25519-dalek`,
+20-round limit and `ControlHandle::release_holdback`. `syncspin-server` carries the same feature
+and runs the server half of both flows: `ServerHandle::start_pairing` refuses a code method without
+it, and with it the server is CPace role `A`. The CPace layer is built here - `x25519-dalek`,
 `elligator2` for the `MCF` map, SHA-512 - because no crate was found that matched draft-21 with the
 spec's `MCF` and `sid` layout. It is pinned to the draft's vectors and the spec's `sid` construction.
 The wrapping takes the connection's cipher suite, so `25519_ChaChaPoly_SHA256` seals with
@@ -238,6 +241,21 @@ store the crate may write, so the event reports it and the host has to drop it.
 `an_unheld_psk_id_is_reported_once_as_a_credential_mismatch` and
 `a_plain_guest_handshake_does_not_ask_for_pairing` pin the observable behaviour, and
 `a_credential_mismatch_is_reported_once_per_connection` pins the once-per-connection rule.
+
+The server half is implemented. `ServerConfig::storage` is the host's `PairingStore`, keyed by
+`client_id`; the listener seals a client's first handshake with the record it holds and reports
+`Event::ClientConnected { approved: true }`. An unpaired client is held at empty activities and
+reported with `approved: false`, and `ServerHandle::approve` activates its roles; approval is
+remembered per `client_id` for the server's lifetime, revocable with
+`ServerHandle::revoke_approval`, and discarded on a successful pairing. `ServerHandle::unpair`
+removes the record, sends `server/unpair` and disconnects.
+`a_token_pairs_a_real_client_and_its_next_connection_authenticates`,
+`the_static_code_flow_stores_a_record_and_promotes_the_connection`,
+`the_dynamic_code_flow_checks_the_commitment_and_binds_the_code`,
+`an_unapproved_client_gets_no_roles_and_no_audio`,
+`revoking_an_approval_takes_the_roles_and_the_audio_away` and
+`unpair_removes_the_record_and_disconnects` pin that side. A client whose record no longer matches what the server holds is refused rather than
+given an unpaired session; entry 20 states that deviation.
 
 One part is still missing. Unpaired access is always admitted: `client/hello` carries
 `unpaired_access: { enabled: true }` unconditionally, there is no setting that turns it off, and so
@@ -500,6 +518,34 @@ announcement ahead of the shared first sample.
 **Removing it:** schedule a new stream at the largest `required_lead_time_ms` among the players that
 are ready when it opens, wait for a late member's report before announcing to it, and test a stream
 with two members whose reported leads differ.
+
+## 20. The server does not try the Sentinel key after a record fails
+
+**Spec:** `connection.md`, _Sentinel Fallback_. After a server announces a `psk_id`, "if [the second
+handshake message] fails and the referenced PSK was not the Sentinel, it verifies the same message
+against the Sentinel PSK before treating the handshake as failed". A message that validates there is
+an authenticated credential-mismatch signal: the session proceeds as an ordinary unpaired,
+Sentinel-keyed one, and the server must not activate roles or declare `playback` while its record
+exists.
+
+**What we do:** `listener::converse` selects the PSK from the record the store holds and reads Noise
+message 2 once. A message that does not authenticate under that key is a silent failure: the
+connection closes, no event is reported and the record is left untouched. A client that lost its
+record therefore cannot reach an unpaired session through this server, and the operator has to
+re-pair it. `a_client_that_cannot_use_its_record_is_refused` pins the refusal and the untouched
+record.
+
+**Why:** trying a second key needs a second handshake state for the _same_ message 1 bytes, because
+the second message's key is derived from the handshake hash and the PSK. `snow`'s `HandshakeState`
+cannot be cloned and exposes no way to replay the token stream with another PSK, so both attempts
+cannot share one transcript. Building the fallback any other way would mean a second Noise
+implementation just for this path.
+
+**Removing it:** either get a clonable or re-playable handshake state from `snow` (or pin a
+handshake state into `syncspin-core` itself), then verify message 2 against the record and, on
+failure, against the Sentinel key, mark the session unpaired and report the mismatch to the host;
+or accept the client's fallback by starting the handshake with the Sentinel key when the client
+advertises that it lost the record, which the wire does not signal.
 
 ## How to update this file
 
