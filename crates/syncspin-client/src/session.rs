@@ -1128,14 +1128,15 @@ impl Session<'_> {
             Ok(Some(activation)) => self.admitted_method(&activation).is_some(),
             Err(_) => true,
         };
-        match admit_activation(
+        if let Some(refusal) = admit_activation(
             self.matched,
             self.config.unpaired_access,
             pairing_admissible,
             &activate,
-        ) {
-            Admitted::Admissible => {}
-            refusal => return self.refuse_activation(refusal).await,
+        )
+        .refusal()
+        {
+            return self.refuse_activation(refusal).await;
         }
 
         // Every activation starts a new regime: messages from an attempt that ended before it are
@@ -1199,13 +1200,12 @@ impl Session<'_> {
     /// `messaging.md` orders the two reasons: `pairing_required` when enabling unpaired access would
     /// have made the activation admissible, `unauthorized` for everything else. The goodbye goes out
     /// before the close so the server can tell "pair against me" from "you sent something I forbid".
-    async fn refuse_activation(&mut self, refusal: Admitted) -> Result<()> {
+    async fn refuse_activation(&mut self, refusal: Refusal) -> Result<()> {
         let (goodbye, ending) = match refusal {
-            Admitted::Admissible => return Ok(()),
-            Admitted::PairingRequired => (GoodbyeReason::PairingRequired, Ending::PairingRequired),
-            Admitted::Unauthorized => (GoodbyeReason::Unauthorized, Ending::Unauthorized),
+            Refusal::PairingRequired => (GoodbyeReason::PairingRequired, Ending::PairingRequired),
+            Refusal::Unauthorized => (GoodbyeReason::Unauthorized, Ending::Unauthorized),
         };
-        if refusal == Admitted::PairingRequired {
+        if refusal == Refusal::PairingRequired {
             self.emit(Event::PairingRequired {
                 server_id: self.server_id.clone(),
                 reason: PairingRequiredReason::UnpairedAccessDisabled,
@@ -2672,6 +2672,29 @@ pub(crate) enum Admitted {
     Unauthorized,
 }
 
+/// The two ways an activation can be refused, each naming its own goodbye.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The setting is the only obstacle: pairing would admit the activation.
+    PairingRequired,
+    /// No setting makes the activation admissible on this connection.
+    Unauthorized,
+}
+
+impl Admitted {
+    /// The refusal this verdict carries, or `None` when the activation is admissible.
+    ///
+    /// Expressing the admissible verdict as `None` leaves the caller no arm that could close a
+    /// connection the verdict just admitted.
+    pub(crate) fn refusal(self) -> Option<Refusal> {
+        match self {
+            Admitted::Admissible => None,
+            Admitted::PairingRequired => Some(Refusal::PairingRequired),
+            Admitted::Unauthorized => Some(Refusal::Unauthorized),
+        }
+    }
+}
+
 /// Reads the activities of a `server/activate` as the set the rules are written against.
 ///
 /// `messaging.md` names the members of a set, so an unknown member and a repeated one are equally
@@ -3747,6 +3770,19 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_names_its_refusal() {
+        assert_eq!(Admitted::Admissible.refusal(), None);
+        assert_eq!(
+            Admitted::PairingRequired.refusal(),
+            Some(Refusal::PairingRequired)
+        );
+        assert_eq!(
+            Admitted::Unauthorized.refusal(),
+            Some(Refusal::Unauthorized)
+        );
+    }
+
+    #[test]
     fn playback_capable_for_follows_the_key_and_the_setting() {
         assert!(
             playback_capable_for(LONG_TERM, false, &[]),
@@ -3757,6 +3793,10 @@ mod tests {
             "unpaired access alone makes a guest playback-capable"
         );
         assert!(
+            playback_capable_for(MatchedPsk::Sentinel, true, &["pairing".to_owned()]),
+            "declaring pairing does not take playback capability away"
+        );
+        assert!(
             !playback_capable_for(MatchedPsk::Sentinel, false, &[]),
             "a guest without unpaired access is not playback-capable"
         );
@@ -3764,27 +3804,6 @@ mod tests {
             !playback_capable_for(MatchedPsk::Sentinel, false, &["pairing".to_owned()]),
             "declaring pairing does not add playback capability"
         );
-    }
-
-    #[test]
-    fn playback_capability_follows_the_setting_and_the_psk() {
-        let pairing_only = vec!["pairing".to_owned()];
-        assert!(!playback_capable_for(
-            MatchedPsk::Sentinel,
-            false,
-            &pairing_only
-        ));
-        assert!(playback_capable_for(
-            MatchedPsk::Sentinel,
-            true,
-            &pairing_only
-        ));
-        assert!(playback_capable_for(
-            MatchedPsk::Stored(PskCategory::LongTerm),
-            false,
-            &[]
-        ));
-        assert!(!playback_capable_for(MatchedPsk::Sentinel, false, &[]));
     }
 
     #[test]

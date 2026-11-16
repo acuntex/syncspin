@@ -230,6 +230,19 @@ async fn wait_for_open(recordings: &Recordings) {
     }
 }
 
+/// Waits until the sink was flushed at least `count` times.
+async fn wait_for_flushes(recordings: &Recordings, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while recordings.flushes() < count {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} sink flushes, saw {}",
+            recordings.flushes()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Builds a configuration for `server` with the given store.
 fn config_for(server: &FakeServer, storage: Option<Arc<dyn Storage>>) -> ClientConfig {
     ClientConfig {
@@ -535,6 +548,57 @@ async fn the_psk_flow_stores_one_record_and_pairs_the_next_connection() {
         Event::Track { title, .. } => assert_eq!(title, "Under the new keys"),
         other => panic!("the session must work under the new keys, got {other:?}"),
     }
+}
+
+/// The switch governs playback on a guest connection, not the pairing flow itself.
+///
+/// A device that has never paired is a guest, so refusing `['pairing']` here would leave it no way
+/// to become paired: the setting would be a one-way door.
+#[tokio::test]
+async fn a_pairing_completes_with_unpaired_access_off() {
+    let pairing_psk = [0x5b; 32];
+    let storage = MemoryStorage::holding(pairing_psk);
+    let mut server = FakeServer::start(ServerOptions {
+        first_activate: Some(pairing_activation()),
+        ..pairing_options(pairing_psk)
+    })
+    .await
+    .unwrap();
+    let mut config = config_for(&server, Some(storage.clone()));
+    config.unpaired_access = false;
+    let (_handle, mut events) = connect(config, Box::new(NullSink))
+        .await
+        .expect("the client must connect to the fake server");
+    expect_connected(&mut events, &server).await;
+
+    let long_term_psk =
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_pair_finalize())
+            .await
+            .expect("the client must send client/pair-finalize")
+            .expect("the connection must not close before the finalize")
+            .0;
+
+    let paired = match next_event(&mut events).await {
+        Event::PairingRequired { .. } => {
+            panic!("an activation that only declares pairing must not be refused by the setting")
+        }
+        Event::Paired { server_id } => server_id,
+        other => panic!("expected Paired, got {other:?}"),
+    };
+    assert_eq!(paired, server.server_id());
+
+    let records = storage.records();
+    assert_eq!(records.len(), 1, "one pairing produces exactly one record");
+    assert_eq!(records[0].category, PskCategory::LongTerm);
+    assert_eq!(
+        records[0].psk, long_term_psk,
+        "the record holds the key the client sent"
+    );
+    assert_eq!(
+        storage.pairing_psk(),
+        Some(pairing_psk),
+        "a successful pairing does not consume the pairing PSK"
+    );
 }
 
 #[tokio::test]
@@ -1120,6 +1184,9 @@ async fn a_rehandshake_to_the_pairing_psk_removes_the_player_role() {
     ));
     wait_for_open(&recordings).await;
 
+    // Losing the player role must not leave the audio it buffered audible, and the flush is what
+    // the clearing in `apply_activate` buys.
+    let flushes_before = recordings.flushes();
     server.rehandshake(pairing_psk, "pr");
     assert!(
         server.wait_for_rehandshake().await,
@@ -1129,6 +1196,7 @@ async fn a_rehandshake_to_the_pairing_psk_removes_the_player_role() {
         Event::StreamEnd { reason } => assert_eq!(reason, StreamEndReason::RoleRemoved),
         other => panic!("expected StreamEnd(RoleRemoved), got {other:?}"),
     }
+    wait_for_flushes(&recordings, flushes_before + 1).await;
     assert!(
         tokio::time::timeout(Duration::from_secs(1), server.wait_for_goodbye())
             .await
