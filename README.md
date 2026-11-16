@@ -27,13 +27,13 @@ project; the name describes only the protocol the code speaks.
 
 ## Crates
 
-| Path                      | Contents                                                                        |
-| ------------------------- | ------------------------------------------------------------------------------- |
-| `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
-| `crates/syncspin-client/` | Session loop, `Sink` trait, event stream, pairing and its `Storage` trait.      |
-| `crates/syncspin-server/` | Listener, one group, roles, host-fed streams, pairing and discovery.            |
-| `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr, pairing.      |
-| `examples/server-demo/`   | Runnable reference server: approves the first client and streams a tone.        |
+| Path                      | Version                                                                                                       | Contents                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `crates/syncspin-core/`   | [![crates.io](https://img.shields.io/crates/v/syncspin-core.svg)](https://crates.io/crates/syncspin-core)     | Noise handshake, framing, messages, clock filter. No transport, no device code. |
+| `crates/syncspin-client/` | [![crates.io](https://img.shields.io/crates/v/syncspin-client.svg)](https://crates.io/crates/syncspin-client) | Session loop, `Sink` trait, event stream, pairing and its `Storage` trait.      |
+| `crates/syncspin-server/` | [![crates.io](https://img.shields.io/crates/v/syncspin-server.svg)](https://crates.io/crates/syncspin-server) | Listener, one group, roles, host-fed streams, pairing and discovery.            |
+| `examples/player-pipe/`   | —                                                                                                             | Runnable reference player: PCM on stdout, status lines on stderr, pairing.      |
+| `examples/server-demo/`   | —                                                                                                             | Runnable reference server: approves the first client and streams a tone.        |
 
 `syncspin-core` never depends on `syncspin-client` or `syncspin-server`; every protocol and crypto
 decision lives in one place.
