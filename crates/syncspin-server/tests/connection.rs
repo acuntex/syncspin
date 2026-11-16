@@ -8,7 +8,9 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use syncspin_core::messages::{ClientCommand, ControllerCommand, ServerError, StreamEnd};
+use syncspin_core::messages::{
+    ClientCommand, ControllerCommand, ServerError, ServerState, StreamEnd,
+};
 #[tokio::test]
 async fn a_client_connects_and_is_activated() -> Result<()> {
     for suite in Suite::ALL {
@@ -1111,6 +1113,154 @@ async fn a_playing_group_declares_the_playback_activity() -> Result<()> {
 
     writer.end();
     client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cleartext_frame_after_the_transport_is_a_protocol_error() -> Result<()> {
+    let (server, port, mut events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+
+    // Once the Noise transport is up, a cleartext text frame has no place on the wire.
+    client.send_text("left the transport").await?;
+    client.expect_closed().await?;
+
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::ClientLeft {
+            reason: "protocol error".to_owned(),
+        },
+        "a peer that drops to cleartext is cut off, not silently ignored"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_frame_that_does_not_decrypt_is_a_protocol_error() -> Result<()> {
+    let (server, port, mut events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+
+    // Bytes that do not authenticate under the transport keys are refused, not ignored.
+    client.socket.send(Message::binary(vec![0xff; 16])).await?;
+    client.expect_closed().await?;
+
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::ClientLeft {
+            reason: "protocol error".to_owned(),
+        },
+        "traffic that does not decrypt is a protocol error, not a message"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_binary_message_of_an_unknown_id_is_ignored() -> Result<()> {
+    let (server, port, mut events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+
+    // A binary message id this revision does not serve carries nothing to act on.
+    let plaintext = encode_binary(0x77, b"a role this server does not serve");
+    let ciphertext = client
+        .noise
+        .as_mut()
+        .expect("the handshake finished")
+        .encrypt(&plaintext)?;
+    client.socket.send(Message::binary(ciphertext)).await?;
+
+    client.goodbye("shutdown").await?;
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::ClientLeft {
+            reason: "shutdown".to_owned(),
+        },
+        "an unknown binary message must not end the connection"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_message_of_the_wrong_direction_is_ignored() -> Result<()> {
+    let (server, port, mut events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+
+    // A server-to-client message type sent by the client is not something the server answers.
+    client
+        .send_json(&Incoming::ServerState(ServerState::default()))
+        .await?;
+    client.goodbye("shutdown").await?;
+
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::ClientLeft {
+            reason: "shutdown".to_owned(),
+        },
+        "a message in the wrong direction is ignored, not a protocol error"
+    );
     server.shutdown().await?;
     Ok(())
 }
