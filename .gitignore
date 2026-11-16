@@ -2,9 +2,10 @@
 *.ipk
 .superpowers/
 
-# `cargo mutants` writes its log, diffs and survivor lists here. CI uploads the directory as an
-# artifact; a local run must not leave it in a commit.
-/mutants.out
+# `cargo mutants` writes its log, diffs and survivor lists here, and rotates the previous run to
+# `mutants.out.old`. CI uploads the directory as an artifact; a local run must not leave it in a
+# commit.
+/mutants.out*
 
 # A player identity generated in the repository root must never be committed. `identity.json` is
 # the name older checkouts used.
