@@ -35,6 +35,8 @@ x25519-dalek = { workspace = true, features = ["static_secrets"] }
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Held below 1.12: proptest 1.12 declares Rust 1.88, and this workspace's MSRV
+# is 1.85. See the rule in `renovate.json5`.
 proptest = "~1.11.0"
 
 [package.metadata.docs.rs]
