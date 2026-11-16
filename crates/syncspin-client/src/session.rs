@@ -515,9 +515,9 @@ pub(crate) struct Session<'a> {
     matched: MatchedPsk,
     /// A pairing requirement this connection still has to report, or `None` once it has.
     ///
-    /// The handshake decides it once, but the spec's rule is about the event: a host must see one
-    /// [`Event::PairingRequired`] per connection, not one per frame. Taking the value is what makes
-    /// a second report impossible.
+    /// The handshake decides it once. Taking the value is what makes a second report of that reason
+    /// impossible; the refused-activation reason is reported by `refuse_activation` instead and
+    /// never touches this field.
     pairing_required: Option<PairingRequiredReason>,
     /// Why this connection has to end after the current wake-up, when a handler ended it instead of
     /// the peer. `serve` returns it on its next iteration.
@@ -1747,11 +1747,12 @@ impl Session<'_> {
         Ok(())
     }
 
-    /// Reports a pairing requirement this connection still owes the host, at most once.
+    /// Reports the handshake's pairing requirement, at most once.
     ///
     /// [`Event::Connected`] goes out first, so the host knows which server the requirement belongs
-    /// to. The handshake decides the requirement once per connection; taking the value here is what
-    /// makes a second report impossible, however many messages the session goes on to handle.
+    /// to. The handshake decides the credential mismatch once per connection; taking the value here
+    /// is what makes a second report of that reason impossible, however many messages the session
+    /// goes on to handle.
     fn report_pairing_required(&mut self) {
         if let Some(reason) = self.pairing_required.take() {
             self.emit(Event::PairingRequired {

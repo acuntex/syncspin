@@ -2475,7 +2475,12 @@ async fn goodbye_from(server: &mut FakeServer) -> Option<String> {
         .expect("the client must say goodbye before closing the connection")
 }
 
-/// Asserts that the client kept the connection open, by waiting for a goodbye it must not send.
+/// Asserts that the client sent no goodbye and did not close the connection within a short window.
+///
+/// The unpaired-access switch under test must leave the connection open, so a `client/goodbye`
+/// fails the test, and a close without one is the same failure observed by the server. The wait is
+/// bounded to 300 ms, so this proves the connection was not closed in that window, not that it
+/// stays open forever.
 async fn assert_no_goodbye(server: &mut FakeServer) {
     if let Ok(observed) =
         tokio::time::timeout(Duration::from_millis(300), server.wait_for_goodbye()).await

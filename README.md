@@ -201,10 +201,6 @@ it found and passes one URL to `connect`, which the spec leaves implementation-d
 
 ## What does not work yet
 
-- **Unpaired access.** The client always admits it: `client/hello` carries
-  `unpaired_access: { enabled: true }` unconditionally, there is no setting that turns it off, and
-  nothing closes an unpaired connection with reason `pairing_required`. A deliberate close sends
-  `client/goodbye` with a reason the host chooses.
 - **Server scope.** No queue, library, playlist, decoding, resampling, HTTP API or UI. The host owns
   the content and writes the frames; the crate owns the connection, clock, group and wire.
 - **Several groups.** One group per server. An unavailable member stays in it and simply receives no

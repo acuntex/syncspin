@@ -478,9 +478,10 @@ pub enum Event {
     /// session continues as an ordinary unpaired one. A server that holds a record for this client
     /// will keep the connection in pairing or idle until the host offers pairing again.
     PairingRequired {
-        /// Static public key of the server that announced the unknown credential.
+        /// Static public key of the server this requirement concerns, as 43 base64url characters.
         server_id: String,
-        /// What the server expects and the client cannot provide.
+        /// Which situation produced the requirement: a credential mismatch, or a refused
+        /// unpaired session.
         reason: PairingRequiredReason,
     },
     /// A pairing attempt ended without a record.
