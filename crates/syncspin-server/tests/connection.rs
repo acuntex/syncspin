@@ -1264,3 +1264,106 @@ async fn a_message_of_the_wrong_direction_is_ignored() -> Result<()> {
     server.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_controller_command_pauses_plays_and_stops_the_group() -> Result<()> {
+    let (server, port, _events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+    let mut writer = server.open_stream(TrackInfo::default());
+    client.read_stream_start().await?;
+
+    let command = |name: &str| {
+        Incoming::ClientCommand(ClientCommand {
+            controller: Some(ControllerCommand {
+                command: name.to_owned(),
+                ..ControllerCommand::default()
+            }),
+        })
+    };
+
+    client.send_json(&command("pause")).await?;
+    client
+        .read_until(|message| match message {
+            Incoming::StreamEnd(_) => Some(()),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(
+        client.read_group_update().await?.playback_state,
+        "stopped",
+        "a controller's pause ends the stream and stops the group"
+    );
+
+    client.send_json(&command("play")).await?;
+    client.read_stream_start().await?;
+    assert_eq!(
+        client.read_group_update().await?.playback_state,
+        "playing",
+        "a controller's play resumes the group"
+    );
+
+    client.send_json(&command("stop")).await?;
+    client
+        .read_until(|message| match message {
+            Incoming::StreamEnd(_) => Some(()),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(
+        client.read_group_update().await?.playback_state,
+        "stopped",
+        "a controller's stop ends the stream"
+    );
+
+    writer.end();
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn opening_a_second_track_is_a_jump_not_an_in_place_change() -> Result<()> {
+    let (server, port, _events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+    let mut writer = server.open_stream(TrackInfo::default());
+    client.read_stream_start().await?;
+
+    // A second stream while the first is active clears the players' buffers and re-announces the
+    // format, instead of changing the running stream in place.
+    let mut second = server.open_stream(TrackInfo {
+        title: Some("A second track".to_owned()),
+        ..TrackInfo::default()
+    });
+    let clear = client
+        .read_until(|message| match message {
+            Incoming::StreamClear(clear) => Some(clear),
+            _ => None,
+        })
+        .await?;
+    assert_eq!(
+        clear.roles,
+        Some(vec!["player".to_owned()]),
+        "a track jump clears the player stream"
+    );
+    let start = client.read_stream_start().await?;
+    assert_eq!(
+        start
+            .player
+            .expect("the new stream carries its format")
+            .codec,
+        "pcm",
+        "the new track announces its format again"
+    );
+
+    second.end();
+    writer.end();
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
