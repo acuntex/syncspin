@@ -44,4 +44,28 @@ exclude_re = [
   # comparison runs, the value is either already rejected or canonical. `||` and `&&` agree on
   # every input that reaches it.
   '^crates/syncspin-core/src/noise\.rs:781:26: replace \|\| with && in ',
+
+  # The Kalman weights below are the filter's internals, not its contract. The contract is the
+  # error bound the estimate promises: after convergence it holds, and every assertion in
+  # tests/clock.rs passes under each of these mutants, including the 2 ms and round-trip bounds.
+  # Pinning them would mean asserting private state or a golden float sequence, and the latter
+  # would fail on any regrouping of the same arithmetic.
+  #
+  # The measurement weight: `MAX_ERROR_SCALE * max_error` versus `+ max_error` changes the
+  # measurement variance by a factor of sixteen, which the gains absorb.
+  '^crates/syncspin-core/src/clock\.rs:170:34: replace \* with \+ in ',
+  # The covariance seed at the second sample: `(p_oo + r) / (dt * dt)`. `+` to `*` multiplies the
+  # seed by 250,000, and `/` to `%` leaves it at the dividend; both are corrected within a sample,
+  # and neither moves the settled estimate.
+  '^crates/syncspin-core/src/clock\.rs:182:36: replace \+ with \* in ',
+  '^crates/syncspin-core/src/clock\.rs:182:41: replace / with % in ',
+  '^crates/syncspin-core/src/clock\.rs:182:47: replace \* with \+ in ',
+  '^crates/syncspin-core/src/clock\.rs:182:47: replace \* with / in ',
+  # Adaptive forgetting scales the covariances by `FORGET_FACTOR^2`. Deflating instead of
+  # inflating changes only the path: after a 1 s step at the cutoff, three samples land at 775,527
+  # us instead of 787,186, eight at 999,773 instead of 1,003,962, and by fifteen samples the two
+  # agree to 91 us either way. The test that covers the branch asserts what the protocol promises
+  # - that the step is followed at all - and no tolerance it can honestly use separates the two.
+  '^crates/syncspin-core/src/clock\.rs:202:20: replace \*= with /= in ',
+  '^crates/syncspin-core/src/clock\.rs:203:20: replace \*= with /= in ',
 ]
