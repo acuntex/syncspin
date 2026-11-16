@@ -1130,7 +1130,7 @@ async fn a_rehandshake_to_the_pairing_psk_removes_the_player_role() {
         other => panic!("expected StreamEnd(RoleRemoved), got {other:?}"),
     }
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), server.wait_for_goodbye())
+        tokio::time::timeout(Duration::from_secs(1), server.wait_for_goodbye())
             .await
             .is_err(),
         "a re-pairing transition must not be closed by the switch"
