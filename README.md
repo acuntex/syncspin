@@ -144,6 +144,14 @@ stamps every chunk from the configured format and fans it out without decoding. 
 cannot play. Volume, mute and play/pause/stop belong to the group. The active roles are the three v1
 roles a player needs: `player@v1`, `controller@v1` and `metadata@v1`.
 
+The server pings a silent link just as the client does: after 15 s without receiving any WebSocket
+frame it sends a ping, and a peer that sends nothing in the 10 s after it - not even a pong - is
+dropped and reported as `Event::ClientLeft` naming the keepalive. Any received frame counts as the
+answer, so a link that keeps carrying clock requests, state reports or commands sees no ping, and a
+client's own ping is answered as before. The ping is a transport control frame with an 8-byte nonce,
+not application data; a client that vanished without closing its socket is noticed within 25 s
+instead of only when the server next writes and TCP fails.
+
 The server has its own pairing: `PairingStore` holds one record per `client_id`, an unpaired client
 is held at empty activities until the operator approves it, and `pair`, `start_pairing`,
 `submit_code` and `unpair` drive the token, static-code and dynamic-code flows. Discovery runs in both directions:
