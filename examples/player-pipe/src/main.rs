@@ -154,42 +154,32 @@ async fn run(options: Options) -> Result<()> {
     #[cfg(not(feature = "storage-file"))]
     let storage: Option<std::sync::Arc<dyn syncspin_client::storage::Storage>> = None;
 
-    let config = ClientConfig {
-        server: options.server,
-        player_name: options.name,
-        // A pipe on a general-purpose host has no hardware to describe; a host that runs on a
-        // device passes the product name, manufacturer and version here so the server shows it.
-        device_info: None,
-        identity,
-        storage,
-        // This example has no decoder, so it asks for raw samples. A host that wants encoded
-        // frames selects `AudioMode::Passthrough` and brings its own decoder.
-        audio_mode: AudioMode::Decode,
-        // Volume and mute are not restored across restarts, so the output starts at full scale and
-        // unmuted.
-        volume: 100,
-        muted: false,
-        volume_policy: VolumePolicy::default(),
-        max_backoff: MAX_BACKOFF,
-        pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
-        #[cfg(feature = "discovery")]
-        inbound: None,
-        #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
-        static_pairing_code: options.static_code.clone(),
-        #[cfg(all(feature = "pairing-code", not(feature = "storage-file")))]
-        static_pairing_code: None,
-        #[cfg(feature = "pairing-code")]
-        pairing_window: syncspin_client::DEFAULT_PAIRING_WINDOW,
-        #[cfg(feature = "pairing-code")]
-        pairing_pending_text: None,
+    let mut config = ClientConfig::new(options.server, options.name, identity);
+    // A pipe on a general-purpose host has no hardware to describe; a host that runs on a device
+    // passes the product name, manufacturer and version here so the server shows it.
+    config.device_info = None;
+    config.storage = storage;
+    // This example has no decoder, so it asks for raw samples. A host that wants encoded frames
+    // selects `AudioMode::Passthrough` and brings its own decoder.
+    config.audio_mode = AudioMode::Decode;
+    // Volume and mute are not restored across restarts, so the output starts at full scale and
+    // unmuted.
+    config.volume = 100;
+    config.muted = false;
+    config.volume_policy = VolumePolicy::default();
+    config.max_backoff = MAX_BACKOFF;
+    config.pairing_timeout = DEFAULT_PAIRING_TIMEOUT;
+    #[cfg(feature = "pairing-code")]
+    {
+        config.static_pairing_code = options.static_code.clone();
+        config.pairing_window = syncspin_client::DEFAULT_PAIRING_WINDOW;
+        config.pairing_pending_text = None;
         // The example has no display and no speaker, so it offers no dynamic pairing code: an
         // empty format list advertises nothing. A host with an out-channel sets both lists and
         // renders `Event::PairingCode`.
-        #[cfg(feature = "pairing-code")]
-        code_formats: Vec::new(),
-        #[cfg(feature = "pairing-code")]
-        code_out_channels: Vec::new(),
-    };
+        config.code_formats = Vec::new();
+        config.code_out_channels = Vec::new();
+    }
 
     // The client owns the reconnect loop: a dropped session is reported on the stream and retried
     // with the same sink and identity, so this example only prints what it sees.

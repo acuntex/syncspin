@@ -12,13 +12,13 @@ harmless.
 
 | #   | Area                                                            | Spec section                                                                                                                                                                      | Status                             |
 | --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| 1   | Server-initiated connections: one at a time, no admission arbitration | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Partly closed in 0.2               |
+| 1   | Server-initiated connections: last-playback server not persisted         | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Rejection closed in 0.2            |
 | 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
 | 3   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
 | 4   | Code pairing behind a feature; CPace layer unaudited            | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
 | 5   | `group/update` as the playback-state source                     | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Closed in 0.2                      |
 | 6   | `server/error` failure diagnostics                              | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Closed in 0.2                      |
-| 7   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
+| 7   | `_sendspin-server._tcp` discovery and explicit URL              | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closed in 0.2                      |
 | 8   | No unpaired-access switch on the client                         | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, client config only           |
 | 9   | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
 | 10  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
@@ -33,7 +33,7 @@ harmless.
 | 19  | The server's stream start lead is one fixed value               | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline              |
 | 20  | The server does not try the Sentinel key after a record fails   | [`connection.md` — Sentinel Fallback](https://github.com/Sendspin/spec/blob/main/connection.md#sentinel-fallback)                                                                 | Accepted, `snow` state             |
 
-## 1. Server-initiated connections: one at a time, no admission arbitration
+## 1. Server-initiated connections: the last-playback server is not persisted
 
 **Spec:** `connection.md`, _Establishing a Connection_ and _Server Initiated Connections_. The spec
 RECOMMENDS server-initiated connections, requires servers to support both methods and requires a
@@ -47,21 +47,29 @@ seconds, and a displaced or rejected connection gets `client/goodbye`.
 `advertise` publishes `_sendspin._tcp` with the bound port and the `path` and `name` TXT records
 through a host-supplied `Discovery`, accepts the inbound upgrade, answers any request carrying an
 `Origin` header with a 403, and runs the same session as a dialled connection. A configuration that
-advertises refuses to dial, so the two methods never run side by side. What is missing is the
-arbitration: the client serves one connection at a time, so a second server's upgrade waits in the
-TCP backlog until the first session ends instead of being rejected with `client/goodbye` reason
-`concurrent_attempt`, and the last-playback server is not persisted. The 30-second provisional
-timeout is not applied either, because no connection is ever held provisional.
+advertises refuses to dial, so the two methods never run side by side. The client admits one
+connection at a time, which the spec permits. A second server that connects while the first session
+is live is no longer queued: the client completes its handshake in a task of its own, then sends
+`client/goodbye` reason `concurrent_attempt` - or `pair/abort` with the same reason when the
+activation declares the `pairing` activity - and closes, as the rejection rule requires. A
+provisional connection that does not reach its first `server/activate` within 30 seconds is dropped.
+`a_second_server_is_rejected_with_concurrent_attempt` pins the rejection, and
+`a_discovered_client_is_connected_without_an_origin_header` pins the server-initiated direction.
+
+What remains is persistence of the last-playback server. The specification says a client MUST store
+the `server_id` of the server most recently admitted with `playback` in its activities; this crate
+has no `Storage` method for it, and the cap of one admitted connection means the both-empty tie-break
+that value decides is not reachable. The MUST is still unimplemented even though it currently has no
+observable effect.
 
 **Why:** capping the client at one connection is what `connection.md` allows ("A client MAY cap how
 many connections it admits at once"), and one group per server makes several simultaneous sessions
-useless for playback. The rejection protocol still has to be written for the case that cap creates;
-it is staged work, not a claim that queuing is equivalent.
+useless for playback. With the cap there is no equal-ranked conflict for a last-playback server to
+decide, so the ranking and displacement rules reduce to always rejecting the second connection.
 
-**Removing it:** implement the admission rules for a second connection - decide the arbitration from
-the activation, answer the loser with `client/goodbye` (`another_server` for a displaced connection,
-`concurrent_attempt` for a rejected one) and drop a provisional connection after 30 seconds - and
-persist the last-playback server. Then delete this entry.
+**Removing it:** add a `Storage` method for the last-playback `server_id`, record it whenever an
+admitted connection whose `activities` include `playback` is activated, and consult it in the
+both-empty tie-break once the cap rises above one. Then delete this entry.
 
 ## 2. No `activities` admissibility handling
 
@@ -199,26 +207,25 @@ logging and operator display, never a verified fact.
 `server_error_roundtrips_and_keeps_an_unknown_reason` pins the decoding, including the preserved
 unknown reason. The server half - sending the message - arrives with `syncspin-server`.
 
-## 7. No `_sendspin-server._tcp` discovery
+## 7. `_sendspin-server._tcp` discovery and explicit URL
 
 **Spec:** `connection.md`, _Client Initiated Connections_. A client that initiates the connection
 SHOULD discover the server over mDNS (`_sendspin-server._tcp`, `path` TXT record REQUIRED, `name`
 OPTIONAL) and connect to the advertised address and path, ignoring loopback and unspecified
 addresses.
 
-**What we do:** the caller passes the URL. There is no mDNS client, no service browser and no
-dependency that could provide one; the only discovery today is whatever the consumer does outside
-the library.
-
-**Why:** discovery is one half of the 0.2 work and would drag an mDNS stack into a build that must
-stay small for the ARM target, while giving the caller a fallback URL anyway. A wrong or filtered
-mDNS answer is also indistinguishable from a wrong URL at this stage, so a library-side browser would
-add a failure mode without a test that could hold it.
-
-**Removing it:** browse `_sendspin-server._tcp`, apply the loopback/unspecified filter and the
-`path` rule, and offer the result to the builder as a candidate list the caller can still override.
-The manual URL stays the fallback, as the spec allows an implementation-defined choice between
-discovered servers.
+**Status: closed in 0.2.** With the `mdns` feature both crates carry an implementation of their
+`Discovery` trait over `mdns-sd`. The server publishes `_sendspin-server._tcp` with the bound port,
+the `path` and `name` TXT records, and browses `_sendspin._tcp` for the clients it dials; the client
+publishes `_sendspin._tcp` and browses `_sendspin-server._tcp` through `discover_servers`. The
+browsers drop loopback and unspecified addresses and refuse a record without a `path` TXT record.
+The caller still chooses among the candidates and passes one URL to `connect`, which the spec leaves
+implementation-defined; nothing browses automatically, so a host decides when multicast is worth
+using. `a_client_record_has_the_service_the_port_the_path_and_the_name`,
+`a_server_record_has_the_service_the_port_the_path_and_the_name` and
+`a_discovered_client_is_connected_without_an_origin_header` pin the records and the
+server-initiated direction. The entry stays as a record of the closure; the next audit of this file
+removes it.
 
 ## 8. No unpaired-access switch
 

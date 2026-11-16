@@ -236,9 +236,8 @@ impl PairingFailure {
 ///
 /// The value is the `reason` field of `client/goodbye`, which the client sends before a graceful
 /// close so the server knows whether to reconnect. Only the reasons this revision can reach are
-/// named: a reason that needs a state this client cannot detect - `unauthorized`,
-/// `pairing_required`, `concurrent_attempt` - is left out until that state exists. The enum is
-/// non-exhaustive: a later revision may add one.
+/// named: `unauthorized` and `pairing_required` are left out until the states that produce them
+/// exist. The enum is non-exhaustive: a later revision may add one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GoodbyeReason {
@@ -248,6 +247,12 @@ pub enum GoodbyeReason {
     /// one connection this revision only lets a host express it through
     /// [`ClientHandle::close`].
     AnotherServer,
+    /// The client rejected a second server because another one is already admitted.
+    ///
+    /// A client that advertises `_sendspin._tcp` caps how many servers it serves at once; the
+    /// admission rule of `connection.md`, _Multiple servers_, rejects the loser with this reason
+    /// and closes the connection.
+    ConcurrentAttempt,
     /// The client is restarting and will reconnect.
     Restart,
     /// The client is shutting down or otherwise going offline.
@@ -264,6 +269,7 @@ impl GoodbyeReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AnotherServer => "another_server",
+            Self::ConcurrentAttempt => "concurrent_attempt",
             Self::Restart => "restart",
             Self::Shutdown => "shutdown",
             Self::UserRequest => "user_request",

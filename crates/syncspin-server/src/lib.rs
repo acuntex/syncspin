@@ -33,7 +33,9 @@
 //! role `A`. The code flows need CPace, so they are behind the `pairing-code` feature; a build
 //! without it refuses them.
 //!
-//! Several groups and discovery do not exist yet.
+//! Several groups do not exist yet. Discovery does: a host supplies a [`Discovery`] backend and
+//! the server advertises `_sendspin-server._tcp`, browses `_sendspin._tcp` and dials every client
+//! it finds. The `mdns` feature carries the mDNS implementation.
 //!
 //! Every connection is encrypted. A client that does not complete the Noise handshake is refused
 //! and there is no plaintext path, not behind a flag, not in a test. A `client/init` the server
@@ -42,6 +44,7 @@
 //!
 //! The crate is published as `publish = false` until the server half has stabilised.
 
+mod discovery;
 mod group;
 mod listener;
 mod pairing;
@@ -67,6 +70,12 @@ use crate::group::Group;
 // re-export keeps a consumer from having to depend on the protocol crate directly.
 pub use syncspin_core::noise::Identity;
 
+#[cfg(feature = "mdns")]
+pub use crate::discovery::MdnsDiscovery;
+pub use crate::discovery::{
+    discover_clients, DiscoveredClient, Discovery, ServiceAdvertisement, CLIENT_SERVICE_TYPE,
+    DEFAULT_SENDSPIN_PATH, SERVER_SERVICE_TYPE,
+};
 pub use crate::pairing::{
     CodeFormat, PairingMethod, PairingRecord, PairingStore, DEFAULT_PAIRING_TIMEOUT,
 };
@@ -113,6 +122,13 @@ pub struct ServerConfig {
     pub storage: Option<Arc<dyn PairingStore>>,
     /// How long one pairing attempt may stay unfinished before the server cancels it.
     pub pairing_timeout: Duration,
+    /// The host's discovery backend, or `None` for a server that only accepts connections.
+    ///
+    /// With a backend the server publishes `_sendspin-server._tcp` and dials the clients that
+    /// advertise `_sendspin._tcp`; without one it neither advertises nor dials, and a client has to
+    /// know the address. The backend is the host's, so `syncspin-server` can also run where
+    /// multicast is unavailable.
+    pub discovery: Option<Arc<dyn Discovery>>,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -127,6 +143,10 @@ impl fmt::Debug for ServerConfig {
             .field("format", &self.format)
             .field("storage", &self.storage.as_ref().map(|_| "<host store>"))
             .field("pairing_timeout", &self.pairing_timeout)
+            .field(
+                "discovery",
+                &self.discovery.as_ref().map(|_| "<host discovery>"),
+            )
             .finish()
     }
 }
@@ -141,6 +161,7 @@ impl Clone for ServerConfig {
             format: self.format.clone(),
             storage: self.storage.clone(),
             pairing_timeout: self.pairing_timeout,
+            discovery: self.discovery.clone(),
         }
     }
 }
@@ -159,6 +180,7 @@ impl ServerConfig {
             format: AudioFormat::pcm(48_000, 2, 16),
             storage: None,
             pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+            discovery: None,
         }
     }
 
@@ -327,6 +349,32 @@ impl Server {
         let (shutdown, shutdown_signal) = watch::channel(false);
         let group = Group::new(config.name.clone(), config.format.clone(), events.clone())?;
         let registry = Arc::new(Registry::new());
+        // The record names the bound port, not the configured one, so `bind` with port zero still
+        // advertises the endpoint a client can actually dial. A backend that cannot publish is
+        // reported here, before any task runs: a server that silently failed to advertise would
+        // look like one nobody chose.
+        let outbound = match config.discovery.clone() {
+            Some(discovery) => {
+                let record = ServiceAdvertisement::server(
+                    local_addr.port(),
+                    config.path.clone(),
+                    config.name.clone(),
+                );
+                discovery
+                    .advertise(record.clone())
+                    .context("the discovery backend refused to advertise this server")?;
+                Some(tokio::spawn(crate::discovery::run(
+                    config.clone(),
+                    group.clone(),
+                    events.clone(),
+                    registry.clone(),
+                    shutdown_signal.clone(),
+                    discovery,
+                    record,
+                )))
+            }
+            None => None,
+        };
         let task = tokio::spawn(listener::run(
             bound,
             config.clone(),
@@ -337,6 +385,7 @@ impl Server {
         ));
         Ok(ServerHandle {
             task: Some(task),
+            outbound,
             event_stream: Some(event_stream),
             shutdown,
             local_addr,
@@ -480,6 +529,8 @@ pub(crate) enum Command {
 /// ends the server, and dropping the handle does the same without waiting for it.
 pub struct ServerHandle {
     task: Option<JoinHandle<Result<()>>>,
+    /// The discovery loop, when the host supplied a backend.
+    outbound: Option<JoinHandle<Result<()>>>,
     event_stream: Option<mpsc::UnboundedReceiver<Event>>,
     shutdown: watch::Sender<bool>,
     local_addr: SocketAddr,
@@ -787,7 +838,15 @@ impl ServerHandle {
     pub async fn shutdown(mut self) -> Result<()> {
         let _ = self.shutdown.send(true);
         let task = self.task.take().expect("the handle owns its task");
-        task.await.context("the listener task panicked")?
+        let listener = task.await.context("the listener task panicked")?;
+        // The discovery loop withdraws the record and waits for the connections it dialled, so it
+        // is awaited after the listener has stopped accepting new ones.
+        let outbound = match self.outbound.take() {
+            Some(task) => task.await.context("the discovery task panicked")?,
+            None => Ok(()),
+        };
+        listener?;
+        outbound
     }
 }
 
@@ -798,8 +857,11 @@ impl Drop for ServerHandle {
     /// [`ServerHandle::shutdown`] sends. It exists so that a handle that is dropped cannot leave a
     /// listener behind on the address.
     fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
         if let Some(task) = self.task.take() {
-            let _ = self.shutdown.send(true);
+            task.abort();
+        }
+        if let Some(task) = self.outbound.take() {
             task.abort();
         }
     }
@@ -830,6 +892,10 @@ mod tests {
             config.format,
             AudioFormat::pcm(48_000, 2, 16),
             "the default stream format is the one every player must support"
+        );
+        assert!(
+            config.discovery.is_none(),
+            "a server with no backend neither advertises nor dials"
         );
     }
 

@@ -39,7 +39,7 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{accept_hdr_async, WebSocketStream};
+use tokio_tungstenite::{accept_hdr_async, connect_async, MaybeTlsStream, WebSocketStream};
 
 use crate::group::{Group, Outbound, CONTROLLER_ROLE, METADATA_ROLE, PLAYER_ROLE};
 use crate::pairing::{self, Attempt, CodeFormat, PairingMethod};
@@ -63,6 +63,14 @@ const HANDSHAKE_MESSAGE_2: &[u8] = b"{}";
 
 /// Unpadded base64url length of a 32-byte key.
 const KEY_CHARS: usize = 43;
+
+/// The socket one connection runs on, whichever side opened it.
+///
+/// A client-initiated connection is accepted as a plain TCP stream; a server-initiated one is
+/// dialled and therefore arrives in the TLS-capable wrapper, even though the advertised address is
+/// `ws://`. The Noise layer inside the payloads is what encrypts, so the difference is only which
+/// handshake built the WebSocket.
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Accepts connections until the listener is told to stop.
 pub(crate) async fn run(
@@ -116,6 +124,39 @@ async fn serve(
     let Some(socket) = upgrade(stream, &config.path).await? else {
         return Ok(());
     };
+    serve_socket(socket, config, group, events, registry, shutdown).await
+}
+
+/// Dials one advertised client and serves the WebSocket it accepts.
+///
+/// `connection.md`, _Server Initiated Connections_: the request goes to the advertised `ws://`
+/// address and path, and carries no `Origin` header - a client refuses one, because the header is
+/// a browser's cross-origin authorisation and not part of this protocol. Who opened the WebSocket
+/// does not change who starts Noise: the server is the initiator in both directions, so the
+/// conversion after the upgrade is the one an accepted connection runs.
+pub(crate) async fn connect(
+    url: &str,
+    config: ServerConfig,
+    group: Arc<Group>,
+    events: mpsc::UnboundedSender<Event>,
+    registry: Arc<Registry>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let (socket, _response) = connect_async(url)
+        .await
+        .with_context(|| format!("failed to connect to the client at {url}"))?;
+    serve_socket(socket, config, group, events, registry, shutdown).await
+}
+
+/// Runs the protocol on a socket whose WebSocket handshake is already done.
+async fn serve_socket(
+    socket: Socket,
+    config: ServerConfig,
+    group: Arc<Group>,
+    events: mpsc::UnboundedSender<Event>,
+    registry: Arc<Registry>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let mut connection = Connection { socket, shutdown };
     converse(&mut connection, &config, &group, &events, &registry).await
 }
@@ -128,7 +169,7 @@ async fn serve(
 // Error responses are the handshake crate's large `http::Response` type; a rejection happens once
 // per refused upgrade, so boxing it would buy nothing.
 #[allow(clippy::result_large_err)]
-async fn upgrade(stream: TcpStream, path: &str) -> Result<Option<WebSocketStream<TcpStream>>> {
+async fn upgrade(stream: TcpStream, path: &str) -> Result<Option<Socket>> {
     let expected = path.to_owned();
     let callback = move |request: &Request, response: Response| {
         if request.uri().path() == expected {
@@ -140,7 +181,7 @@ async fn upgrade(stream: TcpStream, path: &str) -> Result<Option<WebSocketStream
             Err(error)
         }
     };
-    match accept_hdr_async(stream, callback).await {
+    match accept_hdr_async(MaybeTlsStream::Plain(stream), callback).await {
         Ok(socket) => Ok(Some(socket)),
         // The peer asked for another path and was answered with the 404 above.
         Err(WsError::Http(response)) if response.status() == StatusCode::NOT_FOUND => Ok(None),
@@ -332,7 +373,7 @@ enum Encrypted {
 
 /// An established WebSocket connection to one client.
 struct Connection {
-    socket: WebSocketStream<TcpStream>,
+    socket: Socket,
     shutdown: watch::Receiver<bool>,
 }
 

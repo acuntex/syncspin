@@ -76,7 +76,11 @@
 //! An upgrade that carries an `Origin` header is refused, as the spec requires, and the Noise
 //! handshake is unchanged because the server initiates it in both directions. A client uses one of
 //! the two methods at a time: while `ClientConfig::inbound` is set, [`connect`] refuses to dial.
-//! The mDNS library stays outside the crate; the trait is the seam, so a fake drives the tests.
+//! A second server that arrives while one is admitted is rejected with `client/goodbye` reason
+//! `concurrent_attempt` and closed, which is the spec's admission rule for a client that caps
+//! itself at one connection. The `mdns` feature carries the `mdns-sd` implementation of
+//! [`Discovery`]; without it the trait is the seam, so a host can supply its own backend and a
+//! fake drives the tests.
 //!
 //! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
 //! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
@@ -111,6 +115,8 @@ pub use config::{
     CodeFormat, CodeOutChannel, DEFAULT_PAIRING_WINDOW, MAX_PAIRING_PENDING_TEXT_LEN,
     STATIC_PAIRING_CODE_LEN,
 };
+#[cfg(feature = "mdns")]
+pub use discovery::MdnsDiscovery;
 #[cfg(feature = "discovery")]
 pub use discovery::{advertise, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT};
 pub use discovery::{

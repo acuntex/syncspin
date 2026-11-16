@@ -242,6 +242,49 @@ async fn an_inbound_server_runs_the_normal_session() {
     handle.finished().await.expect("the client closes cleanly");
 }
 
+/// A second server that arrives while one is admitted is rejected, not left waiting in the backlog.
+#[tokio::test]
+async fn a_second_server_is_rejected_with_concurrent_attempt() {
+    let discovery = Arc::new(RecordingDiscovery::default());
+    let (mut handle, mut events) = advertise(inbound_config(discovery.clone()), Box::new(NullSink))
+        .await
+        .expect("the client must be able to advertise");
+    let record = discovery.only_record();
+    let url = format!("ws://127.0.0.1:{}{}", record.port, record.path);
+
+    let mut first = FakeServer::dial(&url, ServerOptions::default())
+        .await
+        .expect("the first server reaches the advertised endpoint");
+    assert!(first.wait_for_client_hello().await.is_some());
+    wait_for_connected(&mut events, first.server_id()).await;
+
+    // A second server completes its handshake in parallel and is told why it is not admitted.
+    let mut second = FakeServer::dial(&url, ServerOptions::default())
+        .await
+        .expect("the listener accepts the second connection");
+    assert_eq!(
+        second.wait_for_goodbye().await.as_deref(),
+        Some("concurrent_attempt"),
+        "connection.md rejects a connection that conflicts with the admitted one"
+    );
+
+    // The admitted server keeps its connection: rejection is not a disconnect of the group.
+    assert!(
+        first.wait_for_time_replies(1).await,
+        "the admitted server keeps being served"
+    );
+
+    first.close();
+    assert_eq!(
+        wait_for_disconnected(&mut events).await,
+        Duration::ZERO,
+        "an advertising client does not schedule a connection"
+    );
+
+    handle.close(GoodbyeReason::Shutdown);
+    handle.finished().await.expect("the client closes cleanly");
+}
+
 /// A request that carries an `Origin` header is refused, and the client keeps serving.
 #[tokio::test]
 async fn an_upgrade_with_an_origin_header_is_rejected() {

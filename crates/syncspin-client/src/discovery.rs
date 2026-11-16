@@ -8,10 +8,10 @@
 //! `discovery` feature - the inbound listener that serves the WebSocket the advertisement leads to.
 //! Without that feature the module is the trait and the records alone: nothing listens.
 //!
-//! The mDNS backend is not part of this crate. [`Discovery`] is the seam, so no protocol logic here
-//! opens a socket or joins a multicast group, and the tests drive the advertising with a fake
-//! instead of a network. The listener itself binds a real address, because it has to: it is the
-//! endpoint the advertisement names.
+//! The mDNS backend lives behind the `mdns` feature; without it, [`Discovery`] is the seam and the
+//! host supplies the implementation. No protocol logic here opens a socket or joins a multicast
+//! group, and the tests drive the advertising with a fake instead of a network. The listener itself
+//! binds a real address, because it has to: it is the endpoint the advertisement names.
 //!
 //! The inbound connection runs the same session as a dialled one. Only the WebSocket is different:
 //! the server opened it, so the client answers the upgrade instead of sending it, and it rejects
@@ -150,6 +150,12 @@ pub fn discover_servers(discovery: &dyn Discovery) -> Result<Vec<DiscoveredServe
 #[cfg(feature = "discovery")]
 pub use inbound::{advertise, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT};
 
+#[cfg(feature = "mdns")]
+mod mdns;
+
+#[cfg(feature = "mdns")]
+pub use mdns::MdnsDiscovery;
+
 #[cfg(feature = "discovery")]
 mod inbound {
     use std::fmt;
@@ -162,6 +168,7 @@ mod inbound {
     use syncspin_core::pairing::token::encode_v0;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot};
+    use tokio::task::JoinSet;
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     use tokio_tungstenite::tungstenite::http::header::ORIGIN;
@@ -188,6 +195,13 @@ mod inbound {
     /// handshake is refused whatever interface it reached.
     pub const DEFAULT_INBOUND_ADDR: SocketAddr =
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), DEFAULT_INBOUND_PORT);
+
+    /// How long the rejection of a second server may take before its socket is dropped.
+    ///
+    /// The provisional connection has to reach its first `server/activate` before admission can be
+    /// applied. A server that never gets there is not worth keeping: the cap already rejected it,
+    /// and the spec's own provisional timeout is 30 seconds.
+    const REJECT_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// The server-initiated half of the connection mode.
     ///
@@ -403,7 +417,13 @@ mod inbound {
                 Ok(None) | Err(_) => continue,
             };
 
-            let attempt = session::attempt(
+            // The server-initiated mode admits one server at a time. A second one that arrives
+            // while this session runs is not left in the listen backlog: its handshake is completed
+            // in a task of its own and it is rejected with `concurrent_attempt`, as `connection.md`
+            // requires. The task owns no state of the admitted session, so a slow rejection cannot
+            // hold up playback.
+            let mut rejections = JoinSet::new();
+            let mut attempt = Box::pin(session::attempt(
                 transport,
                 config,
                 events,
@@ -412,8 +432,32 @@ mod inbound {
                 reported_volume,
                 carried,
                 shutdown,
-            )
-            .await;
+            ));
+            let attempt = loop {
+                tokio::select! {
+                    attempt = &mut attempt => break attempt,
+                    // Accepting is cancel-safe: a connection that arrives while another branch is
+                    // busy waits in the backlog for the next round.
+                    accepted = listener.accept() => {
+                        let (stream, _address) =
+                            accepted.context("failed to accept an inbound connection")?;
+                        rejections.spawn(reject_connection(
+                            stream,
+                            config.clone(),
+                            path.to_owned(),
+                            pairing,
+                        ));
+                    }
+                    joined = rejections.join_next(), if !rejections.is_empty() => {
+                        // A rejection that failed changed nothing: the admitted session is the one
+                        // the host hears about.
+                        let _ = joined;
+                    }
+                }
+            };
+            // A rejection that has not finished belongs to a client that is already ending; it is
+            // dropped with the set, which closes its socket.
+            drop(rejections);
             carried = attempt.carried;
 
             // Nothing buffered for the session that ended may become audible later; the flush runs
@@ -445,6 +489,26 @@ mod inbound {
                 return Err(error);
             }
         }
+    }
+
+    /// Rejects one connection that arrived while another server is admitted.
+    ///
+    /// The upgrade rules are the same as for the admitted connection - the path must match and an
+    /// `Origin` header is refused - because a rejected server learns nothing a browser could use.
+    async fn reject_connection(
+        stream: TcpStream,
+        config: ClientConfig,
+        path: String,
+        pairing: Option<PairingPsk>,
+    ) {
+        let Ok(Some(transport)) = upgrade(stream, &path).await else {
+            return;
+        };
+        let _ = tokio::time::timeout(
+            REJECT_TIMEOUT,
+            session::reject_concurrent(transport, &config, pairing, &[]),
+        )
+        .await;
     }
 
     /// Waits for the next inbound connection, answering control requests meanwhile.

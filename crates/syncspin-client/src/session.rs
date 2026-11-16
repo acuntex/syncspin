@@ -250,6 +250,12 @@ impl Transport {
         self.send(Message::binary(bytes)).await
     }
 
+    /// Sends a WebSocket close frame.
+    #[cfg(feature = "discovery")]
+    pub(crate) async fn close(&mut self) -> Result<()> {
+        self.send(Message::Close(None)).await
+    }
+
     /// Writes one WebSocket message on whichever socket this connection runs on.
     async fn send(&mut self, message: Message) -> Result<()> {
         match &mut self.socket {
@@ -2336,6 +2342,50 @@ async fn handshake(
         matched: selected.matched,
         credential_mismatch: selected.credential_mismatch,
     })
+}
+
+/// Completes the handshake of a server that cannot be admitted, then rejects it.
+///
+/// `connection.md`, _Multiple servers (server-initiated)_: the client lets the handshake complete
+/// before it applies admission, so the loser of an arbitration learns why on an encrypted channel.
+/// This client admits one server at a time; while that one is live, every activation on a
+/// provisional connection conflicts with it and is rejected. The activation's `pairing` activity
+/// decides the message: a rejected pairing attempt gets `pair/abort` with reason
+/// `concurrent_attempt`, every other activation `client/goodbye` with the same reason, and then
+/// the socket closes.
+///
+/// A handshake that fails gets no message: the peer never became a connection, and the ordinary
+/// silent-failure rule applies.
+#[cfg(feature = "discovery")]
+pub(crate) async fn reject_concurrent(
+    transport: Transport,
+    config: &ClientConfig,
+    pairing_psk: Option<PairingPsk>,
+    previous_roles: &[String],
+) -> Result<()> {
+    let candidates = Candidates::load(config.storage.as_deref(), &[], pairing_psk)?;
+    let mut ready = match handshake(transport, config, &candidates, previous_roles).await {
+        Ok(ready) => ready,
+        Err(HandshakeError::ServerRejected(_) | HandshakeError::Failed(_)) => return Ok(()),
+    };
+    let reason = PairingFailure::ConcurrentAttempt.as_str().to_owned();
+    let rejection = if ready
+        .activate
+        .activities
+        .iter()
+        .any(|role| role == "pairing")
+    {
+        Incoming::PairAbort(PairAbort { reason })
+    } else {
+        Incoming::ClientGoodbye(ClientGoodbye { reason })
+    };
+    // The connection is closing either way; a write that fails changes nothing the host has to
+    // hear, so the attempt to explain is best effort.
+    if let Ok(ciphertext) = encrypt_json(&mut ready.noise, &rejection) {
+        let _ = ready.transport.send_binary(ciphertext).await;
+    }
+    let _ = ready.transport.close().await;
+    Ok(())
 }
 
 /// Builds the `client/hello` the client announces itself with.

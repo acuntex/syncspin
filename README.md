@@ -140,24 +140,25 @@ carries an `Origin` header is refused with a 403, as the spec requires, and the 
 unchanged: the server is its initiator in both directions.
 
 One server is served at a time. While `ClientConfig::inbound` is set the client does not dial, and
-`connect` refuses: the spec lets a client use one of the two methods at a time, never both. The mDNS
-library itself stays outside the crate — `Discovery` is the seam, so a test drives advertising with a
-fake and no multicast socket is opened.
+`connect` refuses: the spec lets a client use one of the two methods at a time, never both. A second
+server that connects while one is admitted is rejected with `client/goodbye` reason
+`concurrent_attempt` and closed, as the admission rule requires; it is not left waiting in the
+listener's backlog. The `mdns` feature carries an `mdns-sd` implementation of `Discovery`
+(`MdnsDiscovery`); without it the trait is the seam, so a test drives advertising with a fake and no
+multicast socket is opened.
 
 ## What does not work yet
 
 - **Unpaired access.** The client always admits it: `client/hello` carries
   `unpaired_access: { enabled: true }` unconditionally, there is no setting that turns it off, and
   nothing closes an unpaired connection with reason `pairing_required`. A deliberate close sends
-  `client/goodbye` with a reason the host chooses; the reasons for states this revision cannot
-  detect (`unauthorized`, `concurrent_attempt`) are never sent.
+  `client/goodbye` with a reason the host chooses.
 - **Server.** `syncspin-server` is a stub; the listener, streams, roles and pairing server arrive in
   0.2.
 - **Discovery.** With the `discovery` feature the client advertises `_sendspin._tcp` and accepts
-  server-initiated connections, one server at a time. The mDNS backend belongs to the host, so this
-  crate ships no implementation, and the multi-server admission rules of `connection.md` (several
-  connections, `playback`/`pairing` arbitration, the last-playback server) are not implemented: a
-  second server waits until the first is gone.
+  server-initiated connections, one server at a time; a second is rejected with `concurrent_attempt`.
+  The `mdns` feature carries an `mdns-sd` backend for both crates; the last-playback server of
+  `connection.md` is not persisted.
 - **Group state.** `group/update`, the spec's authoritative source of the playback state, is not
   handled.
 - **TLS.** No TLS stack: a `wss://` address is rejected when the client is configured, and nothing

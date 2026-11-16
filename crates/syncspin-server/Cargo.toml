@@ -17,6 +17,10 @@ include = ["src/**", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 # The static and dynamic pairing code flows. Off by default, exactly as in `syncspin-client`: a
 # build that does not carry CPace must not advertise a method that needs it.
 pairing-code = ["syncspin-core/pairing-code"]
+# The mDNS backend for `Discovery`: publish `_sendspin-server._tcp` and browse `_sendspin._tcp`.
+# Off by default so a build that only listens carries no multicast stack. It joins a multicast
+# group and opens sockets; nothing else in this crate does.
+mdns = ["dep:mdns-sd"]
 
 [dependencies]
 syncspin-core = { version = "0.1.0", path = "../syncspin-core" }
@@ -24,6 +28,9 @@ anyhow.workspace = true
 base64.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
+# mDNS is a synchronous daemon on a thread of its own; the feature is off unless a host asks for
+# the backend. Default features off: the `async` and `logging` halves are not used here.
+mdns-sd = { version = "0.21", optional = true, default-features = false }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite.workspace = true
@@ -31,7 +38,8 @@ tokio-tungstenite.workspace = true
 [dev-dependencies]
 # The round-trip test in `tests/roundtrip.rs` runs the real client crate against this server. A
 # dev-dependency does not change the client's public behaviour or the server's published surface.
-syncspin-client = { version = "0.1.0", path = "../syncspin-client" }
+# `discovery` is on only for the server-initiated test, which lets a real client advertise.
+syncspin-client = { version = "0.1.0", path = "../syncspin-client", features = ["discovery"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [package.metadata.docs.rs]
