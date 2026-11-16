@@ -1308,4 +1308,122 @@ mod tests {
             Attempt::code(PairingMethod::DynamicCode, None, 1, DEFAULT_PAIRING_TIMEOUT).is_err()
         );
     }
+
+    #[test]
+    fn the_record_helpers_handle_a_missing_store() {
+        assert!(
+            store_record(None, "a-client", [0u8; 32]).is_err(),
+            "a server without a store cannot keep a record"
+        );
+        assert!(
+            remove_record(None, "a-client").is_ok(),
+            "a server without a store has nothing to remove"
+        );
+    }
+
+    #[test]
+    fn a_token_finalize_without_a_long_term_psk_is_refused() {
+        let mut attempt = Attempt::token(1, DEFAULT_PAIRING_TIMEOUT);
+        attempt
+            .on_pair_init(&pair_init(None), &[0x11; 32])
+            .expect("the init is accepted");
+        assert!(
+            attempt
+                .on_finalize(
+                    &ClientPairFinalize {
+                        long_term_psk: None,
+                        wrapped_psk: None,
+                    },
+                    Suite::ChaChaPoly,
+                    None,
+                )
+                .is_err(),
+            "the Pairing PSK flow must deliver a long-term PSK"
+        );
+    }
+
+    #[cfg(feature = "pairing-code")]
+    fn auth(share: &[u8; 32]) -> ClientPairAuth {
+        ClientPairAuth {
+            pake_msg_2: URL_SAFE_NO_PAD.encode(share),
+        }
+    }
+
+    #[cfg(feature = "pairing-code")]
+    fn confirm(client_kc: &[u8; 64]) -> ClientPairConfirm {
+        ClientPairConfirm {
+            client_kc: URL_SAFE_NO_PAD.encode(client_kc),
+            wrapped_nonce_b: None,
+        }
+    }
+
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_pair_auth_out_of_sequence_is_refused() {
+        let mut attempt = static_attempt();
+        assert!(
+            attempt.on_client_auth(&auth(&[0u8; 32])).is_err(),
+            "client/pair-auth before client/pair-init is out of sequence"
+        );
+        attempt.phase = Phase::AwaitClientAuth;
+        assert!(
+            attempt.on_client_auth(&auth(&[0u8; 32])).is_err(),
+            "client/pair-auth before the CPace round began is out of sequence"
+        );
+    }
+
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_pair_confirm_out_of_sequence_is_refused() {
+        let mut attempt = static_attempt();
+        assert!(
+            attempt
+                .on_client_confirm(&confirm(&[0u8; 64]), &[0x11; 32], Suite::ChaChaPoly)
+                .is_err(),
+            "client/pair-confirm before the share is out of sequence"
+        );
+    }
+
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_pair_retry_out_of_sequence_is_refused() {
+        let mut attempt = static_attempt();
+        assert!(
+            attempt.on_client_retry().is_err(),
+            "a static attempt has no retry round"
+        );
+    }
+
+    #[cfg(feature = "pairing-code")]
+    #[test]
+    fn a_code_flow_finalize_must_carry_the_sealed_key() {
+        let mut attempt = static_attempt();
+        attempt.phase = Phase::AwaitFinalize;
+        assert!(
+            attempt
+                .on_finalize(
+                    &ClientPairFinalize {
+                        long_term_psk: Some(URL_SAFE_NO_PAD.encode([0u8; 32])),
+                        wrapped_psk: None,
+                    },
+                    Suite::ChaChaPoly,
+                    None,
+                )
+                .is_err(),
+            "a code flow delivers its key sealed, never in clear"
+        );
+        assert!(
+            attempt
+                .on_finalize(
+                    &ClientPairFinalize {
+                        long_term_psk: None,
+                        wrapped_psk: None,
+                    },
+                    Suite::ChaChaPoly,
+                    None,
+                )
+                .is_err(),
+            "a code flow without a sealed key has nothing to open"
+        );
+    }
 }
