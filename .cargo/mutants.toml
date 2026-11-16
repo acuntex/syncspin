@@ -1,0 +1,41 @@
+# Settings for `cargo mutants`, used by the weekly CI job and by a local run alike.
+#
+# A surviving mutant is a test gap or an exemption, never a number to accept. This file holds the
+# exemptions and the reason for each one; everything else has to be killed by a test.
+
+# `pairing-code` is off by default, and without it `pairing/pake.rs`, `pairing/wrap.rs` and
+# `pairing/code.rs` are compiled away. cargo-mutants generates mutants from the source tree, not
+# from the build, so those 122 mutants would build unchanged and every one would be reported as
+# missed. The workflow passes the same flag explicitly so the job reads correctly on its own.
+additional_cargo_args = ["--all-features"]
+
+# Mutants that cannot be caught because they do not change behaviour.
+#
+# Each pattern names one mutant, replacement included: `clock.rs:199:70` produces three variants
+# and only the `>=` one is equivalent, so a pattern that stopped at the line would also silence the
+# `==` and `<` variants the suite does catch today.
+#
+# The names carry a line and a column, so an edit above one of these makes its pattern stale. That
+# is deliberate: a stale pattern stops matching, the mutant comes back as a survivor, and the red
+# run points at the exemption that needs a new line number. It never hides a real gap.
+exclude_re = [
+  # `PROCESS_STD_DEV` is 0.0, so the process-noise term is exactly zero whether it is added or
+  # subtracted, multiplied or divided.
+  '^crates/syncspin-core/src/clock\.rs:192:68: replace \+ with - in ',
+  '^crates/syncspin-core/src/clock\.rs:192:94: replace \* with / in ',
+  # The drift diffusion is 1e-11 per sqrt(us): divided by dt it is 4e-28 against a variance near
+  # 8e-6. Multiplying by dt is caught; dividing by it cannot be.
+  '^crates/syncspin-core/src/clock\.rs:194:68: replace \* with / in ',
+  # `>` against `>=` where the two sides are floats that would have to land exactly on each other:
+  # a residual on exactly three times the error bound, and a variance on exactly a quarter of the
+  # squared drift. Both are measure-zero, not untested.
+  '^crates/syncspin-core/src/clock\.rs:199:70: replace > with >= in ',
+  '^crates/syncspin-core/src/clock\.rs:216:50: replace > with >= in ',
+  # `base32_decode` strips every trailing `=`, so padding a body to eight characters or leaving it
+  # unpadded decodes to the same bytes.
+  '^crates/syncspin-core/src/pairing/token\.rs:206:26: replace != with == in ',
+  # The base64 decoder rejects non-canonical trailing bits itself, so by the time the re-encode
+  # comparison runs, the value is either already rejected or canonical. `||` and `&&` agree on
+  # every input that reaches it.
+  '^crates/syncspin-core/src/noise\.rs:781:26: replace \|\| with && in ',
+]
