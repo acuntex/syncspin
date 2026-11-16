@@ -1357,18 +1357,30 @@ mod tests {
         }
     }
 
+    /// Returns the error of a refused attempt, without requiring the success type to be `Debug`.
+    #[cfg(feature = "pairing-code")]
+    fn refusal<T>(result: Result<T>) -> anyhow::Error {
+        match result {
+            Ok(_) => panic!("expected the attempt to refuse, but it accepted"),
+            Err(error) => error,
+        }
+    }
+
     #[cfg(feature = "pairing-code")]
     #[test]
     fn a_pair_auth_out_of_sequence_is_refused() {
         let mut attempt = static_attempt();
+        let error = refusal(attempt.on_client_auth(&auth(&[0u8; 32])));
         assert!(
-            attempt.on_client_auth(&auth(&[0u8; 32])).is_err(),
-            "client/pair-auth before client/pair-init is out of sequence"
+            format!("{error:#}").contains("out of sequence"),
+            "got: {error:#}"
         );
+
         attempt.phase = Phase::AwaitClientAuth;
+        let error = refusal(attempt.on_client_auth(&auth(&[0u8; 32])));
         assert!(
-            attempt.on_client_auth(&auth(&[0u8; 32])).is_err(),
-            "client/pair-auth before the CPace round began is out of sequence"
+            format!("{error:#}").contains("before the CPace round began"),
+            "got: {error:#}"
         );
     }
 
@@ -1376,11 +1388,14 @@ mod tests {
     #[test]
     fn a_pair_confirm_out_of_sequence_is_refused() {
         let mut attempt = static_attempt();
+        let error = refusal(attempt.on_client_confirm(
+            &confirm(&[0u8; 64]),
+            &[0x11; 32],
+            Suite::ChaChaPoly,
+        ));
         assert!(
-            attempt
-                .on_client_confirm(&confirm(&[0u8; 64]), &[0x11; 32], Suite::ChaChaPoly)
-                .is_err(),
-            "client/pair-confirm before the share is out of sequence"
+            format!("{error:#}").contains("out of sequence"),
+            "got: {error:#}"
         );
     }
 
@@ -1388,9 +1403,10 @@ mod tests {
     #[test]
     fn a_pair_retry_out_of_sequence_is_refused() {
         let mut attempt = static_attempt();
+        let error = refusal(attempt.on_client_retry());
         assert!(
-            attempt.on_client_retry().is_err(),
-            "a static attempt has no retry round"
+            format!("{error:#}").contains("out of sequence"),
+            "got: {error:#}"
         );
     }
 
@@ -1399,31 +1415,34 @@ mod tests {
     fn a_code_flow_finalize_must_carry_the_sealed_key() {
         let mut attempt = static_attempt();
         attempt.phase = Phase::AwaitFinalize;
+
+        // Both fields present: the sealed value is well-formed, so only the clear-key guard can
+        // refuse.
+        let error = refusal(attempt.on_finalize(
+            &ClientPairFinalize {
+                long_term_psk: Some(URL_SAFE_NO_PAD.encode([0x11u8; 32])),
+                wrapped_psk: Some(URL_SAFE_NO_PAD.encode([0u8; 48])),
+            },
+            Suite::ChaChaPoly,
+            None,
+        ));
         assert!(
-            attempt
-                .on_finalize(
-                    &ClientPairFinalize {
-                        long_term_psk: Some(URL_SAFE_NO_PAD.encode([0u8; 32])),
-                        wrapped_psk: None,
-                    },
-                    Suite::ChaChaPoly,
-                    None,
-                )
-                .is_err(),
-            "a code flow delivers its key sealed, never in clear"
+            format!("{error:#}").contains("carries the long-term PSK in clear"),
+            "got: {error:#}"
         );
+
+        // Neither field present: only the missing sealed key can refuse.
+        let error = refusal(attempt.on_finalize(
+            &ClientPairFinalize {
+                long_term_psk: None,
+                wrapped_psk: None,
+            },
+            Suite::ChaChaPoly,
+            None,
+        ));
         assert!(
-            attempt
-                .on_finalize(
-                    &ClientPairFinalize {
-                        long_term_psk: None,
-                        wrapped_psk: None,
-                    },
-                    Suite::ChaChaPoly,
-                    None,
-                )
-                .is_err(),
-            "a code flow without a sealed key has nothing to open"
+            format!("{error:#}").contains("carries no wrapped_psk"),
+            "got: {error:#}"
         );
     }
 }

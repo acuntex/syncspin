@@ -949,15 +949,15 @@ mod tests {
 
     impl PairingStore for TestStore {
         fn load_pairings(&self) -> Result<Vec<PairingRecord>> {
-            Ok(Vec::new())
+            unimplemented!("a Debug check never reads the store")
         }
 
         fn store_pairing(&self, _record: PairingRecord) -> Result<()> {
-            Ok(())
+            unimplemented!("a Debug check never writes the store")
         }
 
         fn remove_pairing(&self, _client_id: &str) -> Result<()> {
-            Ok(())
+            unimplemented!("a Debug check never removes from the store")
         }
     }
 
@@ -966,15 +966,15 @@ mod tests {
 
     impl Discovery for TestDiscovery {
         fn advertise(&self, _record: ServiceAdvertisement) -> Result<()> {
-            Ok(())
+            unimplemented!("a Debug check never advertises")
         }
 
         fn withdraw(&self, _service_type: &str) -> Result<()> {
-            Ok(())
+            unimplemented!("a Debug check never withdraws")
         }
 
         fn browse(&self, _service_type: &str) -> Result<Vec<DiscoveredClient>> {
-            Ok(Vec::new())
+            unimplemented!("a Debug check never browses")
         }
     }
 

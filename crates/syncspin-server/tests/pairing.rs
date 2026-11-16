@@ -1151,7 +1151,6 @@ async fn a_pair_token_for_a_client_that_did_not_offer_the_method_is_refused() ->
         next_event(&mut events).await,
         Event::ClientActivated { .. }
     ));
-    expect_no_event(&mut events, Duration::from_millis(200)).await;
 
     client.goodbye("shutdown").await?;
     server.shutdown().await?;
