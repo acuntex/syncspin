@@ -21,7 +21,7 @@ use syncspin_core::messages::{
     DynamicPairingCodeMethod, PairAbort, PairingActivation, StaticPairingCodeMethod,
 };
 use syncspin_core::noise::psk_id_for;
-use syncspin_server::{CodeFormat, PairingMethod, PairingRecord, PairingStore};
+use syncspin_server::{CodeFormat, PairingMethod, PairingRecord, PairingStore, TrackInfo};
 
 /// An in-memory server-side pairing store.
 #[derive(Default)]

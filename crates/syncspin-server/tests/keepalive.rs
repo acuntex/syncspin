@@ -1,13 +1,17 @@
 //! The server's WebSocket keepalive: a silent link is pinged, an unanswered ping drops the peer,
 //! and a normal frame keeps the connection alive.
 //!
-//! The first three tests drive the listener with the fake client in `common`, which is the only
-//! peer that can leave a ping unanswered while keeping the socket open (the real client always
-//! answers a ping). They measure the shipped 15 s and 10 s windows on a paused clock: the clock is
-//! frozen only while the test waits for the server's timer, and every frame exchange runs on the
-//! real clock, because a paused clock does not wake a socket read promptly. The last two are the
-//! cross-crate proof: a real client on a real server, so the two halves exercise each other's ping
-//! and pong code paths, which no single-crate suite can do.
+//! The first five tests drive the listener with the fake client in `common`, which is the only peer
+//! that can leave a ping unanswered while keeping the socket open (the real client always answers a
+//! ping). They measure the shipped 15 s and 10 s windows on a paused clock: the clock is frozen only
+//! while the test waits for the server's timer, and every frame exchange runs on the real clock,
+//! because a paused clock does not wake a socket read promptly. The last two are the cross-crate
+//! proof that the two halves' keepalives interoperate: a real client on a real server must keep a
+//! silent link alive, and neither side may go silent and survive.
+//!
+//! The server's pong to a client ping is pinned by `a_client_ping_is_answered_with_a_pong`, not by
+//! the cross-crate pair: there both sides ping on the same window, so each side's ping keeps the
+//! other's keepalive satisfied.
 
 mod common;
 
@@ -92,7 +96,10 @@ async fn a_silent_connection_is_pinged_after_the_idle_window_and_survives_a_pong
     let (server, port, _) = start().await?;
     let mut client = silent_client(port).await?;
 
-    // The idle window is 15 s: inside it the link is silent, and only after it does the server ping.
+    // The idle window is 15 s. The test cannot read the socket on a paused clock, so it measures
+    // the window in two steps instead of the client suite's auto-advance: no ping may arrive at
+    // 14 s, and one must arrive by 16 s, which bounds the window to the same 1 s slack the client
+    // suite's assertion allows.
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(14)).await;
     tokio::time::resume();
@@ -221,6 +228,68 @@ async fn a_normal_frame_inside_the_pong_window_keeps_the_connection_alive() -> R
 }
 
 #[tokio::test]
+async fn a_client_ping_is_answered_with_a_pong() -> Result<()> {
+    let (server, port, _) = start().await?;
+    let mut client = silent_client(port).await?;
+
+    // The server must answer a WebSocket ping it receives, with the payload it was sent. The
+    // cross-crate test cannot pin this: there the two sides' own pings keep each other's keepalive
+    // satisfied, so mutating the server's pong leaves it green.
+    let payload = vec![9, 8, 7];
+    client.send_ping(&payload).await?;
+    let pong = loop {
+        match client.next_message().await? {
+            Some(Message::Pong(pong)) => break pong.to_vec(),
+            Some(_) => continue,
+            None => panic!("the connection closed before the pong"),
+        }
+    };
+    assert_eq!(pong, payload, "the pong echoes the ping payload");
+
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_frame_waiting_at_the_pong_deadline_keeps_the_connection() -> Result<()> {
+    let (server, port, _) = start().await?;
+    let client = silent_client(port).await?;
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(16)).await;
+    tokio::time::resume();
+    tokio::time::sleep(CROSS).await;
+    let (mut client, payload) = client.wait_for_ping().await?;
+    assert_eq!(
+        payload.len(),
+        8,
+        "the ping carries the 8-byte keepalive nonce"
+    );
+
+    // A frame is now waiting on the wire, unread, while the pong window is about to close. Advance
+    // to the deadline: the frame and the deadline are ready in the same instant, and the server must
+    // read the frame (and count it) before it judges the window. `advance` jumps the clock, so the
+    // ping above was recorded at the 16 s endpoint and its pong window closes at 26 s; the 10 s step
+    // crosses it.
+    tokio::time::pause();
+    client.send_json(&player_state(true, 100, false)).await?;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::resume();
+
+    // The server did not drop the connection at the deadline; it still serves a clock request.
+    let reply = client.round_trip_time(2_000).await?;
+    assert_eq!(
+        reply.client_transmitted, 2_000,
+        "the server still serves the connection after the frame at the deadline"
+    );
+
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn both_sides_keep_a_silent_link_alive() -> Result<()> {
     let config = ServerConfig {
         bind: "127.0.0.1:0".parse().expect("a literal address parses"),
@@ -254,9 +323,11 @@ async fn both_sides_keep_a_silent_link_alive() -> Result<()> {
     ));
 
     // Three rounds: advance past the idle window on the paused clock, resume long enough for the
-    // pings and pongs to cross loopback, and require that neither side ended anything. Three rounds
-    // cover the client pinging twice and the server pinging at least once, so a server that never
-    // answers a ping, or a client that never answers one, fails here.
+    // pings and pongs to cross loopback, and require that neither side ended anything. Because both
+    // sides ping on the same 15 s window, each side's ping keeps the other side's keepalive
+    // satisfied, so this pins bidirectional liveness - neither side can go silent and survive - not
+    // the pong paths, which the fake-client suite pins. The stream announcement the brief suggested
+    // for this finish is not reachable here (see the approve step below).
     for _ in 0..3 {
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(16)).await;

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use syncspin_core::messages::{ClientCommand, ControllerCommand, ServerError, StreamEnd};
+use syncspin_server::TrackInfo;
 #[tokio::test]
 async fn a_client_connects_and_is_activated() -> Result<()> {
     for suite in Suite::ALL {

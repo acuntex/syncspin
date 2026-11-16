@@ -7,8 +7,8 @@
 //! client crate uses, so the responder side is not written twice.
 //!
 //! The module is shared by the test binaries, so a helper one of them does not use is not dead
-//! code, and a re-export one of them does not need is not an unused import.
-#![allow(dead_code, unused_imports)]
+//! code.
+#![allow(dead_code)]
 
 use std::time::Duration;
 
@@ -27,7 +27,7 @@ pub use syncspin_core::noise::{
     Identity, Responder, Suite, TransportState, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
 pub use syncspin_server::{
-    AudioFormat, Event, EventStream, Server, ServerConfig, ServerHandle, TrackInfo, DEFAULT_PATH,
+    AudioFormat, Event, EventStream, Server, ServerConfig, ServerHandle, DEFAULT_PATH,
 };
 pub use tokio::net::TcpStream;
 pub use tokio_tungstenite::tungstenite::protocol::Role;
@@ -39,8 +39,8 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the keepalive tests wait for the server's ping.
 ///
-/// Far beyond the 15 s idle window, so the ping deadline is always reached first on a paused clock,
-/// while a server that never pings still fails the test instead of hanging.
+/// Generous on purpose: the ping is read on the real clock after `resume`, so this is only a ceiling
+/// against a server that never pings, which fails the test instead of hanging.
 pub const KEEPALIVE_WAIT: Duration = Duration::from_secs(60);
 
 /// The name the fake client announces in `client/hello`.
@@ -558,6 +558,14 @@ impl FakeClient {
         let raw = self.socket.into_inner();
         self.socket = WebSocketStream::from_raw_socket(raw, Role::Client, None).await;
         Ok((self, payload))
+    }
+
+    /// Sends one WebSocket ping with `payload`.
+    pub async fn send_ping(&mut self, payload: &[u8]) -> Result<()> {
+        self.socket
+            .send(Message::Ping(payload.to_vec().into()))
+            .await?;
+        Ok(())
     }
 
     /// Sends one WebSocket pong, echoing the ping payload.
