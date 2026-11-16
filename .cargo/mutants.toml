@@ -6,7 +6,10 @@
 # `pairing-code` is off by default, and without it `pairing/pake.rs`, `pairing/wrap.rs` and
 # `pairing/code.rs` are compiled away. cargo-mutants generates mutants from the source tree, not
 # from the build, so those 122 mutants would build unchanged and every one would be reported as
-# missed. The workflow passes the same flag explicitly so the job reads correctly on its own.
+# missed.
+#
+# This is the only place the flag lives: the workflow does not repeat it, because cargo rejects a
+# duplicate `--all-features` and the baseline fails.
 additional_cargo_args = ["--all-features"]
 
 # Mutants that cannot be caught because they do not change behaviour.
