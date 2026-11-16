@@ -12,7 +12,7 @@
 //! Sentinel key seals every other one. A client that cannot use the announced record fails the
 //! handshake and is refused: the server cannot try the Sentinel key on the same message, because
 //! `snow` exposes no way to clone a half-finished handshake state (`docs/spec-deviations.md`,
-//! entry 20).
+//! "The server does not try the Sentinel key after a record fails").
 //!
 //! A failure decided from `client/init` alone is answered with `server/error` and a close; every
 //! later failure is silent, which is why the handshake paths here close without a message.

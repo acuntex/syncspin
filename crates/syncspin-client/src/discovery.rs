@@ -586,6 +586,8 @@ mod inbound {
                     session::Ending::Failed(error) => Err(error),
                     session::Ending::Closed
                     | session::Ending::Unpaired
+                    | session::Ending::PairingRequired
+                    | session::Ending::Unauthorized
                     | session::Ending::Shutdown => Err(anyhow!("the audio sink failed")),
                 };
             }

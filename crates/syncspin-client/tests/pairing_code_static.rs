@@ -124,6 +124,7 @@ fn config_for(endpoint: &str, storage: Option<Arc<dyn Storage>>) -> ClientConfig
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
+        unpaired_access: true,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,

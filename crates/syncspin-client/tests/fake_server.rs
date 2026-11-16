@@ -115,6 +115,11 @@ pub struct ServerOptions {
     /// A conformant server sends nothing after Noise message 1, but a client has to survive a frame
     /// that was already on its way: the client may discard such a message without acting on it.
     pub stale_message_on_rehandshake: bool,
+    /// Activation sent under the keys of a re-handshake, overriding the built one.
+    ///
+    /// The spec requires an activation under the new keys, and the shape a test needs there can differ
+    /// from the playback activation a connected session gets.
+    pub rehandshake_activate: Option<ServerActivate>,
     /// The static pairing code this server expects, which selects the static flow when set.
     ///
     /// The harness plays the server's CPace side with the code as `PRS`. A test that plays an
@@ -178,6 +183,7 @@ impl Default for ServerOptions {
             first_activate: None,
             acknowledge_pairing: true,
             stale_message_on_rehandshake: false,
+            rehandshake_activate: None,
             #[cfg(feature = "pairing-code")]
             static_pairing_code: None,
             #[cfg(feature = "pairing-code")]
@@ -1218,14 +1224,19 @@ async fn serve_connection(
                 noise = new_noise;
                 handshake_hash = new_hash;
                 // The activation is mandatory and is the first message under the new keys.
+                let activation =
+                    options
+                        .rehandshake_activate
+                        .clone()
+                        .unwrap_or_else(|| ServerActivate {
+                            activities: vec!["playback".to_owned()],
+                            active_roles: Some(options.active_roles.clone()),
+                            pairing: None,
+                        });
                 send_encrypted(
                     &mut socket,
                     &mut noise,
-                    &Incoming::ServerActivate(ServerActivate {
-                        activities: vec!["playback".to_owned()],
-                        active_roles: Some(options.active_roles.clone()),
-                        pairing: None,
-                    }),
+                    &Incoming::ServerActivate(activation),
                 )
                 .await?;
             }

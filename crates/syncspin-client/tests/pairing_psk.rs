@@ -16,7 +16,7 @@ use anyhow::{bail, Result};
 use syncspin_client::storage::Storage;
 use syncspin_client::{
     connect, AudioMode, ClientConfig, ClientHandle, Event, EventStream, Identity, PairingFailure,
-    PskCategory, Sink, StoredPsk, VolumePolicy, DEFAULT_PAIRING_TIMEOUT,
+    PskCategory, Sink, StoredPsk, StreamEndReason, VolumePolicy, DEFAULT_PAIRING_TIMEOUT,
 };
 use syncspin_core::messages::{PairingActivation, ServerActivate};
 use syncspin_core::noise::psk_id_for;
@@ -218,6 +218,18 @@ async fn wait_for_writes(recordings: &Recordings, count: usize) -> Vec<(Vec<u8>,
     }
 }
 
+/// Waits until the sink was opened at least once.
+async fn wait_for_open(recordings: &Recordings) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while recordings.opened() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the sink to open"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Builds a configuration for `server` with the given store.
 fn config_for(server: &FakeServer, storage: Option<Arc<dyn Storage>>) -> ClientConfig {
     ClientConfig {
@@ -232,6 +244,7 @@ fn config_for(server: &FakeServer, storage: Option<Arc<dyn Storage>>) -> ClientC
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
+        unpaired_access: true,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -1060,6 +1073,68 @@ async fn a_message_under_the_previous_keys_is_discarded() {
         ),
         other => panic!("expected Track, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_rehandshake_to_the_pairing_psk_removes_the_player_role() {
+    // A paired client with unpaired access off. The server re-handshakes to the pairing PSK to
+    // upgrade the pairing, then activates `[]` with no `active_roles` - admissible, but not
+    // playback-capable, so the roles of the previous keys are dropped instead of the connection
+    // closed.
+    let long_term: [u8; 32] = std::array::from_fn(|index| (index as u8) ^ 0x6b);
+    let pairing_psk = [0x3d; 32];
+    let options = ServerOptions {
+        psk_id: psk_id_for(&long_term),
+        psk_category: "lt".to_owned(),
+        psk: long_term,
+        rehandshake_activate: Some(ServerActivate {
+            activities: Vec::new(),
+            active_roles: None,
+            pairing: None,
+        }),
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let storage = Arc::new(MemoryStorage {
+        pairing: Mutex::new(Some(pairing_psk)),
+        records: Mutex::new(vec![StoredPsk {
+            category: PskCategory::LongTerm,
+            psk: long_term,
+            server_id: server.server_id().to_owned(),
+        }]),
+        ..MemoryStorage::default()
+    });
+    let mut config = config_for(&server, Some(storage));
+    config.unpaired_access = false;
+    let (_handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+
+    expect_connected(&mut events, &server).await;
+    // Roles are active: the sink opens for the paired session.
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    wait_for_open(&recordings).await;
+
+    server.rehandshake(pairing_psk, "pr");
+    assert!(
+        server.wait_for_rehandshake().await,
+        "the client must accept the new keys"
+    );
+    match next_event(&mut events).await {
+        Event::StreamEnd { reason } => assert_eq!(reason, StreamEndReason::RoleRemoved),
+        other => panic!("expected StreamEnd(RoleRemoved), got {other:?}"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), server.wait_for_goodbye())
+            .await
+            .is_err(),
+        "a re-pairing transition must not be closed by the switch"
+    );
 }
 
 /// Waits for the [`Event::Disconnected`] that ends an attempt.

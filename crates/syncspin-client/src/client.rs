@@ -175,6 +175,9 @@ pub enum PairingRequiredReason {
     /// server's and not the client's - so the host decides whether to offer pairing again. A code
     /// flow or the Pairing PSK flow then replaces the record on both sides.
     CredentialMismatch,
+    /// The server asked for an unpaired session while this client refuses unpaired access;
+    /// `Event::PairingRequired` reports it before the close.
+    UnpairedAccessDisabled,
 }
 
 /// Why a pairing attempt ended without a record.
@@ -235,9 +238,8 @@ impl PairingFailure {
 /// Why a client says goodbye to a server.
 ///
 /// The value is the `reason` field of `client/goodbye`, which the client sends before a graceful
-/// close so the server knows whether to reconnect. Only the reasons this revision can reach are
-/// named: `unauthorized` and `pairing_required` are left out until the states that produce them
-/// exist. The enum is non-exhaustive: a later revision may add one.
+/// close so the server knows whether to reconnect. The enum is non-exhaustive: a later revision may
+/// add one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GoodbyeReason {
@@ -261,6 +263,20 @@ pub enum GoodbyeReason {
     UserRequest,
     /// The client processed `server/unpair`.
     Unpaired,
+    /// The client does not admit the unpaired session the server activated, because unpaired access
+    /// is disabled and enabling it would make the activation admissible.
+    ///
+    /// `pairing.md` § _Unpaired Access_ requires a client that stops admitting unpaired access to
+    /// close any connection relying on it with this reason. `messaging.md` § `server/activate`
+    /// names it as the first rejection rule.
+    PairingRequired,
+    /// The server's activation is not allowed for the matched PSK, or it names roles the connection
+    /// may not use.
+    ///
+    /// `messaging.md` § `server/activate` names this as the second rejection rule: the activity set
+    /// is not allowed for the matched PSK, or `active_roles` is non-empty on a connection that is not
+    /// playback-capable.
+    Unauthorized,
 }
 
 impl GoodbyeReason {
@@ -274,6 +290,8 @@ impl GoodbyeReason {
             Self::Shutdown => "shutdown",
             Self::UserRequest => "user_request",
             Self::Unpaired => "unpaired",
+            Self::PairingRequired => "pairing_required",
+            Self::Unauthorized => "unauthorized",
         }
     }
 }
@@ -441,19 +459,29 @@ pub enum Event {
     },
     /// A server needs a pairing this client cannot complete with what it holds.
     ///
-    /// Reported once per connection, never once per message: the situation is decided by the
-    /// Noise handshake, so the event fires after [`Event::Connected`] and before the session acts
-    /// on its first message, and never again while that connection lasts. A plain guest handshake -
-    /// an unpaired connection whose server announced the Sentinel key - is not a mismatch and
-    /// reports nothing.
+    /// Two situations report it, each with its own [`PairingRequiredReason`].
     ///
-    /// Nothing is removed or replaced on either side, and the session continues as an ordinary
-    /// unpaired one. A server that holds a record for this client will keep the connection in
-    /// pairing or idle until the host offers pairing again.
+    /// The handshake reports a credential mismatch once per connection, never once per message: the
+    /// situation is decided by the Noise handshake, so the event fires after [`Event::Connected`]
+    /// and before the session acts on its first message, and never again for that reason while the
+    /// connection lasts. A plain guest handshake - an unpaired connection whose server announced the
+    /// Sentinel key - is not a mismatch and reports nothing.
+    ///
+    /// The second situation is a refused activation: [`ClientConfig::unpaired_access`] is off and
+    /// the server sent a `server/activate` that would be admissible if it were on. That report fires
+    /// at most once, immediately before the client closes the connection with `client/goodbye`
+    /// reason `pairing_required`, and never for a session whose setting admits unpaired access. One
+    /// connection can therefore report this event twice, once per reason, when the handshake found a
+    /// credential mismatch and the activation is then refused.
+    ///
+    /// In the credential-mismatch case nothing is removed or replaced on either side, and the
+    /// session continues as an ordinary unpaired one. A server that holds a record for this client
+    /// will keep the connection in pairing or idle until the host offers pairing again.
     PairingRequired {
-        /// Static public key of the server that announced the unknown credential.
+        /// Static public key of the server this requirement concerns, as 43 base64url characters.
         server_id: String,
-        /// What the server expects and the client cannot provide.
+        /// Which situation produced the requirement: a credential mismatch, or a refused
+        /// unpaired session.
         reason: PairingRequiredReason,
     },
     /// A pairing attempt ended without a record.
@@ -1227,9 +1255,11 @@ async fn serve_until_dropped(
             // The host has to fix the sink; a retry would only fail the same way.
             return match attempt.ending {
                 session::Ending::Failed(error) => Err(error),
-                session::Ending::Closed | session::Ending::Unpaired | session::Ending::Shutdown => {
-                    Err(anyhow!("the audio sink failed"))
-                }
+                session::Ending::Closed
+                | session::Ending::Unpaired
+                | session::Ending::PairingRequired
+                | session::Ending::Unauthorized
+                | session::Ending::Shutdown => Err(anyhow!("the audio sink failed")),
             };
         }
         if let Some(error) = flush_error {
@@ -1297,6 +1327,12 @@ fn endpoint(server: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_new_goodbye_reasons_use_the_wire_spelling() {
+        assert_eq!(GoodbyeReason::PairingRequired.as_str(), "pairing_required");
+        assert_eq!(GoodbyeReason::Unauthorized.as_str(), "unauthorized");
+    }
 
     /// A pairing code is a credential for one attempt: `Debug` names it but never prints it.
     #[cfg(feature = "pairing-code")]
@@ -1497,6 +1533,7 @@ mod tests {
                 volume_policy: VolumePolicy::default(),
                 max_backoff: Duration::from_secs(30),
                 strict_group_id: false,
+                unpaired_access: true,
                 pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
                 #[cfg(feature = "discovery")]
                 inbound: None,
