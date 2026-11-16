@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 
+## [0.3.0] - 2026-11-16
+
+### Added
+
+- **client:** Refuse an activation the matched PSK does not allow (#33)
+
+- Keep a silent session alive with a WebSocket keepalive on both sides (#38)
+
+### Fixed
+
+- Interoperate with a foreign group id and fall back across addresses (#26)
+
+- **core:** Harden the CPace layer after review (#32)
+
+- **server:** Wait for the clock estimate instead of the writer's luck (#35)
+
+- **client:** Use a clock reply that arrives after the per-message timeout (#39)
+
 ## [0.2.0] - 2026-11-16
 
 ### Added
