@@ -303,10 +303,11 @@ pub struct ClientConfig {
     pub strict_group_id: bool,
     /// Whether this client admits a server with no pairing record.
     ///
-    /// The value is advertised in `client/hello` as `unpaired_access.enabled`; with `false` a session
-    /// that is not keyed by a long-term PSK may not be activated for playback, and the client closes it
-    /// with `client/goodbye` reason `pairing_required`. Pairing is unaffected: both pairing flows run
-    /// over a Sentinel-keyed session and stay admissible.
+    /// The value is advertised in `client/hello` as `unpaired_access.enabled`, and nothing else
+    /// currently reads it. It carries the host's decision that a session not keyed by a long-term
+    /// PSK must not be activated for playback and is refused with `client/goodbye` reason
+    /// `pairing_required`. Pairing is unaffected: both pairing flows run over a Sentinel-keyed
+    /// session and stay admissible.
     ///
     /// `pairing.md` leaves the default to the manufacturer and recommends `false` for a client whose
     /// input a stranger could reach, such as a microphone. The default here is `true`, which is what
@@ -611,6 +612,10 @@ mod tests {
         assert!(
             !config.strict_group_id,
             "the documented tolerance is the default; a host opts into the spec's strictness"
+        );
+        assert!(
+            config.unpaired_access,
+            "unpaired access is admitted by default, as every earlier release did"
         );
         assert_eq!(config.pairing_timeout, crate::DEFAULT_PAIRING_TIMEOUT);
         assert!(config.storage.is_none());

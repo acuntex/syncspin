@@ -107,8 +107,8 @@ const CONTROLLER_ROLE: &str = "controller@v1";
 
 /// The roles this client advertises in `client/hello`.
 ///
-/// The activation check reads this list, so an advertisement and its admissibility cannot drift
-/// apart without a test failing.
+/// The list is written here once, so the roles the client announces cannot drift apart from each
+/// other.
 const SUPPORTED_ROLES: [&str; 3] = [PLAYER_ROLE, CONTROLLER_ROLE, METADATA_ROLE];
 
 /// Largest output delay reported to the server, in milliseconds.
