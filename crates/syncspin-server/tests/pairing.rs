@@ -1368,6 +1368,104 @@ async fn a_bad_client_key_confirmation_aborts_the_attempt() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "pairing-code")]
+#[tokio::test]
+async fn a_record_is_stored_even_when_the_live_promotion_fails() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let server_identity = Identity::generate();
+    let (server, port, mut events) = start_with_config(ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("a literal address parses"),
+        storage: Some(store.clone()),
+        pairing_timeout: Duration::from_secs(5),
+        ..ServerConfig::new(SERVER_NAME, server_identity)
+    })
+    .await?;
+    let mut client = FakeClient::connect(port).await?;
+    let client_id = client.identity.public_base64();
+    client.handshake(Suite::ChaChaPoly).await?;
+    client
+        .activate_with(hello_with_pairing(PairingMethod::StaticCode, None))
+        .await?;
+    server.approve(&client_id).await?;
+    client.read_activate(|_| true).await?;
+
+    server
+        .start_pairing(&client_id, PairingMethod::StaticCode, None)
+        .await?;
+    read_pairing_activation(&mut client).await?;
+    let handshake_hash = *client
+        .noise
+        .as_ref()
+        .expect("the handshake finished")
+        .handshake_hash();
+    client
+        .send_json(&Incoming::ClientPairInit(ClientPairInit {
+            pairing_index: 1,
+            commit_b: None,
+        }))
+        .await?;
+    server.submit_code(&client_id, "12345678").await?;
+    let ya = read_server_auth(&mut client).await?;
+    let psk = [0x55; 32];
+    let round = answer_auth(b"12345678", &handshake_hash, 1, 1, &ya, psk, None)?;
+    client
+        .send_json(&Incoming::ClientPairAuth(ClientPairAuth {
+            pake_msg_2: URL_SAFE_NO_PAD.encode(round.share),
+        }))
+        .await?;
+    read_server_confirm(&mut client, &round.expected_server_tag).await?;
+    client
+        .send_json(&Incoming::ClientPairConfirm(ClientPairConfirm {
+            client_kc: URL_SAFE_NO_PAD.encode(round.client_tag),
+            wrapped_nonce_b: None,
+        }))
+        .await?;
+    client
+        .send_json(&Incoming::ClientPairFinalize(ClientPairFinalize {
+            long_term_psk: None,
+            wrapped_psk: Some(URL_SAFE_NO_PAD.encode(round.wrapped_psk)),
+        }))
+        .await?;
+    client
+        .read_pairing(|message| match message {
+            Incoming::ServerPairFinalize(_) => Some(()),
+            _ => None,
+        })
+        .await?;
+
+    // The record is stored before the re-handshake, so a client that abandons the promotion still
+    // leaves the pairing in place.
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the record outlives the promotion"
+    );
+    let paired = wait_for_event(&mut events, |event| matches!(event, Event::Paired { .. })).await;
+    assert_eq!(
+        paired,
+        Event::Paired {
+            client_id: client_id.clone()
+        }
+    );
+
+    // The client drops instead of answering the re-handshake: the connection ends as lost.
+    client.close().await?;
+    let left = wait_for_event(&mut events, |event| {
+        matches!(event, Event::ClientLeft { .. })
+    })
+    .await;
+    assert_eq!(
+        left,
+        Event::ClientLeft {
+            reason: "connection lost".to_owned(),
+        },
+        "a promotion that cannot finish is reported as a lost connection"
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn unpair_removes_the_record_of_a_client_without_a_live_connection() -> Result<()> {
     let store = std::sync::Arc::new(MemoryStore::default());
