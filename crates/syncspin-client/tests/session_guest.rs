@@ -19,7 +19,8 @@ use syncspin_client::{
     DEFAULT_PAIRING_TIMEOUT, NORMAL_PLAYBACK_SPEED,
 };
 use syncspin_core::messages::{
-    ClientState, ControllerState, Incoming, PlayerCommand, Progress, ServerCommand, ServerState,
+    ClientState, ControllerState, GroupUpdate, Incoming, PlayerCommand, Progress, ServerCommand,
+    ServerState,
 };
 use syncspin_core::noise::{psk_id_for, Identity};
 
@@ -1426,6 +1427,127 @@ async fn controller_state_is_reported() {
             assert_eq!(state.muted, Some(false));
         }
         other => panic!("expected State, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn group_update_is_the_authoritative_playback_state() {
+    let options = ServerOptions {
+        active_roles: vec!["player@v1".to_owned(), "controller@v1".to_owned()],
+        ..ServerOptions::default()
+    };
+    let server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // The controller state carries the volume, mute and command set but no group fields.
+    let state = serde_json::to_string(&Incoming::ServerState(ServerState {
+        metadata: None,
+        controller: Some(ControllerState {
+            supported_commands: vec!["play".to_owned()],
+            volume: Some(35),
+            muted: Some(false),
+            repeat: None,
+            shuffle: None,
+        }),
+    }))
+    .unwrap();
+    server.json(state);
+
+    match next_event(&mut events).await {
+        Event::State(state) => {
+            assert_eq!(state.volume, Some(35));
+            assert_eq!(
+                state.group_id, None,
+                "no group/update has arrived, so the client knows no group yet"
+            );
+        }
+        other => panic!("expected State, got {other:?}"),
+    }
+
+    // `group/update` is where the group's playback state comes from, and the picture it completes
+    // keeps the role fields that `server/state` supplied.
+    let group_id = "A".repeat(43);
+    let update = serde_json::to_string(&Incoming::GroupUpdate(GroupUpdate {
+        playback_state: "playing".to_owned(),
+        group_id: group_id.clone(),
+        group_name: "Living room".to_owned(),
+    }))
+    .unwrap();
+    server.json(update);
+
+    match next_event(&mut events).await {
+        Event::State(state) => {
+            assert_eq!(state.playback_state.as_deref(), Some("playing"));
+            assert_eq!(state.group_id.as_deref(), Some(group_id.as_str()));
+            assert_eq!(state.group_name.as_deref(), Some("Living room"));
+            assert_eq!(state.volume, Some(35), "the controller picture is kept");
+            assert_eq!(state.supported_commands, vec!["play".to_owned()]);
+        }
+        other => panic!("expected State, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_group_update_needs_no_role() {
+    // `group/update` is a core message: the client reports it even when the server activated no
+    // role at all, so a host without the controller role still learns what the group is doing.
+    let options = ServerOptions {
+        active_roles: Vec::new(),
+        ..ServerOptions::default()
+    };
+    let server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    let update = serde_json::to_string(&Incoming::GroupUpdate(GroupUpdate {
+        playback_state: "stopped".to_owned(),
+        group_id: "A".repeat(43),
+        group_name: "Living room".to_owned(),
+    }))
+    .unwrap();
+    server.json(update);
+
+    match next_event(&mut events).await {
+        Event::State(state) => {
+            assert_eq!(state.playback_state.as_deref(), Some("stopped"));
+            assert_eq!(state.group_name.as_deref(), Some("Living room"));
+            assert!(state.supported_commands.is_empty());
+        }
+        other => panic!("expected State, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_group_update_with_a_malformed_group_id_is_a_protocol_error() {
+    // The identifier is 32 bytes as 43 unpadded base64url characters; both a wrong length and a
+    // character outside the alphabet are protocol errors that close the connection.
+    for group_id in ["B".repeat(42), format!("{}=", "B".repeat(42))] {
+        let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+        let (_recordings, sink) = recording_sink();
+        let (mut events, _handle) =
+            connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+        expect_connected(&mut events, &server).await;
+
+        let update = serde_json::to_string(&Incoming::GroupUpdate(GroupUpdate {
+            playback_state: "stopped".to_owned(),
+            group_id: group_id.clone(),
+            group_name: "Living room".to_owned(),
+        }))
+        .unwrap();
+        server.json(update);
+
+        match next_event(&mut events).await {
+            Event::Disconnected { reason, .. } => assert!(
+                reason.contains("group_id"),
+                "the reason should name the group_id rule, got: {reason}"
+            ),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
     }
 }
 

@@ -96,6 +96,39 @@ async fn expect_refusal(server: ServerOptions, needle: &str) {
 }
 
 #[tokio::test]
+async fn a_server_error_in_place_of_server_init_is_reported() {
+    let server = FakeServer::start(ServerOptions {
+        server_init_override: Some(
+            r#"{"type":"server/error","payload":{"reason":"future_reason"}}"#.to_owned(),
+        ),
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (mut events, handle) = connect_to(&server).await;
+
+    match next_event(&mut events).await {
+        Event::ServerError { reason } => assert_eq!(
+            reason, "future_reason",
+            "the reason is carried verbatim, even one this revision does not name"
+        ),
+        other => panic!("expected ServerError, got {other:?}"),
+    }
+    // The server rejects the init and closes, so the attempt ends and is retried.
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, retry_in } => {
+            assert!(retry_in > Duration::ZERO);
+            assert!(
+                reason.contains("future_reason"),
+                "the disconnect reason should name the rejection, got: {reason}"
+            );
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    drop(handle);
+}
+
+#[tokio::test]
 async fn a_cleartext_message_that_is_not_server_init_is_refused() {
     expect_refusal(
         ServerOptions {

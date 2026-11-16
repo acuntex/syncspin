@@ -16,8 +16,8 @@ harmless.
 | 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
 | 3   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
 | 4   | Code pairing behind a feature; CPace layer unaudited            | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
-| 5   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Stage 1b                           |
-| 6   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                           |
+| 5   | `group/update` as the playback-state source                     | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Closed in 0.2                      |
+| 6   | `server/error` failure diagnostics                              | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Closed in 0.2                      |
 | 7   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
 | 8   | No unpaired-access switch                                       | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, config only                  |
 | 9   | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
@@ -152,44 +152,41 @@ no review.
 while it is not, a default build departs from the SHOULD by offering only the mandatory method. Add
 spec vectors for the dynamic derivation when they are published.
 
-## 5. `group/update` is not the state source
+## 5. `group/update` as the playback-state source
 
 **Spec:** `messaging.md`, `group/update`. The server MUST send it after the first activation and on
 every change, carrying all fields each time; a `group_id` that is not 43 base64url characters is a
 protocol error and the client MUST close the connection.
 
-**What we do:** `Incoming` has no `group/update` variant, so the session treats it as an unknown
-type and ignores it. The fields it carries are therefore never seen: the `PlaybackState` event is
-filled from `server/state.controller` (volume, mute, supported commands) and the track from
-`server/state.metadata`. `server/state` is no substitute — it carries only the `metadata` and
-`controller` role state — so neither `playback_state` nor `group_id` is known at all, and a malformed
-`group_id` cannot be rejected.
+**Status: closed in 0.2.** `Incoming::GroupUpdate` decodes the message with the spec's three fields,
+and `Session::handle_group_update` makes it the authoritative source of the group part of
+`PlaybackState`: `playback_state`, `group_id` and `group_name` replace the previous values and are
+reported in `Event::State` whatever roles are active, because `group/update` is a core message. The
+controller fields - `supported_commands`, `volume`, `muted` - still come from
+`server/state.controller`, and the two messages complete one picture instead of overwriting each
+other. `group_id` is checked as 32 bytes in 43 canonical unpadded base64url characters and any
+other value closes the connection, as the spec requires; an unknown `playback_state` is carried to
+the host verbatim instead of being rejected.
+`group_update_is_the_authoritative_playback_state`,
+`a_group_update_with_a_malformed_group_id_is_a_protocol_error` and the wire-format test
+`group_update_roundtrips_on_the_wire` pin the behaviour. The entry stays as a record of the
+closure; the next audit of this file removes it.
 
-**Why:** the field was absent from the protocol code this library was extracted from, and the
-message set was frozen before the session loop existed. Leaving it out was preferred over
-half-handling the authoritative state source.
-
-**Removing it:** add the type, treat it as the authoritative `PlaybackState` and `group_id` source,
-validate the `group_id` length and charset, and close on a violation. Delete this entry when that
-lands.
-
-## 6. No failure diagnostics from `server/error`
+## 6. `server/error` failure diagnostics
 
 **Spec:** `messaging.md`, `server/error` and `connection.md`, _Failure Handling_. The server sends it
 in place of `server/init` when it rejects `client/init`, then closes; the reason is
 `unsupported_version`, `unsupported_suite` or `malformed`.
 
-**What we do:** `server/error` has no variant in `Incoming`, so `Incoming::parse` reports it as an
-unknown type and the handshake — which expects `server/init` next — fails with `expected a cleartext
-server/init`. The reason (`unsupported_version`, `unsupported_suite`, `malformed`) never reaches the
-caller, who sees only that generic connect error.
-
-**Why:** the message set was frozen at the types the extracted code used, which never included
-`server/error`; a server that rejects `client/init` is rare enough that the guest session was built
-without it. A dedicated error type is worth adding together with the disconnect reasons, not before.
-
-**Removing it:** add the type and a typed connect error carrying the reason so a caller can act on
-`unsupported_version` rather than guessing. The server half arrives with `syncspin-server`.
+**Status: closed in 0.2 for the client.** `Incoming::ServerError` decodes the cleartext message and
+preserves an unknown `reason` verbatim. The handshake recognises it in place of `server/init`, and
+`session::attempt` reports `Event::ServerError { reason }` to the host before the attempt ends in
+`Event::Disconnected`, so a caller can act on `unsupported_version` instead of seeing only
+`expected a cleartext server/init`. The message is unauthenticated, so the reason is a hint for
+logging and operator display, never a verified fact.
+`a_server_error_in_place_of_server_init_is_reported` pins the client path and
+`server_error_roundtrips_and_keeps_an_unknown_reason` pins the decoding, including the preserved
+unknown reason. The server half - sending the message - arrives with `syncspin-server`.
 
 ## 7. No `_sendspin-server._tcp` discovery
 

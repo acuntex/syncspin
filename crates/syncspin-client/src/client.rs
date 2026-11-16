@@ -306,6 +306,18 @@ pub enum Event {
         /// How long to wait before the next attempt; zero when none follows.
         retry_in: Duration,
     },
+    /// The server rejected the connection's `client/init` with `server/error`.
+    ///
+    /// Reported during the cleartext exchange, before [`Event::Connected`], and followed by
+    /// [`Event::Disconnected`] because the server closes after it. `reason` is the wire value
+    /// carried verbatim: `unsupported_version`, `unsupported_suite` and `malformed` are the ones
+    /// this revision defines, and an unknown value is what a newer server sends. The message is
+    /// unauthenticated, so the reason is a hint for logging and operator display, not a verified
+    /// fact.
+    ServerError {
+        /// Why the server refused the init.
+        reason: String,
+    },
     /// A stream was announced with the given format.
     ///
     /// The sink has been opened for this format before the event is emitted.
@@ -472,6 +484,10 @@ impl fmt::Debug for Event {
                 .field("reason", reason)
                 .field("retry_in", retry_in)
                 .finish(),
+            Self::ServerError { reason } => formatter
+                .debug_struct("ServerError")
+                .field("reason", reason)
+                .finish(),
             Self::StreamStart { format } => formatter
                 .debug_struct("StreamStart")
                 .field("format", format)
@@ -544,6 +560,10 @@ impl fmt::Debug for Event {
 }
 
 /// Playback state as the server describes it.
+///
+/// The group fields come from `group/update`, which is the authoritative source: every message
+/// carries all three, so the latest one is the group's identity and playback state. The controller
+/// fields come from `server/state` and stay part of the picture when a group update arrives.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PlaybackState {
@@ -553,6 +573,15 @@ pub struct PlaybackState {
     pub volume: Option<u8>,
     /// Group mute state, when the server reports one.
     pub muted: Option<bool>,
+    /// Playback state of the group, once a `group/update` arrived.
+    ///
+    /// `playing` and `stopped` are the values this revision defines; a paused group reports
+    /// `stopped`. A value this revision does not name is carried verbatim.
+    pub playback_state: Option<String>,
+    /// Identifier of the group as 43 unpadded base64url characters, once a `group/update` arrived.
+    pub group_id: Option<String>,
+    /// Friendly name of the group, once a `group/update` arrived.
+    pub group_name: Option<String>,
 }
 
 /// A live connection.

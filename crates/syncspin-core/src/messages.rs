@@ -68,6 +68,21 @@ pub struct ServerInit {
     pub version: u32,
 }
 
+/// `server/error`: the server rejected the client's [`ClientInit`] and closes the connection.
+///
+/// Sent in place of [`ServerInit`] when the server cannot accept `client/init` (`connection.md`,
+/// _Failure Handling_), before the Noise handshake starts. `reason` is one of
+/// `unsupported_version`, `unsupported_suite` or `malformed`; an unknown value is carried verbatim
+/// rather than rejected, so a later revision's reason reaches the caller instead of being read as a
+/// decoding failure. The message is unauthenticated: its reason is a hint for logging and operator
+/// display, not a verified fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ServerError {
+    /// Why the server refused the init, for example `unsupported_version`.
+    pub reason: String,
+}
+
 /// `noise/handshake`: one Noise handshake message.
 ///
 /// The server sends the first message right after [`ServerInit`]; the client answers with the
@@ -611,6 +626,24 @@ pub struct ServerState {
     pub controller: Option<ControllerState>,
 }
 
+/// `group/update`: the state and identity of the group this client is part of.
+///
+/// The server sends it after the first `server/activate` and whenever one of the fields changes,
+/// and every message carries all three. `server/state` carries only the role objects, so a client
+/// that wants the group's playback state has no other source. `group_id` that is not 43 unpadded
+/// base64url characters is a protocol error the receiver must close over; the check is the
+/// session's, because it is about a field value rather than the message's shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GroupUpdate {
+    /// `playing` or `stopped`; a paused group reports `stopped`. An unknown value is preserved.
+    pub playback_state: String,
+    /// 32-byte group identifier as 43 unpadded base64url characters.
+    pub group_id: String,
+    /// Friendly name of the group, plain text of at most 64 bytes in UTF-8.
+    pub group_name: String,
+}
+
 // ---------------------------------------------------------------------------
 // Stream lifecycle
 // ---------------------------------------------------------------------------
@@ -844,6 +877,9 @@ pub enum Incoming {
     /// `server/init`, cleartext.
     #[serde(rename = "server/init")]
     ServerInit(ServerInit),
+    /// `server/error`, cleartext, in place of `server/init`.
+    #[serde(rename = "server/error")]
+    ServerError(ServerError),
     /// `noise/handshake`, cleartext.
     #[serde(rename = "noise/handshake")]
     NoiseHandshake(NoiseHandshake),
@@ -907,6 +943,9 @@ pub enum Incoming {
     /// `server/state`.
     #[serde(rename = "server/state")]
     ServerState(ServerState),
+    /// `group/update`.
+    #[serde(rename = "group/update")]
+    GroupUpdate(GroupUpdate),
     /// `server/command`.
     #[serde(rename = "server/command")]
     ServerCommand(ServerCommand),
@@ -993,9 +1032,10 @@ struct EnvelopeType {
 ///
 /// A variant added without its entry here would silently read as an unknown type, so the
 /// integration tests parse one instance of every variant.
-const KNOWN_TYPES: [&str; 28] = [
+const KNOWN_TYPES: [&str; 30] = [
     "client/init",
     "server/init",
+    "server/error",
     "noise/handshake",
     "server/hello",
     "client/hello",
@@ -1017,6 +1057,7 @@ const KNOWN_TYPES: [&str; 28] = [
     "server/time",
     "client/state",
     "server/state",
+    "group/update",
     "server/command",
     "client/command",
     "stream/start",

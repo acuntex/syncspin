@@ -9,9 +9,9 @@ use syncspin_core::messages::{
     AudioChunkHeader, ClientCommand, ClientGoodbye, ClientHello, ClientInit, ClientPairAuth,
     ClientPairConfirm, ClientPairFinalize, ClientPairInit, ClientPairPending, ClientPairRetry,
     ClientState, ClientTime, ControllerCommand, DecodeError, DeviceInfo, DynamicPairingCodeMethod,
-    Incoming, NoiseHandshake, PairAbort, PairingPskMethod, PlayerState, PlayerSupport,
-    ServerActivate, ServerCommand, ServerHello, ServerInit, ServerPairAuth, ServerPairConfirm,
-    ServerPairFinalize, ServerPairInit, ServerState, ServerTime, ServerUnpair,
+    GroupUpdate, Incoming, NoiseHandshake, PairAbort, PairingPskMethod, PlayerState, PlayerSupport,
+    ServerActivate, ServerCommand, ServerError, ServerHello, ServerInit, ServerPairAuth,
+    ServerPairConfirm, ServerPairFinalize, ServerPairInit, ServerState, ServerTime, ServerUnpair,
     StaticPairingCodeMethod, StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
     SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
     PROTOCOL_VERSION,
@@ -81,6 +81,81 @@ fn cleartext_handshake_envelopes_roundtrip_on_the_wire() {
         serde_json::from_str::<Incoming>(&json).unwrap(),
         Incoming::NoiseHandshake(handshake)
     );
+}
+
+#[test]
+fn server_error_roundtrips_and_keeps_an_unknown_reason() {
+    // Cleartext, in place of `server/init`: the payload carries the wire's `reason` alone.
+    let error = ServerError {
+        reason: "unsupported_version".to_owned(),
+    };
+    let json = serde_json::to_string(&Incoming::ServerError(error.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "server/error",
+            "payload": {"reason": "unsupported_version"}
+        })
+    );
+    assert_eq!(
+        Incoming::parse(&json).unwrap(),
+        Some(Incoming::ServerError(error))
+    );
+
+    // A reason this revision does not name is carried verbatim: a later revision's value must not
+    // turn the server's rejection into a decoding failure.
+    assert_eq!(
+        Incoming::parse(r#"{"type":"server/error","payload":{"reason":"future_reason"}}"#).unwrap(),
+        Some(Incoming::ServerError(ServerError {
+            reason: "future_reason".to_owned()
+        }))
+    );
+
+    // The reason is required: a rejection without one tells the caller nothing.
+    assert!(matches!(
+        Incoming::parse(r#"{"type":"server/error","payload":{}}"#),
+        Err(DecodeError::Malformed(_))
+    ));
+}
+
+#[test]
+fn group_update_roundtrips_on_the_wire() {
+    let update = GroupUpdate {
+        playback_state: "playing".to_owned(),
+        group_id: "A".repeat(43),
+        group_name: "Living room".to_owned(),
+    };
+    let json = serde_json::to_string(&Incoming::GroupUpdate(update.clone())).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+        serde_json::json!({
+            "type": "group/update",
+            "payload": {
+                "playback_state": "playing",
+                "group_id": "A".repeat(43),
+                "group_name": "Living room"
+            }
+        }),
+        "every message carries all three fields"
+    );
+    assert_eq!(
+        Incoming::parse(&json).unwrap(),
+        Some(Incoming::GroupUpdate(update))
+    );
+
+    // All three fields are required: a partial update cannot describe the group on its own.
+    for payload in [
+        r#"{"playback_state":"playing"}"#,
+        r#"{"playback_state":"playing","group_id":"AAAA"}"#,
+        r#"{"playback_state":"playing","group_name":"Living room"}"#,
+        r#"{"group_id":"AAAA","group_name":"Living room"}"#,
+    ] {
+        let text = format!(r#"{{"type":"group/update","payload":{payload}}}"#);
+        assert!(
+            matches!(Incoming::parse(&text), Err(DecodeError::Malformed(_))),
+            "a group/update without all three fields must be malformed: {text}"
+        );
+    }
 }
 
 #[test]
@@ -1089,6 +1164,14 @@ fn parse_accepts_every_message_this_revision_implements() {
             unpaired_access: UnpairedAccess::default(),
         }),
         Incoming::ServerActivate(ServerActivate::default()),
+        Incoming::GroupUpdate(GroupUpdate {
+            playback_state: "stopped".to_owned(),
+            group_id: "A".repeat(43),
+            group_name: "Group".to_owned(),
+        }),
+        Incoming::ServerError(ServerError {
+            reason: "malformed".to_owned(),
+        }),
         Incoming::ClientPairInit(ClientPairInit::default()),
         Incoming::ClientPairFinalize(ClientPairFinalize::default()),
         Incoming::ServerPairFinalize(ServerPairFinalize {}),
@@ -1118,7 +1201,7 @@ fn parse_accepts_every_message_this_revision_implements() {
         Incoming::StreamClear(StreamClear::default()),
         Incoming::StreamEnd(StreamEnd::default()),
     ];
-    assert_eq!(messages.len(), 21, "one instance per message type");
+    assert_eq!(messages.len(), 23, "one instance per message type");
     for message in messages {
         let text = serde_json::to_string(&message).unwrap();
         assert_eq!(
