@@ -1,20 +1,71 @@
 //! The server's WebSocket keepalive: a silent link is pinged, an unanswered ping drops the peer,
 //! and a normal frame keeps the connection alive.
 //!
-//! These tests drive the listener with the fake client in `common`, which is the only peer that can
-//! leave a ping unanswered while keeping the socket open (the real client always answers a ping).
-//! They measure the shipped 15 s and 10 s windows on a paused clock: the clock is frozen only while
-//! the test waits for the server's timer, and every frame exchange runs on the real clock, because
-//! a paused clock does not wake a socket read promptly.
+//! The first three tests drive the listener with the fake client in `common`, which is the only
+//! peer that can leave a ping unanswered while keeping the socket open (the real client always
+//! answers a ping). They measure the shipped 15 s and 10 s windows on a paused clock: the clock is
+//! frozen only while the test waits for the server's timer, and every frame exchange runs on the
+//! real clock, because a paused clock does not wake a socket read promptly. The last two are the
+//! cross-crate proof: a real client on a real server, so the two halves exercise each other's ping
+//! and pong code paths, which no single-crate suite can do.
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::*;
+use syncspin_client::{
+    Client, ClientConfig, Event as ClientEvent, EventStream as ClientEventStream, GoodbyeReason,
+    Sink,
+};
 
-/// How long the test lets the frames cross loopback after resuming the clock.
+/// How long the integration test lets the frames cross loopback after resuming the clock.
 const CROSS: Duration = Duration::from_millis(200);
+
+/// A sink that discards what it is given.
+struct NullSink;
+
+impl Sink for NullSink {
+    fn open(&mut self, _format: syncspin_client::AudioFormat) -> Result<()> {
+        Ok(())
+    }
+
+    fn write(&mut self, _frame: syncspin_client::AudioFrame<'_>, _due: Instant) -> Result<()> {
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Asserts that no client disconnect arrived within `within`, draining any other event.
+async fn expect_no_disconnect(events: &mut ClientEventStream, within: Duration) {
+    loop {
+        match tokio::time::timeout(within, events.next()).await {
+            Err(_) => return,
+            Ok(Some(ClientEvent::Disconnected { reason, .. })) => {
+                panic!("the client disconnected during an idle round: {reason}")
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("the client event stream ended"),
+        }
+    }
+}
+
+/// Asserts that no client left within `within`, draining any other event.
+async fn expect_no_client_left(events: &mut EventStream, within: Duration) {
+    loop {
+        match tokio::time::timeout(within, events.next()).await {
+            Err(_) => return,
+            Ok(Some(Event::ClientLeft { reason })) => {
+                panic!("the server dropped the client during an idle round: {reason}")
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("the server event stream ended"),
+        }
+    }
+}
 
 /// Asserts that the server sent no ping within `within`.
 async fn expect_no_ping(client: &mut FakeClient, within: Duration) {
@@ -165,6 +216,134 @@ async fn a_normal_frame_inside_the_pong_window_keeps_the_connection_alive() -> R
     assert_eq!(reply.client_transmitted, 2_000);
 
     client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn both_sides_keep_a_silent_link_alive() -> Result<()> {
+    let config = ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("a literal address parses"),
+        format: AudioFormat::pcm(48_000, 2, 16),
+        ..ServerConfig::new("A test server", Identity::generate())
+    };
+    let mut server = Server::start(config).await?;
+    let port = server.local_addr().port();
+    let mut server_events = server.events();
+
+    // The client connects unapproved, so it gets no roles and the link is silent in both
+    // directions: the only traffic is the keepalive.
+    let identity = Identity::generate();
+    let client_config = ClientConfig::new(format!("127.0.0.1:{port}"), "A test player", identity);
+    let (mut handle, mut client_events) =
+        Client::connect(client_config, Box::new(NullSink)).await?;
+
+    match client_events.next().await {
+        Some(ClientEvent::Connected { encrypted, .. }) => {
+            assert!(encrypted, "the connection is encrypted")
+        }
+        other => panic!("expected Connected, got {other:?}"),
+    }
+    assert!(matches!(
+        next_event(&mut server_events).await,
+        Event::ClientConnected { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut server_events).await,
+        Event::ClientActivated { .. }
+    ));
+
+    // Three rounds: advance past the idle window on the paused clock, resume long enough for the
+    // pings and pongs to cross loopback, and require that neither side ended anything. Three rounds
+    // cover the client pinging twice and the server pinging at least once, so a server that never
+    // answers a ping, or a client that never answers one, fails here.
+    for _ in 0..3 {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(16)).await;
+        tokio::time::resume();
+        tokio::time::sleep(CROSS).await;
+        expect_no_disconnect(&mut client_events, Duration::from_millis(100)).await;
+        expect_no_client_left(&mut server_events, Duration::from_millis(100)).await;
+    }
+
+    // The link still works, not merely "has not failed yet": approve the client so the server
+    // activates its roles and sends the group state, then require the client to report it. The
+    // stream announcement the brief suggested needs the client's clock sync, and the paused-clock
+    // rounds have advanced the tokio clock 48 s past the real one, which the client's reply
+    // deadlines (std time) would read as already expired; a group update needs no clock sync and
+    // still proves the server can reach the client and the client can report it.
+    server.approve(&identity.public_base64()).await?;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(20), client_events.next()).await {
+            Err(_) => panic!("the client did not report the group state"),
+            Ok(Some(ClientEvent::State(state))) => {
+                if state.group_name.as_deref() == Some("A test server") {
+                    break;
+                }
+            }
+            Ok(Some(ClientEvent::Disconnected { reason, .. })) => {
+                panic!("the client disconnected: {reason}")
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("the client event stream ended"),
+        }
+    }
+
+    handle.close(GoodbyeReason::Shutdown);
+    drop(client_events);
+    drop(handle);
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_peer_that_answers_nothing_is_dropped() -> Result<()> {
+    // The real client always answers a ping, so it cannot play the half-open peer this test is
+    // about: the fake client holds its pong instead, and the server must still drop it and go on.
+    let (server, port, mut events) = start().await?;
+    let client = silent_client(port).await?;
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(16)).await;
+    tokio::time::resume();
+    tokio::time::sleep(CROSS).await;
+    let (client, _payload) = client.wait_for_ping().await?;
+    let holder = tokio::spawn(client.hold_unanswered_ping());
+
+    // Past both the idle window and the pong window, the server must end the connection with the
+    // keepalive reason.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(26)).await;
+    tokio::time::resume();
+
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    match next_event(&mut events).await {
+        Event::ClientLeft { reason } => {
+            assert!(
+                reason.contains("keepalive"),
+                "the reason names the keepalive, got: {reason}"
+            );
+        }
+        other => panic!("expected ClientLeft, got {other:?}"),
+    }
+
+    // A second, healthy connection is still served afterwards.
+    let mut second = silent_client(port).await?;
+    let reply = second.round_trip_time(3_000).await?;
+    assert_eq!(
+        reply.client_transmitted, 3_000,
+        "the server still serves a healthy connection after the drop"
+    );
+
+    second.goodbye("shutdown").await?;
+    holder.await.expect("the held socket task must not panic")?;
     server.shutdown().await?;
     Ok(())
 }
