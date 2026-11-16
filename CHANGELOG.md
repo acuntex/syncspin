@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 
+## [0.3.1] - 2026-11-16
+
+### Fixed
+
+- The README published on crates.io still named 0.2 and told readers to depend on `syncspin-client = "0.2"`,
+  which resolves to the release that cannot talk to Music Assistant. The page now names 0.3.1, and
+  `scripts/release.sh` refuses to prepare a release whose README does not carry the full version
+
 ## [0.3.0] - 2026-11-16
 
 ### Added

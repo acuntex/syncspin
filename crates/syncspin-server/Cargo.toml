@@ -22,7 +22,7 @@ pairing-code = ["syncspin-core/pairing-code"]
 mdns = ["dep:mdns-sd"]
 
 [dependencies]
-syncspin-core = { version = "0.3.0", path = "../syncspin-core" }
+syncspin-core = { version = "0.3.1", path = "../syncspin-core" }
 anyhow.workspace = true
 base64.workspace = true
 futures-util.workspace = true
@@ -42,7 +42,7 @@ zeroize.workspace = true
 # The round-trip test in `tests/roundtrip.rs` runs the real client crate against this server. A
 # dev-dependency does not change the client's public behaviour or the server's published surface.
 # `discovery` is on only for the server-initiated test, which lets a real client advertise.
-syncspin-client = { version = "0.3.0", path = "../syncspin-client", features = ["discovery"] }
+syncspin-client = { version = "0.3.1", path = "../syncspin-client", features = ["discovery"] }
 # `test-util` is for the paused clock: the keepalive suites run the shipped 15 s and 10 s windows
 # without waiting for them. It is a test-only feature, so the library build carries neither.
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

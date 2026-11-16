@@ -12,15 +12,15 @@ host supplies the server's frames; it does not turn into a music server.
 
 ## Status
 
-**0.3.0, both halves.** The client is covered by a hermetic test suite, including pairing: the Pairing
+**0.3.1, both halves.** The client is covered by a hermetic test suite, including pairing: the Pairing
 PSK flow, the records it writes, the in-band re-handshake and `server/unpair`, plus the static and
 dynamic code flows behind the `pairing-code` feature. The server accepts clients, owns one group and
 its stream, serves the three roles, pairs with all three methods and discovers peers in both
 directions. Its suites use a fake client that walks the specification, and one test runs the real
 client against the real server so the two halves cannot agree on a bug unnoticed. A session that
 carries no traffic keeps itself alive with a WebSocket keepalive on both sides, and a group id that
-is not the specification's 43 base64url characters is tolerated instead of ending the session. 0.3.0
-publishes `syncspin-server` beside `syncspin-core` and `syncspin-client` from the same tag. The API
+is not the specification's 43 base64url characters is tolerated instead of ending the session. Every
+release publishes `syncspin-server` beside `syncspin-core` and `syncspin-client` from the same tag. The API
 may change before 1.0. The CPace layer behind the code flows has not been reviewed externally, so it
 is unaudited code until it has been; what a reviewer would look at is written down in
 [the review package](docs/cpace-review.md).
@@ -45,8 +45,8 @@ decision lives in one place.
 
 ```toml
 [dependencies]
-syncspin-client = "0.3.0"
-syncspin-server = "0.3.0"
+syncspin-client = "0.3.1"
+syncspin-server = "0.3.1"
 ```
 
 Every release is tagged, and the tag carries the source it was published from. `syncspin-core` is
