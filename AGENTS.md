@@ -12,12 +12,14 @@ This file is for agents and contributors working in this repository.
 | ------------------------- | ------------------------------------------------------------------------------- |
 | `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
 | `crates/syncspin-client/` | Client session loop, `Sink` trait, event stream.                                |
-| `crates/syncspin-server/` | Server listener, streams, roles, pairing (`0.2`, `publish = false`).            |
+| `crates/syncspin-server/` | Listener, one group, roles, streams, pairing and discovery (`0.2`).             |
 | `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr.               |
+| `examples/server-demo/`   | Runnable reference server: approves one client and streams a tone.              |
 | `docs/`                   | Design, spec deviations and the testing handbook.                               |
 
-A fake server under `examples/` is planned but does not exist yet. `player-pipe` is the reference
-`Sink`: it shows the event loop, the identity file and the reconnect policy without device code.
+`player-pipe` is the reference `Sink`: it shows the event loop, the identity file and the reconnect
+policy without device code. `server-demo` is the reference host: it shows the approval gate, the
+event loop and the push data plane, and holds no files.
 
 **Layering rule:** `syncspin-core` never imports `syncspin-client` or `syncspin-server`, and it
 never knows a transport. A dependency pointing from core towards a crate is a bug, not a shortcut.
@@ -30,8 +32,11 @@ cargo test --workspace --features pairing-code,storage-file --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 cargo package -p syncspin-core --locked                 # publishability, before a release
+cargo package -p syncspin-server --locked               # once core and the client are on the registry
 cargo check -p syncspin-core -p syncspin-client --all-features \
   --target armv7-unknown-linux-gnueabihf --locked       # the ARM guard, as CI runs it
+cargo check -p syncspin-server --all-features \
+  --target armv7-unknown-linux-gnueabihf --locked       # the same guard for the server, run it too
 cargo zigbuild --target armv7-unknown-linux-gnueabihf  # once the player/controller features land
 cargo deny check                                       # licences, advisories, sources
 scripts/coverage.sh                                    # coverage, all features, advisory
@@ -48,9 +53,10 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
   Noise handshake hashes - not at `trace`, not in `Debug` output, not in error strings.
 - **When the role feature flags land, the defaults stay `player`, `controller`, `metadata`.**
   `artwork`, `visualizer`, `color` and `source` stay off unless a caller opts in. The role features
-  do not exist yet: the only tables today are `storage-file`, `pairing-code` and `discovery`.
-  `storage-file` is off in `syncspin-client` but on in `player-pipe`, so a workspace build enables it
-  through feature unification; `pairing-code` and `discovery` are off unless requested.
+  do not exist yet: the only tables today are `storage-file` (client), `pairing-code`
+  (core/client/server), `discovery` (client) and `mdns` (client/server). `storage-file` is off in
+  `syncspin-client` but on in `player-pipe`, so a workspace build enables it through feature
+  unification; `pairing-code`, `discovery` and `mdns` are off unless requested.
 - **MSRV 1.85.** A dependency that demands more is pinned or replaced, not silently accepted; the
   `msrv` CI job is the gate.
 - **Names and licence are fixed:** crates `syncspin-core`, `syncspin-client` and `syncspin-server`;

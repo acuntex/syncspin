@@ -58,6 +58,15 @@ for crate in syncspin-core syncspin-client syncspin-server; do
     "crates/${crate}/src/lib.rs"
 done
 
+# The internal path dependencies state their own version requirement. A patch
+# release keeps satisfying `^0.1.0`, but 0.2.0 does not, so every requirement
+# moves with the workspace version before Cargo resolves the lock file.
+for manifest in crates/*/Cargo.toml examples/*/Cargo.toml; do
+  run sed -i -E \
+    "s/(syncspin-(core|client|server) = \{ version = )\"[0-9]+\.[0-9]+\.[0-9]+\"/\1\"${version}\"/" \
+    "$manifest"
+done
+
 # The lock file pins the workspace members' versions, so it has to move with the
 # manifest before the gates run under --locked.
 run cargo update --workspace --offline --quiet

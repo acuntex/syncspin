@@ -1,18 +1,18 @@
 # Publishing on a tag, so a release is a reproducible pipeline step and not a
 # hand-typed sequence on one machine.
 #
-#   git tag -a v0.1.0 -m "…" && git push origin v0.1.0
+#   git tag -a v0.2.0 -m "…" && git push origin v0.2.0
 #
-# The job order is not cosmetic: `syncspin-client` depends on `syncspin-core`
-# through the registry, so the index must list core's version before the client
-# can be packaged. Every step is idempotent — a re-run after a partial failure
-# skips what is already published instead of failing on "crate version already
-# exists".
+# The job order is not cosmetic: `syncspin-client` and `syncspin-server` depend
+# on `syncspin-core` through the registry, so the index must list core's version
+# before either can be packaged. Every step is idempotent — a re-run after a
+# partial failure skips what is already published instead of failing on "crate
+# version already exists".
 #
-# Secret: `CARGO_REGISTRY_TOKEN`, a crates.io token scoped to `syncspin-core`
-# and `syncspin-client` with `publish-new` and `publish-update`. It belongs in a
-# protected `release` environment so a tag pushed by mistake cannot publish
-# without a reviewer.
+# Secret: `CARGO_REGISTRY_TOKEN`, a crates.io token scoped to `syncspin-core`,
+# `syncspin-client` and `syncspin-server` with `publish-new` and
+# `publish-update`. It belongs in a protected `release` environment so a tag
+# pushed by mistake cannot publish without a reviewer.
 
 name: Release
 
@@ -99,9 +99,9 @@ jobs:
           fi
 
       - name: wait for the index to list syncspin-core
-        # `cargo publish` for the client resolves core from the registry, so a
-        # version that exists but is not yet in the index would fail the next
-        # step with a confusing error.
+        # `cargo publish` for the client and the server resolves core from the
+        # registry, so a version that exists but is not yet in the index would
+        # fail the next step with a confusing error.
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
@@ -127,6 +127,37 @@ jobs:
             cargo package -p syncspin-client --locked
           else
             cargo publish -p syncspin-client --locked
+          fi
+
+      - name: wait for the index to list syncspin-client
+        # The server is published after the client, so a client version that
+        # exists but has not propagated would fail the next step with a
+        # confusing resolution error.
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          for attempt in $(seq 1 60); do
+            if curl -fsS -A "syncspin-release" "https://crates.io/api/v1/crates/syncspin-client/${version}" > /dev/null; then
+              echo "syncspin-client ${version} is in the index"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "syncspin-client ${version} did not appear in the index within ten minutes" >&2
+          exit 1
+
+      - name: publish syncspin-server
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          if curl -fsS -A "syncspin-release" "https://crates.io/api/v1/crates/syncspin-server/${version}" > /dev/null; then
+            echo "syncspin-server ${version} is already published; skipping"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo package -p syncspin-server --locked
+          else
+            cargo publish -p syncspin-server --locked
           fi
 
   release:
@@ -159,7 +190,7 @@ jobs:
           if [ -z "${notes//[[:space:]]/}" ]; then
             notes="Release ${version}. See CHANGELOG.md."
           fi
-          body=$(printf 'On crates.io: `syncspin-client = "%s"` and `syncspin-core = "%s"`.\n\n%s\n' "$version" "$version" "$notes")
+          body=$(printf 'On crates.io: `syncspin-core = "%s"`, `syncspin-client = "%s"` and `syncspin-server = "%s"`.\n\n%s\n' "$version" "$version" "$version" "$notes")
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release edit "$TAG" --notes "$body"
           else

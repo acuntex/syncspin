@@ -1,6 +1,6 @@
 [package]
 name = "syncspin-server"
-description = "Sendspin server: listener, streams, roles and pairing (0.2, experimental)"
+description = "Sendspin server: listener, one group, roles, streaming and pairing"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,6 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
-publish = false
 include = ["src/**", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [features]

@@ -1,8 +1,8 @@
 # Testing
 
 Two layers, deliberately unequal: the automated suites are hermetic and run in CI on every push,
-and the end-to-end run against a real Music Assistant server is manual and documented here so it
-stays repeatable.
+and the end-to-end runs against a real Music Assistant server and between two machines are manual
+and documented here so they stay repeatable.
 
 ## The hermetic suite
 
@@ -21,9 +21,12 @@ What the suite must never do:
 - read a real identity, pairing record or configuration file;
 - depend on a live Music Assistant server.
 
-Ports: the client session suite binds one ephemeral loopback port per test (`127.0.0.1:0`, owned and
-closed by the test, never a fixed one); the core suites open no socket at all. A test that needs a
-fixed port, a hostname or a device is wrong by construction.
+Ports: the client and server suites bind one ephemeral loopback port per test (`127.0.0.1:0`, owned
+and closed by the test, never a fixed one); the core suites open no socket at all. The server's
+discovery suite uses a fake backend, so no multicast socket is opened and no mDNS packet leaves the
+process. Identities are generated per test and pairing records live in an in-memory store: a suite
+never reads an identity or a record from disk. A test that needs a fixed port, a hostname or a device
+is wrong by construction.
 
 ### What each suite covers
 
@@ -49,8 +52,13 @@ fixed port, a hostname or a device is wrong by construction.
 | `crates/syncspin-client/tests/pairing_psk.rs`           | The Pairing PSK flow end to end: no store means no advertised method, a store draws exactly one key, the method is advertised in `client/hello`, the flow stores one `LongTerm` record and pairs the next connection, a Sentinel-keyed connection is aborted as unsupported, a silent server times out, a cancelling activation persists nothing, a server abort carries its reason, a refused record and an unreadable store end the session, `server/activate` with `pairing` but no parameters is a protocol error, a malformed pair message closes, audio survives the in-band re-handshake, a pairing after it uses index one, a re-handshake to an unknown key closes, and a message under the previous keys is discarded.                                                                                                                                                                                                                               |
 | `crates/syncspin-client/tests/pairing_code_static.rs`   | The static code flow: a gesture without a connection is an error, a window runs one CPace round and persists the key the fake server unwraps, `client/pair-pending` carries the host's text while no window is open, a wrong server code aborts as a mismatch, the fifth failed confirmation closes the window, `server/pair-auth` without an attempt is a sequence violation, and an activation without a configured code is aborted as unsupported.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `crates/syncspin-client/tests/pairing_code_dynamic.rs`  | The dynamic code flow: the derivation matches a pinned vector, digits and the version-1 QR token reach the host, the commitment opens to the revealed nonce (the fake server checks it), a failed `server_kc` retries with the same code and the same deadline, the twentieth round aborts as a mismatch, the round limit holds the next attempt back until `release_holdback`, abandoned rounds count toward the limit and attempts that never reach a round do not.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `crates/syncspin-server/tests/common/mod.rs`            | The fake client the server suites drive: it walks `client/init`, `server/init`, both Noise messages, `server/hello`, `client/hello` and `server/activate` in the order `connection.md` and `messaging.md` define, and reports what the server sent. It shares the core responder rather than the server's internals and carries no tests of its own.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `crates/syncspin-server/tests/connection.rs`            | The listener and one group end to end: both cipher suites, `server/error` for a refused `client/init`, a silent close for an unauthenticated handshake, `server/hello` and `server/activate`, only the configured path served, the three roles activated, `player@v1` withheld when the client lacks the stream format, audio frames with playout timestamps, `server/state` carrying the group and the track, volume and controller commands, pause ending the stream and play announcing it again, two players receiving identical frames, a stalled member not holding up the other, a clock reply per member, a `client/state` report that is not a command, no audio before the player state, an unavailable member receiving none, and `client/goodbye` reported verbatim.                                                                                                                                                                               |
+| `crates/syncspin-server/tests/pairing.rs`               | The server's pairing: a token pairs a real client and its next connection authenticates, another client's token is refused, an unapproved client gets no roles and no audio, revoking an approval takes both away, `unpair` removes the record and disconnects, a client that cannot use its record is refused without touching it, a malformed pairing message is a protocol error, and the static and dynamic code flows complete through CPace with the commitment and code binding; a wrong static code ends without a record.                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `crates/syncspin-server/tests/discovery.rs`             | A fake `Discovery` and a real advertising client: the server publishes its record, dials the advertised endpoint with no `Origin` header, and refuses an endpoint that is not `ws://`; the client's record carries the service, port, path and name. No multicast socket is opened.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `crates/syncspin-server/tests/roundtrip.rs`             | The two halves in one process: the real `syncspin-client` against the real server, with an encrypted connection, a `stream/start` the sink is opened for, the server's bytes arriving unchanged, and a playout deadline ahead of the frame's arrival.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `examples/player-pipe` (in-module tests)                | The example's command line: the default name, identity file and pairing store, `--flag=value` parsing, `--help` without a server, the token mode without a server and its refusal of one, the static-code and window pair (both flags required, eight digits), a bad code never echoed, the usage text naming the flags this build has, and rejection of incomplete, unknown, empty, dashed and over-long values as well as a TLS or non-`ws` server address.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| In-module unit tests (`crates/*/src`)                   | The per-crate `version()` test, the prologue parsing and identity-redaction tests beside `noise.rs`, and the PSK-selection, endpoint and codec-name tests beside the client code.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| In-module unit tests (`crates/*/src`)                   | The per-crate `version()` test, the prologue parsing and identity-redaction tests beside `noise.rs`, the PSK-selection, endpoint and codec-name tests beside the client code, the server's defaults and configuration validation, the audio format's duration and format gate, and the discovery record constructors (the mDNS record tests run only with `mdns`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 A fake server, not a live Music Assistant, is the reference peer for anything that needs a peer.
 
@@ -58,7 +66,10 @@ A fake server, not a live Music Assistant, is the reference peer for anything th
 
 The pairing suites are split by flow. Feature unification decides what a run covers: `storage-file`
 is off in `syncspin-client` but on in `player-pipe`, so a workspace run enables it for the client and
-runs the file backend's tests; `pairing-code` is off everywhere unless requested.
+runs the file backend's tests; `pairing-code` is off everywhere unless requested. The server's
+`pairing.rs` runs without features for the token flow and the approval gate, and the code flows are
+compiled in only with `pairing-code`; its `PairingStore` is an in-memory map, so no suite writes a
+record to disk.
 
 ```sh
 cargo test --workspace --locked
@@ -87,6 +98,10 @@ What the suites do not cover:
   `client/pair-pending` first. The library supports a window opened before a _later_ activation, and
   that path is untested.
 - a live server. Everything above runs against the fake server; see the manual pairing run below.
+- the `mdns` backend. Its record constructors are unit-tested, but publishing and browsing need a
+  multicast socket, so CI drives both crates through a fake `Discovery` and never runs the backend.
+- a second machine. The server suites use loopback; the two-device LAN check below has not been
+  performed.
 - external review. The CPace layer has draft vectors and hermetic tests, not a review
   ([`spec-deviations.md`](spec-deviations.md), entry 4).
 
@@ -121,7 +136,10 @@ cargo check -p syncspin-core -p syncspin-client --all-features \
 
 `--all-features` is what makes the guard cover the pairing stack: `elligator2`, `hmac` and the
 ChaCha20-Poly1305 wrapping are optional dependencies behind `pairing-code`, and without the flag they
-are not cross-compiled at all. The `arm` job runs exactly this command.
+are not cross-compiled at all. The `arm` job runs this command, which covers `syncspin-core` and
+`syncspin-client`. `syncspin-server` builds under the same flags; add `-p syncspin-server` to include
+it. The job has not been widened to the server yet, so a server-only ARM regression would not turn CI
+red.
 
 This is a compile guard, not a release build: it catches a dependency that does not compile for the
 target, which is the failure that actually happens. Once the `player`/`controller` features exist,
@@ -183,9 +201,9 @@ it against the running server.
   (`Sink::underruns` keeps its default of zero), so a zero reading proves nothing there; judge gaps
   by ear. Silence with a healthy connection usually means a playout deadline in the past.
 - **State.** Title and artist arrive from `server/state.metadata`, and volume, mute and the supported
-  commands from `server/state.controller`. The group's `playback_state` and `group_id` travel in
-  `group/update`, which the library does not handle yet, so playing/stopped is not observable — see
-  [`spec-deviations.md`](spec-deviations.md).
+  commands from `server/state.controller`. The group's `playback_state`, `group_id` and `group_name`
+  arrive in `group/update`, which the client handles as the authoritative group state; the controller
+  fields still come from `server/state.controller`.
 - **Volume.** A volume command from the server arrives as `Event::Volume`, which the player prints to
   stderr, and the session has already applied it: the request runs through
   `ClientConfig::volume_policy`, and the level that came out of it is what the next `client/state`
@@ -281,3 +299,41 @@ what it sent. Record both before filing an issue, with the token and all key mat
 - Confirm nothing is left connected: `ss -tn | grep 8927` should be empty.
 - Never paste a pairing token, a keypair or a pairing record into a log excerpt, an issue or a
   commit. Redact before sharing.
+
+## Manual two-device LAN check (not yet performed)
+
+Not part of CI: it needs two machines on one LAN, a player and ears. **This check has not been
+performed for 0.2.** It is the only run that puts these two crates on separate machines; the suites
+bind loopback and use fake discovery.
+
+1. On the first device, start the demo server:
+
+   ```sh
+   cargo run -p server-demo
+   ```
+
+   It prints the address it listens on and generates a new identity. It has no pairing store, so the
+   first client is unpaired and the demo approves it on arrival.
+
+2. On the second device, point the player at that address and play the tone:
+
+   ```sh
+   cargo run -p player-pipe -- --server <server>:8927 | aplay -f S16_LE -r 48000 -c 2
+   ```
+
+   `<server>` is the address the server printed, not a name or address kept in this document.
+
+3. Expected: the server reports `ClientConnected`, then `ClientActivated` with `player@v1` and
+   `streaming a 440 Hz tone`; the player hears the quiet tone without a handshake retry loop. Stop
+   the server: the player reports `Disconnected` and retries; start the server again and it plays.
+
+4. Stop both with Ctrl-C. Restarting `server-demo` gives it a new identity, so a client that paired
+   with the previous run must pair again; this is the example's in-memory identity, not a library
+   rule. The server leaves nothing behind; the player writes its identity and pairing store in its
+   working directory as usual, so delete those if the run was throwaway.
+
+What this does not exercise: mDNS in either direction. `server-demo` has no `Discovery` backend and
+`player-pipe` does not advertise, so the two examples only cover the client-initiated connection.
+The server-initiated path needs hosts that supply a `Discovery` on each side; it is covered by the
+fake backend in `crates/syncspin-server/tests/discovery.rs` and the `mdns` unit tests, not by a LAN
+run.

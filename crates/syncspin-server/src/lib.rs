@@ -42,7 +42,8 @@
 //! cannot accept is answered with `server/error` and a close; every later handshake failure is
 //! silent, as the specification requires.
 //!
-//! The crate is published as `publish = false` until the server half has stabilised.
+//! The crate is published from the same tag as `syncspin-core` and `syncspin-client`; see the
+//! workspace README for the release order.
 
 mod discovery;
 mod group;
