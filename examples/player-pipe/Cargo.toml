@@ -18,9 +18,10 @@ storage-file = ["syncspin-client/storage-file"]
 # configuration fields that only exist there. A host crate that enables `pairing-code` on the
 # client needs the same mirror to construct `ClientConfig`.
 pairing-code = ["syncspin-client/pairing-code"]
-# Mirrors the client's server-initiated mode for the same reason: `--all-features` turns it on in
-# the client, so the example has to name the field it adds. The example itself does not advertise.
-discovery = ["syncspin-client/discovery"]
+# The client's server-initiated mode plus its mDNS backend, so `--advertise` publishes
+# `_sendspin._tcp` and `--discover` browses `_sendspin-server._tcp` over a real multicast group.
+# The backend is the crates'; the example opens no socket of its own.
+discovery = ["syncspin-client/discovery", "syncspin-client/mdns"]
 
 [dependencies]
 syncspin-client = { version = "0.2.0", path = "../../crates/syncspin-client" }

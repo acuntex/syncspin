@@ -21,6 +21,17 @@
 //! stdout, so it can be piped into whatever renders it; every status line in this example is on
 //! stderr. A build with `--features pairing-code` also carries the static pairing code flow.
 //!
+//! A build with `--features discovery` can also find its server, or let the server find it:
+//!
+//! ```sh
+//! player-pipe --discover | aplay -f S16_LE -r 48000 -c 2
+//! player-pipe --advertise | aplay -f S16_LE -r 48000 -c 2
+//! ```
+//!
+//! `--discover` browses `_sendspin-server._tcp` and dials the first server it finds; `--advertise`
+//! publishes `_sendspin._tcp` and accepts the server that connects. Neither takes `--server`, and
+//! the two are exclusive, because `connection.md` allows one connection mode at a time.
+//!
 //! Status lines are for people. In a playback run, audio is the only thing that reaches stdout.
 
 mod pipe_sink;
@@ -34,6 +45,10 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(feature = "storage-file")]
 use syncspin_client::storage::{FileStorage, Storage};
+#[cfg(feature = "discovery")]
+use syncspin_client::{
+    discover_servers, DiscoveredServer, Discovery, Inbound, MdnsDiscovery, SERVER_SERVICE_TYPE,
+};
 use syncspin_client::{
     AudioMode, Client, ClientConfig, Event, Identity, VolumePolicy, DEFAULT_PAIRING_TIMEOUT,
     MAX_PLAYER_NAME_LEN,
@@ -154,7 +169,33 @@ async fn run(options: Options) -> Result<()> {
     #[cfg(not(feature = "storage-file"))]
     let storage: Option<std::sync::Arc<dyn syncspin_client::storage::Storage>> = None;
 
-    let mut config = ClientConfig::new(options.server, options.name, identity);
+    // `--discover` resolves an address before the configuration exists. The daemon lives for one
+    // browse and is dropped with it, so a dialling player joins no multicast group afterwards.
+    #[cfg(feature = "discovery")]
+    let server = if options.discover {
+        let discovery =
+            MdnsDiscovery::new().context("failed to start the mDNS daemon to discover a server")?;
+        let server = discovered_endpoint(&discovery)?;
+        eprintln!("discovered a server at {server}");
+        server
+    } else {
+        options.server.clone()
+    };
+    #[cfg(not(feature = "discovery"))]
+    let server = options.server.clone();
+
+    // `--advertise` keeps its backend until the listener and its advertisement exist; a daemon that
+    // cannot start is reported before anything else is bound.
+    #[cfg(feature = "discovery")]
+    let publishing: Option<std::sync::Arc<dyn Discovery>> = if options.advertise {
+        Some(std::sync::Arc::new(MdnsDiscovery::new().context(
+            "failed to start the mDNS daemon to advertise this player",
+        )?))
+    } else {
+        None
+    };
+
+    let mut config = ClientConfig::new(server, options.name.clone(), identity);
     // A pipe on a general-purpose host has no hardware to describe; a host that runs on a device
     // passes the product name, manufacturer and version here so the server shows it.
     config.device_info = None;
@@ -182,7 +223,26 @@ async fn run(options: Options) -> Result<()> {
     }
 
     // The client owns the reconnect loop: a dropped session is reported on the stream and retried
-    // with the same sink and identity, so this example only prints what it sees.
+    // with the same sink and identity, so this example only prints what it sees. The advertise mode
+    // has no server address; the inbound listener it binds is what a server dials.
+    #[cfg(feature = "discovery")]
+    let (handle, mut events) = match publishing {
+        Some(discovery) => {
+            let (handle, events) = syncspin_client::advertise(
+                inbound_config(config, discovery),
+                Box::new(PipeSink::new()),
+            )
+            .await?;
+            eprintln!(
+                "advertising {} as {}; waiting for a server to connect",
+                syncspin_client::CLIENT_SERVICE_TYPE,
+                options.name
+            );
+            (handle, events)
+        }
+        None => Client::connect(config, Box::new(PipeSink::new())).await?,
+    };
+    #[cfg(not(feature = "discovery"))]
     let (handle, mut events) = Client::connect(config, Box::new(PipeSink::new())).await?;
     loop {
         tokio::select! {
@@ -358,11 +418,20 @@ fn save_identity(path: &Path, identity: &Identity) -> Result<()> {
 /// What the command line asked for.
 struct Options {
     /// Server address as `host[:port]` or a `ws://` URL.
+    ///
+    /// Empty in a discovery mode: `--discover` resolves the address at run time and `--advertise`
+    /// names none, because it accepts the server that connects.
     server: String,
     /// Player name announced to the server.
     name: String,
     /// File that holds the X25519 identity.
     identity: PathBuf,
+    /// Whether to publish `_sendspin._tcp` and accept the server that connects.
+    #[cfg(feature = "discovery")]
+    advertise: bool,
+    /// Whether to browse `_sendspin-server._tcp` and dial the first server found.
+    #[cfg(feature = "discovery")]
+    discover: bool,
     /// File that holds the pairing PSK and records.
     #[cfg(feature = "storage-file")]
     pairing_store: PathBuf,
@@ -402,6 +471,10 @@ where
     let mut server = None;
     let mut name = DEFAULT_NAME.to_owned();
     let mut identity = PathBuf::from(DEFAULT_IDENTITY);
+    #[cfg(feature = "discovery")]
+    let mut advertise = false;
+    #[cfg(feature = "discovery")]
+    let mut discover = false;
     #[cfg(feature = "storage-file")]
     let mut pairing_store = PathBuf::from(DEFAULT_PAIRING_STORE);
     #[cfg(feature = "storage-file")]
@@ -418,6 +491,14 @@ where
             "--server" => server = Some(take_value(flag, inline, &mut args)?),
             "--name" => name = take_value(flag, inline, &mut args)?,
             "--identity" => identity = PathBuf::from(take_value(flag, inline, &mut args)?),
+            #[cfg(feature = "discovery")]
+            "--advertise" => advertise = true,
+            #[cfg(feature = "discovery")]
+            "--discover" => discover = true,
+            #[cfg(not(feature = "discovery"))]
+            "--advertise" | "--discover" => bail!(
+                "discovery needs the discovery feature: rebuild with --features discovery"
+            ),
             #[cfg(feature = "storage-file")]
             "--pairing-store" => {
                 pairing_store = PathBuf::from(take_value(flag, inline, &mut args)?)
@@ -449,6 +530,10 @@ where
         if server.is_some() {
             bail!("--pairing-token prints the token and exits; drop --server");
         }
+        #[cfg(feature = "discovery")]
+        if advertise || discover {
+            bail!("--pairing-token prints the token and exits; drop --advertise and --discover");
+        }
         #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
         if static_code.is_some() || open_window {
             bail!(
@@ -461,8 +546,30 @@ where
         }));
     }
 
-    let server = server.ok_or_else(|| anyhow!("--server is required; try --help"))?;
-    check_server(&server)?;
+    #[cfg(feature = "discovery")]
+    if advertise && discover {
+        bail!("--advertise and --discover are two connection modes: pick one");
+    }
+    #[cfg(feature = "discovery")]
+    let server = match (server, advertise, discover) {
+        (Some(_), true, _) => {
+            bail!("--advertise accepts the servers that connect; drop --server")
+        }
+        (Some(_), _, true) => bail!("--discover finds the server itself; drop --server"),
+        (Some(server), false, false) => {
+            check_server(&server)?;
+            server
+        }
+        (None, false, false) => bail!("--server is required; try --help"),
+        // One of the two discovery modes was asked for; neither names an address.
+        (None, _, _) => String::new(),
+    };
+    #[cfg(not(feature = "discovery"))]
+    let server = {
+        let server = server.ok_or_else(|| anyhow!("--server is required; try --help"))?;
+        check_server(&server)?;
+        server
+    };
     if name.len() > MAX_PLAYER_NAME_LEN {
         bail!(
             "--name is {} bytes, but the protocol allows at most {MAX_PLAYER_NAME_LEN}",
@@ -491,6 +598,10 @@ where
         server,
         name,
         identity,
+        #[cfg(feature = "discovery")]
+        advertise,
+        #[cfg(feature = "discovery")]
+        discover,
         #[cfg(feature = "storage-file")]
         pairing_store,
         #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
@@ -528,6 +639,38 @@ fn check_server(server: &str) -> Result<()> {
         bail!("unsupported URL scheme in {server:?}; use ws:// or host:port");
     }
     Ok(())
+}
+
+/// Returns the endpoint of the first server discovery reports.
+///
+/// A browse is a snapshot, so the caller starts the server first or retries; this example keeps the
+/// command line one-shot instead of hiding a retry loop behind it. A record that cannot name a
+/// `ws://` endpoint is skipped rather than guessed at.
+#[cfg(feature = "discovery")]
+fn discovered_endpoint(discovery: &dyn Discovery) -> Result<String> {
+    let servers = discover_servers(discovery)?;
+    servers
+        .iter()
+        .find_map(DiscoveredServer::endpoint)
+        .ok_or_else(|| {
+            anyhow!(
+                "no server advertised {SERVER_SERVICE_TYPE}; start one with `server-demo --mdns` \
+                 or pass --server"
+            )
+        })
+}
+
+/// Puts the client in the server-initiated mode over `discovery`.
+///
+/// Pure apart from the backend it receives: it binds nothing, so a test can pass a fake and inspect
+/// the configuration the advertise mode hands to [`syncspin_client::advertise`].
+#[cfg(feature = "discovery")]
+fn inbound_config(
+    mut config: ClientConfig,
+    discovery: std::sync::Arc<dyn Discovery>,
+) -> ClientConfig {
+    config.inbound = Some(Inbound::new(discovery));
+    config
 }
 
 /// Splits `--flag=value` into its two halves; leaves every other argument unchanged.
@@ -570,12 +713,19 @@ Usage: player-pipe --server <host[:port] | ws://url> [options]
     text.push_str(
         "       player-pipe --pairing-token [--identity <path>] [--pairing-store <path>]\n",
     );
+    #[cfg(feature = "discovery")]
+    text.push_str(
+        "       player-pipe --discover [options]
+       player-pipe --advertise [options]
+",
+    );
 
     text.push_str(&format!(
         "\
 Options:
       --server <host[:port] | ws://url>
-                              Address of the Sendspin server (required), for
+                              Address of the Sendspin server (required unless a
+                              discovery switch finds or accepts one), for
                               example music-assistant.local:8927; TLS (wss://)
                               is not supported by this build
       --name <player name>    Name this player announces [default: {DEFAULT_NAME}]
@@ -585,6 +735,15 @@ Options:
                               [default: {DEFAULT_IDENTITY}]
 "
     ));
+    #[cfg(feature = "discovery")]
+    text.push_str(
+        "
+      --advertise             Publish _sendspin._tcp over mDNS and accept the server
+                              that connects, instead of dialing one
+      --discover              Browse for a server over mDNS and dial the first one
+                              found, instead of taking --server
+",
+    );
     #[cfg(feature = "storage-file")]
     text.push_str(&format!(
         "
@@ -656,6 +815,11 @@ mod tests {
         assert_eq!(options.server, "music-assistant.local");
         assert_eq!(options.name, DEFAULT_NAME);
         assert_eq!(options.identity, PathBuf::from(DEFAULT_IDENTITY));
+        #[cfg(feature = "discovery")]
+        {
+            assert!(!options.advertise);
+            assert!(!options.discover);
+        }
         #[cfg(feature = "storage-file")]
         assert_eq!(options.pairing_store, PathBuf::from(DEFAULT_PAIRING_STORE));
         #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
@@ -781,6 +945,10 @@ mod tests {
         for line in [
             "\n      --pairing-token",
             "\n      --pairing-store",
+            #[cfg(feature = "discovery")]
+            "\n      --advertise",
+            #[cfg(feature = "discovery")]
+            "\n      --discover",
             "\n  -h, --help",
         ] {
             assert!(
@@ -807,6 +975,151 @@ mod tests {
     fn help_is_reported_without_a_server() {
         assert!(matches!(parse(&["--help"]), Ok(Parse::Help)));
         assert!(matches!(parse(&["-h"]), Ok(Parse::Help)));
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn advertise_and_discover_are_connection_modes_of_their_own() {
+        let advertising = options(&["--advertise", "--name", "Kitchen"]);
+        assert!(advertising.advertise);
+        assert!(!advertising.discover);
+        assert_eq!(advertising.server, "");
+        assert_eq!(advertising.name, "Kitchen");
+
+        let discovering = options(&["--discover", "--identity=/tmp/identity.key"]);
+        assert!(discovering.discover);
+        assert!(!discovering.advertise);
+        assert_eq!(discovering.server, "");
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn the_connection_modes_are_mutually_exclusive() {
+        for (args, expected) in [
+            (&["--server", "host", "--advertise"][..], "drop --server"),
+            (&["--server", "host", "--discover"][..], "drop --server"),
+            (&["--advertise", "--discover"][..], "pick one"),
+        ] {
+            let Err(error) = parse(args) else {
+                panic!("{args:?} must be rejected");
+            };
+            assert!(
+                format!("{error}").contains(expected),
+                "{args:?} should report {expected:?}, got: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "storage-file")]
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn the_token_mode_refuses_the_discovery_switches() {
+        for args in [
+            &["--pairing-token", "--advertise"][..],
+            &["--pairing-token", "--discover"][..],
+        ] {
+            let Err(error) = parse(args) else {
+                panic!("{args:?} must be rejected");
+            };
+            assert!(
+                format!("{error}").contains("drop --advertise and --discover"),
+                "the error should say what to drop, got: {error}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "discovery"))]
+    #[test]
+    fn discovery_flags_name_the_missing_feature() {
+        for flag in ["--advertise", "--discover"] {
+            let Err(error) = parse(&["--server", "host", flag]) else {
+                panic!("{flag} without the discovery feature must be rejected");
+            };
+            let text = format!("{error}");
+            assert!(
+                text.contains("--features discovery"),
+                "the error must name the feature that adds the flag, got: {text}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "discovery"))]
+    #[test]
+    fn a_build_without_discovery_does_not_list_the_switches() {
+        let text = usage();
+        assert!(!text.contains("--advertise"), "got: {text}");
+        assert!(!text.contains("--discover"), "got: {text}");
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn the_usage_lists_the_discovery_switches() {
+        let text = usage();
+        assert!(text.contains("--advertise"), "got: {text}");
+        assert!(text.contains("--discover"), "got: {text}");
+    }
+
+    /// A [`Discovery`] that answers from memory, so the wiring is tested without multicast.
+    #[cfg(feature = "discovery")]
+    #[derive(Default)]
+    struct MemoryDiscovery {
+        servers: Vec<DiscoveredServer>,
+    }
+
+    #[cfg(feature = "discovery")]
+    impl Discovery for MemoryDiscovery {
+        fn advertise(&self, _service: syncspin_client::ServiceAdvertisement) -> Result<()> {
+            Ok(())
+        }
+
+        fn withdraw(&self, _service_type: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn browse(&self, _service_type: &str) -> Result<Vec<DiscoveredServer>> {
+            Ok(self.servers.clone())
+        }
+    }
+
+    /// The advertise mode adds an inbound listener with the spec's address and path, binding none.
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn the_advertise_mode_builds_the_inbound_config_without_a_socket() {
+        let config = inbound_config(
+            ClientConfig::new(String::new(), "Test player", Identity::generate()),
+            std::sync::Arc::new(MemoryDiscovery::default()),
+        );
+        let inbound = config
+            .inbound
+            .expect("the advertise mode sets ClientConfig::inbound");
+        assert_eq!(inbound.listen, syncspin_client::DEFAULT_INBOUND_ADDR);
+        assert_eq!(inbound.path, syncspin_client::DEFAULT_SENDSPIN_PATH);
+    }
+
+    /// The discover mode turns the first reported record into the address the config dials.
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn the_discover_mode_builds_a_ws_dial_target_from_the_first_server() {
+        let discovery = MemoryDiscovery {
+            servers: vec![DiscoveredServer {
+                addresses: vec!["192.0.2.7:8927".to_owned()],
+                path: "/sendspin".to_owned(),
+                name: Some("A server".to_owned()),
+            }],
+        };
+        assert_eq!(
+            discovered_endpoint(&discovery).expect("a server is advertised"),
+            "ws://192.0.2.7:8927/sendspin"
+        );
+
+        let empty = MemoryDiscovery::default();
+        let Err(error) = discovered_endpoint(&empty) else {
+            panic!("an empty browse must not name an endpoint");
+        };
+        assert!(
+            format!("{error}").contains(SERVER_SERVICE_TYPE),
+            "the error should name what was looked for, got: {error}"
+        );
     }
 
     #[test]
