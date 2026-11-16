@@ -105,6 +105,12 @@ const METADATA_ROLE: &str = "metadata@v1";
 /// Versioned role identifier of the group controller state.
 const CONTROLLER_ROLE: &str = "controller@v1";
 
+/// The roles this client advertises in `client/hello`.
+///
+/// The activation check reads this list, so an advertisement and its admissibility cannot drift
+/// apart without a test failing.
+const SUPPORTED_ROLES: [&str; 3] = [PLAYER_ROLE, CONTROLLER_ROLE, METADATA_ROLE];
+
 /// Largest output delay reported to the server, in milliseconds.
 const MAX_OUTPUT_DELAY_MS: u32 = 5_000;
 
@@ -2447,11 +2453,10 @@ fn client_hello(config: &ClientConfig) -> Incoming {
             software_version: info.software_version.clone(),
             mac_address: info.mac_address.clone(),
         }),
-        supported_roles: vec![
-            PLAYER_ROLE.to_owned(),
-            CONTROLLER_ROLE.to_owned(),
-            METADATA_ROLE.to_owned(),
-        ],
+        supported_roles: SUPPORTED_ROLES
+            .iter()
+            .map(|role| (*role).to_owned())
+            .collect(),
         player_support: Some(PlayerSupport {
             supported_formats: vec![SupportedFormat {
                 codec: codec.to_owned(),
@@ -2462,7 +2467,9 @@ fn client_hello(config: &ClientConfig) -> Incoming {
             buffer_capacity: BUFFER_CAPACITY,
         }),
         supported_pair_methods: pair_methods(config),
-        unpaired_access: UnpairedAccess { enabled: true },
+        unpaired_access: UnpairedAccess {
+            enabled: config.unpaired_access,
+        },
     })
 }
 
@@ -3085,6 +3092,7 @@ mod tests {
             volume_policy: crate::config::VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             strict_group_id: false,
+            unpaired_access: true,
             pairing_timeout: crate::client::DEFAULT_PAIRING_TIMEOUT,
             #[cfg(feature = "discovery")]
             inbound: None,

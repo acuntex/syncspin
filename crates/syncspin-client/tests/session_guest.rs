@@ -294,6 +294,7 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
+        unpaired_access: true,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -1238,6 +1239,7 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
+        unpaired_access: true,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -1329,11 +1331,40 @@ async fn the_client_announces_the_player_role_and_the_requested_format() {
         .expect("the player role needs support data");
     assert_eq!(support.supported_formats[0].codec, "flac");
     assert_eq!(support.supported_formats[0].sample_rate, 48_000);
-    assert!(hello.unpaired_access.enabled);
     assert_eq!(
         hello.device_info, None,
         "a host that describes no device announces none"
     );
+}
+
+#[tokio::test]
+async fn a_default_client_admits_unpaired_access() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (_events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    let hello = server
+        .wait_for_client_hello()
+        .await
+        .expect("client/hello arrives");
+    assert!(hello.unpaired_access.enabled);
+}
+
+#[tokio::test]
+async fn a_client_that_refuses_unpaired_access_says_so_in_client_hello() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    // Both are bound, not dropped: dropping the event stream ends the session.
+    let (_handle, _events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+    let hello = server
+        .wait_for_client_hello()
+        .await
+        .expect("client/hello arrives");
+    assert!(!hello.unpaired_access.enabled);
 }
 
 #[tokio::test]

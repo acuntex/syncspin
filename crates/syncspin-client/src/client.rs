@@ -1523,6 +1523,7 @@ mod tests {
                 volume_policy: VolumePolicy::default(),
                 max_backoff: Duration::from_secs(30),
                 strict_group_id: false,
+                unpaired_access: true,
                 pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
                 #[cfg(feature = "discovery")]
                 inbound: None,

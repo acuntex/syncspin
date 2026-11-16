@@ -301,6 +301,17 @@ pub struct ClientConfig {
     /// `docs/spec-deviations.md`. A host that talks to a conformant server, or that wants the
     /// spec's rule enforced, sets this to `true`.
     pub strict_group_id: bool,
+    /// Whether this client admits a server with no pairing record.
+    ///
+    /// The value is advertised in `client/hello` as `unpaired_access.enabled`; with `false` a session
+    /// that is not keyed by a long-term PSK may not be activated for playback, and the client closes it
+    /// with `client/goodbye` reason `pairing_required`. Pairing is unaffected: both pairing flows run
+    /// over a Sentinel-keyed session and stay admissible.
+    ///
+    /// `pairing.md` leaves the default to the manufacturer and recommends `false` for a client whose
+    /// input a stranger could reach, such as a microphone. The default here is `true`, which is what
+    /// every release before this setting did.
+    pub unpaired_access: bool,
     /// How long one pairing attempt may run, measured from `client/pair-init`.
     ///
     /// On expiry the client sends `pair/abort` with reason `attempt_timeout` and reports
@@ -380,6 +391,7 @@ impl fmt::Debug for ClientConfig {
             .field("volume_policy", &self.volume_policy)
             .field("max_backoff", &self.max_backoff)
             .field("strict_group_id", &self.strict_group_id)
+            .field("unpaired_access", &self.unpaired_access)
             .field("pairing_timeout", &self.pairing_timeout);
         // The static code is a credential, so it is named but never printed.
         #[cfg(feature = "pairing-code")]
@@ -405,7 +417,7 @@ impl ClientConfig {
     ///
     /// Everything a host rarely changes starts at a documented value: no device description, no
     /// pairing store, [`AudioMode::Decode`], volume 100 and unmuted, [`VolumePolicy::default`],
-    /// [`DEFAULT_MAX_BACKOFF`], the tolerated foreign `group_id`, and
+    /// [`DEFAULT_MAX_BACKOFF`], the tolerated foreign `group_id`, unpaired access admitted, and
     /// [`DEFAULT_PAIRING_TIMEOUT`](crate::DEFAULT_PAIRING_TIMEOUT). A
     /// host that restores a level or a mute state sets [`ClientConfig::volume`] and
     /// [`ClientConfig::muted`] on the value this returns.
@@ -430,6 +442,8 @@ impl ClientConfig {
             // The documented tolerance is the default: a foreign group id does not close the
             // connection unless the host asks for the spec's strictness.
             strict_group_id: false,
+            // Earlier releases admitted every session, so the setting starts where they left off.
+            unpaired_access: true,
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
             #[cfg(feature = "pairing-code")]
             static_pairing_code: None,
@@ -567,6 +581,7 @@ mod tests {
             volume_policy: VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             strict_group_id: false,
+            unpaired_access: true,
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
             #[cfg(feature = "discovery")]
             inbound: None,
