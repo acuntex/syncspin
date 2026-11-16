@@ -52,6 +52,8 @@ use syncspin_core::pairing::wrap::{self, NONCE_LABEL, PSK_LABEL};
 use crate::config::CodeFormat;
 use crate::config::{PskCategory, StoredPsk};
 use crate::storage::Storage;
+#[cfg(feature = "pairing-code")]
+use syncspin_core::noise::Suite;
 use syncspin_core::noise::SENTINEL_PSK;
 
 /// Method identifier of the Pairing PSK flow, as it is spelled on the wire.
@@ -631,17 +633,23 @@ impl PairingAttempt {
     /// intermediate session key stays inside this call; only what the next two messages need is
     /// kept.
     ///
+    /// `suite` is the cipher suite the connection negotiated, because the spec seals the two
+    /// wrapped fields with that suite's AEAD. The session passes the suite of the transport the
+    /// pairing exchange runs inside.
+    ///
     /// # Errors
     ///
-    /// Fails when the round is not waiting for the server's share, and when the server's share
-    /// encodes a low-order point, which the draft requires the round to abort. The session treats
-    /// that as a protocol error and closes the connection.
+    /// Fails when the round is not waiting for the server's share, when the server's share
+    /// encodes a low-order point, which the draft requires the round to abort, and when the
+    /// build cannot seal under `suite`. The session treats that as a protocol error and closes
+    /// the connection.
     #[cfg(feature = "pairing-code")]
     pub(crate) fn accept_server_share(
         &mut self,
         prs: &[u8],
         sid: &[u8],
         peer_share: &[u8; SHARE_LEN],
+        suite: Suite,
     ) -> Result<[u8; SHARE_LEN]> {
         if !self.awaiting_server_auth() {
             bail!("the attempt is not waiting for the server's CPace share");
@@ -660,12 +668,13 @@ impl PairingAttempt {
         let isk = pake::intermediate_session_key(sid, &point, &transcript);
         let expected_server_tag = pake::key_confirmation_tag(sid, &isk, peer_share, AD_SERVER);
         let client_tag = pake::key_confirmation_tag(sid, &isk, &share, AD_CLIENT);
-        let wrapped_psk = wrap::wrap(&wrap::k_wrap(PSK_LABEL, sid, &isk), &self.psk);
+        let wrapped_psk = wrap::wrap(suite, &wrap::k_wrap(PSK_LABEL, sid, &isk), &self.psk)?;
         let wrapped_nonce_b = match &self.flow {
             Flow::Dynamic(state) => Some(wrap::wrap(
+                suite,
                 &wrap::k_wrap(NONCE_LABEL, sid, &isk),
                 &state.nonce_b,
-            )),
+            )?),
             _ => None,
         };
 
@@ -986,7 +995,7 @@ mod tests {
 
         let mut attempt = PairingAttempt::static_code(7, Duration::from_secs(120), None);
         let share = attempt
-            .accept_server_share(CODE.as_bytes(), &sid, &peer_share)
+            .accept_server_share(CODE.as_bytes(), &sid, &peer_share, Suite::ChaChaPoly)
             .expect("the server's share is a group element");
 
         let point = pake::scalar_mult_vfy(&server_scalar, &share).expect("a group element");
@@ -1062,7 +1071,8 @@ mod tests {
             .expect("a sealed value is 48 bytes");
         let key = wrap::k_wrap(PSK_LABEL, &sid, &isk);
         assert_eq!(
-            wrap::unwrap(&key, &sealed).expect("the seal opens under the server's key"),
+            wrap::unwrap(Suite::ChaChaPoly, &key, &sealed)
+                .expect("the seal opens under the server's key"),
             attempt.psk(),
             "the server recovers exactly the long-term PSK the record keeps"
         );
@@ -1280,7 +1290,7 @@ mod tests {
         let server_scalar = [0x44; 32];
         let peer_share = pake::public_share(&server_scalar, &generator).expect("a group element");
         let share = attempt
-            .accept_server_share(&prs, &sid, &peer_share)
+            .accept_server_share(&prs, &sid, &peer_share, Suite::ChaChaPoly)
             .expect("the server's share is a group element");
 
         let point = pake::scalar_mult_vfy(&server_scalar, &share).expect("a group element");
@@ -1379,7 +1389,8 @@ mod tests {
             .expect("a sealed value is 48 bytes");
         let nonce_key = wrap::k_wrap(NONCE_LABEL, &retry_sid, &retry_isk);
         assert_eq!(
-            wrap::unwrap(&nonce_key, &sealed).expect("the seal opens under the server's key"),
+            wrap::unwrap(Suite::ChaChaPoly, &nonce_key, &sealed)
+                .expect("the seal opens under the server's key"),
             NONCE_B,
             "the server recovers exactly the nonce it committed to"
         );
@@ -1392,7 +1403,7 @@ mod tests {
             .expect("a sealed value is 48 bytes");
         let psk_key = wrap::k_wrap(PSK_LABEL, &retry_sid, &retry_isk);
         assert_eq!(
-            wrap::unwrap(&psk_key, &sealed_psk).expect("the seal opens"),
+            wrap::unwrap(Suite::ChaChaPoly, &psk_key, &sealed_psk).expect("the seal opens"),
             attempt.psk()
         );
 

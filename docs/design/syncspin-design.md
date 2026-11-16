@@ -192,8 +192,9 @@ MCF and the spec's generator/`sid` layout. If not, the CPace wrapper is built ar
 - **0.2: both directions.** The server advertises `_sendspin-server._tcp` and discovers clients via
   `_sendspin._tcp`; the client advertises itself and accepts server-initiated connections. That
   closes the 0.1 deviation. Spec rule to respect: a client that advertises MUST NOT additionally
-  connect manually, so the client exposes `advertise = true|false` and the manual path stays the
-  fallback for setups where mDNS is filtered (as in some consumer builds today).
+  connect manually, so `ClientConfig::inbound` selects the advertising mode and a configuration that
+  sets it refuses to dial; the manual path stays the fallback for setups where mDNS is filtered (as
+  in some consumer builds today).
 - `wss://` only as a feature for remote access, never the default.
 
 ## Repository layout (target)

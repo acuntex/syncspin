@@ -68,6 +68,20 @@
 //! [`ControlHandle::pairing_token`] hands the operator the version-0 `SP:` token while a store is
 //! configured; it is a credential, so a host renders it only when the operator needs it.
 //!
+//! With the `discovery` feature the client can also take the other half of `connection.md`: instead
+//! of dialling a server it advertises `_sendspin._tcp` and accepts the server that connects.
+//! `Inbound` names the host's [`Discovery`] backend, the address to listen on and the path to
+//! serve; `advertise` publishes the record - the bound port and the `path` and `name` TXT
+//! records - and then serves one server at a time through the same session as a dialled connection.
+//! An upgrade that carries an `Origin` header is refused, as the spec requires, and the Noise
+//! handshake is unchanged because the server initiates it in both directions. A client uses one of
+//! the two methods at a time: while `ClientConfig::inbound` is set, [`connect`] refuses to dial.
+//! A second server that arrives while one is admitted is rejected with `client/goodbye` reason
+//! `concurrent_attempt` and closed, which is the spec's admission rule for a client that caps
+//! itself at one connection. The `mdns` feature carries the `mdns-sd` implementation of
+//! [`Discovery`]; without it the trait is the seam, so a host can supply its own backend and a
+//! fake drives the tests.
+//!
 //! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
 //! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
 //! [`Event::StreamClear`] for a seek, plus [`Event::Track`] for the now-playing metadata with its
@@ -79,6 +93,7 @@
 
 mod client;
 mod config;
+mod discovery;
 mod pairing;
 mod session;
 mod sink;
@@ -92,12 +107,21 @@ pub use client::{
     INITIAL_BACKOFF, NORMAL_PLAYBACK_SPEED,
 };
 pub use config::{
-    AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, MAX_PLAYER_NAME_LEN,
+    AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, DEFAULT_MAX_BACKOFF,
+    MAX_PLAYER_NAME_LEN,
 };
 #[cfg(feature = "pairing-code")]
 pub use config::{
     CodeFormat, CodeOutChannel, DEFAULT_PAIRING_WINDOW, MAX_PAIRING_PENDING_TEXT_LEN,
     STATIC_PAIRING_CODE_LEN,
+};
+#[cfg(feature = "mdns")]
+pub use discovery::MdnsDiscovery;
+#[cfg(feature = "discovery")]
+pub use discovery::{advertise, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT};
+pub use discovery::{
+    discover_servers, DiscoveredServer, Discovery, ServiceAdvertisement, CLIENT_SERVICE_TYPE,
+    DEFAULT_SENDSPIN_PATH, SERVER_SERVICE_TYPE,
 };
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};
 

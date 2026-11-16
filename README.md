@@ -1,8 +1,8 @@
 # syncspin
 
-A Rust library for [the Sendspin protocol](https://github.com/Sendspin/spec): a client today, a
-server planned. A server owns the queue and the clock, clients render the audio and report their
-state back.
+A Rust library for [the Sendspin protocol](https://github.com/Sendspin/spec): a client and a server.
+The server owns the clock and the stream, clients render the audio and report their state back. A
+host supplies the server's frames; it does not turn into a music server.
 
 [![CI](https://github.com/acuntex/syncspin/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/acuntex/syncspin/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/syncspin-client.svg)](https://crates.io/crates/syncspin-client)
@@ -12,12 +12,15 @@ state back.
 
 ## Status
 
-**0.1, client first.** The client is implemented and covered by a hermetic test suite, including
-pairing: the Pairing PSK flow, the records it writes, the in-band re-handshake and `server/unpair`,
-plus the static and dynamic code flows behind the `pairing-code` feature. `syncspin-server` is a stub
-with `publish = false`. `syncspin-core` and `syncspin-client` are published on crates.io. The API may
-change before 1.0. The CPace layer behind the code flows has not been reviewed
-externally, so it is unaudited code until it has been.
+**0.2, both halves.** The client is covered by a hermetic test suite, including pairing: the Pairing
+PSK flow, the records it writes, the in-band re-handshake and `server/unpair`, plus the static and
+dynamic code flows behind the `pairing-code` feature. The server accepts clients, owns one group and
+its stream, serves the three roles, pairs with all three methods and discovers peers in both
+directions. Its suites use a fake client that walks the specification, and one test runs the real
+client against the real server so the two halves cannot agree on a bug unnoticed. 0.2 publishes
+`syncspin-server` beside `syncspin-core` and `syncspin-client` from the same tag. The API may change
+before 1.0. The CPace layer behind the code flows has not been reviewed externally, so it is
+unaudited code until it has been.
 
 `syncspin` is not an official Sendspin implementation and is not affiliated with the Sendspin
 project; the name describes only the protocol the code speaks.
@@ -28,8 +31,9 @@ project; the name describes only the protocol the code speaks.
 | ------------------------- | ------------------------------------------------------------------------------- |
 | `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
 | `crates/syncspin-client/` | Session loop, `Sink` trait, event stream, pairing and its `Storage` trait.      |
-| `crates/syncspin-server/` | Planned for 0.2: listener, streams, roles, pairing.                             |
+| `crates/syncspin-server/` | Listener, one group, roles, host-fed streams, pairing and discovery.            |
 | `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr, pairing.      |
+| `examples/server-demo/`   | Runnable reference server: approves the first client and streams a tone.        |
 
 `syncspin-core` never depends on `syncspin-client` or `syncspin-server`; every protocol and crypto
 decision lives in one place.
@@ -38,17 +42,29 @@ decision lives in one place.
 
 ```toml
 [dependencies]
-syncspin-client = "0.1"
+syncspin-client = "0.2"
+syncspin-server = "0.2"
 ```
 
-`syncspin-server` is not published; the client is the whole of 0.1. Every release is tagged, and the
-tag carries the source it was published from.
+Every release is tagged, and the tag carries the source it was published from. `syncspin-core` is
+published first; the other two depend on it through the registry.
 
-The example player needs a Sendspin server to talk to:
+The two examples can talk to each other, with no music server in between. Start the demo server and
+note the address it prints:
 
 ```sh
-cargo run -p player-pipe -- --server music-assistant.local:8927 | aplay -f S16_LE -r 48000 -c 2
+cargo run -p server-demo
 ```
+
+Then point the player at that address:
+
+```sh
+cargo run -p player-pipe -- --server <server>:8927 | aplay -f S16_LE -r 48000 -c 2
+```
+
+`server-demo` approves its first client, activates the roles it offered and streams a quiet 440 Hz
+tone until Ctrl-C. It holds no files and decodes nothing; its identity is new on every run. The same
+player talks to Music Assistant's Sendspin provider when `--server` names that endpoint instead.
 
 Run `cargo run -p player-pipe -- --help` for the player name, the identity file and the pairing
 store. The first run writes `./identity.key` and `./pairing.json` with owner-only permissions; later
@@ -63,8 +79,9 @@ directly and keep it out of logs and issues. A server that admits unpaired clien
 player as a guest. `--features pairing-code` adds `--static-code` and `--open-window` for the static
 code flow.
 
-The example's source is meant to be read: `src/main.rs` holds the event loop, the identity handling
-and the pairing token, `src/pipe_sink.rs` the `Sink` implementation.
+Both examples are meant to be read. `player-pipe/src/main.rs` holds the event loop, the identity
+handling and the pairing token, and `player-pipe/src/pipe_sink.rs` the `Sink` implementation.
+`server-demo/src/main.rs` holds the approval gate, the event loop and the push data plane.
 
 ## What works today
 
@@ -102,6 +119,28 @@ mute, stop or restart its output first; a reconnect flush produces no stream eve
 carries the now-playing metadata with the position, the duration and the playback speed in per-mille,
 where `1000` is normal speed.
 
+### The server
+
+`syncspin-server` listens on a configurable address and path, answers `client/init` with `server/init`
+and runs the Noise handshake as its initiator over either cipher suite. A `client/init` it cannot
+accept is answered with `server/error` and a close; a handshake that does not authenticate ends
+without a further message. Each connection is reported to the host as it connects, is activated and
+leaves.
+
+One group holds every client. All members receive the same frames with the same playout timestamps,
+the server answers each client's `client/time` burst, and a member that stops reading does not hold
+up the others. The host pushes audio into a `StreamWriter` from `ServerHandle::open_stream`; the server
+stamps every chunk from the configured format and fans it out without decoding. A client is given
+`player@v1` only when its `player@v1_support` lists that exact format, so nobody is sent a stream it
+cannot play. Volume, mute and play/pause/stop belong to the group. The active roles are the three v1
+roles a player needs: `player@v1`, `controller@v1` and `metadata@v1`.
+
+The server has its own pairing: `PairingStore` holds one record per `client_id`, an unpaired client
+is held at empty activities until the operator approves it, and `pair`, `start_pairing`,
+`submit_code` and `unpair` drive the token, static-code and dynamic-code flows. Discovery runs in both directions:
+with a `Discovery` backend the server advertises `_sendspin-server._tcp` and dials the clients that
+advertise `_sendspin._tcp`; the `mdns` feature carries the `mdns-sd` implementation.
+
 ## Pairing
 
 Pairing belongs to the host: it supplies a [`Storage`](crates/syncspin-client/src/storage.rs) with the
@@ -128,24 +167,59 @@ pairing window the host opens or by the process-wide round limit. The dynamic fl
 a six-digit code or a version-1 token; both flows deliver the long-term key sealed under the CPace
 output. The CPace layer is unaudited — see [Status](#status).
 
+The server's side is symmetric. `ServerConfig::storage` is the host's `PairingStore`, keyed by
+`client_id`; the listener seals a client's first handshake with the record it holds. A client with no
+record is reported with `approved: false`, gets no roles and no audio, and stays that way until
+`ServerHandle::approve` or a completed pairing. `Event::PairingRequested` asks the operator for a
+code, `Event::Paired` reports the record, and `ServerHandle::unpair` removes it and disconnects.
+Approval lasts as long as the server process; it is not written to a store and a restart asks again.
+
+## Discovery
+
+`connection.md` gives a server two ways to reach a client and a client two ways to reach a server.
+Both halves implement both. A server with a `Discovery` backend publishes
+`_sendspin-server._tcp` with its bound port, `path` and `name` and browses `_sendspin._tcp` for the
+clients it dials. The `mdns` feature carries an `mdns-sd` implementation for each crate; without a
+backend the `Discovery` trait is the seam, so a test drives advertising with a fake and no multicast
+socket is opened.
+
+With the `discovery` feature the client can take the server-initiated half: instead of dialling a
+server it advertises `_sendspin._tcp` through a host-supplied `Discovery` and accepts the server that
+connects. `Inbound` carries the backend, the listen address (every interface on 8928 by default) and
+the path (`/sendspin` by default); `advertise` publishes the record with the bound port and the
+`path` and `name` TXT records, then serves the inbound WebSocket. An upgrade that carries an `Origin`
+header is refused with a 403, as the spec requires, and the Noise handshake is unchanged: the server
+is its initiator in both directions.
+
+One server is served at a time. While `ClientConfig::inbound` is set the client does not dial, and
+`connect` refuses: the spec lets a client use one of the two methods at a time, never both. A second
+server that connects while one is admitted is rejected with `client/goodbye` reason
+`concurrent_attempt` and closed, as the admission rule requires; it is not left waiting in the
+listener's backlog. Nothing browses automatically on the client: the host chooses among the servers
+it found and passes one URL to `connect`, which the spec leaves implementation-defined.
+
 ## What does not work yet
 
 - **Unpaired access.** The client always admits it: `client/hello` carries
   `unpaired_access: { enabled: true }` unconditionally, there is no setting that turns it off, and
   nothing closes an unpaired connection with reason `pairing_required`. A deliberate close sends
-  `client/goodbye` with a reason the host chooses; the reasons for states this revision cannot
-  detect (`unauthorized`, `concurrent_attempt`) are never sent.
-- **Server.** `syncspin-server` is a stub; the listener, streams, roles and pairing server arrive in
-  0.2.
-- **Discovery.** Clients do not advertise over mDNS and do not accept server-initiated connections.
-- **Group state.** `group/update`, the spec's authoritative source of the playback state, is not
-  handled.
+  `client/goodbye` with a reason the host chooses.
+- **Server scope.** No queue, library, playlist, decoding, resampling, HTTP API or UI. The host owns
+  the content and writes the frames; the crate owns the connection, clock, group and wire.
+- **Several groups.** One group per server. An unavailable member stays in it and simply receives no
+  audio; there is no solo group and no `switch` command cycle.
+- **Roles.** Only `player@v1`, `controller@v1` and `metadata@v1`. There are no other role versions
+  and no `artwork`, `visualizer`, `color` or `source` role.
+- **Discovery persistence.** Both crates browse and advertise, but the client does not persist the
+  server it last admitted with `playback`, and the server keeps operator approval for its lifetime
+  only. A restart asks the operator again.
+- **Playout lead.** Every member shares one timeline whose first sample is 200 ms after the stream
+  opens. The reported `required_lead_time_ms` and `min_buffer_ms` are read but do not move it.
 - **TLS.** No TLS stack: a `wss://` address is rejected when the client is configured, and nothing
-  is downgraded to `ws://`. A TLS backend is out of scope for 0.1.
+  is downgraded to `ws://`. A TLS backend is out of scope for 0.2.
 
-Pairing, discovery, `group/update` and the other departures from the specification are tracked with
-their reasons and the work that closes them in [docs/spec-deviations.md](docs/spec-deviations.md).
-The server half is not a deviation — it is staged work for 0.2.
+Pairing, discovery and the other departures from the specification are tracked with their reasons
+and the work that closes them in [docs/spec-deviations.md](docs/spec-deviations.md).
 
 ## Integrating a client
 
@@ -169,10 +243,27 @@ event stream ends the connection.
 
 ## Integrating a server
 
-`syncspin-server` is a stub and is not published. It is where the listener, the stream handling, the
-roles and the server side of pairing will live for 0.2, and its shape is described in
-[docs/design/syncspin-design.md](docs/design/syncspin-design.md). Until then, build the client side
-and use a Sendspin server you already have.
+A host supplies the server's identity, an optional
+[`PairingStore`](crates/syncspin-server/src/pairing.rs) and an optional
+[`Discovery`](crates/syncspin-server/src/discovery.rs). `Server::start` binds the listener and hands
+back a handle and an event stream. The host writes frames into the `StreamWriter` that
+`open_stream` returns and follows the connections through the events:
+
+```rust
+let mut server = Server::start(config).await?;
+let mut events = server.events();
+let mut stream = server.open_stream(track);
+stream.write(&pcm);
+while let Some(event) = events.next().await {
+    // ClientConnected, ClientActivated, PairingRequested, Paired, ClientLeft, ...
+}
+```
+
+An unapproved client reaches `ClientConnected { approved: false }` and gets no roles until
+`server.approve(&client_id).await?`; a paired client arrives already approved.
+`server.set_volume`, `play`, `pause` and `stop` change the group, and `pair`, `start_pairing`,
+`submit_code` and `unpair` drive the pairing flows. `examples/server-demo` is the smallest complete
+host, including the approval call; its source is short enough to read next to this section.
 
 ## Related projects
 

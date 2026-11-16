@@ -1,10 +1,10 @@
-//! Sendspin's Noise layer: `Noise_KKpsk2_25519_ChaChaPoly_SHA256`.
+//! Sendspin's Noise layer: `Noise_KKpsk2_25519_<cipher>_SHA256`.
 //!
 //! Every Sendspin connection is wrapped in Noise. The handshake follows the cleartext init
 //! exchange and precedes all application traffic:
 //!
 //! ```text
-//! client -> server  client/init      cleartext JSON, carries the client_id
+//! client -> server  client/init      cleartext JSON, carries the client_id and the suite
 //! server -> client  server/init      cleartext JSON, carries the server_id
 //! server -> client  noise/handshake  Noise message 1, payload {"psk_id": .., "psk_category": ..}
 //! client -> server  noise/handshake  Noise message 2, payload {}
@@ -16,11 +16,19 @@
 //! the exact concatenation of the `client/init` and `server/init` bytes as sent on the wire, so
 //! tampering with the cleartext exchange fails the handshake.
 //!
-//! This module is the responder half plus the transport that follows the handshake. It does not
-//! interpret handshake payloads; the session layer validates the `psk_id`/`psk_category`
-//! metadata. This milestone uses the published Sentinel PSK, which is what an unpaired client
-//! uses and which provides no authentication on its own; selecting a different PSK from message 1
-//! arrives with the session layer.
+//! This module carries both halves of the handshake - [`Responder`] for the client, [`Initiator`]
+//! for the server - plus the transport that follows it. It does not interpret handshake payloads;
+//! the session layer validates the `psk_id`/`psk_category` metadata. This milestone uses the
+//! published Sentinel PSK, which is what an unpaired client uses and which provides no
+//! authentication on its own; selecting a different PSK from message 1 arrives with the session
+//! layer.
+//!
+//! # Cipher suites
+//!
+//! The specification defines two suites and requires a server to support both. [`Suite`] is the
+//! set this build has; a name outside it is refused. The client picks the suite and announces it
+//! in `client/init`, so there is no negotiation to fall back from: a responder built for another
+//! suite than the one announced is an error, not a downgrade.
 
 use std::fmt;
 
@@ -30,8 +38,61 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-/// Noise protocol parameters used by Sendspin.
-pub const NOISE_PARAMS: &str = "Noise_KKpsk2_25519_ChaChaPoly_SHA256";
+/// A Sendspin cipher suite: the `<DH>_<cipher>_<hash>` tail of a Noise protocol name.
+///
+/// The specification lists both of these and requires a server to have both; a client announces
+/// the one it uses in `client/init`. [`Suite::ChaChaPoly`] is the default because it is the suite
+/// this library has always spoken and the one its pairing wrapping was pinned against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Suite {
+    /// `25519_ChaChaPoly_SHA256`, the software-friendly suite and the default.
+    #[default]
+    ChaChaPoly,
+    /// `25519_AESGCM_SHA256`, the hardware-accelerated suite.
+    AesGcm,
+}
+
+impl Suite {
+    /// Every suite this implementation has, in the order the specification lists them.
+    pub const ALL: [Suite; 2] = [Suite::ChaChaPoly, Suite::AesGcm];
+
+    /// The name `client/init` carries in `suite`, which is also the `<DH>_<cipher>_<hash>`
+    /// tail of the Noise protocol name.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Suite::ChaChaPoly => "25519_ChaChaPoly_SHA256",
+            Suite::AesGcm => "25519_AESGCM_SHA256",
+        }
+    }
+
+    /// The full Noise protocol name: `Noise_KKpsk2_` followed by [`Suite::wire_name`].
+    pub const fn params(self) -> &'static str {
+        match self {
+            Suite::ChaChaPoly => "Noise_KKpsk2_25519_ChaChaPoly_SHA256",
+            Suite::AesGcm => "Noise_KKpsk2_25519_AESGCM_SHA256",
+        }
+    }
+
+    /// Parses the suite name a `client/init` announces.
+    ///
+    /// `None` means this build does not have the suite. There is deliberately no fallback to
+    /// [`Suite::default`]: a caller that cannot honour the announced suite must refuse it.
+    pub fn from_wire_name(name: &str) -> Option<Suite> {
+        Suite::ALL
+            .into_iter()
+            .find(|suite| suite.wire_name() == name)
+    }
+}
+
+impl fmt::Display for Suite {
+    /// Writes the wire name, so an error names the suite the peer announced.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.wire_name())
+    }
+}
+
+/// Noise protocol parameters of the default suite, [`Suite::ChaChaPoly`].
+pub const NOISE_PARAMS: &str = Suite::ChaChaPoly.params();
 
 /// The published Sentinel PSK, used whenever no paired PSK applies.
 ///
@@ -173,31 +234,72 @@ impl fmt::Debug for Identity {
 /// Noise responder state for one connection.
 pub struct Responder {
     handshake: snow::HandshakeState,
+    /// The suite this handshake runs, kept for the transport and for callers that report it.
+    suite: Suite,
 }
 
 impl Responder {
-    /// Builds the responder for the client side of a Sendspin handshake.
+    /// Builds the responder for the client side of a Sendspin handshake, using the suite the
+    /// prologue's `client/init` announces.
     ///
     /// `prologue` must be the exact concatenation of the `client/init` and `server/init` bytes
-    /// as transmitted, in that order. It is mixed into the handshake verbatim, and the
-    /// initiator's static public key is read from the `server_id` field of the `server/init`
-    /// document it contains. A prologue that is not a sequence of JSON documents, that carries
-    /// no `server/init`, or that carries two of them is rejected; use [`Responder::with_peer`]
-    /// when the key is already known, as during a re-handshake where the prologue is the
-    /// previous handshake hash.
+    /// as transmitted, in that order. It is mixed into the handshake verbatim, the initiator's
+    /// static public key is read from the `server_id` field of the `server/init` document it
+    /// contains, and the cipher suite from the `suite` field of `client/init`. A prologue that
+    /// is not a sequence of JSON documents, that carries no `server/init`, that carries two of
+    /// them, that announces no suite or that announces one this build does not have is
+    /// rejected; use [`Responder::with_peer`] when the key is already known, as during a
+    /// re-handshake where the prologue is the previous handshake hash.
     pub fn new(identity: &Identity, prologue: &[u8]) -> Result<Responder> {
         let peer_public = initiator_key_from_prologue(prologue)?;
-        Responder::with_peer(identity, &peer_public, prologue)
+        let suite = suite_from_prologue(prologue)?;
+        Responder::with_peer_suite(identity, &peer_public, suite, prologue)
     }
 
-    /// Builds the responder with the initiator's static public key supplied explicitly.
+    /// Builds the responder for the suite the prologue announces, refusing any other.
+    ///
+    /// This is [`Responder::new`] with an explicit choice, for a caller that must pin the suite.
+    /// A prologue whose `client/init` announces a different suite is an error: honouring the
+    /// caller's suite would hand the peer a handshake it cannot follow, and switching to the
+    /// announced one would be a silent downgrade of what the caller asked for.
+    pub fn with_suite(identity: &Identity, suite: Suite, prologue: &[u8]) -> Result<Responder> {
+        let peer_public = initiator_key_from_prologue(prologue)?;
+        let announced = suite_from_prologue(prologue)?;
+        if announced != suite {
+            bail!(
+                "the `client/init` in the prologue announces the cipher suite `{announced}`, so \
+                 this handshake cannot run `{suite}`; a suite the peer did not announce is \
+                 refused, never substituted"
+            );
+        }
+        Responder::with_peer_suite(identity, &peer_public, suite, prologue)
+    }
+
+    /// Builds the responder with the initiator's static public key supplied explicitly, for the
+    /// default suite [`Suite::ChaChaPoly`].
     ///
     /// Use this when the prologue is not the init exchange, for example on a re-handshake whose
     /// prologue is the previous handshake hash. `prologue` still reaches Noise unchanged; both
-    /// sides must mix in the same bytes.
+    /// sides must mix in the same bytes. A re-handshake must keep the suite of the connection it
+    /// replaces, so a caller that can offer more than one suite must use
+    /// [`Responder::with_peer_suite`] and pass the suite the connection already runs.
     pub fn with_peer(
         identity: &Identity,
         peer_public: &[u8; 32],
+        prologue: &[u8],
+    ) -> Result<Responder> {
+        Responder::with_peer_suite(identity, peer_public, Suite::default(), prologue)
+    }
+
+    /// Builds the responder for an explicit peer key and suite.
+    ///
+    /// This is the constructor every other one ends in. It does not read the prologue, so it is
+    /// the one to use on a re-handshake, where the prologue is the previous handshake hash and
+    /// carries no announcement.
+    pub fn with_peer_suite(
+        identity: &Identity,
+        peer_public: &[u8; 32],
+        suite: Suite,
         prologue: &[u8],
     ) -> Result<Responder> {
         identity.validate()?;
@@ -205,7 +307,8 @@ impl Responder {
         // Keep the published constant honest even if someone edits it.
         debug_assert_eq!(psk_id_for(&SENTINEL_PSK), SENTINEL_PSK_ID);
 
-        let params = NOISE_PARAMS
+        let params = suite
+            .params()
             .parse()
             .context("failed to parse the Noise protocol parameters")?;
         let handshake = snow::Builder::new(params)
@@ -219,7 +322,12 @@ impl Responder {
             .context("failed to set the Noise prologue")?
             .build_responder()
             .context("failed to build the Noise responder")?;
-        Ok(Responder { handshake })
+        Ok(Responder { handshake, suite })
+    }
+
+    /// Returns the cipher suite this handshake runs.
+    pub fn suite(&self) -> Suite {
+        self.suite
     }
 
     /// Replaces the pre-shared key used by the rest of the handshake.
@@ -244,27 +352,14 @@ impl Responder {
     /// (`psk_id`, `psk_category`) for the session layer to validate; the handshake itself starts
     /// with the Sentinel PSK, which [`Responder::set_psk`] can replace.
     pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
-        ensure_message_len(msg.len(), "handshake message")?;
-        let mut payload = vec![0u8; plaintext_capacity(msg.len(), "handshake message")?];
-        let len = self
-            .handshake
-            .read_message(msg, &mut payload)
-            .context("failed to read the Noise handshake message")?;
-        payload.truncate(len);
-        Ok(payload)
+        read_handshake_payload(&mut self.handshake, msg)
     }
 
     /// Writes Noise handshake message 2 and returns it.
     ///
     /// The payload is the empty JSON object that Sendspin requires; it is not configurable.
     pub fn write_message(&mut self) -> Result<Vec<u8>> {
-        let mut message = vec![0u8; MAX_MESSAGE_LEN];
-        let len = self
-            .handshake
-            .write_message(HANDSHAKE_MESSAGE_2, &mut message)
-            .context("failed to write the Noise handshake message")?;
-        message.truncate(len);
-        Ok(message)
+        write_handshake_payload(&mut self.handshake, HANDSHAKE_MESSAGE_2)
     }
 
     /// Returns whether both handshake messages have been processed.
@@ -277,22 +372,189 @@ impl Responder {
     /// Fails if a handshake message is still outstanding, which
     /// [`Responder::handshake_finished`] reports ahead of time.
     pub fn into_transport(self) -> Result<TransportState> {
-        // `h` is final once the second message has been processed, and `into_transport_mode`
-        // consumes the handshake state that holds it.
-        let handshake_hash: [u8; 32] = self
-            .handshake
-            .get_handshake_hash()
-            .try_into()
-            .context("the Noise handshake hash is not 32 bytes")?;
-        let state = self
-            .handshake
-            .into_transport_mode()
-            .context("failed to finish the Noise handshake")?;
-        Ok(TransportState {
-            state,
-            handshake_hash,
-        })
+        transport_from(self.handshake, self.suite)
     }
+}
+
+/// Noise initiator state for one connection: the server half.
+///
+/// The server always sends the first handshake message, so this type produces message 1 and
+/// consumes message 2. It starts with the published Sentinel PSK; [`Initiator::set_psk`] selects
+/// the key the session will actually use, which message 1 must announce.
+///
+/// The suite is the one the client announced in `client/init`: a server must run exactly that one,
+/// because the client builds its responder for it. There is no fallback - [`Initiator::new`]
+/// refuses a prologue that announces another suite, and [`Initiator::with_announced_suite`] takes
+/// the suite from the announcement so the two cannot disagree.
+pub struct Initiator {
+    handshake: snow::HandshakeState,
+    /// The suite this handshake runs, kept for the transport and for callers that report it.
+    suite: Suite,
+}
+
+impl Initiator {
+    /// Builds the initiator for an explicit peer key and suite.
+    ///
+    /// `prologue` reaches Noise unchanged, so both sides must mix in the same bytes: the exact
+    /// `client/init` and `server/init` of a first handshake, or the previous handshake hash on a
+    /// re-handshake. When the prologue carries a `client/init`, the suite it announces must be
+    /// `suite`; a prologue that carries no announcement - a re-handshake hash, which is not
+    /// JSON - leaves `suite` as the only source, and a suite this build does not have is always
+    /// refused.
+    pub fn new(
+        identity: &Identity,
+        peer_public: &[u8; 32],
+        suite: Suite,
+        prologue: &[u8],
+    ) -> Result<Initiator> {
+        if let Some(announced) = announced_suite_from_prologue(prologue)? {
+            if announced != suite {
+                bail!(
+                    "the `client/init` in the prologue announces the cipher suite `{announced}`, \
+                     so this handshake cannot run `{suite}`; the suite a peer announced is \
+                     refused when it differs, never substituted"
+                );
+            }
+        }
+        Initiator::build(identity, peer_public, suite, prologue)
+    }
+
+    /// Builds the initiator for the suite the prologue's `client/init` announces.
+    ///
+    /// This is the constructor for a first handshake: the announcement decides the suite, so the
+    /// two cannot disagree. A prologue that is not the init exchange, that carries no
+    /// `client/init`, that carries two of them, that announces no suite or that announces one
+    /// this build does not have is rejected; use [`Initiator::new`] on a re-handshake, where the
+    /// prologue is the previous handshake hash.
+    pub fn with_announced_suite(
+        identity: &Identity,
+        peer_public: &[u8; 32],
+        prologue: &[u8],
+    ) -> Result<Initiator> {
+        let suite = suite_from_prologue(prologue)?;
+        Initiator::build(identity, peer_public, suite, prologue)
+    }
+
+    /// Builds the handshake state every constructor ends in.
+    fn build(
+        identity: &Identity,
+        peer_public: &[u8; 32],
+        suite: Suite,
+        prologue: &[u8],
+    ) -> Result<Initiator> {
+        identity.validate()?;
+
+        // Keep the published constant honest even if someone edits it.
+        debug_assert_eq!(psk_id_for(&SENTINEL_PSK), SENTINEL_PSK_ID);
+
+        let params = suite
+            .params()
+            .parse()
+            .context("failed to parse the Noise protocol parameters")?;
+        let handshake = snow::Builder::new(params)
+            .local_private_key(&identity.secret)
+            .context("failed to set the local static key")?
+            .remote_public_key(peer_public)
+            .context("failed to set the peer static key")?
+            .psk(2, &SENTINEL_PSK)
+            .context("failed to set the handshake PSK")?
+            .prologue(prologue)
+            .context("failed to set the Noise prologue")?
+            .build_initiator()
+            .context("failed to build the Noise initiator")?;
+        Ok(Initiator { handshake, suite })
+    }
+
+    /// Returns the cipher suite this handshake runs.
+    pub fn suite(&self) -> Suite {
+        self.suite
+    }
+
+    /// Replaces the pre-shared key used by the rest of the handshake.
+    ///
+    /// The initiator starts with the published Sentinel PSK. Call this before writing message 1
+    /// when the handshake announces a private key, because message 1's payload names the key this
+    /// call selects; noise mixes the key into message 2 either way, so both sides must use the
+    /// same value or the peer's message 2 does not authenticate.
+    pub fn set_psk(&mut self, psk: &[u8; 32]) -> Result<()> {
+        self.handshake
+            .set_psk(2, psk)
+            .context("failed to set the Noise handshake PSK")
+    }
+
+    /// Writes Noise handshake message 1 with `payload` and returns the message.
+    ///
+    /// The payload is the PSK metadata (`psk_id`, `psk_category`) the session layer builds; this
+    /// module does not interpret it. It travels encrypted, so it must fit into a Noise message.
+    pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        write_handshake_payload(&mut self.handshake, payload)
+    }
+
+    /// Reads Noise handshake message 2 and returns its decrypted payload.
+    ///
+    /// The payload is returned verbatim; Sendspin requires it to be the empty JSON object, which
+    /// the session layer checks. Fails when the message does not authenticate, which covers a
+    /// message sealed with another PSK, a changed byte and a truncation.
+    pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
+        read_handshake_payload(&mut self.handshake, msg)
+    }
+
+    /// Returns whether both handshake messages have been processed.
+    pub fn handshake_finished(&self) -> bool {
+        self.handshake.is_handshake_finished()
+    }
+
+    /// Finishes the handshake and switches to transport mode.
+    ///
+    /// Returns what [`Responder::into_transport`] returns: the handshake hash a re-handshake
+    /// mixes in and the suite these keys were derived under. Fails if message 2 is still
+    /// outstanding, which [`Initiator::handshake_finished`] reports ahead of time.
+    pub fn into_transport(self) -> Result<TransportState> {
+        transport_from(self.handshake, self.suite)
+    }
+}
+
+/// Reads a handshake message and returns the payload it carries.
+fn read_handshake_payload(handshake: &mut snow::HandshakeState, msg: &[u8]) -> Result<Vec<u8>> {
+    ensure_message_len(msg.len(), "handshake message")?;
+    let mut payload = vec![0u8; plaintext_capacity(msg.len(), "handshake message")?];
+    let len = handshake
+        .read_message(msg, &mut payload)
+        .context("failed to read the Noise handshake message")?;
+    payload.truncate(len);
+    Ok(payload)
+}
+
+/// Writes one handshake message carrying `payload`.
+fn write_handshake_payload(
+    handshake: &mut snow::HandshakeState,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let mut message = vec![0u8; MAX_MESSAGE_LEN];
+    let len = handshake
+        .write_message(payload, &mut message)
+        .context("failed to write the Noise handshake message")?;
+    message.truncate(len);
+    Ok(message)
+}
+
+/// Finishes a handshake and switches to transport mode.
+///
+/// `h` is final once the second message has been processed, and `into_transport_mode` consumes the
+/// handshake state that holds it.
+fn transport_from(handshake: snow::HandshakeState, suite: Suite) -> Result<TransportState> {
+    let handshake_hash: [u8; 32] = handshake
+        .get_handshake_hash()
+        .try_into()
+        .context("the Noise handshake hash is not 32 bytes")?;
+    let state = handshake
+        .into_transport_mode()
+        .context("failed to finish the Noise handshake")?;
+    Ok(TransportState {
+        state,
+        handshake_hash,
+        suite,
+    })
 }
 
 /// A Noise transport session: one ciphertext per message.
@@ -304,9 +566,19 @@ pub struct TransportState {
     state: snow::TransportState,
     /// The handshake hash `h` of the handshake that produced these keys.
     handshake_hash: [u8; 32],
+    /// The cipher suite of the handshake that produced these keys.
+    suite: Suite,
 }
 
 impl TransportState {
+    /// Returns the cipher suite these keys were derived under.
+    ///
+    /// A re-handshake must use it again, and so must anything the specification seals with the
+    /// suite's AEAD, such as a pairing payload.
+    pub fn suite(&self) -> Suite {
+        self.suite
+    }
+
     /// Returns the handshake hash `h` of the handshake these keys came from.
     ///
     /// Noise finalises `h` when the second handshake message is processed, and nothing after that
@@ -389,6 +661,85 @@ fn initiator_key_from_prologue(prologue: &[u8]) -> Result<[u8; 32]> {
 /// Derives the X25519 public key that belongs to `secret`.
 fn public_key_for(secret: &[u8; 32]) -> [u8; 32] {
     PublicKey::from(&StaticSecret::from(*secret)).to_bytes()
+}
+
+/// Reads the cipher suite the prologue's `client/init` announces.
+///
+/// The suite a handshake runs is the suite the client announced: it is not negotiated, and a
+/// name this build does not have is an error rather than a reason to use [`Suite::default`]. A
+/// prologue with no `client/init`, a missing or non-string `suite` and two `client/init`
+/// documents are errors too, for the same reason a missing `server_id` is: the handshake would
+/// otherwise guess what the peer meant.
+fn suite_from_prologue(prologue: &[u8]) -> Result<Suite> {
+    let mut announced = None;
+    for document in serde_json::Deserializer::from_slice(prologue).into_iter::<serde_json::Value>()
+    {
+        let document = document.context("the prologue is not a sequence of JSON documents")?;
+        if let Some(suite) = client_init_suite(&document)? {
+            if announced.is_some() {
+                bail!("the prologue contains more than one `client/init` document");
+            }
+            announced = Some(suite);
+        }
+    }
+
+    announced.ok_or_else(|| {
+        anyhow!(
+            "the prologue contains no `client/init` document with a `suite`, so the cipher suite \
+             is unknown; a first handshake needs the init exchange, pass the suite with \
+             `Responder::with_peer_suite` on a re-handshake"
+        )
+    })
+}
+
+/// Reads the suite a prologue announces, if the prologue is the init exchange at all.
+///
+/// `None` means there is no `client/init` document to read: a re-handshake prologue is the
+/// previous handshake hash, which is not JSON, and carries no announcement. A `client/init` that
+/// carries no usable suite is still an error, so an announcement is never half-read.
+fn announced_suite_from_prologue(prologue: &[u8]) -> Result<Option<Suite>> {
+    let mut announced = None;
+    for document in serde_json::Deserializer::from_slice(prologue).into_iter::<serde_json::Value>()
+    {
+        let Ok(document) = document else {
+            // Not a sequence of JSON documents: no announcement to check against.
+            return Ok(None);
+        };
+        if let Some(suite) = client_init_suite(&document)? {
+            if announced.is_some() {
+                bail!("the prologue contains more than one `client/init` document");
+            }
+            announced = Some(suite);
+        }
+    }
+    Ok(announced)
+}
+
+/// Returns the suite one init document announces, or `None` when it is not a `client/init`.
+fn client_init_suite(document: &serde_json::Value) -> Result<Option<Suite>> {
+    if document.get("type").and_then(serde_json::Value::as_str) != Some("client/init") {
+        return Ok(None);
+    }
+    let name = document
+        .pointer("/payload/suite")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "the `client/init` document carries no string `payload.suite`; the cipher suite \
+                 is required and is not assumed to be `{}`",
+                Suite::default()
+            )
+        })?;
+    Ok(Some(Suite::from_wire_name(name).ok_or_else(|| {
+        anyhow!(
+            "the `client/init` document announces the cipher suite `{name}`, which this build \
+             does not have; it supports {}",
+            Suite::ALL
+                .map(Suite::wire_name)
+                .map(|name| format!("`{name}`"))
+                .join(", ")
+        )
+    })?))
 }
 
 /// Rejects a Noise message that exceeds the protocol maximum.

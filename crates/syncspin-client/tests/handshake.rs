@@ -44,6 +44,8 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "discovery")]
+        inbound: None,
         #[cfg(feature = "pairing-code")]
         static_pairing_code: None,
         #[cfg(feature = "pairing-code")]
@@ -88,6 +90,39 @@ async fn expect_refusal(server: ServerOptions, needle: &str) {
             assert!(
                 retry_in > Duration::ZERO,
                 "a handshake refusal is retried, so a delay must be recommended"
+            );
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    drop(handle);
+}
+
+#[tokio::test]
+async fn a_server_error_in_place_of_server_init_is_reported() {
+    let server = FakeServer::start(ServerOptions {
+        server_init_override: Some(
+            r#"{"type":"server/error","payload":{"reason":"future_reason"}}"#.to_owned(),
+        ),
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (mut events, handle) = connect_to(&server).await;
+
+    match next_event(&mut events).await {
+        Event::ServerError { reason } => assert_eq!(
+            reason, "future_reason",
+            "the reason is carried verbatim, even one this revision does not name"
+        ),
+        other => panic!("expected ServerError, got {other:?}"),
+    }
+    // The server rejects the init and closes, so the attempt ends and is retried.
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, retry_in } => {
+            assert!(retry_in > Duration::ZERO);
+            assert!(
+                reason.contains("future_reason"),
+                "the disconnect reason should name the rejection, got: {reason}"
             );
         }
         other => panic!("expected Disconnected, got {other:?}"),

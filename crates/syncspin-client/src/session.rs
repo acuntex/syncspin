@@ -35,7 +35,7 @@ use syncspin_core::framing::{
 };
 use syncspin_core::messages::{
     AudioChunkHeader, ClientCommand, ClientGoodbye, ClientHello, ClientInit, ClientPairFinalize,
-    ClientPairInit, ClientState, ClientTime, ControllerCommand, DeviceInfo, Incoming,
+    ClientPairInit, ClientState, ClientTime, ControllerCommand, DeviceInfo, GroupUpdate, Incoming,
     NoiseHandshake, PairAbort, PairingActivation, PairingPskMethod, PlayerState, PlayerSupport,
     ServerActivate, ServerCommand, ServerState, ServerTime, StreamClear, StreamStart,
     SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
@@ -129,6 +129,9 @@ const SUPPORTED_BIT_DEPTH: u8 = 16;
 /// Length of a canonical unpadded base64url key id.
 const PSK_ID_LEN: usize = 43;
 
+/// Length of a canonical unpadded base64url group identifier.
+const GROUP_ID_LEN: usize = 43;
+
 /// How many failed key confirmations one pairing window admits.
 ///
 /// `pairing.md`: the window closes on its fifth failed attempt, where a failure is the client's
@@ -168,7 +171,20 @@ const PAIRING_MESSAGE_TYPES: [&str; 5] = [
 /// message per binary frame afterwards. Control frames are answered here so the session only sees
 /// application messages.
 pub(crate) struct Transport {
-    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    socket: Socket,
+}
+
+/// The WebSocket a session runs on, and which side opened it.
+///
+/// The connection mode changes who dials, not who starts the Noise handshake: the server is the
+/// initiator either way (`connection.md`, _Encryption_). Only the socket type differs, so the
+/// session above this sees one transport.
+enum Socket {
+    /// The client dialled a server it found, the client-initiated mode.
+    Dialled(WebSocketStream<MaybeTlsStream<TcpStream>>),
+    /// A server dialled the endpoint this client advertised, the server-initiated mode.
+    #[cfg(feature = "discovery")]
+    Accepted(WebSocketStream<TcpStream>),
 }
 
 /// One application message read from the socket.
@@ -187,28 +203,36 @@ impl Transport {
         let (socket, _response) = tokio_tungstenite::connect_async(url)
             .await
             .with_context(|| format!("failed to connect to the server at {url}"))?;
-        Ok(Transport { socket })
+        Ok(Transport {
+            socket: Socket::Dialled(socket),
+        })
+    }
+
+    /// Wraps a WebSocket a server opened on this client's advertised endpoint.
+    #[cfg(feature = "discovery")]
+    pub(crate) fn accept(socket: WebSocketStream<TcpStream>) -> Transport {
+        Transport {
+            socket: Socket::Accepted(socket),
+        }
     }
 
     /// Reads the next application message, answering pings on the way.
     pub(crate) async fn read(&mut self) -> Result<SocketMessage> {
         loop {
-            let message = self
-                .socket
-                .next()
-                .await
-                .transpose()
-                .context("the WebSocket read failed")?;
+            let message = match &mut self.socket {
+                Socket::Dialled(socket) => socket.next().await,
+                #[cfg(feature = "discovery")]
+                Socket::Accepted(socket) => socket.next().await,
+            }
+            .transpose()
+            .context("the WebSocket read failed")?;
             match message {
                 Some(Message::Text(text)) => {
                     return Ok(SocketMessage::Text(text.as_str().to_owned()))
                 }
                 Some(Message::Binary(bytes)) => return Ok(SocketMessage::Binary(bytes.to_vec())),
                 Some(Message::Ping(payload)) => {
-                    self.socket
-                        .send(Message::Pong(payload))
-                        .await
-                        .context("the WebSocket pong failed")?;
+                    self.send(Message::Pong(payload)).await?;
                 }
                 Some(Message::Pong(_)) | Some(Message::Frame(_)) => continue,
                 Some(Message::Close(_)) | None => return Ok(SocketMessage::Closed),
@@ -218,18 +242,28 @@ impl Transport {
 
     /// Sends one cleartext JSON text frame.
     pub(crate) async fn send_text(&mut self, text: &str) -> Result<()> {
-        self.socket
-            .send(Message::text(text))
-            .await
-            .context("the WebSocket send failed")
+        self.send(Message::text(text)).await
     }
 
     /// Sends one binary frame.
     pub(crate) async fn send_binary(&mut self, bytes: Vec<u8>) -> Result<()> {
-        self.socket
-            .send(Message::binary(bytes))
-            .await
-            .context("the WebSocket send failed")
+        self.send(Message::binary(bytes)).await
+    }
+
+    /// Sends a WebSocket close frame.
+    #[cfg(feature = "discovery")]
+    pub(crate) async fn close(&mut self) -> Result<()> {
+        self.send(Message::Close(None)).await
+    }
+
+    /// Writes one WebSocket message on whichever socket this connection runs on.
+    async fn send(&mut self, message: Message) -> Result<()> {
+        match &mut self.socket {
+            Socket::Dialled(socket) => socket.send(message).await,
+            #[cfg(feature = "discovery")]
+            Socket::Accepted(socket) => socket.send(message).await,
+        }
+        .context("the WebSocket send failed")
     }
 }
 
@@ -440,6 +474,11 @@ pub(crate) struct Session<'a> {
     /// Controller commands the server last advertised, or `None` before its first controller
     /// state.
     controller_commands: Option<Vec<String>>,
+    /// The state last reported to the host, merged from `group/update` and `server/state`.
+    ///
+    /// `group/update` supplies the group fields and `server/state` the controller ones, so either
+    /// message can complete the picture the other has already filled in.
+    playback: PlaybackState,
     /// Static public key of the server this connection talks to.
     server_id: String,
     /// Which key sealed the handshake.
@@ -534,11 +573,26 @@ pub(crate) async fn attempt(
     };
     let ready = match handshake {
         Ok(result) => result,
-        Err(_elapsed) => Err(anyhow!("timed out during the Noise handshake")),
+        Err(_elapsed) => Err(HandshakeError::Failed(anyhow!(
+            "timed out during the Noise handshake"
+        ))),
     };
     let ready = match ready {
         Ok(ready) => ready,
-        Err(error) => {
+        // The server said why it refused `client/init`. The host hears the reason verbatim before
+        // the attempt is reported as failed.
+        Err(HandshakeError::ServerRejected(reason)) => {
+            let _ = events.send(Event::ServerError {
+                reason: reason.clone(),
+            });
+            return Attempt {
+                carried,
+                connected: false,
+                sink_failed: false,
+                ending: Ending::Failed(anyhow!("the server rejected client/init: {reason}")),
+            };
+        }
+        Err(HandshakeError::Failed(error)) => {
             return Attempt {
                 carried,
                 connected: false,
@@ -572,6 +626,7 @@ pub(crate) async fn attempt(
         muted: carried.muted,
         sink_failed: false,
         controller_commands: None,
+        playback: PlaybackState::default(),
         server_id: ready.server_id.clone(),
         matched: ready.matched,
         pairing_required: ready
@@ -919,6 +974,7 @@ impl Session<'_> {
                 self.handle_state(state);
                 Ok(())
             }
+            Incoming::GroupUpdate(update) => self.handle_group_update(update),
             Incoming::ServerCommand(command) => self.handle_command(command).await,
             Incoming::StreamStart(start) => self.handle_stream_start(start),
             Incoming::StreamEnd(end) if !affects_player(end.roles.as_deref()) => Ok(()),
@@ -959,7 +1015,14 @@ impl Session<'_> {
             .context("noise/handshake data is not unpadded base64url")?;
         let peer = decode_server_key(&self.server_id)?;
         let prologue = *self.noise.handshake_hash();
-        let mut responder = Responder::with_peer(&self.config.identity, &peer, &prologue)?;
+        // A re-handshake keeps the suite of the connection it replaces: the peer derives the new
+        // keys under the same one.
+        let mut responder = Responder::with_peer_suite(
+            &self.config.identity,
+            &peer,
+            self.noise.suite(),
+            &prologue,
+        )?;
         let metadata_payload = responder
             .read_message(&message_1)
             .context("failed to read Noise re-handshake message 1")?;
@@ -1427,7 +1490,7 @@ impl Session<'_> {
             attempt.pairing_index,
             attempt.round(),
         );
-        let share = attempt.accept_server_share(&prs, &sid, &peer_share)?;
+        let share = attempt.accept_server_share(&prs, &sid, &peer_share, self.noise.suite())?;
         let reply = Incoming::ClientPairAuth(ClientPairAuth {
             pake_msg_2: URL_SAFE_NO_PAD.encode(share),
         });
@@ -1865,13 +1928,33 @@ impl Session<'_> {
         if self.role_active(CONTROLLER_ROLE) {
             if let Some(controller) = state.controller {
                 self.controller_commands = Some(controller.supported_commands.clone());
-                self.emit(Event::State(PlaybackState {
-                    supported_commands: controller.supported_commands,
-                    volume: controller.volume,
-                    muted: controller.muted,
-                }));
+                self.playback.supported_commands = controller.supported_commands;
+                self.playback.volume = controller.volume;
+                self.playback.muted = controller.muted;
+                self.emit(Event::State(self.playback.clone()));
             }
         }
+    }
+
+    /// Reports one `group/update`: the authoritative source of the group's playback state.
+    ///
+    /// The message is a core one and valid whatever roles are active, so it is not gated on a role.
+    /// Its fields complete the picture `server/state` fills in for the roles: the group fields are
+    /// replaced, the controller fields stay. `group_id` is 32 bytes as 43 unpadded base64url
+    /// characters; any other value is a protocol error, so the connection closes as the spec
+    /// requires. A `playback_state` this revision does not name is carried to the host verbatim.
+    fn handle_group_update(&mut self, update: GroupUpdate) -> Result<()> {
+        if !is_canonical_group_id(&update.group_id) {
+            bail!(
+                "group/update carries a group_id that is not a canonical {GROUP_ID_LEN}-character \
+                 base64url identifier"
+            );
+        }
+        self.playback.playback_state = Some(update.playback_state);
+        self.playback.group_id = Some(update.group_id);
+        self.playback.group_name = Some(update.group_name);
+        self.emit(Event::State(self.playback.clone()));
+        Ok(())
     }
 
     /// Applies a volume or mute request from the server and reports the result.
@@ -2111,6 +2194,34 @@ impl Session<'_> {
     }
 }
 
+/// Why the cleartext exchange or the Noise handshake did not produce a session.
+///
+/// The two cases are kept apart because only one of them carries something the host has to hear:
+/// `server/error` is the server's own explanation, while every other failure is local.
+#[derive(Debug)]
+enum HandshakeError {
+    /// The server answered `client/init` with `server/error` and closed.
+    ///
+    /// The reason is the wire value, preserved verbatim, and never key material.
+    ServerRejected(String),
+    /// A transport failure, a refused message or a missing one.
+    Failed(anyhow::Error),
+}
+
+impl From<anyhow::Error> for HandshakeError {
+    /// Wraps every ordinary failure, so `?` keeps working inside the handshake.
+    fn from(error: anyhow::Error) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<syncspin_core::messages::DecodeError> for HandshakeError {
+    /// Wraps a malformed handshake message as an ordinary failure.
+    fn from(error: syncspin_core::messages::DecodeError) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
 /// Runs the cleartext exchange and the Noise handshake.
 ///
 /// The Noise metadata in message 1 decides which key seals message 2. A malformed announcement
@@ -2121,7 +2232,7 @@ async fn handshake(
     config: &ClientConfig,
     candidates: &Candidates,
     previous_roles: &[String],
-) -> Result<Ready> {
+) -> Result<Ready, HandshakeError> {
     // 1. client/init. Its exact bytes are the first half of the Noise prologue.
     let client_init = Incoming::ClientInit(ClientInit {
         client_id: config.identity.public_base64(),
@@ -2137,10 +2248,21 @@ async fn handshake(
     let server_init_text = read_cleartext(&mut transport).await?;
     let server_init = match Incoming::parse(&server_init_text)? {
         Some(Incoming::ServerInit(server_init)) => server_init,
-        _ => bail!("expected a cleartext server/init"),
+        // The server refused `client/init` and named why; it closes the connection next.
+        Some(Incoming::ServerError(error)) => {
+            return Err(HandshakeError::ServerRejected(error.reason))
+        }
+        _ => {
+            return Err(HandshakeError::Failed(anyhow!(
+                "expected a cleartext server/init"
+            )))
+        }
     };
     if server_init.version != PROTOCOL_VERSION {
-        bail!("unsupported server version {}", server_init.version);
+        return Err(HandshakeError::Failed(anyhow!(
+            "unsupported server version {}",
+            server_init.version
+        )));
     }
     let server_init_bytes = server_init_text.into_bytes();
 
@@ -2150,7 +2272,11 @@ async fn handshake(
         Some(Incoming::NoiseHandshake(handshake)) => URL_SAFE_NO_PAD
             .decode(&handshake.data)
             .context("noise/handshake data is not unpadded base64url")?,
-        _ => bail!("expected noise/handshake message 1"),
+        _ => {
+            return Err(HandshakeError::Failed(anyhow!(
+                "expected noise/handshake message 1"
+            )))
+        }
     };
 
     // 4. Read message 1, validate its PSK metadata and seal message 2 with the selected key.
@@ -2177,7 +2303,11 @@ async fn handshake(
     let hello = read_encrypted_json(&mut transport, &mut noise).await?;
     match Incoming::parse(&hello)? {
         Some(Incoming::ServerHello(_)) => {}
-        _ => bail!("expected an encrypted server/hello after the Noise handshake"),
+        _ => {
+            return Err(HandshakeError::Failed(anyhow!(
+                "expected an encrypted server/hello after the Noise handshake"
+            )))
+        }
     }
 
     // 6. client/hello.
@@ -2189,7 +2319,11 @@ async fn handshake(
     let activate = read_encrypted_json(&mut transport, &mut noise).await?;
     let activate = match Incoming::parse(&activate)? {
         Some(Incoming::ServerActivate(activate)) => activate,
-        _ => bail!("expected an encrypted server/activate after client/hello"),
+        _ => {
+            return Err(HandshakeError::Failed(anyhow!(
+                "expected an encrypted server/activate after client/hello"
+            )))
+        }
     };
     // The first activation of a connection must carry the roles. If it does not, the previous
     // session's set is the safer starting point than none, because the server is already breaking
@@ -2208,6 +2342,50 @@ async fn handshake(
         matched: selected.matched,
         credential_mismatch: selected.credential_mismatch,
     })
+}
+
+/// Completes the handshake of a server that cannot be admitted, then rejects it.
+///
+/// `connection.md`, _Multiple servers (server-initiated)_: the client lets the handshake complete
+/// before it applies admission, so the loser of an arbitration learns why on an encrypted channel.
+/// This client admits one server at a time; while that one is live, every activation on a
+/// provisional connection conflicts with it and is rejected. The activation's `pairing` activity
+/// decides the message: a rejected pairing attempt gets `pair/abort` with reason
+/// `concurrent_attempt`, every other activation `client/goodbye` with the same reason, and then
+/// the socket closes.
+///
+/// A handshake that fails gets no message: the peer never became a connection, and the ordinary
+/// silent-failure rule applies.
+#[cfg(feature = "discovery")]
+pub(crate) async fn reject_concurrent(
+    transport: Transport,
+    config: &ClientConfig,
+    pairing_psk: Option<PairingPsk>,
+    previous_roles: &[String],
+) -> Result<()> {
+    let candidates = Candidates::load(config.storage.as_deref(), &[], pairing_psk)?;
+    let mut ready = match handshake(transport, config, &candidates, previous_roles).await {
+        Ok(ready) => ready,
+        Err(HandshakeError::ServerRejected(_) | HandshakeError::Failed(_)) => return Ok(()),
+    };
+    let reason = PairingFailure::ConcurrentAttempt.as_str().to_owned();
+    let rejection = if ready
+        .activate
+        .activities
+        .iter()
+        .any(|role| role == "pairing")
+    {
+        Incoming::PairAbort(PairAbort { reason })
+    } else {
+        Incoming::ClientGoodbye(ClientGoodbye { reason })
+    };
+    // The connection is closing either way; a write that fails changes nothing the host has to
+    // hear, so the attempt to explain is best effort.
+    if let Ok(ciphertext) = encrypt_json(&mut ready.noise, &rejection) {
+        let _ = ready.transport.send_binary(ciphertext).await;
+    }
+    let _ = ready.transport.close().await;
+    Ok(())
 }
 
 /// Builds the `client/hello` the client announces itself with.
@@ -2450,6 +2628,21 @@ fn names_pairing_message(text: &str) -> bool {
 /// Whether `value` is the canonical unpadded base64url encoding of a 32-byte key id.
 fn is_canonical_psk_id(value: &str) -> bool {
     if value.len() != PSK_ID_LEN {
+        return false;
+    }
+    match URL_SAFE_NO_PAD.decode(value) {
+        Ok(bytes) => bytes.len() == 32 && URL_SAFE_NO_PAD.encode(&bytes) == value,
+        Err(_) => false,
+    }
+}
+
+/// Whether `value` is the canonical unpadded base64url encoding of a 32-byte group id.
+///
+/// The spec gives a group id as 32 server-chosen bytes in 43 base64url characters, so both a wrong
+/// length and a character outside the alphabet are violations. The group id is public, not key
+/// material, but the canonical check is the same one the handshake applies to a `psk_id`.
+fn is_canonical_group_id(value: &str) -> bool {
+    if value.len() != GROUP_ID_LEN {
         return false;
     }
     match URL_SAFE_NO_PAD.decode(value) {
@@ -2825,6 +3018,8 @@ mod tests {
             volume_policy: crate::config::VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             pairing_timeout: crate::client::DEFAULT_PAIRING_TIMEOUT,
+            #[cfg(feature = "discovery")]
+            inbound: None,
             #[cfg(feature = "pairing-code")]
             static_pairing_code: None,
             #[cfg(feature = "pairing-code")]
@@ -2878,6 +3073,7 @@ mod tests {
             muted: false,
             sink_failed: false,
             controller_commands: None,
+            playback: PlaybackState::default(),
             server_id: SERVER_ID.to_owned(),
             matched: MatchedPsk::Sentinel,
             pairing_required: None,
@@ -2927,7 +3123,9 @@ mod tests {
             .expect("the socket accepts SO_LINGER");
         drop(server_socket);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        Transport { socket }
+        Transport {
+            socket: Socket::Dialled(socket),
+        }
     }
 
     /// Runs a complete Noise handshake locally and returns the responder's transport.

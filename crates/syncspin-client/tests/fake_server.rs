@@ -23,7 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{accept_async, WebSocketStream};
+use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
 
 use syncspin_core::framing::{split_binary, MAX_PLAINTEXT_LEN};
 use syncspin_core::messages::{
@@ -35,6 +35,8 @@ use syncspin_core::messages::{
 use syncspin_core::messages::{
     ClientPairAuth, ClientPairFinalize, ServerPairAuth, ServerPairConfirm, ServerPairInit,
 };
+#[cfg(feature = "pairing-code")]
+use syncspin_core::noise::Suite;
 use syncspin_core::noise::{
     psk_id_for, MAX_MESSAGE_LEN, NOISE_PARAMS, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
@@ -47,7 +49,7 @@ use syncspin_core::pairing::token;
 #[cfg(feature = "pairing-code")]
 use syncspin_core::pairing::wrap;
 
-type Socket = WebSocketStream<TcpStream>;
+type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// How the fake server announces its key and which key it actually uses.
 pub struct ServerOptions {
@@ -322,7 +324,8 @@ pub enum Observation {
 
 /// A started fake server.
 pub struct FakeServer {
-    address: SocketAddr,
+    /// The listener's address, for a harness that accepts; `None` for one that dials.
+    address: Option<SocketAddr>,
     server_id: String,
     commands: UnboundedSender<Command>,
     observations: UnboundedReceiver<Observation>,
@@ -372,7 +375,58 @@ impl FakeServer {
         });
 
         Ok(FakeServer {
-            address,
+            address: Some(address),
+            server_id,
+            commands,
+            observations,
+            task,
+            hashes,
+        })
+    }
+
+    /// Dials a client's advertised endpoint and serves the connection it opens.
+    ///
+    /// This is the server-initiated side of `connection.md`: the server is the WebSocket client and
+    /// still the Noise initiator, so it runs the same messages as [`start`](FakeServer::start). The
+    /// upgrade carries no `Origin` header; a test that wants one builds it by hand.
+    pub async fn dial(url: &str, options: ServerOptions) -> Result<FakeServer> {
+        let keypair = Builder::new(NOISE_PARAMS.parse()?)
+            .generate_keypair()
+            .context("failed to generate the server keypair")?;
+        let server_id = URL_SAFE_NO_PAD.encode(&keypair.public);
+
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
+        let (observation_tx, observations) = mpsc::unbounded_channel();
+        let paired = Arc::new(Mutex::new(None));
+        let hashes = Arc::new(Mutex::new(Vec::new()));
+        let url = url.to_owned();
+        let task = tokio::spawn({
+            let hashes = Arc::clone(&hashes);
+            async move {
+                let outcome = async {
+                    let (socket, _response) = connect_async(&url)
+                        .await
+                        .context("the client refused the WebSocket upgrade")?;
+                    serve_connection(
+                        socket,
+                        &keypair,
+                        &options,
+                        &mut command_rx,
+                        &observation_tx,
+                        true,
+                        &paired,
+                        &hashes,
+                    )
+                    .await
+                };
+                if let Err(error) = outcome.await {
+                    eprintln!("fake server stopped: {error:#}");
+                }
+            }
+        });
+
+        Ok(FakeServer {
+            address: None,
             server_id,
             commands,
             observations,
@@ -383,7 +437,9 @@ impl FakeServer {
 
     /// The `host:port` address to put into [`syncspin_client::ClientConfig::server`].
     pub fn endpoint(&self) -> String {
-        self.address.to_string()
+        self.address
+            .expect("only a harness that accepts connections has an endpoint")
+            .to_string()
     }
 
     /// The server's static public key, as the client should report it.
@@ -790,7 +846,9 @@ async fn serve(
             .accept()
             .await
             .context("the client never connected")?;
-        let socket = accept_async(tcp)
+        // The same socket type as the dialling harness: the transport inside is plain either way,
+        // and one alias keeps every helper usable for both directions.
+        let socket = accept_async(MaybeTlsStream::Plain(tcp))
             .await
             .context("the WebSocket upgrade failed")?;
         let announce_roles = index == 0 || !options.omit_active_roles_after_the_first;
@@ -1417,8 +1475,9 @@ async fn finish_pairing(
             .dynamic
             .wrapped_nonce_b
             .ok_or_else(|| anyhow!("client/pair-confirm carried no wrapped_nonce_B"))?;
+        // The fake server's initiator runs NOISE_PARAMS, so its wrapping uses that suite too.
         let nonce_key = wrap::k_wrap(wrap::NONCE_LABEL, &round.sid, &isk);
-        let nonce_b = wrap::unwrap(&nonce_key, &sealed_nonce)
+        let nonce_b = wrap::unwrap(Suite::ChaChaPoly, &nonce_key, &sealed_nonce)
             .context("wrapped_nonce_B does not open under the round's key")?;
         let committed = pake
             .dynamic
@@ -1450,7 +1509,7 @@ async fn finish_pairing(
     }
 
     let key = wrap::k_wrap(wrap::PSK_LABEL, &round.sid, &isk);
-    let long_term_psk = wrap::unwrap(&key, &sealed)?;
+    let long_term_psk = wrap::unwrap(Suite::ChaChaPoly, &key, &sealed)?;
     if long_term_psk == SENTINEL_PSK {
         bail!("the client delivered the published Sentinel key as a long-term PSK");
     }

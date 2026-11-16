@@ -117,6 +117,8 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "discovery")]
+        inbound: None,
         #[cfg(feature = "pairing-code")]
         static_pairing_code: None,
         #[cfg(feature = "pairing-code")]
@@ -290,6 +292,8 @@ async fn an_unreachable_server_is_an_event_and_not_an_error() {
         volume_policy: VolumePolicy::default(),
         max_backoff: MAX_BACKOFF,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "discovery")]
+        inbound: None,
         #[cfg(feature = "pairing-code")]
         static_pairing_code: None,
         #[cfg(feature = "pairing-code")]
@@ -563,6 +567,8 @@ async fn the_retry_delay_is_awaited_before_the_next_attempt() {
         volume_policy: VolumePolicy::default(),
         max_backoff: retry,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "discovery")]
+        inbound: None,
         #[cfg(feature = "pairing-code")]
         static_pairing_code: None,
         #[cfg(feature = "pairing-code")]

@@ -10,49 +10,71 @@ harmless.
 
 ## Summary
 
-| #   | Area                                                            | Spec section                                                                                                                                                                      | Status                             |
-| --- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| 1   | Client-initiated connections only, no client mDNS advertisement | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Closes in 0.2                      |
-| 2   | No `activities` admissibility handling                          | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
-| 3   | `psk_id` validation deferred to the session layer               | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
-| 4   | Code pairing behind a feature; CPace layer unaudited            | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
-| 5   | `group/update` is not the state source                          | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Stage 1b                           |
-| 6   | No failure diagnostics from `server/error`                      | [`messaging.md` — `server/error`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-servererror)                                                             | Stage 1b                           |
-| 7   | No `_sendspin-server._tcp` discovery, explicit URL only         | [`connection.md` — Client Initiated Connections](https://github.com/Sendspin/spec/blob/main/connection.md#client-initiated-connections)                                           | Closes in 0.2                      |
-| 8   | No unpaired-access switch                                       | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, config only                  |
-| 9   | Scheduled metadata applied immediately                          | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
-| 10  | In-place format change flushes buffered audio                   | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
-| 11  | `Sink::underruns()` reported but never used                     | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
-| 12  | `stream/clear` with `from_timestamp` flushes everything         | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                           |
-| 13  | Playout deadlines begin after three clock bursts                | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                         |
-| 14  | A player volume above 100 is capped, not rejected               | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`      |
-| 15  | A transport command before the controller state is not checked  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
-| 16  | A reconnect keeps the last known `active_roles`                 | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
-| 17  | A malformed control message is ignored, not fatal               | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
+| #   | Area                                                             | Spec section                                                                                                                                                                      | Status                             |
+| --- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| 1   | Server-initiated connections: last-playback server not persisted | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Open, no last-playback record      |
+| 2   | No `activities` admissibility handling                           | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Stage 1b                           |
+| 3   | `psk_id` validation deferred to the session layer                | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
+| 4   | Code pairing behind a feature; CPace layer unaudited             | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
+| 5   | No unpaired-access switch on the client                          | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, client config only           |
+| 6   | Approval is not persisted across restarts                        | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, server lifetime              |
+| 7   | Scheduled metadata applied immediately                           | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
+| 8   | In-place format change flushes buffered audio                    | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
+| 9   | `Sink::underruns()` reported but never used                      | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
+| 10  | `stream/clear` with `from_timestamp` flushes everything          | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                           |
+| 11  | Playout deadlines begin after three clock bursts                 | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                         |
+| 12  | A player volume above 100 is capped, not rejected                | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`      |
+| 13  | A transport command before the controller state is not checked   | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
+| 14  | A reconnect keeps the last known `active_roles`                  | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
+| 15  | A malformed control message is ignored, not fatal                | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
+| 16  | A server keeps an unavailable client in the group                | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                      | Open, one group                    |
+| 17  | The server's stream start lead is one fixed value                | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline              |
+| 18  | The server does not try the Sentinel key after a record fails    | [`connection.md` — Sentinel Fallback](https://github.com/Sendspin/spec/blob/main/connection.md#sentinel-fallback)                                                                 | Accepted, `snow` state             |
 
-## 1. Client-initiated connections only
+## 1. Server-initiated connections: the last-playback server is not persisted
 
-**Spec:** `connection.md`, _Establishing a Connection_ and _Client Initiated Connections_. The spec
+**Spec:** `connection.md`, _Establishing a Connection_ and _Server Initiated Connections_. The spec
 RECOMMENDS server-initiated connections, requires servers to support both methods and requires a
-client to use exactly one of them. A client using client-initiated connections MUST NOT advertise
-`_sendspin._tcp`.
+client to use exactly one of them. A client that advertises `_sendspin._tcp` MUST advertise the port
+and the `path` TXT record, reject an upgrade carrying an `Origin` header and MUST NOT also connect
+manually. The _Multiple servers_ section then arbitrates several connections: at most one with
+`playback` and one with `pairing`, a provisional connection that never activates is dropped after 30
+seconds, and a displaced or rejected connection gets `client/goodbye`.
 
-**What we do:** `ClientConfig` takes a WebSocket URL (`ws://<server>:8927/sendspin`; a bare address
-gets the default endpoint) and `connect` opens one connection to it. There is no advertisement, no
-listening socket and no discovery: the client never owns a `_sendspin._tcp` service, so it also never
-arbitrates competing servers.
+**What we do:** with the `discovery` feature the client implements the server-initiated half:
+`advertise` publishes `_sendspin._tcp` with the bound port and the `path` and `name` TXT records
+through a host-supplied `Discovery`, accepts the inbound upgrade, answers any request carrying an
+`Origin` header with a 403, and runs the same session as a dialled connection. A configuration that
+advertises refuses to dial, so the two methods never run side by side. The client admits one
+connection at a time, which the spec permits. A second server that connects while the first session
+is live is no longer queued: the client completes its handshake in a task of its own, then sends
+`client/goodbye` reason `concurrent_attempt` - or `pair/abort` with the same reason when the
+activation declares the `pairing` activity - and closes, as the rejection rule requires. A
+provisional connection that does not reach its first `server/activate` within 30 seconds is dropped.
+`a_second_server_is_rejected_with_concurrent_attempt` pins the rejection.
 
-**Why:** 0.1 is a client only. An advertisement obliges the advertiser to accept inbound upgrades,
-reject requests carrying `Origin`, arbitrate `playback`/`pairing` activities across connections and
-persist a last-playback server — all of which belong to the multi-server work in 0.2. Adding a
-listening socket and an mDNS dependency for a mode nobody consumes yet would enlarge the surface
-without a test that can hold it.
+The server's side is implemented too. With a `Discovery` backend it publishes
+`_sendspin-server._tcp` with the bound port, the `path` and `name` TXT records, browses
+`_sendspin._tcp` and dials the clients it finds without an `Origin` header.
+`a_server_record_has_the_service_the_port_the_path_and_the_name` and
+`a_discovered_client_is_connected_without_an_origin_header` pin the record and the dialled direction.
+Exclusivity is the client's rule; the server does not merge a dialled connection with an inbound
+one.
 
-**Removing it:** implement the server-initiated half — advertise with the `path` (and optional
-`name`) TXT records, accept the upgrade on that path, reject any request with an `Origin` header,
-apply the admission rules, send `client/goodbye` with `another_server` / `concurrent_attempt` when
-displacing or rejecting, and expose a switch so a caller never advertises and connects manually at
-the same time. Then delete this entry.
+What remains is persistence of the last-playback server. The specification says a client MUST store
+the `server_id` of the server most recently admitted with `playback` in its activities; this crate
+has no `Storage` method for it, and the cap of one admitted connection means the both-empty tie-break
+that value decides is not reachable. The MUST is still unimplemented even though it currently has no
+observable effect.
+
+**Why:** capping the client at one connection is what `connection.md` allows ("A client MAY cap how
+many connections it admits at once"), and one group per server makes several simultaneous sessions
+useless for playback. With the cap there is no equal-ranked conflict for a last-playback server to
+decide, so the ranking and displacement rules reduce to always rejecting the second connection.
+
+**Removing it:** add a `Storage` method for the last-playback `server_id`, record it whenever an
+admitted connection whose `activities` include `playback` is activated, and consult it in the
+both-empty tie-break once the cap rises above one. Then delete this entry.
 
 ## 2. No `activities` admissibility handling
 
@@ -129,14 +151,18 @@ the client as `B` and the `MCF` generator, plus the wrapped-PSK exchange.
 and offered only when a `Storage` can persist the record they produce - and, for the dynamic flow,
 when the host advertises an emission format and an out-channel. The static flow is gated by the
 pairing window `ControlHandle::open_pairing_window` opens; the dynamic flow is gated by its
-20-round limit and `ControlHandle::release_holdback`. The CPace layer is built here - `x25519-dalek`,
+20-round limit and `ControlHandle::release_holdback`. `syncspin-server` carries the same feature
+and runs the server half of both flows: `ServerHandle::start_pairing` refuses a code method without
+it, and with it the server is CPace role `A`. The CPace layer is built here - `x25519-dalek`,
 `elligator2` for the `MCF` map, SHA-512 - because no crate was found that matched draft-21 with the
 spec's `MCF` and `sid` layout. It is pinned to the draft's vectors and the spec's `sid` construction.
-The wrapping uses ChaCha20-Poly1305, fixed in `syncspin-core::pairing::wrap`, which is correct for
-`25519_ChaChaPoly_SHA256`, the only suite this build negotiates; offering
-`25519_AESGCM_SHA256` would need the AEAD selected per connection instead. The specification
-publishes no test vectors for the dynamic code derivation: the tests pin a vector computed from the
-spec's formula and run the flow end to end against the fake server only.
+The wrapping takes the connection's cipher suite, so `25519_ChaChaPoly_SHA256` seals with
+ChaCha20-Poly1305 and `25519_AESGCM_SHA256` with AES-256-GCM, both through the resolver `snow`
+already brings. `syncspin-core` has both suites and refuses a name it does not have; the client in
+this workspace still announces `25519_ChaChaPoly_SHA256` in `client/init`, so AES-GCM is reachable
+from `syncspin-core` only until a client opts into it. The specification publishes no test vectors
+for the dynamic code derivation: the tests pin a vector computed from the spec's formula and run the
+flow end to end against the fake server only.
 
 **The CPace and wrapping layer has not had an external review.** That is the reason this entry still
 exists after both flows shipped.
@@ -147,71 +173,10 @@ Pairing PSK flow only; one that enables it accepts that the layer is new code wi
 no review.
 
 **Removing it:** get the layer reviewed externally. Then decide whether the feature becomes default:
-while it is not, a default build departs from the SHOULD by offering only the mandatory method. Select
-the AEAD from the negotiated suite when a second suite is offered, and add spec vectors for the
-dynamic derivation when they are published.
+while it is not, a default build departs from the SHOULD by offering only the mandatory method. Add
+spec vectors for the dynamic derivation when they are published.
 
-## 5. `group/update` is not the state source
-
-**Spec:** `messaging.md`, `group/update`. The server MUST send it after the first activation and on
-every change, carrying all fields each time; a `group_id` that is not 43 base64url characters is a
-protocol error and the client MUST close the connection.
-
-**What we do:** `Incoming` has no `group/update` variant, so the session treats it as an unknown
-type and ignores it. The fields it carries are therefore never seen: the `PlaybackState` event is
-filled from `server/state.controller` (volume, mute, supported commands) and the track from
-`server/state.metadata`. `server/state` is no substitute — it carries only the `metadata` and
-`controller` role state — so neither `playback_state` nor `group_id` is known at all, and a malformed
-`group_id` cannot be rejected.
-
-**Why:** the field was absent from the protocol code this library was extracted from, and the
-message set was frozen before the session loop existed. Leaving it out was preferred over
-half-handling the authoritative state source.
-
-**Removing it:** add the type, treat it as the authoritative `PlaybackState` and `group_id` source,
-validate the `group_id` length and charset, and close on a violation. Delete this entry when that
-lands.
-
-## 6. No failure diagnostics from `server/error`
-
-**Spec:** `messaging.md`, `server/error` and `connection.md`, _Failure Handling_. The server sends it
-in place of `server/init` when it rejects `client/init`, then closes; the reason is
-`unsupported_version`, `unsupported_suite` or `malformed`.
-
-**What we do:** `server/error` has no variant in `Incoming`, so `Incoming::parse` reports it as an
-unknown type and the handshake — which expects `server/init` next — fails with `expected a cleartext
-server/init`. The reason (`unsupported_version`, `unsupported_suite`, `malformed`) never reaches the
-caller, who sees only that generic connect error.
-
-**Why:** the message set was frozen at the types the extracted code used, which never included
-`server/error`; a server that rejects `client/init` is rare enough that the guest session was built
-without it. A dedicated error type is worth adding together with the disconnect reasons, not before.
-
-**Removing it:** add the type and a typed connect error carrying the reason so a caller can act on
-`unsupported_version` rather than guessing. The server half arrives with `syncspin-server`.
-
-## 7. No `_sendspin-server._tcp` discovery
-
-**Spec:** `connection.md`, _Client Initiated Connections_. A client that initiates the connection
-SHOULD discover the server over mDNS (`_sendspin-server._tcp`, `path` TXT record REQUIRED, `name`
-OPTIONAL) and connect to the advertised address and path, ignoring loopback and unspecified
-addresses.
-
-**What we do:** the caller passes the URL. There is no mDNS client, no service browser and no
-dependency that could provide one; the only discovery today is whatever the consumer does outside
-the library.
-
-**Why:** discovery is one half of the 0.2 work and would drag an mDNS stack into a build that must
-stay small for the ARM target, while giving the caller a fallback URL anyway. A wrong or filtered
-mDNS answer is also indistinguishable from a wrong URL at this stage, so a library-side browser would
-add a failure mode without a test that could hold it.
-
-**Removing it:** browse `_sendspin-server._tcp`, apply the loopback/unspecified filter and the
-`path` rule, and offer the result to the builder as a candidate list the caller can still override.
-The manual URL stays the fallback, as the spec allows an implementation-defined choice between
-discovered servers.
-
-## 8. No unpaired-access switch
+## 5. No unpaired-access switch on the client
 
 **Spec:** `pairing.md`, _Unpaired Access_ and _Pairing Records_, and `messaging.md`, `server/unpair`
 and `client/goodbye`. Whether a client admits unpaired access is a local setting, advertised in
@@ -239,6 +204,22 @@ store the crate may write, so the event reports it and the host has to drop it.
 `a_plain_guest_handshake_does_not_ask_for_pairing` pin the observable behaviour, and
 `a_credential_mismatch_is_reported_once_per_connection` pins the once-per-connection rule.
 
+The server's side is implemented. `ServerConfig::storage` is the host's `PairingStore`, keyed by
+`client_id`; the listener seals a client's first handshake with the record it holds and reports
+`Event::ClientConnected { approved: true }`. An unpaired client is held at empty activities and
+reported with `approved: false`, and `ServerHandle::approve` activates its roles; approval is
+remembered per `client_id` for the server's lifetime, revocable with
+`ServerHandle::revoke_approval`, and discarded on a successful pairing. `ServerHandle::unpair`
+removes the record, sends `server/unpair` and disconnects. Entry 6 records that the approval itself
+does not survive a restart.
+`a_token_pairs_a_real_client_and_its_next_connection_authenticates`,
+`the_static_code_flow_stores_a_record_and_promotes_the_connection`,
+`the_dynamic_code_flow_checks_the_commitment_and_binds_the_code`,
+`an_unapproved_client_gets_no_roles_and_no_audio`,
+`revoking_an_approval_takes_the_roles_and_the_audio_away` and
+`unpair_removes_the_record_and_disconnects` pin that side. A client whose record no longer matches what the server holds is refused rather than
+given an unpaired session; entry 18 states that deviation.
+
 One part is still missing. Unpaired access is always admitted: `client/hello` carries
 `unpaired_access: { enabled: true }` unconditionally, there is no setting that turns it off, and so
 no `pairing_required` close exists.
@@ -251,7 +232,29 @@ reporting the mismatch and saying `unpaired` do not depend on it.
 `client/hello`, and close an unpaired connection with `pairing_required` when it is turned off.
 Test it on the fake server by asserting the goodbye reason arrives before the close.
 
-## 9. Scheduled metadata applied immediately
+## 6. Approval is not persisted across restarts
+
+**Spec:** `pairing.md`, _Unpaired Access_. Operator approval is granted per `client_id`; it SHOULD
+persist, MUST be revocable, and MUST be discarded on a successful pairing.
+
+**What we do:** `Registry::approved` is an in-memory set owned by the running server. It survives a
+reconnect and is dropped by `ServerHandle::revoke_approval`, by `ServerHandle::unpair` and by a
+successful pairing, but it is never written anywhere, so stopping the server forgets every approval.
+`an_unapproved_client_gets_no_roles_and_no_audio` and
+`revoking_an_approval_takes_the_roles_and_the_audio_away` pin the gate and the revocation; no test
+covers persistence because there is no store to read.
+
+**Why:** approval is an operator decision about one client, and the crate has no storage for it:
+`PairingStore` is keyed by `client_id` but holds only the long-term PSKs of paired clients, and a
+host that wanted approvals to survive a restart would need a second trait or a wider record.
+Remembering it for the process keeps the MUSTs that are testable - gating, revocation and the pairing
+reset - while the SHOULD waits for a store the host owns.
+
+**Removing it:** add an approval store the host supplies (or a flag on `PairingStore`) keyed by
+`client_id`, write on `approve`, remove on `revoke_approval`, `unpair` and a completed pairing, and
+test that a fresh server reads the approval back.
+
+## 7. Scheduled metadata applied immediately
 
 **Spec:** `messaging.md`, `server/state` → `metadata.timestamp`. The field is the server time at
 which the metadata becomes valid; a client that buffers audio ahead of playout should schedule the
@@ -270,7 +273,7 @@ queue.
 and emit at the mapped deadline. Test a future timestamp, a past one, and a change superseded before
 it becomes valid.
 
-## 10. In-place format change flushes buffered audio
+## 8. In-place format change flushes buffered audio
 
 **Spec:** `messaging.md`, `stream/start`. The server may send it again with a new format to
 reconfigure a running stream.
@@ -287,7 +290,7 @@ offers, and the current consumer's format does not change mid-stream.
 for the old buffer to drain at the switch timestamp, and test a mid-stream change against a sink
 that records the boundary.
 
-## 11. `Sink::underruns()` is not used
+## 9. `Sink::underruns()` is not used
 
 **Spec:** none; this is the design's sink contract (`docs/design/syncspin-design.md`, _Playout
 timing_), which expects underrun counts to feed buffer corrections.
@@ -305,7 +308,7 @@ number into playback would be an unverified control loop.
 `min_buffer_ms` (bounded) when the count rises, and test the reported value against a fake sink that
 returns a fixed count.
 
-## 12. `stream/clear` with `from_timestamp` flushes everything
+## 10. `stream/clear` with `from_timestamp` flushes everything
 
 **Spec:** `messaging.md`, `stream/clear`. A `from_timestamp` asks the client to discard the buffered
 audio from that server time onward and keep what is earlier; an absent timestamp clears everything.
@@ -325,7 +328,7 @@ at a seek, but leaving stale audio buffered would be worse.
 into the session) and discard only frames whose deadline is at or after the mapped timestamp; test a
 clear in the middle of a burst of buffered frames.
 
-## 13. Playout deadlines begin after three clock bursts
+## 11. Playout deadlines begin after three clock bursts
 
 **Spec:** `messaging.md`, _Clock Synchronization_. The client estimates the server clock from bursts
 of `client/time`/`server/time`, one request at a time, and schedules each frame's playout from that
@@ -349,7 +352,7 @@ required earlier, seed the filter from the first three bursts before reporting t
 readiness with an explicit accuracy bound; test deadlines with one, two and three answered
 requests.
 
-## 14. A player volume above 100 is capped, not rejected
+## 12. A player volume above 100 is capped, not rejected
 
 **Spec:** `roles/player/v1.md`, `server/command` player object. `volume` is an integer in the range
 0-100, and `messaging.md` says a field value outside the fixed range its definition gives is a
@@ -364,14 +367,14 @@ stays open. `a_server_volume_above_the_protocol_range_is_capped` pins the behavi
 
 **Why:** closing the connection would silence playback over a value the server got wrong, and the
 right audible outcome - full volume, no mute change - is unambiguous. The alternative, closing,
-belongs with the failure handling that `server/error` and typed protocol errors would introduce
-(entry 6); until then a cap is the failure mode that keeps the player usable.
+belongs with the failure handling that typed protocol errors would introduce; until then a cap is
+the failure mode that keeps the player usable.
 
 **Removing it:** give `clamp_volume_with` and `handle_command` a typed rejection path and close the
 connection with a protocol-error reason once that path exists, or reject the value at the parser
 with the same effect. Test the closed connection instead of the capped level.
 
-## 15. A transport command before the controller state is not checked
+## 13. A transport command before the controller state is not checked
 
 **Spec:** `roles/controller/v1.md`, `client/command` controller object. `command` MUST be one of
 the values listed in `supported_commands` from the latest controller state the client received in
@@ -391,7 +394,7 @@ closes with the first controller state, which the server sends promptly after ac
 `ControlHandle` query) and let the host disable its buttons until the first state arrives, then
 refuse every command while the set is unknown.
 
-## 16. A reconnect keeps the last known `active_roles`
+## 14. A reconnect keeps the last known `active_roles`
 
 **Spec:** `messaging.md`, `server/activate`. `active_roles` is required on the first activation of a
 connection and persists across later activations that omit it; a client treats a first
@@ -417,7 +420,7 @@ is exactly when a silent player is hardest to notice.
 server to send a conformant activation; test that no `client/state` and no audio follow until it
 does.
 
-## 17. A malformed control message is ignored, not fatal
+## 15. A malformed control message is ignored, not fatal
 
 **Spec:** `messaging.md`, _Communication_ and _Binary Message ID Structure_. A field value in a
 recognized message that is outside the fixed range or length limit its definition gives is a
@@ -452,8 +455,82 @@ client could have used. The stderr line is the only trace, and it names the pars
 material.
 
 **Removing it:** decode every control message against a typed error and close the connection with a
-protocol-error reason once the close path carries one (`server/error`, entry 6); turn the lenient
-branch into a typed protocol error and flip both tests.
+protocol-error reason once the close path carries one (`server/error` exists; the client still keeps
+the lenient path); turn the lenient branch into a typed protocol error and flip both tests.
+
+## 16. A server keeps an unavailable client in the group
+
+**Spec:** `messaging.md`, _`client/state`_ and _Server behavior when a client becomes unavailable
+(`available: false`)_. A client that reports `available: false` is moved to a new solo group with
+`group/update`, and `stream/end` is sent for every active stream; it rejoins its previous group only
+through an explicit `switch`, never automatically.
+
+**What we do:** the server has one group. A member that reports `available: false` stays in it; the
+group stops sending it audio, and `Group::report_client_state` records the report without touching
+group volume, mute or playback. No `group/update` and no `stream/end` follow, and a member that
+reports `available: true` again receives the running stream without an announcement, because its
+stream was never ended. `a_member_that_reports_itself_unavailable_receives_no_audio` pins the
+withheld audio, and `group_state_applies_to_every_member_and_a_report_is_not_a_command` pins that a
+report never becomes a command.
+
+**Why:** a solo group and the `switch` command cycle need several groups per server, which this
+milestone does not have; the one thing that must not happen - audio to a client that says it will
+not play it - is kept, and the rest of the rule cannot be followed without the groups it names.
+
+**Removing it:** add solo groups, move an unavailable member into one, send the `group/update` and
+`stream/end` the spec requires in that order, and serve the controller's `switch` command; then flip
+the first test so an unavailable member ends in a stopped solo group.
+
+## 17. The server's stream start lead is one fixed value
+
+**Spec:** `messaging.md`, _`stream/start`_. After a role that defines a `client/state` object is
+added to `active_roles`, the server MUST wait for that update before starting the role's stream, and
+each role's stream configuration is derived from what the client reports - for the player, its
+`required_lead_time_ms` and `min_buffer_ms`.
+
+**What we do:** the stream waits for the update (the group announces nothing to a member without its
+`player` object) but schedules the first sample at `START_LEAD`, 200 ms after the stream opens, for
+every member. The reported lead and buffer are read but not used. The group fans one timeline out to
+every member, so all of them share the timestamps; the tests
+`two_players_receive_the_same_frames` and `a_player_hears_nothing_before_it_reports_its_state` pin
+that.
+
+**Why:** a stream is one timeline: starting it at each member's own reported lead would give the
+members different timestamps for the same audio, which the server fan-out and the group design do
+not allow. The honest fixes are a lead derived from the slowest ready player, or a per-member
+announcement ahead of the shared first sample.
+
+**Removing it:** schedule a new stream at the largest `required_lead_time_ms` among the players that
+are ready when it opens, wait for a late member's report before announcing to it, and test a stream
+with two members whose reported leads differ.
+
+## 18. The server does not try the Sentinel key after a record fails
+
+**Spec:** `connection.md`, _Sentinel Fallback_. After a server announces a `psk_id`, "if [the second
+handshake message] fails and the referenced PSK was not the Sentinel, it verifies the same message
+against the Sentinel PSK before treating the handshake as failed". A message that validates there is
+an authenticated credential-mismatch signal: the session proceeds as an ordinary unpaired,
+Sentinel-keyed one, and the server must not activate roles or declare `playback` while its record
+exists.
+
+**What we do:** `listener::converse` selects the PSK from the record the store holds and reads Noise
+message 2 once. A message that does not authenticate under that key is a silent failure: the
+connection closes, no event is reported and the record is left untouched. A client that lost its
+record therefore cannot reach an unpaired session through this server, and the operator has to
+re-pair it. `a_client_that_cannot_use_its_record_is_refused` pins the refusal and the untouched
+record.
+
+**Why:** trying a second key needs a second handshake state for the _same_ message 1 bytes, because
+the second message's key is derived from the handshake hash and the PSK. `snow`'s `HandshakeState`
+cannot be cloned and exposes no way to replay the token stream with another PSK, so both attempts
+cannot share one transcript. Building the fallback any other way would mean a second Noise
+implementation just for this path.
+
+**Removing it:** either get a clonable or re-playable handshake state from `snow` (or pin a
+handshake state into `syncspin-core` itself), then verify message 2 against the record and, on
+failure, against the Sentinel key, mark the session unpaired and report the mismatch to the host;
+or accept the client's fallback by starting the handshake with the Sentinel key when the client
+advertises that it lost the record, which the wire does not signal.
 
 ## How to update this file
 

@@ -124,6 +124,8 @@ fn config_for(endpoint: &str, storage: Option<Arc<dyn Storage>>) -> ClientConfig
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
+        #[cfg(feature = "discovery")]
+        inbound: None,
         static_pairing_code: Some(CODE.to_owned()),
         pairing_window: DEFAULT_PAIRING_WINDOW,
         pairing_pending_text: None,

@@ -1,9 +1,9 @@
 # Contributing
 
-This is an early library: the client works and is tested, the server is a stub, and the API is
-allowed to change until 1.0. Contributions that make the protocol handling more correct, the tests
-more honest or the documentation more accurate are welcome — including the ones that tell us we got
-something wrong.
+This is an early library: the client and the server work and are tested, and the API is allowed to
+change until 1.0. Contributions that make the protocol handling more correct, the tests more honest
+or the documentation more accurate are welcome — including the ones that tell us we got something
+wrong.
 
 ## What is welcome
 
@@ -42,10 +42,11 @@ npx --yes prettier@3.9.10 --check .
 Feature unification decides what those three runs cover. `syncspin-client` has no default
 features, but `player-pipe` enables `storage-file` by default, so the workspace run turns it on for
 the client and runs the file backend's tests; `pairing-code` is off everywhere unless requested. The
-second run adds the code flows, and the third tests the library crates with their own defaults —
-what a consumer that enables nothing gets. All three are the `test` gate. `--locked` is not
-optional: the workspace ships a `Cargo.lock`, and a test run that silently resolves new versions
-tells you nothing about the code that will be released.
+second run adds the code flows, and the third tests `syncspin-core` and `syncspin-client` with their
+own defaults — what a consumer that enables nothing gets. The workspace runs also cover
+`syncspin-server`, which has no default features; its code-flow tests join the second run. All three
+commands are the `test` gate. `--locked` is not optional: the workspace ships a `Cargo.lock`, and a
+test run that silently resolves new versions tells you nothing about the code that will be released.
 
 The MSRV is 1.85 and is checked separately:
 
@@ -106,15 +107,18 @@ required would gate pull requests on numbers that move with a refactor, not with
 ## Tests
 
 The suites are hermetic: no network, no audio device, no listener on a real port. A test that needs
-one is wrong by construction. Anything that needs a peer runs against the fake server in
-`crates/syncspin-client/tests/`, not against a live Music Assistant.
+one is wrong by construction. The client suites run against the fake server in
+`crates/syncspin-client/tests/`, the server suites against a fake client in
+`crates/syncspin-server/tests/`, and one round-trip test runs the real client crate against the real
+server crate. Nothing runs against a live Music Assistant or opens a multicast socket.
 
 ## Release mechanics
 
-`syncspin-core` has to be published before `syncspin-client`: the client's `syncspin-core`
-dependency is a path dependency that `cargo package` rewrites to a registry dependency, so
-`cargo package -p syncspin-client` fails until `syncspin-core` exists on crates.io.
-`syncspin-server` is `publish = false` and stays out of the release.
+Publishing is ordered by the registry: `syncspin-client` and `syncspin-server` both depend on
+`syncspin-core` through a path dependency that `cargo package` rewrites to a registry dependency, so
+neither can be packaged until `syncspin-core` exists on crates.io. The client is published next, then
+the server, so the release order is core → client → server. All three crates publish from one tag; no
+library crate is `publish = false`.
 
 `CHANGELOG.md` is generated with [git-cliff](https://github.com/orhun/git-cliff) from the tags and
 the conventional commits; do not edit it by hand.
@@ -126,8 +130,9 @@ scripts/release.sh 0.2.0            # bump, changelog, gates, commit
 scripts/release.sh 0.2.0 --dry-run  # show what it would change
 ```
 
-It bumps the workspace version and the three `version()` tripwires, refreshes `Cargo.lock`,
-prepends the changelog section rendered from the commits since the last tag, and refuses to continue
+It bumps the workspace version, the internal path-dependency requirements and the three `version()`
+tripwires, refreshes `Cargo.lock`, prepends the changelog section rendered from the commits since the
+last tag, and refuses to continue
 if the previous version is still named anywhere outside `CHANGELOG.md` and the lock file — that check
 exists because a published README once advertised the release before it. Then it runs the format and
 test gates and commits `chore(release): <version>`.
@@ -144,11 +149,11 @@ git tag -a v0.2.0 -m "syncspin 0.2.0" && git push origin v0.2.0
 
 [`release.yml`](.github/workflows/release.yml) verifies the commit under the tag, refuses a tag that
 does not match the workspace version, publishes `syncspin-core`, waits for the index, publishes
-`syncspin-client`, and writes the GitHub release from the changelog section. It runs in the `release`
-environment, which holds the `CARGO_REGISTRY_TOKEN` secret; add required reviewers there if a pushed
-tag should not be able to publish on its own. A manual run packages without uploading unless
-`dry_run` is cleared, and every step skips a version that is already on the registry, so a partial
-run can be repeated.
+`syncspin-client`, waits again, publishes `syncspin-server`, and writes the GitHub release from the
+changelog section. It runs in the `release` environment, which holds the `CARGO_REGISTRY_TOKEN`
+secret scoped to all three crates; add required reviewers there if a pushed tag should not be able to
+publish on its own. A manual run packages without uploading unless `dry_run` is cleared, and every
+step skips a version that is already on the registry, so a partial run can be repeated.
 
 ## Licence of contributions
 

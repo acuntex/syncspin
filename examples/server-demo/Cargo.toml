@@ -1,0 +1,15 @@
+[package]
+name = "server-demo"
+description = "Example Sendspin server that approves one client and streams a tone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+syncspin-server = { version = "0.1.0", path = "../../crates/syncspin-server" }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
