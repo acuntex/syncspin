@@ -15,7 +15,7 @@ state back.
 **0.1, client first.** The client is implemented and covered by a hermetic test suite, including
 pairing: the Pairing PSK flow, the records it writes, the in-band re-handshake and `server/unpair`,
 plus the static and dynamic code flows behind the `pairing-code` feature. `syncspin-server` is a stub
-with `publish = false`. `syncspin-core` and `syncspin-client` are on crates.io as 0.1.0. The API may
+with `publish = false`. `syncspin-core` and `syncspin-client` are published on crates.io. The API may
 change before 1.0. The CPace layer behind the code flows has not been reviewed
 externally, so it is unaudited code until it has been.
 
@@ -38,11 +38,11 @@ decision lives in one place.
 
 ```toml
 [dependencies]
-syncspin-client = "0.1.0"
+syncspin-client = "0.1"
 ```
 
-`syncspin-server` is not published; the client is the whole of 0.1. The tag `v0.1.0` marks the
-release.
+`syncspin-server` is not published; the client is the whole of 0.1. Every release is tagged, and the
+tag carries the source it was published from.
 
 The example player needs a Sendspin server to talk to:
 
