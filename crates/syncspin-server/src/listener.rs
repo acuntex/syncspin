@@ -704,12 +704,15 @@ impl Session<'_> {
             // as a playing one does. Before the ping it is the idle window from the last frame;
             // after the ping it is the shorter window a peer has to prove the link still delivers.
             let keepalive = self.keepalive_deadline();
-            // `biased` polls the branches in declaration order and takes the first that is ready,
-            // which matters in two ways. `outgoing` comes first so a busy inbound stream can never
-            // starve the audio it carries. `frame` (the read) comes before the keepalive branch so
-            // a frame already waiting on the wire is consumed and counted before the pong window is
-            // judged: a frame that arrives at the deadline keeps the connection, instead of the
-            // deadline branch winning the coin flip and dropping a healthy client.
+            // `biased` polls the branches in declaration order and takes the first that is ready.
+            // `outgoing` comes first so inbound traffic cannot starve the audio it carries; the
+            // read and the keepalive branches are polled in every gap between chunks. Only a host
+            // that feeds faster than the socket drains - the unbounded-queue case the group already
+            // documents - can hold them off, which is a pre-existing limit of the queue, not of this
+            // ordering. `frame` (the read) comes before the keepalive branch so a frame already
+            // waiting on the wire is consumed and counted before the pong window is judged: a frame
+            // that arrives at the deadline keeps the connection, instead of the deadline branch
+            // winning the coin flip and dropping a healthy client.
             tokio::select! {
                 biased;
                 outgoing = async {
