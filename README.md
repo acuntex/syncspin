@@ -12,15 +12,17 @@ host supplies the server's frames; it does not turn into a music server.
 
 ## Status
 
-**0.2, both halves.** The client is covered by a hermetic test suite, including pairing: the Pairing
+**0.3.0, both halves.** The client is covered by a hermetic test suite, including pairing: the Pairing
 PSK flow, the records it writes, the in-band re-handshake and `server/unpair`, plus the static and
 dynamic code flows behind the `pairing-code` feature. The server accepts clients, owns one group and
 its stream, serves the three roles, pairs with all three methods and discovers peers in both
 directions. Its suites use a fake client that walks the specification, and one test runs the real
-client against the real server so the two halves cannot agree on a bug unnoticed. 0.2 publishes
-`syncspin-server` beside `syncspin-core` and `syncspin-client` from the same tag. The API may change
-before 1.0. The CPace layer behind the code flows has not been reviewed externally, so it is
-unaudited code until it has been; what a reviewer would look at is written down in
+client against the real server so the two halves cannot agree on a bug unnoticed. A session that
+carries no traffic keeps itself alive with a WebSocket keepalive on both sides, and a group id that
+is not the specification's 43 base64url characters is tolerated instead of ending the session. 0.3.0
+publishes `syncspin-server` beside `syncspin-core` and `syncspin-client` from the same tag. The API
+may change before 1.0. The CPace layer behind the code flows has not been reviewed externally, so it
+is unaudited code until it has been; what a reviewer would look at is written down in
 [the review package](docs/cpace-review.md).
 
 `syncspin` is not an official Sendspin implementation and is not affiliated with the Sendspin
@@ -43,8 +45,8 @@ decision lives in one place.
 
 ```toml
 [dependencies]
-syncspin-client = "0.2"
-syncspin-server = "0.2"
+syncspin-client = "0.3.0"
+syncspin-server = "0.3.0"
 ```
 
 Every release is tagged, and the tag carries the source it was published from. `syncspin-core` is
@@ -213,7 +215,7 @@ it found and passes one URL to `connect`, which the spec leaves implementation-d
 - **Playout lead.** Every member shares one timeline whose first sample is 200 ms after the stream
   opens. The reported `required_lead_time_ms` and `min_buffer_ms` are read but do not move it.
 - **TLS.** No TLS stack: a `wss://` address is rejected when the client is configured, and nothing
-  is downgraded to `ws://`. A TLS backend is out of scope for 0.2.
+  is downgraded to `ws://`. A TLS backend is out of scope.
 
 Pairing, discovery and the other departures from the specification are tracked with their reasons
 and the work that closes them in [docs/spec-deviations.md](docs/spec-deviations.md).
