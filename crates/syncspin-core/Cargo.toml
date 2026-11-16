@@ -35,7 +35,7 @@ x25519-dalek = { workspace = true, features = ["static_secrets"] }
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
-proptest = "~1.11.0"
+proptest = "~1.12.0"
 
 [package.metadata.docs.rs]
 all-features = true
