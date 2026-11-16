@@ -1203,6 +1203,42 @@ async fn the_initial_state_is_sent_after_two_time_replies() {
 }
 
 #[tokio::test]
+async fn a_burst_with_a_sample_does_not_wait_for_a_lost_last_reply() {
+    let options = ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // Answer the first seven requests of the burst immediately, so the burst already holds a sample,
+    // and withhold the eighth. A reply for the eighth can never beat what is buffered, so the state
+    // report must follow the eighth request's timeout, not the two-second burst deadline.
+    for _ in 0..7 {
+        let transmitted = server
+            .next_time_request()
+            .await
+            .expect("the client must keep asking for time");
+        server.answer_time(transmitted);
+    }
+    assert!(
+        server.next_time_request().await.is_some(),
+        "the eighth request must arrive"
+    );
+    let withheld_at = Instant::now();
+
+    let state = wait_for_client_state(&mut server).await;
+    assert!(state.available);
+    assert!(
+        withheld_at.elapsed() < Duration::from_secs(1),
+        "the state report must follow the last request's timeout, not the two-second burst deadline"
+    );
+}
+
+#[tokio::test]
 async fn readding_the_player_role_reports_state_again() {
     let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let (_recordings, sink) = recording_sink();

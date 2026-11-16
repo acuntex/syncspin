@@ -876,10 +876,11 @@ impl Session<'_> {
 
     /// Handles a deadline that fired while the session was waiting.
     ///
-    /// A per-message clock timeout moves the burst on to its next request. The overall burst
-    /// deadline ends the burst with the measurements it has gathered; a per-message timeout alone
-    /// does not end it, because a reply that arrives late is still a valid measurement. The pairing
-    /// attempt's timeout is checked first, because it ends the attempt instead of continuing it.
+    /// A per-message clock timeout moves the burst on to its next request. When the last request
+    /// times out the burst ends unless it holds no sample yet: a sample already in hand cannot be
+    /// beaten by a later reply's larger error bound, while a burst with nothing buffered has
+    /// everything to gain from waiting for late replies until its deadline. The pairing attempt's
+    /// timeout is checked first, because it ends the attempt instead of continuing it.
     async fn handle_clock_timeout(&mut self) -> Result<()> {
         if self
             .pairing_deadline()
@@ -893,11 +894,18 @@ impl Session<'_> {
         if burst_expired {
             return self.finish_burst().await;
         }
-        // A per-message timeout only releases the request on the wire so the next one can go out;
-        // the burst keeps its deadline, so a late reply for an earlier request is still collected
-        // and `finish_burst` runs when that deadline elapses.
+        // A per-message timeout only releases the request on the wire so the next one can go out.
         self.reply_deadline = None;
         self.outstanding_sent_us = None;
+        if self.sync_remaining == 0 {
+            // The last request just timed out. A sample already buffered cannot be beaten by a
+            // later reply's larger error bound, so the burst ends now instead of idling to the
+            // burst deadline. With nothing buffered, a late reply is the only hope of a sample, so
+            // the burst stays open until its deadline.
+            if !self.burst_samples.is_empty() {
+                self.finish_burst().await?;
+            }
+        }
         Ok(())
     }
 
