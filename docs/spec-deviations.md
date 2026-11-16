@@ -10,26 +10,26 @@ harmless.
 
 ## Summary
 
-| #   | Area                                                                   | Spec section                                                                                                                                                                      | Status                             |
-| --- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| 1   | Server-initiated connections: last-playback server not persisted       | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Open, no last-playback record      |
-| 3   | `psk_id` validation deferred to the session layer                      | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
-| 4   | Code pairing behind a feature; CPace layer unaudited                   | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
-| 6   | Approval is not persisted across restarts                              | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, server lifetime              |
-| 7   | Scheduled metadata applied immediately                                 | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
-| 8   | In-place format change flushes buffered audio                          | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
-| 9   | `Sink::underruns()` reported but never used                            | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
-| 10  | `stream/clear` with `from_timestamp` flushes everything                | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                           |
-| 11  | Playout deadlines begin after three clock bursts                       | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                         |
-| 12  | A player volume above 100 is capped, not rejected                      | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`      |
-| 13  | A transport command before the controller state is not checked         | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`          |
-| 14  | A reconnect keeps the last known `active_roles` while playback-capable | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`              |
-| 15  | A malformed control message is ignored, not fatal                      | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message` |
-| 16  | A server keeps an unavailable client in the group                      | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                      | Open, one group                    |
-| 17  | The server's stream start lead is one fixed value                      | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline              |
-| 18  | The server does not try the Sentinel key after a record fails          | [`connection.md` — Sentinel Fallback](https://github.com/Sendspin/spec/blob/main/connection.md#sentinel-fallback)                                                                 | Accepted, `snow` state             |
-| 19  | A foreign `group_id` is accepted unless strict mode is set             | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Accepted, `strict_group_id`        |
-| 20  | Live unpaired-access changes are not applied to a running connection   | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, `restart` goodbye            |
+| #   | Area                                                                   | Spec section                                                                                                                                                                      | Status                                      |
+| --- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| 1   | Server-initiated connections: last-playback server not persisted       | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Open, no last-playback record               |
+| 3   | `psk_id` validation deferred to the session layer                      | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`                      |
+| 4   | Code pairing behind a feature; CPace layer unaudited                   | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`                    |
+| 6   | Approval is not persisted across restarts                              | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, server lifetime                       |
+| 7   | Scheduled metadata applied immediately                                 | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                                    |
+| 8   | In-place format change flushes buffered audio                          | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                                    |
+| 9   | `Sink::underruns()` reported but never used                            | — (library contract, no wire field)                                                                                                                                               | Stage 1b                                    |
+| 10  | `stream/clear` with `from_timestamp` flushes everything                | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                                    |
+| 11  | Playout deadlines begin after three clock bursts                       | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                                  |
+| 12  | A player volume above 100 is capped, not rejected                      | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`               |
+| 13  | A transport command before the controller state is not checked         | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`                   |
+| 14  | A reconnect keeps the last known `active_roles` while playback-capable | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`                       |
+| 15  | A malformed control message is ignored, not fatal                      | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message`          |
+| 16  | A server keeps an unavailable client in the group                      | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                      | Open, one group                             |
+| 17  | The server's stream start lead is one fixed value                      | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline                       |
+| 18  | The server does not try the Sentinel key after a record fails          | [`connection.md` — Sentinel Fallback](https://github.com/Sendspin/spec/blob/main/connection.md#sentinel-fallback)                                                                 | Accepted, `snow` state                      |
+| 19  | A foreign `group_id` is accepted unless strict mode is set             | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Accepted, `strict_group_id`                 |
+| 20  | Live unpaired-access changes are not applied to a running connection   | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, `pairing_required`/`restart` goodbyes |
 
 ## 1. Server-initiated connections: the last-playback server is not persisted
 
@@ -320,8 +320,10 @@ connection and persists across later activations that omit it; a client treats a
 **What we do:** the connection carries the roles of the session that ended into the next attempt
 (`Carried::active_roles`), and the handshake uses them when the first activation omits
 `active_roles` (`handshake`, `activate.active_roles.unwrap_or_else(|| previous_roles.to_vec())`).
-Whether the seeded set survives depends on the activation guard every activation passes through
-(`admit_activation`): the re-evaluation keeps it only while the connection is playback-capable. On a
+Whether the seeded set survives depends on `apply_activate`, the handler every activation passes
+through: its guard calls `admit_activation`, which returns only the verdict, and a separate block
+then clears the carried roles when an activation that omits `active_roles` leaves the connection not
+playback-capable. On a
 paired connection - or a guest whose setting admits unpaired access - the `player@v1` role therefore
 stays active across a reconnect even when the server omits the field: the new session reports its
 `client/state` and starts its clock burst as if the roles had been announced. A guest with
@@ -492,29 +494,33 @@ default and never sees the event.
 
 ## 20. Live unpaired-access changes are not applied to a running connection
 
-**Spec:** `pairing.md`, _Unpaired Access_. The `restart` goodbye is how a client applies a change of
-its unpaired-access setting to a connection that is already running: it sends `client/goodbye`
-reason `restart`, the server re-establishes the connection, and the new session runs under the new
-setting.
+**Spec:** `pairing.md`, _Unpaired Access_. A client that stops admitting unpaired access closes the
+relying connections that depended on it with `client/goodbye` reason `pairing_required`. The
+`restart` goodbye is the enabled direction: a client that admits unpaired access MAY close and
+re-establish a connection with `client/goodbye` reason `restart`, and the new session runs under the
+new setting.
 
 **What we do:** the setting is read from the configuration the connection was built with
-(`ClientConfig::unpaired_access`, consulted in `admit_activation`), and the session borrows that
-configuration for every activation it checks. A change the host makes to its own configuration does
-not reach a session that is already running: a host that wants a live connection to stop admitting
-unpaired access closes the session through `ClientHandle::close` and
+(`ClientConfig::unpaired_access`), at the guard's call site in `apply_activate`, which passes it to
+`admit_activation`; `admit_activation` only returns the verdict. A change the host makes to its own
+configuration does not reach a session that is already running: a host that wants a live connection
+to stop admitting unpaired access closes the session through `ClientHandle::close` and
 starts a new connection with a configuration that sets `unpaired_access: false`, whose activation
-guard then applies the new setting. The `restart` goodbye is never sent automatically: no control
-request flips the setting on a running session.
+guard then applies the new setting. Neither goodbye is sent automatically: no control request flips
+the setting on a running session, so the `pairing_required` close for a connection that becomes
+unadmitted and the `restart` re-establishment for one that becomes admitted are both left to the
+host.
 
 **Why:** the configuration is owned by the connection, not by the session: it is captured when the
 host calls `connect`, and every activation check borrows it from there. There is
 no channel that could carry a setting change into a live session, and adding one would mean deciding
-what to do with an unpaired session the moment it becomes unadmitted - which is exactly the
-`restart` rule that is not implemented.
+what to do with the connections a change makes admissible or not - the two directions the spec
+answers with `pairing_required` and `restart`, neither of which is implemented.
 
-**Removing it:** add a control request that flips the setting on a live session and sends
-`client/goodbye` reason `restart` on an unpaired session, so the server re-establishes the
-connection under the new setting; then delete this entry.
+**Removing it:** add a control request that flips the setting on a live session, closes the relying
+connections with `client/goodbye` reason `pairing_required` when the setting turns off, and sends
+reason `restart` on an unpaired session when it turns on so the server re-establishes the connection
+under the new setting; then delete this entry.
 
 ## How to update this file
 
