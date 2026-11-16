@@ -74,11 +74,19 @@ are configured in [`.pre-commit-config.yaml`](.pre-commit-config.yaml); install 
 | `docs`    | `cargo doc` without warnings, so a broken doc link cannot merge.                                                                                              |
 | `secrets` | No credential in the history, scanned with gitleaks.                                                                                                          |
 
-Three more jobs report without blocking: `coverage` (line coverage with every feature, floor 91.0),
-`package` (`cargo package -p syncspin-core`) and `mutants` (weekly, `syncspin-core`). The floor
-follows the workspace: core and the client sit around 96.7, and the server crate that arrived in 0.2
-sits near 85, which is what moved the number down. Making them required would gate pull requests on
-numbers that move with a refactor, not with a defect.
+Two more jobs report without blocking: `coverage` (line coverage with every feature, floor 91.0) and
+`package` (`cargo package -p syncspin-core`). The floor follows the workspace: core and the client
+sit around 96.7, and the server crate that arrived in 0.2 sits near 85, which is what moved the
+number down. Making them required would gate pull requests on numbers that move with a refactor,
+not with a defect.
+
+`mutants` is a third job that is not in the required set, and it is not a number either. It runs
+weekly over `syncspin-core` and `cargo-mutants` exits non-zero as soon as one mutant survives, so a
+red run is a test gap or an exemption to add - it stays red until one of the two happens. Read it as
+a work list, not as a gate: the result arrives weekly, not on a pull request. A surviving mutant
+that cannot be killed because the mutation does not change behaviour needs an explicit exemption -
+a skip in the code or an exclusion in the cargo-mutants configuration - and the reason recorded
+next to it.
 
 ## Hard rules
 

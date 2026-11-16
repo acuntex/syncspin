@@ -155,22 +155,50 @@ jobs:
   mutants:
     # Weekly only: one full test run per mutant. `syncspin-core` first - it holds the
     # protocol and crypto code where a silent behaviour change would be worst.
+    #
+    # One runner cannot finish this in the timeout below. `syncspin-core` has 553 mutants and
+    # each one costs a build plus the suite; the first scheduled run got through a few dozen of
+    # them in 22 minutes before the runner shut down. The work is therefore split into four
+    # shards of about 140 mutants each, with two mutants built at a time per shard.
+    #
+    # Every shard must be invoked with identical arguments and the same denominator, or the
+    # shards disagree about which mutant belongs to whom and the results are meaningless.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      # A surviving mutant in one shard must not stop the others from finishing: the point of
+      # the run is the complete list, not the first red line.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked
-      - name: Mutation testing (core)
-        run: cargo mutants -p syncspin-core --timeout 120 --no-times
+      # Prebuilt binary instead of `cargo install --locked`: the build cost about a minute per
+      # shard and buys nothing, since every shard runs the same published tool.
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2
+        with:
+          tool: cargo-mutants
+      - name: Mutation testing (core, shard ${{ matrix.shard }}/4)
+        # `--all-features` is not optional here. `pairing-code` is off by default, so without it
+        # `pairing/pake.rs`, `wrap.rs` and `code.rs` are compiled away: their 122 mutants build
+        # unchanged, the suite passes, and every one of them is reported as missed. The mutants
+        # are generated from the source tree, not from the build.
+        #
+        # `--jobs 2` runs two mutants at a time on the four-core runner; the jobserver
+        # cargo-mutants starts keeps the concurrent rustc processes within the CPU budget.
+        run: >
+          cargo mutants -p syncspin-core --all-features --timeout 120 --no-times
+          --shard ${{ matrix.shard }}/4 --jobs 2
       - name: Upload the surviving mutants
-        if: failure()
+        # `always()` and a per-shard name: a shard that is interrupted still has results worth
+        # reading, and four shards cannot share one artifact name.
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: mutants-out
+          name: mutants-out-${{ matrix.shard }}
           path: mutants.out/
           if-no-files-found: ignore
 
