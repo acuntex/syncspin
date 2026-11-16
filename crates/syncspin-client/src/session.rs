@@ -89,6 +89,22 @@ const SYNC_REPLY_TIMEOUT: Duration = Duration::from_millis(250);
 /// window must not be able to hold a deliberate shutdown open.
 const GOODBYE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long the link may stay silent before the client sends a WebSocket ping.
+///
+/// The protocol has no application-level liveness message: `client/time` flows only while a player
+/// role is active, so an idle session sends nothing, and a server that dropped the session leaves
+/// the local socket "open" forever. The ping is the only traffic this adds, and a link that carries
+/// audio, metadata or clock replies never sees one.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+
+/// How long the link may stay silent after a keepalive ping before the session is treated as dead.
+///
+/// Any received frame counts as the answer, not only a pong: audio that arrives while the ping is
+/// outstanding proves the link is alive just as well. A half-open link is therefore detected within
+/// 25 s of the last frame the client received, and the attempt ends as a failure so the supervisor
+/// reconnects.
+const KEEPALIVE_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Overall cap on one burst, so a peer that stalls cannot hold the session loop.
 const SYNC_BURST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -185,6 +201,17 @@ const PAIRING_MESSAGE_TYPES: [&str; 5] = [
 /// application messages.
 pub(crate) struct Transport {
     socket: Socket,
+    /// When a WebSocket frame of any kind was last received.
+    ///
+    /// The keepalive measures silence from here. A pong, a ping, a text frame and a binary frame all
+    /// count alike: the question is whether the link still delivers anything, not what it delivers.
+    last_received: tokio::time::Instant,
+    /// How many WebSocket frames of any kind have been received.
+    ///
+    /// Whether a ping was answered is decided by this count, not by the timestamps: a pong can come
+    /// back within the same clock tick as the ping that asked for it, and two equal instants must
+    /// not read as "no frame arrived".
+    frames_received: u64,
 }
 
 /// The WebSocket a session runs on, and which side opened it.
@@ -218,6 +245,8 @@ impl Transport {
             .with_context(|| format!("failed to connect to the server at {url}"))?;
         Ok(Transport {
             socket: Socket::Dialled(socket),
+            last_received: tokio::time::Instant::now(),
+            frames_received: 0,
         })
     }
 
@@ -226,6 +255,8 @@ impl Transport {
     pub(crate) fn accept(socket: WebSocketStream<TcpStream>) -> Transport {
         Transport {
             socket: Socket::Accepted(socket),
+            last_received: tokio::time::Instant::now(),
+            frames_received: 0,
         }
     }
 
@@ -239,6 +270,12 @@ impl Transport {
             }
             .transpose()
             .context("the WebSocket read failed")?;
+            // Every frame is liveness, including the control frames handled below: the keepalive
+            // asks whether the link still delivers anything, not whether it delivers audio.
+            if message.is_some() {
+                self.last_received = tokio::time::Instant::now();
+                self.frames_received = self.frames_received.wrapping_add(1);
+            }
             match message {
                 Some(Message::Text(text)) => {
                     return Ok(SocketMessage::Text(text.as_str().to_owned()))
@@ -251,6 +288,24 @@ impl Transport {
                 Some(Message::Close(_)) | None => return Ok(SocketMessage::Closed),
             }
         }
+    }
+
+    /// When a WebSocket frame was last received, of any kind.
+    pub(crate) fn last_received(&self) -> tokio::time::Instant {
+        self.last_received
+    }
+
+    /// How many WebSocket frames of any kind have been received.
+    pub(crate) fn frames_received(&self) -> u64 {
+        self.frames_received
+    }
+
+    /// Sends one WebSocket ping with `payload`.
+    ///
+    /// The payload is a keepalive nonce, never application data: it exists so two pings are
+    /// distinguishable on a capture, and the client asks nothing of its contents.
+    pub(crate) async fn send_ping(&mut self, payload: &[u8]) -> Result<()> {
+        self.send(Message::Ping(payload.to_vec().into())).await
     }
 
     /// Sends one cleartext JSON text frame.
@@ -309,6 +364,14 @@ struct Rehandshake {
     previous: NoiseTransport,
     /// Deadline for the activation under the new keys.
     deadline: Instant,
+}
+
+/// The keepalive ping on the wire.
+struct KeepalivePing {
+    /// When the ping went out.
+    sent: tokio::time::Instant,
+    /// How many frames had been received then; a later count means the link answered.
+    seen: u64,
 }
 
 /// The pairing window of this connection.
@@ -432,6 +495,8 @@ enum Wakeup {
     Shutdown(GoodbyeReason),
     /// The clock deadline elapsed.
     Clock,
+    /// The keepalive deadline elapsed: a ping is due, or the one on the wire timed out.
+    Keepalive,
 }
 
 /// The kind of one decrypted transport message, decided by its binary message id.
@@ -549,6 +614,11 @@ pub(crate) struct Session<'a> {
     /// A re-handshake whose new keys are in place, or `None` when the connection is not switching
     /// keys.
     rehandshake: Option<Rehandshake>,
+    /// When the keepalive ping on the wire went out and what it expects, or `None` when none is
+    /// outstanding.
+    keepalive_ping: Option<KeepalivePing>,
+    /// Nonce of the next keepalive ping; its payload is the big-endian 8 bytes of this counter.
+    keepalive_nonce: u64,
 }
 
 /// Runs one connection attempt: the handshake, then the session loop.
@@ -675,6 +745,8 @@ pub(crate) async fn attempt(
         #[cfg(feature = "pairing-code")]
         failed_rounds: carried.failed_rounds,
         rehandshake: None,
+        keepalive_ping: None,
+        keepalive_nonce: 0,
     };
     session.publish_volume();
 
@@ -736,6 +808,14 @@ impl Session<'_> {
                 return Ok(ending);
             }
 
+            // A frame that arrived after the ping answered it, whatever its kind: a pong to this
+            // ping, a pong to another one, audio or metadata all prove the link is alive. This is
+            // checked again when the keepalive deadline fires, because a control frame is consumed
+            // inside the transport's read and does not wake the loop.
+            if self.keepalive_answered() {
+                self.keepalive_ping = None;
+            }
+
             // A re-handshake suspends the clock work: no application message may be sent until the
             // new activation arrives, so a burst is not started and no request is put on the wire.
             if self.rehandshake.is_none() {
@@ -758,6 +838,12 @@ impl Session<'_> {
                 .min(),
             };
 
+            // The keepalive is a deadline of its own and is never replaced by the clock work: it
+            // runs with every role combination, so an idle session notices a dead link just as a
+            // playing one does. Before the ping it is the idle window from the last frame; after
+            // the ping it is the shorter window a peer has to prove the link still delivers.
+            let keepalive = self.keepalive_deadline();
+
             // The control receiver outlives individual handles: dropping the last one disables the
             // branch instead of ending the session.
             let control = &mut self.control;
@@ -779,6 +865,7 @@ impl Session<'_> {
                         None => pending().await,
                     }
                 } => Wakeup::Clock,
+                () = tokio::time::sleep_until(keepalive) => Wakeup::Keepalive,
             };
 
             match wakeup {
@@ -807,8 +894,60 @@ impl Session<'_> {
                     }
                     self.handle_clock_timeout().await?;
                 }
+                Wakeup::Keepalive => self.handle_keepalive_timeout().await?,
             }
         }
+    }
+
+    /// Whether a frame arrived after the keepalive ping went out.
+    ///
+    /// Any frame counts, not only a pong, and the payload is never inspected: the question is
+    /// whether the link still delivers something.
+    fn keepalive_answered(&self) -> bool {
+        self.keepalive_ping
+            .as_ref()
+            .is_some_and(|ping| self.transport.frames_received() != ping.seen)
+    }
+
+    /// When the keepalive next has work: the ping is due after the idle window, and the pong
+    /// window closes when a ping is outstanding.
+    fn keepalive_deadline(&self) -> tokio::time::Instant {
+        match &self.keepalive_ping {
+            Some(ping) if !self.keepalive_answered() => ping.sent + KEEPALIVE_PONG_TIMEOUT,
+            _ => self.transport.last_received() + KEEPALIVE_IDLE,
+        }
+    }
+
+    /// Sends a keepalive ping when the link has been silent, or ends the session when a ping went
+    /// unanswered.
+    ///
+    /// Any frame received after the ping cancels it before the deadline is judged, so a pong that
+    /// raced the deadline - or audio that arrived while the ping was on the wire - keeps the
+    /// session. Ending here is a failed attempt, which the caller reports as
+    /// [`Event::Disconnected`](crate::Event::Disconnected) and follows with a reconnect, so a
+    /// half-open link is repaired by the ordinary reconnect path.
+    async fn handle_keepalive_timeout(&mut self) -> Result<()> {
+        if self.keepalive_answered() {
+            self.keepalive_ping = None;
+        }
+        if tokio::time::Instant::now() < self.keepalive_deadline() {
+            // A frame arrived after this wait's deadline was computed; the loop recomputes it.
+            return Ok(());
+        }
+        if self.keepalive_ping.is_some() {
+            bail!(
+                "no WebSocket frame arrived within {KEEPALIVE_PONG_TIMEOUT:?} of a keepalive ping, \
+                 so the connection is dead"
+            );
+        }
+        let payload = self.keepalive_nonce.to_be_bytes();
+        self.keepalive_nonce = self.keepalive_nonce.wrapping_add(1);
+        self.transport.send_ping(&payload).await?;
+        self.keepalive_ping = Some(KeepalivePing {
+            sent: tokio::time::Instant::now(),
+            seen: self.transport.frames_received(),
+        });
+        Ok(())
     }
 
     /// Sends the next `client/time` request of the current burst when one is due.
@@ -3389,6 +3528,8 @@ mod tests {
             #[cfg(feature = "pairing-code")]
             failed_rounds: Arc::new(AtomicU32::new(0)),
             rehandshake: None,
+            keepalive_ping: None,
+            keepalive_nonce: 0,
         }
     }
 
@@ -3425,6 +3566,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         Transport {
             socket: Socket::Dialled(socket),
+            last_received: tokio::time::Instant::now(),
+            frames_received: 0,
         }
     }
 

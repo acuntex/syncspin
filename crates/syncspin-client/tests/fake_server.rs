@@ -70,6 +70,13 @@ pub struct ServerOptions {
     pub active_roles: Vec<String>,
     /// How many `client/time` requests to answer; `None` answers all, `Some(0)` none.
     pub answer_time_limit: Option<usize>,
+    /// Whether a WebSocket ping from the client is answered with a pong.
+    ///
+    /// With `false` the harness records the ping and then leaves the socket open without reading or
+    /// writing it again: no pong leaves this side (tungstenite's automatic one included), and the
+    /// client sees the silence a half-open link produces. The socket stays open until the test's
+    /// runtime ends, so the client does not see a clean close either.
+    pub answer_pings: bool,
     /// Whether `client/time` requests are reported but not answered until the test asks.
     pub manual_time: bool,
     /// How many connections the server accepts before it stops listening.
@@ -168,6 +175,7 @@ impl Default for ServerOptions {
             ],
             answer_time_limit: None,
             manual_time: false,
+            answer_pings: true,
             connections: 1,
             omit_active_roles_after_the_first: false,
             server_init_override: None,
@@ -324,6 +332,10 @@ pub enum Observation {
     PairingAborted(String),
     /// The client said why it is closing the connection.
     Goodbye(String),
+    /// The client sent a WebSocket ping; the payload is its keepalive nonce.
+    Ping(Vec<u8>),
+    /// The client answered a WebSocket ping; the payload is the one it received.
+    Pong(Vec<u8>),
     /// The connection closed.
     Closed,
 }
@@ -807,6 +819,28 @@ impl FakeServer {
         }
     }
 
+    /// Waits until the client sends a WebSocket ping and returns its payload.
+    pub async fn wait_for_ping(&mut self) -> Option<Vec<u8>> {
+        loop {
+            match self.observation().await {
+                Some(Observation::Ping(payload)) => return Some(payload),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
+    /// Waits until the client answers a WebSocket ping and returns the payload it echoed.
+    pub async fn wait_for_pong(&mut self) -> Option<Vec<u8>> {
+        loop {
+            match self.observation().await {
+                Some(Observation::Pong(payload)) => return Some(payload),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     /// Waits until the client says goodbye and returns the reason it sent.
     pub async fn wait_for_goodbye(&mut self) -> Option<String> {
         loop {
@@ -1095,7 +1129,25 @@ async fn serve_connection(
                 .await?;
             }
             LinkEvent::Socket(Some(Ok(Message::Ping(payload)))) => {
-                socket.send(Message::Pong(payload)).await?;
+                let _ = observations.send(Observation::Ping(payload.to_vec()));
+                if options.answer_pings {
+                    socket.send(Message::Pong(payload)).await?;
+                } else {
+                    // The link is now half-open from the client's point of view: the socket stays
+                    // open, but nothing here reads or writes it any more, so tungstenite's
+                    // automatically queued pong is never flushed either. The holder task keeps the
+                    // connection alive for the rest of the test; returning without it would close
+                    // the socket, which a client must see as a clean close instead of a dead link.
+                    let inner = socket.into_inner();
+                    tokio::spawn(async move {
+                        let _held = inner;
+                        std::future::pending::<()>().await;
+                    });
+                    return Ok(());
+                }
+            }
+            LinkEvent::Socket(Some(Ok(Message::Pong(payload)))) => {
+                let _ = observations.send(Observation::Pong(payload.to_vec()));
             }
             LinkEvent::Socket(Some(Ok(Message::Close(_))) | None | Some(Err(_))) => {
                 let _ = observations.send(Observation::Closed);

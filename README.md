@@ -92,6 +92,13 @@ A connection reconnects on its own: when an attempt ends, the crate flushes the 
 same sink, identity, volume and mute state. It stops only when the audio sink fails or when the
 handle or event stream is dropped.
 
+A silent link is detected instead of staying "connected" forever: after 15 s without receiving any
+WebSocket frame the client sends a ping, and when nothing arrives in the 10 s after it the attempt
+ends as a disconnect so the reconnect above runs. A link that carries audio, metadata or clock
+replies never sees a ping, and a ping from the server is answered as before. The ping is a
+transport control frame with an 8-byte nonce, not a protocol message and not application data;
+the client depends on the peer answering pings or sending something else within that window.
+
 `ClientConfig::volume` and `ClientConfig::muted` are the level and mute state the first `client/state`
 carries. A host passes the values it restored, so the server never sees an invented baseline; a host
 without stored values passes `100` and `false`. `ControlHandle::set_volume` returns the level that
