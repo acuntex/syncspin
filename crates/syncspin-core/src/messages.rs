@@ -25,7 +25,12 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Noise cipher suite name carried by `client/init`.
-pub const NOISE_SUITE: &str = "25519_ChaChaPoly_SHA256";
+///
+/// This is the suite the client of this library announces,
+/// [`Suite::ChaChaPoly`](crate::noise::Suite::ChaChaPoly). A server MUST support both suites in
+/// [`Suite::ALL`](crate::noise::Suite::ALL), so the choice lives with the client and the server
+/// reads it from `client/init` rather than negotiating.
+pub const NOISE_SUITE: &str = crate::noise::Suite::ChaChaPoly.wire_name();
 
 /// Binary message id of a player audio chunk.
 pub const AUDIO_CHUNK_ID: u8 = 4;

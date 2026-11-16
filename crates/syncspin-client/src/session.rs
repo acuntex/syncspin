@@ -959,7 +959,14 @@ impl Session<'_> {
             .context("noise/handshake data is not unpadded base64url")?;
         let peer = decode_server_key(&self.server_id)?;
         let prologue = *self.noise.handshake_hash();
-        let mut responder = Responder::with_peer(&self.config.identity, &peer, &prologue)?;
+        // A re-handshake keeps the suite of the connection it replaces: the peer derives the new
+        // keys under the same one.
+        let mut responder = Responder::with_peer_suite(
+            &self.config.identity,
+            &peer,
+            self.noise.suite(),
+            &prologue,
+        )?;
         let metadata_payload = responder
             .read_message(&message_1)
             .context("failed to read Noise re-handshake message 1")?;
@@ -1427,7 +1434,7 @@ impl Session<'_> {
             attempt.pairing_index,
             attempt.round(),
         );
-        let share = attempt.accept_server_share(&prs, &sid, &peer_share)?;
+        let share = attempt.accept_server_share(&prs, &sid, &peer_share, self.noise.suite())?;
         let reply = Incoming::ClientPairAuth(ClientPairAuth {
             pake_msg_2: URL_SAFE_NO_PAD.encode(share),
         });

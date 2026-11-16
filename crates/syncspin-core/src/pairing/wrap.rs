@@ -19,21 +19,28 @@
 //! A payload that fails to authenticate is an error, never a zero or partially decrypted value,
 //! and neither [`Debug`] output nor an error string ever carries the key, the value or the seal.
 //!
-//! # The AEAD is the suite's
+//! # The AEAD is the connection's suite
 //!
-//! The spec seals with the AEAD of the connection's negotiated cipher suite. Sendspin defines
-//! two suites - `25519_ChaChaPoly_SHA256` and `25519_AESGCM_SHA256` - and this crate offers the
-//! first only ([`NOISE_SUITE`](crate::messages::NOISE_SUITE)), so the AEAD here is
-//! ChaCha20-Poly1305. Offering `25519_AESGCM_SHA256` would mean selecting the AEAD from the
-//! suite rather than fixing it in this module.
+//! The spec seals with the AEAD of the connection's negotiated cipher suite, so every function
+//! here takes a [`Suite`]: `25519_ChaChaPoly_SHA256` seals with ChaCha20-Poly1305 and
+//! `25519_AESGCM_SHA256` with AES-256-GCM. Both are 32-byte-key, 12-byte-nonce, 16-byte-tag
+//! ciphers, so `K_wrap` and the sealed length are the same under either; only the ciphertext
+//! differs, and a value sealed under one suite does not open under the other.
+//!
+//! The ciphers come from the same resolver `snow` uses for the handshake, which is where the
+//! dependency already sits. A build whose resolver lacks the suite's cipher returns an error and
+//! never falls back to the other suite.
 //!
 //! The module is behind the `pairing-code` feature with [`pake`](super::pake): wrapping exists
-//! only for the code flows, and the default build keeps no AEAD of its own.
+//! only for the code flows.
 
 use anyhow::{anyhow, Result};
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
 use sha2::{Digest, Sha256};
+use snow::params::CipherChoice;
+use snow::resolvers::{CryptoResolver, DefaultResolver};
+use snow::types::Cipher;
+
+use crate::noise::Suite;
 
 /// The label that derives the key for `wrapped_psk`.
 pub const PSK_LABEL: &[u8] = b"sendspin-pair-psk-wrap-v1";
@@ -50,15 +57,18 @@ const TAG_LEN: usize = 16;
 /// The length of a sealed value: ciphertext plus tag, the spec's 48-byte field.
 const SEALED_LEN: usize = VALUE_LEN + TAG_LEN;
 
-/// The nonce every wrapping uses. A key is derived per field per session, so it seals exactly
-/// one value and the zero nonce never repeats under the same key.
-const NONCE_BYTES: [u8; 12] = [0u8; 12];
+/// The nonce number every wrapping uses. A key is derived per field per session, so it seals
+/// exactly one value and the zero nonce never repeats under the same key. Zero is the spec's
+/// twelve zero bytes under either cipher: both render a `u64` into the last eight bytes, and
+/// this value is zero in either byte order.
+const WRAP_NONCE: u64 = 0;
 
 /// Derives `K_wrap = SHA-256(label || sid || ISK)`.
 ///
 /// `label` is [`PSK_LABEL`] or [`NONCE_LABEL`], `sid` the CPace session id exactly as the PAKE
 /// used it, and `isk` the 64-byte CPace intermediate session key. The three are concatenated
-/// raw; their lengths are fixed by the protocol, so no delimiter is needed.
+/// raw; their lengths are fixed by the protocol, so no delimiter is needed. The suite does not
+/// enter the derivation: both of Sendspin's suites use the same key with a different AEAD.
 pub fn k_wrap(label: &[u8], sid: &[u8], isk: &[u8; 64]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(label);
@@ -67,63 +77,73 @@ pub fn k_wrap(label: &[u8], sid: &[u8], isk: &[u8; 64]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Seals a 32-byte value under `K_wrap`, returning the 48-byte ciphertext and tag.
+/// Seals a 32-byte value under `K_wrap` with the AEAD of `suite`, returning ciphertext and tag.
 ///
 /// The nonce is twelve zero bytes and the associated data is empty, as the spec requires. A
 /// key is used for one value only, which is what makes the fixed nonce safe.
 ///
+/// # Errors
+///
+/// Fails when the build's cipher resolver has no AEAD for `suite`. That is the honest refusal:
+/// sealing under the other suite's cipher would produce a field the peer cannot open.
+///
 /// # Example
 ///
 /// ```
+/// use syncspin_core::noise::Suite;
 /// use syncspin_core::pairing::wrap::{unwrap, wrap};
 ///
 /// // The key comes from `k_wrap` in a real flow; any 32 bytes will do here.
 /// let key = [0x42; 32];
 /// let value = [0x24; 32];
-/// assert_eq!(unwrap(&key, &wrap(&key, &value)).expect("round trip"), value);
+/// let sealed = wrap(Suite::ChaChaPoly, &key, &value).expect("the cipher is available");
+/// assert_eq!(unwrap(Suite::ChaChaPoly, &key, &sealed).expect("round trip"), value);
 /// ```
-pub fn wrap(key: &[u8; 32], value: &[u8; 32]) -> [u8; SEALED_LEN] {
-    let mut sealed = [0u8; SEALED_LEN];
-    sealed[..VALUE_LEN].copy_from_slice(value);
+pub fn wrap(suite: Suite, key: &[u8; 32], value: &[u8; 32]) -> Result<[u8; SEALED_LEN]> {
+    let cipher = cipher(suite, key)?;
 
-    // In-place detached keeps the encryption allocation-free; the tag is appended by hand to
-    // match the spec's ciphertext-plus-tag field. A 32-byte value is far below the AEAD's
-    // maximum, so sealing cannot fail.
-    let tag = cipher(key)
-        .encrypt_in_place_detached(&nonce(), &[], &mut sealed[..VALUE_LEN])
-        .expect("ChaCha20-Poly1305 always seals a 32-byte value");
-    sealed[VALUE_LEN..].copy_from_slice(&tag);
-    sealed
+    // The AEAD appends its tag, so one buffer holds the whole field. A 32-byte value is far
+    // below the maximum, so sealing cannot fail.
+    let mut sealed = [0u8; SEALED_LEN];
+    let written = cipher.encrypt(WRAP_NONCE, &[], value, &mut sealed);
+    debug_assert_eq!(written, SEALED_LEN, "the AEAD appends a {TAG_LEN}-byte tag");
+    Ok(sealed)
 }
 
-/// Opens a 48-byte sealed value under `K_wrap`, returning the 32-byte value.
+/// Opens a 48-byte sealed value under `K_wrap` with the AEAD of `suite`, returning the value.
 ///
 /// # Errors
 ///
-/// Fails when the tag does not authenticate: a wrong key - a different label, `sid` or `ISK` -
-/// or any changed byte of the ciphertext or tag. The error names no key, value or seal bytes.
-pub fn unwrap(key: &[u8; 32], sealed: &[u8; SEALED_LEN]) -> Result<[u8; 32]> {
-    let mut value = [0u8; VALUE_LEN];
-    value.copy_from_slice(&sealed[..VALUE_LEN]);
-    let tag = Tag::from_slice(&sealed[VALUE_LEN..]);
+/// Fails when the tag does not authenticate: a wrong key - a different label, `sid` or `ISK` - a
+/// seal made under the other suite, or any changed byte of the ciphertext or tag. It also fails
+/// when the build's cipher resolver has no AEAD for `suite`. The error names no key, value or
+/// seal bytes.
+pub fn unwrap(suite: Suite, key: &[u8; 32], sealed: &[u8; SEALED_LEN]) -> Result<[u8; 32]> {
+    let cipher = cipher(suite, key)?;
 
-    cipher(key)
-        .decrypt_in_place_detached(&nonce(), &[], &mut value, tag)
+    let mut value = [0u8; VALUE_LEN];
+    cipher
+        .decrypt(WRAP_NONCE, &[], sealed, &mut value)
         .map_err(|_| anyhow!("the wrapped pairing value does not authenticate"))?;
     Ok(value)
 }
 
-/// Builds the cipher for `key`.
+/// Builds the suite's AEAD for `key`.
 ///
-/// `new_from_slice` only fails on a key of the wrong length, and `key` is exactly 32 bytes, so
-/// the failure is unreachable. The panic message carries no key material.
-fn cipher(key: &[u8; 32]) -> ChaCha20Poly1305 {
-    ChaCha20Poly1305::new_from_slice(key).expect("a ChaCha20-Poly1305 key is 32 bytes")
-}
-
-/// Returns the fixed wrapping nonce.
-fn nonce() -> Nonce {
-    Nonce::from(NONCE_BYTES)
+/// The resolver is `snow`'s default one, the same one the handshake uses, so a build that has a
+/// suite for Noise has it here as well. A missing cipher is an error and not a reason to seal
+/// under the other suite. The panic messages and error strings carry no key material: `set`
+/// cannot fail on a 32-byte key.
+fn cipher(suite: Suite, key: &[u8; 32]) -> Result<Box<dyn Cipher>> {
+    let choice = match suite {
+        Suite::ChaChaPoly => CipherChoice::ChaChaPoly,
+        Suite::AesGcm => CipherChoice::AESGCM,
+    };
+    let mut cipher = DefaultResolver.resolve_cipher(&choice).ok_or_else(|| {
+        anyhow!("the cipher suite `{suite}` is not available in this build, so it cannot seal")
+    })?;
+    cipher.set(key);
+    Ok(cipher)
 }
 
 #[cfg(test)]
@@ -142,10 +162,24 @@ mod tests {
 
     #[test]
     fn a_wrap_is_deterministic_for_one_key_and_value() {
-        // The nonce is fixed by the spec, so the same key and value must seal identically; if
-        // this ever changes, the peer derives a different ciphertext for the same field.
+        // The nonce is fixed by the spec, so the same key and value must seal identically under
+        // either suite; if this ever changes, the peer derives a different ciphertext for the
+        // same field.
         let key = [0x11; 32];
         let value = [0x22; 32];
-        assert_eq!(wrap(&key, &value), wrap(&key, &value));
+        for suite in Suite::ALL {
+            assert_eq!(
+                wrap(suite, &key, &value).expect("the cipher is available"),
+                wrap(suite, &key, &value).expect("the cipher is available")
+            );
+        }
+    }
+
+    #[test]
+    fn the_fixed_nonce_is_zero() {
+        // The wrapped field's nonce is the spec's twelve zero bytes, not the handshake's
+        // counter; a change here would still round-trip against this crate and fail against a
+        // real server.
+        assert_eq!(WRAP_NONCE, 0);
     }
 }

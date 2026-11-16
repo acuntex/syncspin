@@ -35,6 +35,8 @@ use syncspin_core::messages::{
 use syncspin_core::messages::{
     ClientPairAuth, ClientPairFinalize, ServerPairAuth, ServerPairConfirm, ServerPairInit,
 };
+#[cfg(feature = "pairing-code")]
+use syncspin_core::noise::Suite;
 use syncspin_core::noise::{
     psk_id_for, MAX_MESSAGE_LEN, NOISE_PARAMS, SENTINEL_PSK, SENTINEL_PSK_ID,
 };
@@ -1417,8 +1419,9 @@ async fn finish_pairing(
             .dynamic
             .wrapped_nonce_b
             .ok_or_else(|| anyhow!("client/pair-confirm carried no wrapped_nonce_B"))?;
+        // The fake server's initiator runs NOISE_PARAMS, so its wrapping uses that suite too.
         let nonce_key = wrap::k_wrap(wrap::NONCE_LABEL, &round.sid, &isk);
-        let nonce_b = wrap::unwrap(&nonce_key, &sealed_nonce)
+        let nonce_b = wrap::unwrap(Suite::ChaChaPoly, &nonce_key, &sealed_nonce)
             .context("wrapped_nonce_B does not open under the round's key")?;
         let committed = pake
             .dynamic
@@ -1450,7 +1453,7 @@ async fn finish_pairing(
     }
 
     let key = wrap::k_wrap(wrap::PSK_LABEL, &round.sid, &isk);
-    let long_term_psk = wrap::unwrap(&key, &sealed)?;
+    let long_term_psk = wrap::unwrap(Suite::ChaChaPoly, &key, &sealed)?;
     if long_term_psk == SENTINEL_PSK {
         bail!("the client delivered the published Sentinel key as a long-term PSK");
     }

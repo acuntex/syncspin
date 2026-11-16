@@ -15,13 +15,13 @@ include = ["src/**", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 [features]
 # Code-based Sendspin pairing: CPace over X25519 with SHA-512, and the AEAD that seals the
 # values crossing the wire under its output. Off by default so the default build stays free
-# of the PAKE and the extra cipher dependency.
-pairing-code = ["dep:elligator2", "dep:chacha20poly1305", "dep:hmac"]
+# of the PAKE and its extra dependencies. The AEADs themselves come from `snow`'s resolver,
+# which is already a dependency, so no cipher crate is named here.
+pairing-code = ["dep:elligator2", "dep:hmac"]
 
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
-chacha20poly1305 = { workspace = true, optional = true }
 elligator2 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }

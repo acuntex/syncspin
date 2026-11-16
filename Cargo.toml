@@ -17,10 +17,6 @@ categories = ["multimedia::audio", "network-programming"]
 [workspace.dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
-# The AEAD of the `25519_ChaChaPoly_SHA256` suite, used to wrap pairing payloads. `alloc` and
-# `getrandom` stay off: the wrap uses the detached in-place API, so it needs neither a heap
-# buffer nor a key generator.
-chacha20poly1305 = { version = "0.10.1", default-features = false }
 # Only the Elligator 2 map is needed for CPace; the default `keygen` feature would add
 # curve25519-dalek, rand_core and zeroize for a key generator this workspace does not use.
 elligator2 = { version = "0.1.0", default-features = false }

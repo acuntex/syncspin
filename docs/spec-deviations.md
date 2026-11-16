@@ -132,11 +132,13 @@ pairing window `ControlHandle::open_pairing_window` opens; the dynamic flow is g
 20-round limit and `ControlHandle::release_holdback`. The CPace layer is built here - `x25519-dalek`,
 `elligator2` for the `MCF` map, SHA-512 - because no crate was found that matched draft-21 with the
 spec's `MCF` and `sid` layout. It is pinned to the draft's vectors and the spec's `sid` construction.
-The wrapping uses ChaCha20-Poly1305, fixed in `syncspin-core::pairing::wrap`, which is correct for
-`25519_ChaChaPoly_SHA256`, the only suite this build negotiates; offering
-`25519_AESGCM_SHA256` would need the AEAD selected per connection instead. The specification
-publishes no test vectors for the dynamic code derivation: the tests pin a vector computed from the
-spec's formula and run the flow end to end against the fake server only.
+The wrapping takes the connection's cipher suite, so `25519_ChaChaPoly_SHA256` seals with
+ChaCha20-Poly1305 and `25519_AESGCM_SHA256` with AES-256-GCM, both through the resolver `snow`
+already brings. `syncspin-core` has both suites and refuses a name it does not have; the client in
+this workspace still announces `25519_ChaChaPoly_SHA256` in `client/init`, so AES-GCM is reachable
+from `syncspin-core` only until a client opts into it. The specification publishes no test vectors
+for the dynamic code derivation: the tests pin a vector computed from the spec's formula and run the
+flow end to end against the fake server only.
 
 **The CPace and wrapping layer has not had an external review.** That is the reason this entry still
 exists after both flows shipped.
@@ -147,9 +149,8 @@ Pairing PSK flow only; one that enables it accepts that the layer is new code wi
 no review.
 
 **Removing it:** get the layer reviewed externally. Then decide whether the feature becomes default:
-while it is not, a default build departs from the SHOULD by offering only the mandatory method. Select
-the AEAD from the negotiated suite when a second suite is offered, and add spec vectors for the
-dynamic derivation when they are published.
+while it is not, a default build departs from the SHOULD by offering only the mandatory method. Add
+spec vectors for the dynamic derivation when they are published.
 
 ## 5. `group/update` is not the state source
 
