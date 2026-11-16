@@ -1414,6 +1414,39 @@ fn reassembler_yields_a_message_only_on_the_last_fragment() {
 }
 
 #[test]
+fn a_fragment_may_fill_the_byte_cap_exactly() {
+    // The cap is a maximum, not an exclusive bound: a first fragment carrying exactly the cap is
+    // legal, and so is a continuation that brings a message to exactly the cap.
+    const CAP: usize = 4;
+
+    let mut reassembler = Reassembler::new(CAP);
+    let whole = vec![
+        BINARY_MESSAGE_ID_FRAGMENT,
+        FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST,
+        9,
+        1,
+        2,
+        3,
+        4,
+    ];
+    assert_eq!(
+        reassembler.push(&whole).unwrap(),
+        Some((9, vec![1, 2, 3, 4])),
+        "a first fragment of exactly the cap must be accepted"
+    );
+
+    let mut reassembler = Reassembler::new(CAP);
+    let first = vec![BINARY_MESSAGE_ID_FRAGMENT, FRAGMENT_FLAG_FIRST, 9, 1, 2];
+    assert_eq!(reassembler.push(&first).unwrap(), None);
+    let rest = vec![BINARY_MESSAGE_ID_FRAGMENT, FRAGMENT_FLAG_LAST, 3, 4];
+    assert_eq!(
+        reassembler.push(&rest).unwrap(),
+        Some((9, vec![1, 2, 3, 4])),
+        "a continuation that fills the cap exactly must be accepted"
+    );
+}
+
+#[test]
 fn reassembler_rejects_a_non_fragment_while_in_flight() {
     let payload = vec![0x22; 32];
     let frames = split_binary(4, &payload, 16);
