@@ -933,4 +933,127 @@ mod tests {
         config.path = "/".to_owned();
         assert!(config.validate().is_ok(), "the root path is absolute");
     }
+
+    #[test]
+    fn a_zero_pairing_timeout_is_rejected() {
+        let mut config = ServerConfig::new("a server", Identity::generate());
+        config.pairing_timeout = Duration::ZERO;
+        assert!(
+            config.validate().is_err(),
+            "an attempt with no deadline could never be cancelled"
+        );
+    }
+
+    /// A store that keeps nothing, for the configuration and handle `Debug` checks.
+    struct TestStore;
+
+    impl PairingStore for TestStore {
+        fn load_pairings(&self) -> Result<Vec<PairingRecord>> {
+            Ok(Vec::new())
+        }
+
+        fn store_pairing(&self, _record: PairingRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove_pairing(&self, _client_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A discovery backend that does nothing, for the configuration `Debug` check.
+    struct TestDiscovery;
+
+    impl Discovery for TestDiscovery {
+        fn advertise(&self, _record: ServiceAdvertisement) -> Result<()> {
+            Ok(())
+        }
+
+        fn withdraw(&self, _service_type: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn browse(&self, _service_type: &str) -> Result<Vec<DiscoveredClient>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn the_configuration_debug_redacts_the_store_and_the_discovery() {
+        let mut config = ServerConfig::new("a server", Identity::generate());
+        config.storage = Some(std::sync::Arc::new(TestStore));
+        config.discovery = Some(std::sync::Arc::new(TestDiscovery));
+
+        let text = format!("{config:?}");
+        assert!(text.contains("<host store>"), "got: {text}");
+        assert!(text.contains("<host discovery>"), "got: {text}");
+        assert!(!text.contains("TestStore"), "got: {text}");
+        assert!(!text.contains("TestDiscovery"), "got: {text}");
+
+        let bare = ServerConfig::new("a server", Identity::generate());
+        let text = format!("{bare:?}");
+        assert!(text.contains("storage: None"), "got: {text}");
+        assert!(text.contains("discovery: None"), "got: {text}");
+    }
+
+    async fn started() -> ServerHandle {
+        let mut config = ServerConfig::new("a server", Identity::generate());
+        config.bind = "127.0.0.1:0".parse().expect("a literal address parses");
+        Server::start(config)
+            .await
+            .expect("the listener starts on a loopback port")
+    }
+
+    #[tokio::test]
+    async fn the_handle_debug_reports_the_address_without_secrets() {
+        let server = started().await;
+        let text = format!("{server:?}");
+        assert!(text.contains("local_addr"), "got: {text}");
+        assert!(text.contains("stopped: false"), "got: {text}");
+        server.shutdown().await.expect("the listener shuts down");
+    }
+
+    #[tokio::test]
+    async fn the_event_stream_is_single_consumer() {
+        let mut server = started().await;
+        let _first = server.events();
+        let mut second = server.events();
+        assert!(
+            second.next().await.is_none(),
+            "the second stream has already ended"
+        );
+        server.shutdown().await.expect("the listener shuts down");
+    }
+
+    #[tokio::test]
+    async fn pairing_without_a_store_is_refused() {
+        let server = started().await;
+        let error = server
+            .pair("SP:any-token")
+            .await
+            .expect_err("a server without a store cannot pair anyone");
+        assert!(
+            format!("{error:#}").contains("no pairing store"),
+            "got: {error:#}"
+        );
+        server.shutdown().await.expect("the listener shuts down");
+    }
+
+    #[tokio::test]
+    async fn a_static_code_attempt_with_an_emission_format_is_refused() {
+        let server = started().await;
+        let error = server
+            .start_pairing(
+                "a-client",
+                PairingMethod::StaticCode,
+                Some(CodeFormat::Digits),
+            )
+            .await
+            .expect_err("the static flow carries no emission format");
+        assert!(
+            format!("{error:#}").contains("takes no emission format"),
+            "got: {error:#}"
+        );
+        server.shutdown().await.expect("the listener shuts down");
+    }
 }

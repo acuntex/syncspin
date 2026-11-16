@@ -1367,3 +1367,22 @@ async fn a_bad_client_key_confirmation_aborts_the_attempt() -> Result<()> {
     server.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn unpair_removes_the_record_of_a_client_without_a_live_connection() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let client_id = Identity::generate().public_base64();
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk: [0x5a; 32],
+    })?;
+
+    let (server, _port, _events) = start_with_config(config(store.clone())?).await?;
+    server.unpair(&client_id).await?;
+    assert!(
+        store.record_for(&client_id).is_none(),
+        "unpairing a client that is offline still removes its record"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
