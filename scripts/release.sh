@@ -107,6 +107,18 @@ if ! $dry_run; then
     printf 'edit those files, then run this script again\n' >&2
     exit 1
   fi
+
+  # Catching the previous version is not enough, and a series is not a version either.
+  # 0.3.0 shipped a README that still advertised `syncspin-client = "0.2"`: only `0.2.0`
+  # was checked, and `0.2` is not `0.2.0`. So the README that lands on every crates.io
+  # page (`readme.workspace = true`) must name this release in full - a series such as
+  # `0.3` would pass this check and then quietly outlive the patch releases under it.
+  if ! grep -qF "${version}" README.md; then
+    printf 'README.md does not name %s; the crates.io page would describe another release\n' \
+      "${version}" >&2
+    printf 'write the full version there, then run this script again\n' >&2
+    exit 1
+  fi
 fi
 
 # 4. Gates before the commit exists.
