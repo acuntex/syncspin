@@ -373,6 +373,12 @@ pub(crate) enum Ending {
     Closed,
     /// The server dropped this client's pairing record, so the client ended the connection.
     Unpaired,
+    /// The server wanted an unpaired session and this client does not admit one.
+    #[allow(dead_code)] // Constructed once the activation rules land (Task 4).
+    PairingRequired,
+    /// The server's activation is not allowed for the key that sealed this connection.
+    #[allow(dead_code)] // Constructed once the activation rules land (Task 4).
+    Unauthorized,
     /// The host closed the connection deliberately, after saying why.
     Shutdown,
     /// The attempt failed.
@@ -385,6 +391,14 @@ impl Ending {
         match self {
             Self::Closed => "the server closed the connection".to_owned(),
             Self::Unpaired => "the server dropped this client's pairing record".to_owned(),
+            Self::PairingRequired => {
+                "the server wanted an unpaired session and this client does not admit one"
+                    .to_owned()
+            }
+            Self::Unauthorized => {
+                "the server's activation is not allowed for the key that sealed this connection"
+                    .to_owned()
+            }
             Self::Shutdown => "the client closed the connection".to_owned(),
             Self::Failed(error) => format!("{error:#}"),
         }
@@ -2800,6 +2814,18 @@ mod tests {
     use super::*;
     #[cfg(feature = "pairing-code")]
     use crate::config::CodeOutChannel;
+
+    #[test]
+    fn a_refused_session_reports_why_it_refused() {
+        assert_eq!(
+            Ending::PairingRequired.reason(),
+            "the server wanted an unpaired session and this client does not admit one"
+        );
+        assert_eq!(
+            Ending::Unauthorized.reason(),
+            "the server's activation is not allowed for the key that sealed this connection"
+        );
+    }
 
     /// Builds a metadata payload with the Sentinel id and the given category.
     fn sentinel_metadata(category: &str) -> String {
