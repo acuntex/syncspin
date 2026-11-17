@@ -46,6 +46,7 @@ struct Recordings {
     opened: Arc<Mutex<Vec<AudioFormat>>>,
     written: Arc<Mutex<Vec<WrittenFrame>>>,
     flushes: Arc<Mutex<usize>>,
+    discards: Arc<Mutex<Vec<Instant>>>,
 }
 
 impl Recordings {
@@ -68,6 +69,14 @@ impl Recordings {
             .flushes
             .lock()
             .expect("the recordings lock is not poisoned")
+    }
+
+    /// The deadlines of every `discard_from`, in call order.
+    fn discards(&self) -> Vec<Instant> {
+        self.discards
+            .lock()
+            .expect("the recordings lock is not poisoned")
+            .clone()
     }
 }
 
@@ -104,9 +113,11 @@ struct RecordingSink {
     recordings: Recordings,
     fail_on_write: Option<usize>,
     fail_on_flush: Option<usize>,
+    fail_on_discard: Option<usize>,
     fail_on_open: bool,
     latency: Option<Duration>,
     writes: usize,
+    discards: usize,
     /// Flush call that holds the session until the gate is released.
     hold_flush: Option<usize>,
     gate: Option<FlushGate>,
@@ -118,9 +129,11 @@ impl RecordingSink {
             recordings,
             fail_on_write: None,
             fail_on_flush: None,
+            fail_on_discard: None,
             fail_on_open: false,
             latency: None,
             writes: 0,
+            discards: 0,
             hold_flush: None,
             gate: None,
         }
@@ -131,9 +144,11 @@ impl RecordingSink {
             recordings,
             fail_on_write: Some(write),
             fail_on_flush: None,
+            fail_on_discard: None,
             fail_on_open: false,
             latency: None,
             writes: 0,
+            discards: 0,
             hold_flush: None,
             gate: None,
         }
@@ -145,9 +160,11 @@ impl RecordingSink {
             recordings,
             fail_on_write: None,
             fail_on_flush: Some(flush),
+            fail_on_discard: None,
             fail_on_open: false,
             latency: None,
             writes: 0,
+            discards: 0,
             hold_flush: None,
             gate: None,
         }
@@ -159,9 +176,11 @@ impl RecordingSink {
             recordings,
             fail_on_write: None,
             fail_on_flush: None,
+            fail_on_discard: None,
             fail_on_open: true,
             latency: None,
             writes: 0,
+            discards: 0,
             hold_flush: None,
             gate: None,
         }
@@ -172,9 +191,11 @@ impl RecordingSink {
             recordings,
             fail_on_write: None,
             fail_on_flush: None,
+            fail_on_discard: None,
             fail_on_open: false,
             latency: Some(latency),
             writes: 0,
+            discards: 0,
             hold_flush: None,
             gate: None,
         }
@@ -185,11 +206,29 @@ impl RecordingSink {
             recordings,
             fail_on_write: None,
             fail_on_flush: None,
+            fail_on_discard: None,
             fail_on_open: false,
             latency: None,
             writes: 0,
+            discards: 0,
             hold_flush: Some(hold_flush),
             gate: Some(gate),
+        }
+    }
+
+    /// Creates a sink that fails the `discard`th `discard_from`, counting from one.
+    fn failing_discard_on(recordings: Recordings, discard: usize) -> RecordingSink {
+        RecordingSink {
+            recordings,
+            fail_on_write: None,
+            fail_on_flush: None,
+            fail_on_discard: Some(discard),
+            fail_on_open: false,
+            latency: None,
+            writes: 0,
+            discards: 0,
+            hold_flush: None,
+            gate: None,
         }
     }
 }
@@ -245,6 +284,22 @@ impl Sink for RecordingSink {
                 gate.wait();
             }
         }
+        Ok(())
+    }
+
+    fn discard_from(&mut self, due: Instant) -> Result<()> {
+        self.discards += 1;
+        if self.fail_on_discard == Some(self.discards) {
+            bail!(
+                "the recording sink was told to fail on discard {}",
+                self.discards
+            );
+        }
+        self.recordings
+            .discards
+            .lock()
+            .expect("the recordings lock is not poisoned")
+            .push(due);
         Ok(())
     }
 
@@ -406,6 +461,23 @@ async fn wait_for_flushes(recordings: &Recordings, count: usize) {
             Instant::now() < deadline,
             "timed out waiting for {count} sink flushes, saw {}",
             recordings.flushes()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Waits until the sink recorded `count` discards and returns their deadlines.
+async fn wait_for_discards(recordings: &Recordings, count: usize) -> Vec<Instant> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let discards = recordings.discards();
+        if discards.len() >= count {
+            return discards;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} sink discards, saw {}",
+            discards.len()
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -636,7 +708,7 @@ async fn a_bare_player_role_still_ends_the_stream() {
 }
 
 #[tokio::test]
-async fn a_stream_clear_carries_the_timestamp() {
+async fn a_clear_with_a_timestamp_discards_from_it_and_one_without_flushes() {
     let server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let (recordings, sink) = recording_sink();
     let (mut events, _handle) =
@@ -648,6 +720,8 @@ async fn a_stream_clear_carries_the_timestamp() {
         next_event(&mut events).await,
         Event::StreamStart { .. }
     ));
+    // `stream/start` flushed the previous (absent) stream once.
+    assert_eq!(recordings.flushes(), 1);
 
     let seek_position = now_us() - 1_000_000;
     server.stream_clear(Some(seek_position));
@@ -659,7 +733,12 @@ async fn a_stream_clear_carries_the_timestamp() {
         ),
         other => panic!("expected StreamClear, got {other:?}"),
     }
-    wait_for_flushes(&recordings, 2).await;
+    wait_for_discards(&recordings, 1).await;
+    assert_eq!(
+        recordings.flushes(),
+        1,
+        "a clear with a timestamp must discard, not flush"
+    );
 
     server.stream_clear(None);
     match next_event(&mut events).await {
@@ -669,7 +748,12 @@ async fn a_stream_clear_carries_the_timestamp() {
         ),
         other => panic!("expected StreamClear, got {other:?}"),
     }
-    wait_for_flushes(&recordings, 3).await;
+    wait_for_flushes(&recordings, 2).await;
+    assert_eq!(
+        recordings.discards().len(),
+        1,
+        "a clear without a timestamp must flush, not discard"
+    );
 }
 
 #[tokio::test]
@@ -720,7 +804,7 @@ async fn no_audio_is_written_after_stream_end() {
 }
 
 #[tokio::test]
-async fn stream_clear_flushes_the_sink() {
+async fn a_timestamped_clear_discards_and_keeps_the_stream_open() {
     let server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let (recordings, sink) = recording_sink();
     let (mut events, _handle) =
@@ -732,13 +816,123 @@ async fn stream_clear_flushes_the_sink() {
         next_event(&mut events).await,
         Event::StreamStart { .. }
     ));
+    let flushes_before = recordings.flushes();
     server.stream_clear(Some(now_us() - 1_000_000));
-    wait_for_flushes(&recordings, 2).await;
+    wait_for_discards(&recordings, 1).await;
+    assert_eq!(
+        recordings.flushes(),
+        flushes_before,
+        "a timestamped clear must not also flush what plays earlier"
+    );
 
     // A clear is a seek, not an end: the announced format stays open and later chunks still play.
     server.audio(now_us(), 0, vec![0x66; 64]);
     let written = wait_for_writes(&recordings, 1).await;
     assert_eq!(written[0].frame, Written::Pcm(vec![0x66; 64]));
+}
+
+#[tokio::test]
+async fn a_clear_with_a_timestamp_maps_the_deadline_once_the_clock_is_ready() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // The state report follows the first completed burst. The filter needs three measurements,
+    // so the client runs three bursts before the clock is ready; the server counts the replies,
+    // and the 24th is ordered before the clear below.
+    wait_for_client_state(&mut server).await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_time_replies(24))
+            .await
+            .expect("the fake server must answer the initial bursts"),
+        "the connection must stay open while the clock estimate forms"
+    );
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    server.stream_clear(Some(now_us() + 250_000));
+
+    let discards = wait_for_discards(&recordings, 1).await;
+    let due = discards[0];
+    let now = Instant::now();
+    assert!(
+        due > now + Duration::from_millis(100),
+        "the discard deadline {due:?} must be ahead of now {now:?}"
+    );
+    assert!(
+        due < now + Duration::from_millis(700),
+        "the discard deadline {due:?} must be near the announced timestamp"
+    );
+}
+
+#[tokio::test]
+async fn a_clear_before_the_clock_is_ready_discards_from_now() {
+    // With no `client/time` reply the filter has no estimate, so a future timestamp maps to now.
+    let options = ServerOptions {
+        answer_time_limit: Some(0),
+        ..ServerOptions::default()
+    };
+    let server = FakeServer::start(options).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_clear(Some(now_us() + 5_000_000));
+
+    let discards = wait_for_discards(&recordings, 1).await;
+    assert!(
+        discards[0] <= Instant::now(),
+        "without a clock estimate the discard deadline must be now, not a future instant"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_discard_ends_the_connection() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let recordings = Recordings::default();
+    let sink = Box::new(RecordingSink::failing_discard_on(recordings, 1));
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    server.stream_clear(Some(now_us()));
+
+    match next_event(&mut events).await {
+        Event::StreamClear { .. } => {}
+        other => panic!("the clear is reported before the discard, got {other:?}"),
+    }
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, retry_in } => {
+            assert!(
+                reason.contains("rejected a discard"),
+                "the reason must name the failed discard, got: {reason}"
+            );
+            assert_eq!(
+                retry_in,
+                Duration::ZERO,
+                "a broken sink is not retried, so no delay is recommended"
+            );
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(5), handle.finished())
+        .await
+        .expect("the session must not hang after a sink error");
+    assert!(
+        outcome.is_err(),
+        "a sink failure must be returned from the session task"
+    );
 }
 
 #[tokio::test]

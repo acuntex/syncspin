@@ -125,10 +125,10 @@ hardware rather than only the player name. A host that describes no device passe
 
 The stream lifecycle is visible on the event stream: `Event::StreamStart` announces a new format,
 `Event::StreamEnd` reports a pause or a removed player role, and `Event::StreamClear` reports a seek
-with its timestamp. The end and clear events arrive before the client flushes the sink, so a host can
-mute, stop or restart its output first; a reconnect flush produces no stream event. `Event::Track`
-carries the now-playing metadata with the position, the duration and the playback speed in per-mille,
-where `1000` is normal speed.
+with its timestamp. The end and clear events arrive before the client discards or flushes buffered
+audio, so a host can mute, stop or restart its output first; a reconnect flush produces no stream
+event. `Event::Track` carries the now-playing metadata with the position, the duration and the
+playback speed in per-mille, where `1000` is normal speed.
 
 ### The server
 
@@ -243,12 +243,13 @@ and the work that closes them in [docs/spec-deviations.md](docs/spec-deviations.
 ## Integrating a client
 
 A host supplies a [`Sink`](crates/syncspin-client/src/sink.rs): `open` for a new format, `write` for
-every chunk with the playout deadline the client computed, `flush` at each boundary the crate
-announces, and optionally `latency` and `underruns` so the client can hold its buffer and report
-timing. The crate owns the connection, the clock and the reconnect loop; the host owns the output
-device, the identity file and everything below the pipe. Pairing needs a
-[`Storage`](crates/syncspin-client/src/storage.rs) as well; without one the client offers no pairing
-method, and a host that already holds records can pass them to `connect_with_psks` instead.
+every chunk with the playout deadline the client computed, `discard_from` for a seek with a
+timestamp, `flush` at each boundary the crate announces, and optionally `latency` and `underruns` so
+the client can hold its buffer and report timing. The crate owns the connection, the clock and the
+reconnect loop; the host owns the output device, the identity file and everything below the pipe.
+Pairing needs a [`Storage`](crates/syncspin-client/src/storage.rs) as well; without one the client
+offers no pairing method, and a host that already holds records can pass them to `connect_with_psks`
+instead.
 
 ```rust
 let (handle, mut events) = Client::connect(config, Box::new(my_sink)).await?;

@@ -85,8 +85,8 @@
 //! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
 //! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
 //! [`Event::StreamClear`] for a seek, plus [`Event::Track`] for the now-playing metadata with its
-//! position, duration and playback speed. The end and clear events arrive before the sink is
-//! flushed, so the host can mute, stop or restart its output first.
+//! position, duration and playback speed. The end and clear events arrive before the client
+//! discards or flushes the buffered audio, so the host can mute, stop or restart its output first.
 //!
 //! The connection keeps running until the audio sink fails, which the host has to repair, or until
 //! the handle or the event stream is dropped.

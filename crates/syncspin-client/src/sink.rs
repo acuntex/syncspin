@@ -7,14 +7,14 @@
 //! A sink is moved into [`connect`](crate::connect) once and reused for every connection attempt
 //! the client makes, so a reconnect does not need the host to build another one. Calls are strictly
 //! ordered and come from the client's task: a flush and then [`Sink::open`] when a stream starts,
-//! [`Sink::write`] for every audio chunk, and a flush at each boundary listed on
-//! [`Sink::flush`]. A sink may block only as long as it takes to enqueue the frame: a write that
-//! never returns stalls the connection, because the trait is synchronous and the client has no
-//! second thread to read the socket.
+//! [`Sink::write`] for every audio chunk, and a discard or a flush at each boundary listed on
+//! [`Sink::discard_from`] and [`Sink::flush`]. A sink may block only as long as it takes to
+//! enqueue the frame: a write that never returns stalls the connection, because the trait is
+//! synchronous and the client has no second thread to read the socket.
 //!
-//! An error from [`Sink::open`], [`Sink::write`] or [`Sink::flush`] is fatal for the connection:
-//! the client reports it and stops instead of retrying a broken output, so the host has to build a
-//! new sink and call [`connect`](crate::connect) again.
+//! An error from [`Sink::open`], [`Sink::write`], [`Sink::discard_from`] or [`Sink::flush`] is
+//! fatal for the connection: the client reports it and stops instead of retrying a broken output,
+//! so the host has to build a new sink and call [`connect`](crate::connect) again.
 
 use std::fmt;
 use std::time::Duration;
@@ -150,8 +150,9 @@ pub trait Sink: Send + 'static {
     ///
     /// - on `stream/start`, after the previous stream and before [`Sink::open`] for the new one,
     /// - on `stream/end`, after [`Event::StreamEnd`](crate::Event::StreamEnd),
-    /// - on `stream/clear`, which seeks or restarts the stream without ending it, after
-    ///   [`Event::StreamClear`](crate::Event::StreamClear),
+    /// - on a `stream/clear` that carries no timestamp, after
+    ///   [`Event::StreamClear`](crate::Event::StreamClear); a clear that carries one is a
+    ///   [`Sink::discard_from`] instead,
     /// - when the server removes the `player@v1` role, after an
     ///   [`Event::StreamEnd`](crate::Event::StreamEnd) with
     ///   [`StreamEndReason::RoleRemoved`](crate::StreamEndReason::RoleRemoved), and
@@ -161,6 +162,25 @@ pub trait Sink: Send + 'static {
     /// It must succeed when no stream is open, so a sink can treat it as "discard everything, keep
     /// the output device". An error ends the connection.
     fn flush(&mut self) -> anyhow::Result<()>;
+
+    /// Drops the buffered audio that is due at or after `due`, keeping what plays earlier.
+    ///
+    /// Called on a `stream/clear` that carries a `from_timestamp`, after
+    /// [`Event::StreamClear`](crate::Event::StreamClear). `due` is the server timestamp mapped
+    /// through the client's clock estimate. It is [`std::time::Instant::now`] while no estimate is
+    /// ready, for a timestamp that already lies in the past, and when the mapping would overflow —
+    /// each of which drops everything buffered and matches [`Sink::flush`].
+    ///
+    /// It must succeed when no stream is open or no queue exists: an empty queue discards nothing.
+    /// A clear can arrive before `stream/start` or after `stream/end`, and the client does not
+    /// withhold it.
+    ///
+    /// The default drops everything, so a sink with no timestamped queue keeps the flush
+    /// behaviour without implementing this. An error ends the connection.
+    fn discard_from(&mut self, due: std::time::Instant) -> anyhow::Result<()> {
+        let _ = due;
+        self.flush()
+    }
 
     /// Reports the output delay the sink adds beyond the audio port.
     ///
@@ -180,7 +200,49 @@ pub trait Sink: Send + 'static {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::*;
+
+    /// A sink that implements only the required methods and counts its flushes.
+    struct FlushingSink {
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl Sink for FlushingSink {
+        fn open(&mut self, _format: AudioFormat) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn write(
+            &mut self,
+            _frame: AudioFrame<'_>,
+            _due: std::time::Instant,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> anyhow::Result<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_sink_without_its_own_discard_flushes_everything() {
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut sink = FlushingSink {
+            flushes: Arc::clone(&flushes),
+        };
+        sink.discard_from(std::time::Instant::now())
+            .expect("the default discard must flush");
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "a sink without its own discard must receive one flush"
+        );
+    }
 
     #[test]
     fn codec_names_roundtrip_through_the_wire_identifier() {

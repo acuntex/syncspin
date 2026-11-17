@@ -2099,18 +2099,22 @@ impl Session<'_> {
 
     /// Drops buffered audio without ending the stream.
     ///
-    /// The client holds no timestamped audio queue of its own - the sink does - so the only
-    /// granularity it can offer is a full flush: a clear with a `from_timestamp` also drops the
-    /// frames after it. The announced format stays open, because the spec lets the stream continue
-    /// and the chunks that follow a seek still belong to it.
+    /// A clear that carries a `from_timestamp` becomes a [`Sink::discard_from`]: the client maps
+    /// the server timestamp through its clock estimate and the sink drops only the audio due at or
+    /// after it. Without a timestamp the sink is flushed; while no estimate is ready the deadline
+    /// is now, which drops everything the sink buffered. The announced format stays open, because
+    /// the spec lets the stream continue and the chunks that follow a seek still belong to it.
     ///
-    /// The event goes out before the flush, so a host can restart its output and re-prime a
+    /// The event goes out before the sink call, so a host can restart its output and re-prime a
     /// decoder before the buffered audio is dropped.
     fn handle_stream_clear(&mut self, clear: StreamClear) -> Result<()> {
         self.emit(Event::StreamClear {
             from_timestamp: clear.from_timestamp,
         });
-        self.flush_sink()
+        match clear.from_timestamp {
+            Some(timestamp) => self.discard_sink(self.playout_deadline(timestamp)),
+            None => self.flush_sink(),
+        }
     }
 
     /// Flushes the sink, recording a failure the caller has to treat as fatal.
@@ -2120,6 +2124,18 @@ impl Session<'_> {
             Err(error) => {
                 self.sink_failed = true;
                 Err(error).context("the audio sink rejected a flush")
+            }
+        }
+    }
+
+    /// Discards the sink's audio due at or after `due`, recording a failure the caller has to
+    /// treat as fatal.
+    fn discard_sink(&mut self, due: Instant) -> Result<()> {
+        match self.sink.discard_from(due) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.sink_failed = true;
+                Err(error).context("the audio sink rejected a discard")
             }
         }
     }

@@ -136,6 +136,8 @@ pub trait Sink: Send + 'static {
     /// the time filter and `output_delay_ms`. The sink honours it and reports back.
     fn write(&mut self, frame: AudioFrame<'_>, due: Instant) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
+    /// Drops the audio due at or after `due`; the default flushes everything.
+    fn discard_from(&mut self, due: Instant) -> Result<()> { self.flush() }
     fn latency(&self) -> Option<Duration> { None }
     fn underruns(&self) -> u64 { 0 }
 }
@@ -145,7 +147,7 @@ pub enum Event {
     Disconnected { reason: String, retry_in: Duration },
     StreamStart { format: AudioFormat },
     StreamEnd { reason: StreamEndReason },     // End | RoleRemoved, before the sink flush
-    StreamClear { from_timestamp: Option<i64> }, // seek, before the sink flush
+    StreamClear { from_timestamp: Option<i64> }, // seek, before the sink discards or flushes
     Track { title: String, artist: String, album: Option<String>, duration: Option<Duration>,
             playback_speed: u32 },                            // per-mille, 1000 = normal
     State(PlaybackState),
