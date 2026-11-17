@@ -474,6 +474,37 @@ mod tests {
         let mut trailing = [0u8; 32];
         trailing[31] = 1;
         assert!(!is_all_zero(&trailing), "a non-zero last byte counts");
+
+        // A peer that repeats one non-zero byte is not the zero element either. Accumulating with
+        // XOR would cancel an even number of identical bytes and call this a low-order point.
+        assert!(
+            !is_all_zero(&[1u8; 32]),
+            "32 identical non-zero bytes are not zero"
+        );
+    }
+
+    #[test]
+    fn the_lexicographical_order_is_bytes_then_a_prefix() {
+        // §A.3.1 orders byte by byte, and only a proper prefix counts as smaller. Both sides of
+        // the comparison come from peers, so an equal pair must not be "larger" and a prefix must
+        // not win: that would break the symmetry the role assignment depends on.
+        assert!(
+            !lexicographically_larger(&[1, 2], &[1, 2]),
+            "equal slices are not larger"
+        );
+        assert!(
+            lexicographically_larger(&[1, 3], &[1, 2]),
+            "byte order decides"
+        );
+        assert!(!lexicographically_larger(&[1, 2], &[1, 3]));
+        assert!(
+            !lexicographically_larger(&[1, 2], &[1, 2, 0]),
+            "a proper prefix is smaller"
+        );
+        assert!(
+            lexicographically_larger(&[1, 2, 0], &[1, 2]),
+            "the longer slice is larger when the shorter one is its prefix"
+        );
     }
 
     #[test]
