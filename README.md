@@ -189,8 +189,12 @@ output. The CPace layer is unaudited — see [Status](#status).
 The server's side is symmetric. `ServerConfig::storage` is the host's `PairingStore`, keyed by
 `client_id`; the listener seals a client's first handshake with the record it holds. A client with no
 record is reported with `approved: false`, gets no roles and no audio, and stays that way until
-`ServerHandle::approve` or a completed pairing. `Event::PairingRequested` asks the operator for a
-code, `Event::Paired` reports the record, and `ServerHandle::unpair` removes it and disconnects.
+`ServerHandle::approve` or a completed pairing. A client that seals its handshake with the Sentinel
+key while the server holds its record is admitted unpaired, reported with
+`Event::CredentialMismatch`, and re-pairs. `Event::PairingRequested` asks the operator for a code,
+`Event::Paired` reports the record, and `ServerHandle::unpair` removes it and disconnects — except on
+a live connection that fell back to the Sentinel key over its record, where the call is refused
+until the record is gone.
 Approval lasts as long as the server process; it is not written to a store and a restart asks again.
 
 ## Discovery

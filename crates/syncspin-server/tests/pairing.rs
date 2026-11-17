@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -62,6 +63,57 @@ impl PairingStore for MemoryStore {
             .expect("the store lock is not poisoned")
             .retain(|record| record.client_id != client_id);
         Ok(())
+    }
+}
+
+/// An in-memory store that can be told to fail one of its operations.
+///
+/// The two flags are independent on purpose: a `fail_load` row exercises the lookup a mismatch
+/// refusal makes, a `fail_remove` row the removal the no-connection path performs. One flag for
+/// both could pass without ever reaching the removal.
+#[derive(Default)]
+struct FlakyStore {
+    inner: MemoryStore,
+    fail_load: AtomicBool,
+    fail_remove: AtomicBool,
+}
+
+impl FlakyStore {
+    fn set_fail_load(&self, fail: bool) {
+        self.fail_load.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_fail_remove(&self, fail: bool) {
+        self.fail_remove.store(fail, Ordering::SeqCst);
+    }
+
+    /// Reads the record straight from the inner store, bypassing the `fail_load` flag.
+    fn record_for(&self, client_id: &str) -> Option<PairingRecord> {
+        self.inner.record_for(client_id)
+    }
+
+    fn store_pairing(&self, record: PairingRecord) -> Result<()> {
+        PairingStore::store_pairing(&self.inner, record)
+    }
+}
+
+impl PairingStore for FlakyStore {
+    fn load_pairings(&self) -> Result<Vec<PairingRecord>> {
+        if self.fail_load.load(Ordering::SeqCst) {
+            bail!("the store cannot be read");
+        }
+        self.inner.load_pairings()
+    }
+
+    fn store_pairing(&self, record: PairingRecord) -> Result<()> {
+        self.inner.store_pairing(record)
+    }
+
+    fn remove_pairing(&self, client_id: &str) -> Result<()> {
+        if self.fail_remove.load(Ordering::SeqCst) {
+            bail!("the store cannot remove the record");
+        }
+        self.inner.remove_pairing(client_id)
     }
 }
 
@@ -123,14 +175,19 @@ impl Sink for NullSink {
     }
 }
 
-/// Builds one of the test servers, with a store and the pairing timeout tests can live with.
-fn config(store: std::sync::Arc<MemoryStore>) -> Result<ServerConfig> {
+/// Builds one of the test servers, over any store.
+fn config_with_store(store: std::sync::Arc<dyn PairingStore>) -> Result<ServerConfig> {
     Ok(ServerConfig {
         bind: "127.0.0.1:0".parse().expect("a literal address parses"),
         storage: Some(store),
         pairing_timeout: Duration::from_secs(5),
         ..ServerConfig::new(SERVER_NAME, Identity::generate())
     })
+}
+
+/// Builds one of the test servers, with a store and the pairing timeout tests can live with.
+fn config(store: std::sync::Arc<MemoryStore>) -> Result<ServerConfig> {
+    config_with_store(store)
 }
 
 /// Waits for the server event `want` selects, skipping the others.
@@ -141,6 +198,76 @@ async fn wait_for_event(events: &mut EventStream, mut want: impl FnMut(&Event) -
             return event;
         }
     }
+}
+
+/// Asserts that no `CredentialMismatch` arrives within `within`.
+///
+/// The events a connection without a mismatch legitimately sends - its empty activation, a
+/// pairing, the leave - are skipped, so [`expect_no_event`] cannot be used for this window: the
+/// question is whether the fallback fired, not whether anything happened.
+async fn expect_no_mismatch(events: &mut EventStream, within: Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, events.next()).await {
+            Err(_) => return,
+            Ok(None) => panic!("the event stream ended"),
+            Ok(Some(Event::CredentialMismatch { .. })) => {
+                panic!("a connection without a held record reported a credential mismatch")
+            }
+            Ok(Some(Event::ClientActivated { .. }))
+            | Ok(Some(Event::Paired { .. }))
+            | Ok(Some(Event::ClientLeft { .. })) => continue,
+            Ok(Some(other)) => panic!("expected no other event, got {other:?}"),
+        }
+    }
+}
+
+/// Connects a client that seals message 2 with the Sentinel key against a server holding a record
+/// for it, and asserts the admission that fallback produces.
+///
+/// The record is not announced, so the client still sees `lt` on message 1; only the key that
+/// sealed the handshake differs. Roles and activities stay empty, `ClientConnected` reports the
+/// connection unapproved, and the `CredentialMismatch` follows.
+async fn connect_without_its_record(
+    port: u16,
+    identity: Identity,
+    suite: Suite,
+    events: &mut EventStream,
+) -> Result<FakeClient> {
+    let client_id = identity.public_base64();
+    let mut client = FakeClient::connect(port).await?;
+    client.identity = identity;
+    let (mut responder, category) = client.begin_handshake_any(suite).await?;
+    assert_eq!(category, "lt", "the server announces its record");
+    responder.set_psk(&SENTINEL_PSK)?;
+    client.finish_handshake(responder).await?;
+
+    let activate = client.activate().await?;
+    assert!(
+        activate.active_roles.unwrap_or_default().is_empty(),
+        "a client that could not use its record gets no roles"
+    );
+    assert!(
+        activate.activities.is_empty(),
+        "a client that could not use its record gets no activity"
+    );
+    assert!(
+        matches!(
+            next_event(events).await,
+            Event::ClientConnected {
+                approved: false,
+                ..
+            }
+        ),
+        "the mismatched connection is reported unapproved"
+    );
+    assert_eq!(
+        next_event(events).await,
+        Event::CredentialMismatch { client_id },
+        "the mismatch is reported after the connection"
+    );
+    Ok(client)
 }
 
 /// Waits for the next client event, failing the test if none arrives.
@@ -267,6 +394,103 @@ async fn a_token_pairs_a_real_client_and_its_next_connection_authenticates() -> 
     }
 
     second.close(GoodbyeReason::Shutdown);
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_real_client_that_lost_its_record_connects_and_can_pair() -> Result<()> {
+    // The server still holds a record for the client; the client has none. The mismatch is what the
+    // real client reports, and the token it can still show is the way back: pairing replaces the
+    // record and promotes the live connection to it.
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    let lost_psk = [0x71; 32];
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk: lost_psk,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let client_store = std::sync::Arc::new(ClientStore::default());
+    let (mut handle, mut client_events) = real_client(port, identity, client_store.clone()).await?;
+
+    // An empty client store cannot use the announced record, so it falls back to the Sentinel key
+    // and the server admits it as a guest: unapproved, then the mismatch that is the operator's cue.
+    assert!(
+        matches!(
+            next_event(&mut events).await,
+            Event::ClientConnected {
+                approved: false,
+                ..
+            }
+        ),
+        "the record did not seal the handshake, so the connection is unapproved"
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::CredentialMismatch {
+            client_id: client_id.clone()
+        },
+        "the server reports the record it holds but the client could not use"
+    );
+
+    // The event is actionable: the token flow reaches the registered session without a reconnect.
+    let token = handle
+        .control()
+        .pairing_token()
+        .expect("a client with a store shows its token");
+    tokio::time::timeout(TIMEOUT, server.pair(&token))
+        .await
+        .context("the token flow did not finish")??;
+
+    loop {
+        match next_client_event(&mut client_events).await {
+            ClientEvent::Paired { .. } => break,
+            ClientEvent::Disconnected { reason, .. } => bail!("the client disconnected: {reason}"),
+            _ => continue,
+        }
+    }
+    let replaced = store
+        .record_for(&client_id)
+        .expect("the pairing stored a record for the client");
+    assert_ne!(
+        replaced.psk, lost_psk,
+        "the pairing replaced the record the client had lost"
+    );
+    let client_records = client_store
+        .records
+        .lock()
+        .expect("the store lock is not poisoned")
+        .clone();
+    assert_eq!(client_records.len(), 1, "the client stored its record");
+    assert_eq!(
+        client_records[0].psk, replaced.psk,
+        "both sides agree on the key"
+    );
+
+    // The promotion activated the recovered session, and the mismatch is over for this connection.
+    loop {
+        match next_event(&mut events).await {
+            Event::ClientActivated { roles, .. } if roles.contains(&"player@v1".to_owned()) => {
+                break
+            }
+            Event::CredentialMismatch { .. } => {
+                panic!("the re-paired connection reported a second credential mismatch")
+            }
+            _ => continue,
+        }
+    }
+    expect_no_mismatch(&mut events, Duration::from_millis(200)).await;
+
+    handle.close(GoodbyeReason::Shutdown);
+    drop(client_events);
+    drop(handle);
+    wait_for_event(&mut events, |event| {
+        matches!(event, Event::ClientLeft { .. })
+    })
+    .await;
     server.shutdown().await?;
     Ok(())
 }
@@ -506,12 +730,10 @@ async fn unpair_removes_the_record_and_disconnects() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_client_that_cannot_use_its_record_is_refused() -> Result<()> {
-    // `docs/spec-deviations.md`, "The server does not try the Sentinel key after a record fails":
-    // the server announces the record it holds and refuses a
-    // message that does not authenticate under it. It cannot retry the same message with the
-    // Sentinel key, so a client that lost its record does not get an unpaired session from this
-    // server; the record stays, and re-pairing is the way back.
+async fn a_client_that_cannot_use_its_record_is_admitted_unpaired() -> Result<()> {
+    // A record the client cannot use no longer refuses it: the server retries message 2 under the
+    // Sentinel key, admits the connection without roles, and reports the mismatch. The record is
+    // untouched, so re-pairing remains the way back.
     let store = std::sync::Arc::new(MemoryStore::default());
     let identity = Identity::generate();
     let client_id = identity.public_base64();
@@ -522,15 +744,97 @@ async fn a_client_that_cannot_use_its_record_is_refused() -> Result<()> {
     })?;
 
     let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let mut client =
+        connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the admission must not touch the record"
+    );
+
+    // The session stays open: a client the server admitted unpaired may still leave cleanly.
+    client.goodbye("done").await?;
+    assert_eq!(
+        wait_for_event(&mut events, |event| matches!(
+            event,
+            Event::ClientLeft { .. }
+        ))
+        .await,
+        Event::ClientLeft {
+            reason: "done".to_owned(),
+        }
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sentinel_valued_record_is_treated_as_absent() -> Result<()> {
+    // The Sentinel key is published, so a record holding it is not a credential: the lookup skips
+    // it and the row stays in the store, because removing a record is the host's business.
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk: SENTINEL_PSK,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.identity = identity;
+    let (mut responder, category) = client.begin_handshake_any(Suite::ChaChaPoly).await?;
+    assert_eq!(
+        category, "sn",
+        "a record holding the Sentinel key is not announced"
+    );
+    responder.set_psk(&SENTINEL_PSK)?;
+    client.finish_handshake(responder).await?;
+
+    let activate = client.activate().await?;
+    assert!(activate.active_roles.unwrap_or_default().is_empty());
+    assert!(activate.activities.is_empty());
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected {
+            approved: false,
+            ..
+        }
+    ));
+    expect_no_mismatch(&mut events, Duration::from_millis(200)).await;
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(SENTINEL_PSK),
+        "the row is treated as absent, not deleted"
+    );
+
+    client.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_record_that_does_not_authenticate_under_either_key_closes() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    let psk = [0x66; 32];
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
     let mut client = FakeClient::connect(port).await?;
     client.identity = identity;
     let (mut responder, category) = client.begin_handshake_any(Suite::ChaChaPoly).await?;
     assert_eq!(category, "lt", "the server announces its record");
-    responder.set_psk(&SENTINEL_PSK)?;
+    responder.set_psk(&[0x99; 32])?;
     let outcome = client.finish_handshake(responder).await;
     assert!(
         outcome.is_err(),
-        "a message sealed with the Sentinel key must not be accepted"
+        "a message under neither the record's nor the Sentinel key must not be accepted"
     );
     client.expect_closed().await?;
     expect_no_event(&mut events, Duration::from_millis(200)).await;
@@ -538,6 +842,615 @@ async fn a_client_that_cannot_use_its_record_is_refused() -> Result<()> {
         store.record_for(&client_id).map(|record| record.psk),
         Some(psk),
         "a failed handshake must not touch the record"
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fallback_over_aes_gcm_behaves_identically() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    let psk = [0x11; 32];
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let mut client = connect_without_its_record(port, identity, Suite::AesGcm, &mut events).await?;
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the suite changes nothing about the record"
+    );
+
+    client.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lingering_approval_does_not_give_a_mismatched_session_roles() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk: [0x22; 32],
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    // No connection is live, so the approval is only remembered for the next one.
+    server.approve(&client_id).await?;
+    let mut client =
+        connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+
+    client.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_next_connection_repeats_the_mismatch() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    let psk = [0x44; 32];
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    for _ in 0..2 {
+        let mut client =
+            connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+        client.goodbye("done").await?;
+        wait_for_event(&mut events, |event| {
+            matches!(event, Event::ClientLeft { .. })
+        })
+        .await;
+    }
+
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "neither connection touched the record"
+    );
+    assert!(
+        server.revoke_approval(&client_id).await.is_err(),
+        "the mismatch never stored an approval"
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_record_for_another_client_does_not_trigger_the_fallback() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let other = Identity::generate();
+    let other_id = other.public_base64();
+    let other_psk = [0x33; 32];
+    store.store_pairing(PairingRecord {
+        client_id: other_id.clone(),
+        psk: other_psk,
+    })?;
+
+    let identity = Identity::generate();
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.identity = identity;
+    let (mut responder, category) = client.begin_handshake_any(Suite::ChaChaPoly).await?;
+    assert_eq!(
+        category, "sn",
+        "a record of another client does not leak into this handshake"
+    );
+    responder.set_psk(&SENTINEL_PSK)?;
+    client.finish_handshake(responder).await?;
+
+    let activate = client.activate().await?;
+    assert!(activate.active_roles.unwrap_or_default().is_empty());
+    assert!(activate.activities.is_empty());
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected {
+            approved: false,
+            ..
+        }
+    ));
+    // The lookup missed, so no retry was attempted and there is nothing to report as a mismatch.
+    expect_no_mismatch(&mut events, Duration::from_millis(200)).await;
+    assert_eq!(
+        store.record_for(&other_id).map(|record| record.psk),
+        Some(other_psk),
+        "the other client's record is untouched"
+    );
+
+    client.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The host commands on a mismatched session
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn approving_a_mismatched_session_is_refused_and_stores_nothing() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    let psk = [0x21; 32];
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let mut client =
+        connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+
+    let error = server
+        .approve(&client_id)
+        .await
+        .expect_err("an approval is refused while the record exists");
+    assert!(
+        format!("{error:#}").contains("mismatch"),
+        "the error names the mismatch: {error:#}"
+    );
+    assert!(
+        server.revoke_approval(&client_id).await.is_err(),
+        "the refused approval must not be remembered"
+    );
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the refusal leaves the record alone"
+    );
+
+    // The same client reconnects after the operator removed the record: the refused call left no
+    // approval behind, so the next connection is reported unapproved.
+    store.remove_pairing(&client_id)?;
+    client.goodbye("done").await?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, Event::ClientLeft { .. })
+    })
+    .await;
+
+    let mut second = FakeClient::connect(port).await?;
+    second.identity = identity;
+    second.handshake(Suite::ChaChaPoly).await?;
+    second.activate().await?;
+    assert_eq!(
+        wait_for_event(&mut events, |event| matches!(
+            event,
+            Event::ClientConnected { .. }
+        ))
+        .await,
+        Event::ClientConnected {
+            client_id,
+            name: CLIENT_NAME.to_owned(),
+            approved: false,
+        },
+        "the refused approval stored nothing for the next connection"
+    );
+
+    second.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lingering_approval_still_refuses_approve() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    let psk = [0x22; 32];
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    // No connection is live, so this approval is only remembered for the next one.
+    server.approve(&client_id).await?;
+    let mut client =
+        connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+
+    // The mismatch check precedes the already-approved short-circuit: the lingering approval
+    // changes neither the answer nor the state.
+    let error = server
+        .approve(&client_id)
+        .await
+        .expect_err("a lingering approval does not let a mismatched session be approved");
+    assert!(
+        format!("{error:#}").contains("mismatch"),
+        "the error names the mismatch: {error:#}"
+    );
+
+    server.revoke_approval(&client_id).await?;
+    let activate = client
+        .read_activate(|activities| activities.is_empty())
+        .await?;
+    assert!(
+        activate.active_roles.unwrap_or_default().is_empty(),
+        "the session still holds no roles after the refusal"
+    );
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the refusal leaves the record alone"
+    );
+
+    client.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn removing_the_record_then_approving_recovers_the_live_session() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk: [0x23; 32],
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let mut client =
+        connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+
+    // The prohibition's precondition is gone once the store no longer holds the record.
+    store.remove_pairing(&client_id)?;
+    server.approve(&client_id).await?;
+    let activate = client
+        .read_activate(|activities| activities.is_empty())
+        .await?;
+    assert!(
+        activate
+            .active_roles
+            .unwrap_or_default()
+            .contains(&"player@v1".to_owned()),
+        "the recovered session is activated with its roles"
+    );
+
+    // The recovery cleared the flag, so the connection does not report the mismatch again.
+    expect_no_mismatch(&mut events, Duration::from_millis(200)).await;
+
+    client.goodbye("done").await?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, Event::ClientLeft { .. })
+    })
+    .await;
+
+    // The handle recorded the approval only after the session confirmed the activation.
+    let mut second = FakeClient::connect(port).await?;
+    second.identity = identity;
+    second.handshake(Suite::ChaChaPoly).await?;
+    second.activate().await?;
+    let connected = wait_for_event(&mut events, |event| {
+        matches!(event, Event::ClientConnected { .. })
+    })
+    .await;
+    assert!(
+        matches!(connected, Event::ClientConnected { approved: true, .. }),
+        "the next connection reports the recovered approval: {connected:?}"
+    );
+
+    second.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unpairing_a_mismatched_session_keeps_the_record_and_the_approval() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    let psk = [0x24; 32];
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    server.approve(&client_id).await?;
+    let mut client =
+        connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+
+    let error = server
+        .unpair(&client_id)
+        .await
+        .expect_err("an unpair is refused while the record exists");
+    assert!(
+        format!("{error:#}").contains("mismatch"),
+        "the error names the mismatch: {error:#}"
+    );
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the refused unpair leaves the record alone"
+    );
+
+    // The refusal touched neither the registry nor the connection: the approval is still there to
+    // be revoked, and the revocation reaches the session.
+    server.revoke_approval(&client_id).await?;
+    let activate = client
+        .read_activate(|activities| activities.is_empty())
+        .await?;
+    assert!(activate.active_roles.unwrap_or_default().is_empty());
+
+    client.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn removing_the_record_then_unpairing_disconnects() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk: [0x25; 32],
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let mut client =
+        connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+
+    // The removal is already done by the store, so the unpair only has to end the connection.
+    store.remove_pairing(&client_id)?;
+    server.unpair(&client_id).await?;
+    let message = client
+        .read_until(|message| match message {
+            Incoming::ServerUnpair(_) => Some(()),
+            _ => None,
+        })
+        .await;
+    assert!(message.is_ok(), "the client is told the record is gone");
+    client.expect_closed().await?;
+    assert_eq!(
+        wait_for_event(&mut events, |event| matches!(
+            event,
+            Event::ClientLeft { .. }
+        ))
+        .await,
+        Event::ClientLeft {
+            reason: "unpaired".to_owned(),
+        }
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_event_is_actionable_before_the_session_loop() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk: [0x26; 32],
+    })?;
+
+    let (server, port, mut events) = start_with_config(config(store.clone())?).await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.identity = identity;
+    let (mut responder, category) = client.begin_handshake_any(Suite::ChaChaPoly).await?;
+    assert_eq!(category, "lt", "the server announces its record");
+    responder.set_psk(&SENTINEL_PSK)?;
+    client.finish_handshake(responder).await?;
+    // The host reacts to the events, not to the activation: `client/hello` is sent, and the two
+    // events are read before anything else.
+    client.send_json(&client_hello()).await?;
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected {
+            approved: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::CredentialMismatch {
+            client_id: client_id.clone()
+        },
+        "the mismatch follows the connection"
+    );
+
+    // The session registered before the event went out, so the handle reaches it and the refusal
+    // is the mismatch one; "no live connection" would mean the event arrived too early to act on.
+    let error = server
+        .approve(&client_id)
+        .await
+        .expect_err("the mismatched session is refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("mismatch"),
+        "the error names the mismatch: {message}"
+    );
+    assert!(
+        !message.contains("no live connection"),
+        "the event is actionable: {message}"
+    );
+
+    client.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failing_store_leaves_approve_and_unpair_untouched() -> Result<()> {
+    let store = std::sync::Arc::new(FlakyStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    let psk = [0x27; 32];
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config_with_store(store.clone())?).await?;
+    let mut client =
+        connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+
+    // A store that cannot be read is the error of the call, and nothing else changes.
+    store.set_fail_load(true);
+    let error = server
+        .approve(&client_id)
+        .await
+        .expect_err("a store read failure refuses the approval");
+    assert!(
+        format!("{error:#}").contains("cannot be read"),
+        "the store error is reported: {error:#}"
+    );
+    let error = server
+        .unpair(&client_id)
+        .await
+        .expect_err("a store read failure refuses the unpair");
+    assert!(
+        format!("{error:#}").contains("cannot be read"),
+        "the store error is reported: {error:#}"
+    );
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the failed calls leave the record alone"
+    );
+    assert!(
+        server.revoke_approval(&client_id).await.is_err(),
+        "the failed approvals stored nothing"
+    );
+
+    // The second call fails the same way: the first did not activate the session, so there is no
+    // already-approved short-circuit to answer `Ok`.
+    let error = server
+        .approve(&client_id)
+        .await
+        .expect_err("a store read failure still refuses the second approval");
+    assert!(
+        format!("{error:#}").contains("cannot be read"),
+        "the store error is reported again: {error:#}"
+    );
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the record is untouched by either call"
+    );
+
+    client.goodbye("done").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unpair_without_a_live_connection_and_a_failing_store_keeps_the_record() -> Result<()> {
+    let store = std::sync::Arc::new(FlakyStore::default());
+    let identity = Identity::generate();
+    let client_id = identity.public_base64();
+    let psk = [0x28; 32];
+    store.store_pairing(PairingRecord {
+        client_id: client_id.clone(),
+        psk,
+    })?;
+
+    let (server, port, mut events) = start_with_config(config_with_store(store.clone())?).await?;
+    let mut client =
+        connect_without_its_record(port, identity, Suite::ChaChaPoly, &mut events).await?;
+    client.goodbye("done").await?;
+    wait_for_event(&mut events, |event| {
+        matches!(event, Event::ClientLeft { .. })
+    })
+    .await;
+
+    // Only the removal fails, so the lookup a live session still makes is unaffected: until the
+    // registration is gone the mismatch refusal fires, and once it is gone the direct path reaches
+    // `remove_pairing` and fails there.
+    store.set_fail_remove(true);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let error = loop {
+        let error = server
+            .unpair(&client_id)
+            .await
+            .expect_err("the record cannot be removed while the store fails");
+        let message = format!("{error:#}");
+        if message.contains("cannot remove") {
+            break message;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the direct path was not reached within 1 s; last error: {message}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        error.contains("cannot remove"),
+        "the error comes from the store: {error}"
+    );
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the failed removal leaves the record alone"
+    );
+
+    store.set_fail_remove(false);
+    server.unpair(&client_id).await?;
+    assert!(
+        store.record_for(&client_id).is_none(),
+        "the retry removes the record"
+    );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unpaired_access_disabled_client_stays_connected_and_idle() -> Result<()> {
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let (server, port, mut events) = start_with_config(config(store)?).await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.handshake(Suite::ChaChaPoly).await?;
+
+    let Incoming::ClientHello(mut hello) = client_hello() else {
+        panic!("the helper builds a client/hello");
+    };
+    hello.unpaired_access.enabled = false;
+    let activate = client.activate_with(Incoming::ClientHello(hello)).await?;
+    assert!(activate.active_roles.unwrap_or_default().is_empty());
+    assert!(activate.activities.is_empty());
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected {
+            approved: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { roles, .. } if roles.is_empty()
+    ));
+    // The server sends no activation this client would have to reject.
+    expect_no_event(&mut events, Duration::from_millis(200)).await;
+
+    // The connection stays usable: a state report is accepted before a clean goodbye.
+    client.send_json(&player_state(true, 100, false)).await?;
+    client.goodbye("idle").await?;
+    assert_eq!(
+        wait_for_event(&mut events, |event| matches!(
+            event,
+            Event::ClientLeft { .. }
+        ))
+        .await,
+        Event::ClientLeft {
+            reason: "idle".to_owned(),
+        }
     );
 
     server.shutdown().await?;
@@ -685,6 +1598,53 @@ async fn accept_rehandshake(
     });
     client.send_json(&message_2).await?;
     client.noise = Some(responder.into_transport()?);
+    Ok(())
+}
+
+/// Reads the promotion's `noise/handshake` and answers message 2 under `sealed_with`.
+///
+/// The announcement is checked first: the server promotes the connection to `announced`, under the
+/// long-term category. The caller then sees what the server does with a message 2 that does not
+/// authenticate against that key: the re-handshake has no Sentinel fallback, so the connection ends.
+#[cfg(feature = "pairing-code")]
+async fn reject_rehandshake(
+    client: &mut FakeClient,
+    server_public: [u8; 32],
+    announced: [u8; 32],
+    sealed_with: &[u8; 32],
+) -> Result<()> {
+    let previous = *client
+        .noise
+        .as_ref()
+        .expect("the handshake finished before a re-handshake")
+        .handshake_hash();
+    let suite = client
+        .noise
+        .as_ref()
+        .expect("the handshake finished before a re-handshake")
+        .suite();
+    let handshake = client
+        .read_until(|message| match message {
+            Incoming::NoiseHandshake(handshake) => Some(handshake),
+            _ => None,
+        })
+        .await?;
+    let message_1 = URL_SAFE_NO_PAD.decode(&handshake.data)?;
+    let mut responder =
+        Responder::with_peer_suite(&client.identity, &server_public, suite, &previous)?;
+    let metadata = responder.read_message(&message_1)?;
+    let announcement: serde_json::Value = serde_json::from_slice(&metadata)?;
+    assert_eq!(
+        announcement["psk_id"].as_str(),
+        Some(psk_id_for(&announced).as_str()),
+        "the server promotes the connection to the record it stored"
+    );
+    assert_eq!(announcement["psk_category"].as_str(), Some("lt"));
+    responder.set_psk(sealed_with)?;
+    let message_2 = Incoming::NoiseHandshake(NoiseHandshake {
+        data: URL_SAFE_NO_PAD.encode(responder.write_message()?),
+    });
+    client.send_json(&message_2).await?;
     Ok(())
 }
 
@@ -868,6 +1828,121 @@ async fn the_static_code_flow_stores_a_record_and_promotes_the_connection() -> R
     assert_eq!(paired, Event::Paired { client_id });
 
     let _ = client.goodbye("shutdown").await;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(feature = "pairing-code")]
+#[tokio::test]
+async fn a_rehandshake_miss_does_not_fall_back_to_the_sentinel() -> Result<()> {
+    // The promotion's re-handshake has no fallback: a client that answers message 2 under a key
+    // other than the announced record ends the connection, even though the record was already
+    // stored. The Sentinel key is the sharpest choice - it is the only wrong key a fallback-aware
+    // read would accept, so a listener that used `read_message_with_sentinel` here would promote
+    // the connection instead of closing it.
+    let store = std::sync::Arc::new(MemoryStore::default());
+    let server_identity = Identity::generate();
+    let (server, port, mut events) = start_with_config(ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("a literal address parses"),
+        storage: Some(store.clone()),
+        pairing_timeout: Duration::from_secs(5),
+        ..ServerConfig::new(SERVER_NAME, server_identity)
+    })
+    .await?;
+    let mut client = FakeClient::connect(port).await?;
+    let client_id = client.identity.public_base64();
+    client.handshake(Suite::ChaChaPoly).await?;
+    client
+        .activate_with(hello_with_pairing(PairingMethod::StaticCode, None))
+        .await?;
+    server.approve(&client_id).await?;
+    client.read_activate(|_| true).await?;
+
+    server
+        .start_pairing(&client_id, PairingMethod::StaticCode, None)
+        .await?;
+    let activation = read_pairing_activation(&mut client).await?;
+    assert_eq!(activation.method, "static_pairing_code");
+    assert_eq!(activation.format, None);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientActivated { .. }
+    ));
+    assert_eq!(
+        next_event(&mut events).await,
+        Event::PairingRequested {
+            client_id: client_id.clone(),
+            method: PairingMethod::StaticCode,
+            code: None,
+        },
+        "the host is asked for the code the device carries"
+    );
+
+    let code = "12345678";
+    let handshake_hash = *client
+        .noise
+        .as_ref()
+        .expect("the handshake finished")
+        .handshake_hash();
+    client
+        .send_json(&Incoming::ClientPairInit(ClientPairInit {
+            pairing_index: 1,
+            commit_b: None,
+        }))
+        .await?;
+    let psk = [0x31; 32];
+    server.submit_code(&client_id, "1234-5678").await?;
+    let ya = read_server_auth(&mut client).await?;
+    let round = answer_auth(code.as_bytes(), &handshake_hash, 1, 1, &ya, psk, None)?;
+    client
+        .send_json(&Incoming::ClientPairAuth(ClientPairAuth {
+            pake_msg_2: URL_SAFE_NO_PAD.encode(round.share),
+        }))
+        .await?;
+    read_server_confirm(&mut client, &round.expected_server_tag).await?;
+    client
+        .send_json(&Incoming::ClientPairConfirm(ClientPairConfirm {
+            client_kc: URL_SAFE_NO_PAD.encode(round.client_tag),
+            wrapped_nonce_b: None,
+        }))
+        .await?;
+    client
+        .send_json(&Incoming::ClientPairFinalize(ClientPairFinalize {
+            long_term_psk: None,
+            wrapped_psk: Some(URL_SAFE_NO_PAD.encode(round.wrapped_psk)),
+        }))
+        .await?;
+    client
+        .read_pairing(|message| match message {
+            Incoming::ServerPairFinalize(_) => Some(()),
+            _ => None,
+        })
+        .await?;
+
+    // The record is stored before the re-handshake, so a miss must leave it in place.
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "the server stored the record before it promoted the connection"
+    );
+    reject_rehandshake(&mut client, server_identity.public, psk, &SENTINEL_PSK).await?;
+    client.expect_closed().await?;
+    assert_eq!(
+        store.record_for(&client_id).map(|record| record.psk),
+        Some(psk),
+        "a failed promotion must not remove the record it stored"
+    );
+    // No fallback: the miss produces neither a Sentinel session nor a second mismatch report.
+    expect_no_mismatch(&mut events, Duration::from_millis(200)).await;
+
     server.shutdown().await?;
     Ok(())
 }

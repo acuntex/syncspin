@@ -9,10 +9,11 @@
 //!
 //! The PSK of the first handshake is chosen from the client's `client_id`: a record the host's
 //! [`PairingStore`](crate::PairingStore) holds seals a paired connection, and the published
-//! Sentinel key seals every other one. A client that cannot use the announced record fails the
-//! handshake and is refused: the server cannot try the Sentinel key on the same message, because
-//! `snow` exposes no way to clone a half-finished handshake state (`docs/spec-deviations.md`,
-//! "The server does not try the Sentinel key after a record fails").
+//! Sentinel key seals every other one. A client that holds no usable record seals message 2 with
+//! the Sentinel key; when the announced record did not seal it, the server retries the same message
+//! under the Sentinel key ([`Initiator::read_message_with_sentinel`]). If that authenticates, the
+//! connection is admitted without roles and the mismatch is reported: the client does not hold the
+//! record, and the record stays where it is until the operator replaces it.
 //!
 //! A failure decided from `client/init` alone is answered with `server/error` and a close; every
 //! later failure is silent, which is why the handshake paths here close without a message.
@@ -32,7 +33,9 @@ use syncspin_core::messages::{
     ClientPairPending, ClientPairRetry, Incoming, NoiseHandshake, PairingActivation,
     ServerActivate, ServerError, ServerHello, ServerInit, ServerTime, PROTOCOL_VERSION,
 };
-use syncspin_core::noise::{psk_id_for, Initiator, Suite, TransportState, SENTINEL_PSK};
+use syncspin_core::noise::{
+    psk_id_for, Initiator, PskOutcome, Suite, TransportState, SENTINEL_PSK,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
@@ -261,6 +264,7 @@ async fn converse(
     // A store that cannot be read ends the connection: continuing would announce the Sentinel key
     // to a client whose record exists, which is a silent downgrade to an unpaired session.
     let record = pairing::record_for(config.storage.as_deref(), &accepted.client_id)?;
+    let has_record = record.is_some();
     let (psk, category) = match record {
         Some(psk) => (psk, CATEGORY_LONG_TERM),
         None => (SENTINEL_PSK, CATEGORY_SENTINEL),
@@ -281,16 +285,36 @@ async fn converse(
     connection.send_text(&encode(&message_1)?).await?;
 
     // 4. Noise message 2. Every failure from here on is silent.
+    //
+    // The announcement is the record's, whatever key the client actually sealed with. Only a
+    // connection whose record exists is offered the retry under the Sentinel key: without one the
+    // announced key already is the Sentinel key, and there is nothing to retry.
     let Some(message_2) = connection.read_handshake_message().await? else {
         return Ok(());
     };
-    let mut noise = match initiator.read_message(&message_2) {
-        Ok(payload) if payload == HANDSHAKE_MESSAGE_2 => initiator
-            .into_transport()
-            .context("failed to finish the Noise handshake")?,
-        // A message that does not authenticate under the announced key is a silent failure. The
-        // record is left alone, so a client that lost its key cannot erase the server's.
-        _ => {
+    let read = if has_record {
+        initiator.read_message_with_sentinel(&message_2)
+    } else {
+        initiator
+            .read_message(&message_2)
+            .map(|payload| (PskOutcome::SelectedKey, payload))
+    };
+    let (outcome, payload) = match read {
+        Ok(read) => read,
+        // A message that authenticates under neither key is a silent failure. The record is left
+        // alone, so a client that lost its key cannot erase the server's.
+        Err(_) => {
+            let _ = connection.close().await;
+            return Ok(());
+        }
+    };
+    if payload != HANDSHAKE_MESSAGE_2 {
+        let _ = connection.close().await;
+        return Ok(());
+    }
+    let mut noise = match initiator.into_transport() {
+        Ok(noise) => noise,
+        Err(_) => {
             let _ = connection.close().await;
             return Ok(());
         }
@@ -306,19 +330,29 @@ async fn converse(
         return Ok(());
     };
     let client_id = accepted.client_id.clone();
-    let paired = record.is_some();
+    let paired = has_record && outcome == PskOutcome::SelectedKey;
+    // The record exists, but the client sealed with the Sentinel key: it does not hold the record
+    // and must not be treated as paired, however the operator's approval stands.
+    let credential_mismatch = has_record && outcome == PskOutcome::SentinelFallback;
     let approved = paired || registry.is_approved(&client_id);
-    let _ = events.send(Event::ClientConnected {
-        client_id: client_id.clone(),
-        name: client_hello.name.clone(),
-        approved,
-    });
 
     // 6. The session owns the connection from here: the activation, the group, the commands and
-    // the pairing attempt all travel through it.
+    // the pairing attempt all travel through it. The registration goes first, so a host that
+    // reacts to `CredentialMismatch` already finds the session; the command channel is unbounded
+    // and a command sent before the loop starts waits there.
     let session_id = registry.next_session();
     let (commands, command_stream) = mpsc::unbounded_channel();
     registry.register(&client_id, session_id, commands);
+    let _ = events.send(Event::ClientConnected {
+        client_id: client_id.clone(),
+        name: client_hello.name.clone(),
+        approved: paired || (approved && !credential_mismatch),
+    });
+    if credential_mismatch {
+        let _ = events.send(Event::CredentialMismatch {
+            client_id: client_id.clone(),
+        });
+    }
     let session = Session {
         connection,
         config,
@@ -330,6 +364,7 @@ async fn converse(
         hello: client_hello,
         paired,
         approved,
+        credential_mismatch,
         roles: Vec::new(),
         member: None,
         outbound: None,
@@ -648,6 +683,11 @@ struct Session<'a> {
     paired: bool,
     /// Whether the operator approved the client.
     approved: bool,
+    /// Whether the store holds a record the connection did not seal with.
+    ///
+    /// The server retried message 2 under the Sentinel key and it authenticated, so the client does
+    /// not hold the record. The session is admitted without roles and the record is left alone.
+    credential_mismatch: bool,
     /// Versioned roles the connection may use.
     roles: Vec<String>,
     /// The group membership, once the connection has roles.
@@ -860,8 +900,10 @@ impl Session<'_> {
     ///
     /// An unapproved, unpaired client gets an empty role list: `pairing.md` forbids activating
     /// roles on an unpaired connection its operator has not approved. A client that admits no
-    /// unpaired access gets none either, because it would have to reject the activation. A paired
-    /// client needs no approval and no unpaired access.
+    /// unpaired access gets none either, because it would have to reject the activation. A
+    /// connection whose record did not seal the handshake gets none either, approval or not: it
+    /// holds no credential the server trusts, so re-pairing is the way back. A paired client needs
+    /// no approval and no unpaired access.
     async fn activate_roles(&mut self, noise: &mut TransportState) -> Result<()> {
         let (roles, withheld) = self.effective_roles();
         self.roles = roles.clone();
@@ -893,6 +935,11 @@ impl Session<'_> {
 
     /// Returns the roles this connection may use now, and why the player role is missing.
     fn effective_roles(&self) -> (Vec<String>, Option<String>) {
+        // A connection whose record did not seal the handshake holds no credential the server
+        // trusts, so an approval cannot turn it into a member either: re-pairing is the way back.
+        if self.credential_mismatch {
+            return (Vec::new(), None);
+        }
         if !self.paired && (!self.approved || !self.hello.unpaired_access.enabled) {
             return (Vec::new(), None);
         }
@@ -1048,7 +1095,25 @@ impl Session<'_> {
     }
 
     /// Activates the roles the operator's approval admits.
+    ///
+    /// A connection whose record did not seal the handshake is not approved while the store still
+    /// holds that record: its approval is refused with an error naming the mismatch, because the
+    /// client holds no credential the server trusts. Once the record is gone from the store, the
+    /// flag is cleared and the approval activates the roles - the recovery path for a live session
+    /// whose record the host removed.
     async fn approve(&mut self, noise: &mut TransportState) -> Result<()> {
+        if self.credential_mismatch {
+            if pairing::record_for(self.config.storage.as_deref(), &self.client_id)?.is_some() {
+                bail!(
+                    "the client's pairing record did not seal this connection (a credential \
+                     mismatch), so an approval is refused; re-pair the client, or remove the \
+                     record through the store and approve again"
+                );
+            }
+            self.credential_mismatch = false;
+            self.approved = true;
+            return self.activate_roles(noise).await;
+        }
         if self.approved {
             return Ok(());
         }
@@ -1464,11 +1529,12 @@ impl Session<'_> {
     ///
     /// `server/pair-finalize` is already on the wire, so the client has stored its side. The
     /// re-handshake follows immediately and its activation is the first message under the new
-    /// keys, as `connection.md` requires.
+    /// keys, as `connection.md` requires. The record is stored by now, so `approved`, the dropped
+    /// approval and [`Event::Paired`] are true before it; `paired` and the cleared mismatch are
+    /// not, until the new key has actually sealed the connection.
     async fn complete_pairing(&mut self, noise: &mut TransportState, psk: [u8; 32]) -> Result<()> {
         self.attempt = None;
         self.discarding_pairing_messages = true;
-        self.paired = true;
         self.approved = true;
         // `pairing.md` discards an approval when a pairing succeeds: the record replaces it.
         self.registry.forget_approval(&self.client_id);
@@ -1488,6 +1554,10 @@ impl Session<'_> {
             self.ending = Some("connection lost".to_owned());
             return Ok(());
         }
+        // The new key sealed the connection, so the record now authenticates it and the
+        // credential mismatch it recovered from is over.
+        self.paired = true;
+        self.credential_mismatch = false;
         self.pairing_index = 0;
         self.activate_roles(noise).await?;
         if let Some(reply) = self.pending_pair_reply.take() {
@@ -1557,8 +1627,25 @@ impl Session<'_> {
     }
 
     /// Removes the record, tells the client and ends the connection.
+    ///
+    /// A connection whose record did not seal the handshake may not remove that record: the
+    /// mismatch is a signal, and a session that never authenticated with the record must not
+    /// destroy it. The removal is refused with an error naming the mismatch. Once the record is
+    /// gone from the store, there is nothing left to remove and the unpair only ends the
+    /// connection.
     async fn unpair(&mut self, noise: &mut TransportState) -> Result<()> {
-        pairing::remove_record(self.config.storage.as_deref(), &self.client_id)?;
+        if self.credential_mismatch {
+            if pairing::record_for(self.config.storage.as_deref(), &self.client_id)?.is_some() {
+                bail!(
+                    "the client's pairing record did not seal this connection (a credential \
+                     mismatch), so the record is left alone; re-pair the client, or remove the \
+                     record through the store and unpair again"
+                );
+            }
+            self.credential_mismatch = false;
+        } else {
+            pairing::remove_record(self.config.storage.as_deref(), &self.client_id)?;
+        }
         self.connection
             .send_json(noise, &Incoming::ServerUnpair(Default::default()))
             .await?;
