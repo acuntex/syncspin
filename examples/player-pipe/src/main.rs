@@ -32,6 +32,9 @@
 //! publishes `_sendspin._tcp` and accepts the server that connects. Neither takes `--server`, and
 //! the two are exclusive, because `connection.md` allows one connection mode at a time.
 //!
+//! By default the server may play to this client without a pairing record. `--pairing-required`
+//! refuses an unpaired session, so the server must pair with this client before playback.
+//!
 //! Status lines are for people. In a playback run, audio is the only thing that reaches stdout.
 
 mod pipe_sink;
@@ -208,6 +211,9 @@ async fn run(options: Options) -> Result<()> {
     config.volume_policy = VolumePolicy::default();
     config.max_backoff = MAX_BACKOFF;
     config.pairing_timeout = DEFAULT_PAIRING_TIMEOUT;
+    // `--pairing-required` refuses a session the server activates without a pairing record, so only
+    // a paired server may play to this client.
+    config.unpaired_access = !options.pairing_required;
     #[cfg(feature = "pairing-code")]
     {
         config.static_pairing_code = options.static_code.clone();
@@ -327,7 +333,7 @@ async fn run(options: Options) -> Result<()> {
                         "unpaired: the server dropped the record for {server_id}"
                     ),
                     Event::PairingRequired { server_id, reason } => eprintln!(
-                        "pairing required by {server_id}: {reason:?}"
+                        "pairing required for server {server_id}: {reason:?}"
                     ),
                     Event::PairingFailed { reason } => {
                         eprintln!("pairing failed: {}", reason.as_str())
@@ -428,6 +434,9 @@ struct Options {
     name: String,
     /// File that holds the X25519 identity.
     identity: PathBuf,
+    /// Whether a server must have a pairing record before this player accepts playback, and the
+    /// client advertises that in `client/hello`.
+    pairing_required: bool,
     /// Whether to publish `_sendspin._tcp` and accept the server that connects.
     #[cfg(feature = "discovery")]
     advertise: bool,
@@ -473,6 +482,7 @@ where
     let mut server = None;
     let mut name = DEFAULT_NAME.to_owned();
     let mut identity = PathBuf::from(DEFAULT_IDENTITY);
+    let mut pairing_required = false;
     #[cfg(feature = "discovery")]
     let mut advertise = false;
     #[cfg(feature = "discovery")]
@@ -493,6 +503,7 @@ where
             "--server" => server = Some(take_value(flag, inline, &mut args)?),
             "--name" => name = take_value(flag, inline, &mut args)?,
             "--identity" => identity = PathBuf::from(take_value(flag, inline, &mut args)?),
+            "--pairing-required" => pairing_required = true,
             #[cfg(feature = "discovery")]
             "--advertise" => advertise = true,
             #[cfg(feature = "discovery")]
@@ -531,6 +542,9 @@ where
     if pairing_token {
         if server.is_some() {
             bail!("--pairing-token prints the token and exits; drop --server");
+        }
+        if pairing_required {
+            bail!("--pairing-token prints the token and exits; drop --pairing-required");
         }
         #[cfg(feature = "discovery")]
         if advertise || discover {
@@ -600,6 +614,7 @@ where
         server,
         name,
         identity,
+        pairing_required,
         #[cfg(feature = "discovery")]
         advertise,
         #[cfg(feature = "discovery")]
@@ -728,6 +743,9 @@ Options:
                               43-character base64url secret on one line, not JSON;
                               created with owner-only permissions when missing
                               [default: {DEFAULT_IDENTITY}]
+      --pairing-required      Require a pairing before playback: an unpaired
+                              session is refused, so the server must pair with
+                              this client before it may play to it
 "
     ));
     #[cfg(feature = "discovery")]
@@ -827,6 +845,15 @@ mod tests {
     }
 
     #[test]
+    fn pairing_required_is_off_by_default_and_on_when_asked() {
+        let defaults = options(&["--server", "host"]);
+        assert!(!defaults.pairing_required);
+
+        let requiring = options(&["--server", "host", "--pairing-required"]);
+        assert!(requiring.pairing_required);
+    }
+
+    #[test]
     fn flags_accept_an_inline_value() {
         let options = options(&[
             "--server=music-assistant.local:8927",
@@ -858,13 +885,24 @@ mod tests {
     #[cfg(feature = "storage-file")]
     #[test]
     fn the_token_mode_refuses_a_connection() {
-        let Err(error) = parse(&["--pairing-token", "--server", "host"]) else {
-            panic!("a token run must not connect");
-        };
-        assert!(
-            format!("{error}").contains("drop --server"),
-            "the error should say what to drop, got: {error}"
-        );
+        for (args, dropped) in [
+            (
+                &["--pairing-token", "--server", "host"][..],
+                "drop --server",
+            ),
+            (
+                &["--pairing-token", "--pairing-required"][..],
+                "drop --pairing-required",
+            ),
+        ] {
+            let Err(error) = parse(args) else {
+                panic!("{args:?} must be rejected: a token run takes no connection flags");
+            };
+            assert!(
+                format!("{error}").contains(dropped),
+                "the error should say what to drop ({dropped}), got: {error}"
+            );
+        }
     }
 
     #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
@@ -929,6 +967,7 @@ mod tests {
     #[test]
     fn the_usage_lists_the_flags_this_build_has() {
         let text = usage();
+        assert!(text.contains("--pairing-required"), "got: {text}");
         assert!(text.contains("--pairing-token"), "got: {text}");
         assert!(text.contains("--pairing-store"), "got: {text}");
         #[cfg(feature = "pairing-code")]
