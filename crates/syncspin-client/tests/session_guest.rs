@@ -350,6 +350,8 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
         unpaired_access: true,
+        required_lead_time_ms: 250,
+        min_buffer_ms: None,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -1449,6 +1451,138 @@ async fn the_initial_state_is_sent_after_two_time_replies() {
 }
 
 #[tokio::test]
+async fn the_initial_state_carries_the_configured_timing() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.required_lead_time_ms = 400;
+    config.min_buffer_ms = Some(600);
+    let (_handle, _events) = connect(config, sink)
+        .await
+        .expect("the client must connect to the fake server");
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.required_lead_time_ms, 400,
+        "the lead the host configured must reach the server"
+    );
+    assert_eq!(
+        player.min_buffer_ms, 600,
+        "a pinned buffer must be reported exactly as configured"
+    );
+}
+
+#[tokio::test]
+async fn an_auto_min_buffer_starts_at_250() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (_handle, _events) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.min_buffer_ms, 250,
+        "an unpinned buffer starts at the value every release before this field reported"
+    );
+    assert_eq!(
+        player.required_lead_time_ms, 250,
+        "a host that configures nothing keeps the lead earlier releases reported"
+    );
+}
+
+#[tokio::test]
+async fn a_pin_above_five_seconds_is_refused() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.min_buffer_ms = Some(5_001);
+
+    match connect(config, sink).await {
+        Ok(_) => panic!("a pin above the protocol's 5000 ms range must be refused"),
+        Err(error) => {
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("min_buffer_ms") && message.contains("5000"),
+                "the error must name the field and the range, got: {message}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_lead_above_five_seconds_is_accepted() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.required_lead_time_ms = 6_000;
+    let (_handle, _events) = connect(config, sink)
+        .await
+        .expect("the lead has no upper bound, so 6000 ms is a valid configuration");
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.required_lead_time_ms, 6_000,
+        "the lead reaches the wire unchanged"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_value_is_not_overwritten() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.min_buffer_ms = Some(400);
+    let (_handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect to the fake server");
+    expect_connected(&mut events, &server).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.min_buffer_ms, 400,
+        "the pin is what the host asked for"
+    );
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    // A start-from-empty burst does not represent steady-state delay, so wait past the warmup the
+    // estimator applies. Then send more chunks than its window needs and a change needs two
+    // evaluations to apply (128 minimum samples plus two 32-sample steps), so 200 covers both: a
+    // session that derived would have reported a new value by the end of this.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // A send-ahead of 50 ms maps each chunk to a transmit time 50 ms before now, so the measured
+    // arrival delay is about 50 ms: far from the pin, and far from the 250 ms an unpinned session
+    // starts at. A pinned session that was accidentally treated as auto would derive ~50 ms and
+    // report it, which the timeout below catches.
+    for _ in 0..200 {
+        server.audio(now_us(), 50_000, vec![0x5a; 64]);
+    }
+    wait_for_writes(&recordings, 200).await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server.wait_for_client_state())
+            .await
+            .is_err(),
+        "a pinned session must not report another state once audio arrives"
+    );
+}
+
+#[tokio::test]
 async fn a_burst_with_a_sample_does_not_wait_for_a_lost_last_reply() {
     let options = ServerOptions {
         manual_time: true,
@@ -1576,6 +1710,8 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
         unpaired_access: true,
+        required_lead_time_ms: 250,
+        min_buffer_ms: None,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,

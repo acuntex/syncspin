@@ -53,6 +53,8 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         max_backoff: Duration::from_secs(30),
         strict_group_id: false,
         unpaired_access: true,
+        required_lead_time_ms: 250,
+        min_buffer_ms: None,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,

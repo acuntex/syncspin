@@ -133,10 +133,10 @@ const SUPPORTED_ROLES: [&str; 3] = [PLAYER_ROLE, CONTROLLER_ROLE, METADATA_ROLE]
 /// Largest output delay reported to the server, in milliseconds.
 const MAX_OUTPUT_DELAY_MS: u32 = 5_000;
 
-/// Startup lead time reported to the server, in milliseconds.
-const REQUIRED_LEAD_TIME_MS: u32 = 250;
-
-/// Buffer the server should keep filled, in milliseconds.
+/// Buffer duration a session starts with when the configuration does not pin one, in milliseconds.
+///
+/// The first `client/state` goes out after one clock sample, before the arrival-delay distribution
+/// holds enough samples to derive a value, so the session reports this until it can derive one.
 const MIN_BUFFER_MS: u32 = 250;
 
 /// Largest total size of outstanding audio chunks this client accepts.
@@ -593,6 +593,12 @@ pub(crate) struct Session<'a> {
     volume: u8,
     /// Mute state in force.
     muted: bool,
+    /// Buffer duration in force, in milliseconds.
+    ///
+    /// Starts at the configured pin, or at [`MIN_BUFFER_MS`] when the configuration leaves the value
+    /// to the session. Every `client/state` reports it; a pinned session leaves it alone, and an
+    /// unpinned one replaces it with a value derived from arrival delay.
+    min_buffer_ms: u32,
     /// Whether a sink call failed, which the host has to repair before another attempt.
     sink_failed: bool,
     /// Whether this connection already reported a non-canonical `group_id`.
@@ -771,6 +777,7 @@ pub(crate) async fn attempt(
         shutdown,
         volume: carried.volume,
         muted: carried.muted,
+        min_buffer_ms: config.min_buffer_ms.unwrap_or(MIN_BUFFER_MS),
         sink_failed: false,
         group_id_tolerance_reported: false,
         controller_commands: None,
@@ -2042,8 +2049,8 @@ impl Session<'_> {
                 volume: Some(self.volume),
                 muted: Some(self.muted),
                 output_delay_ms,
-                required_lead_time_ms: REQUIRED_LEAD_TIME_MS,
-                min_buffer_ms: MIN_BUFFER_MS,
+                required_lead_time_ms: self.config.required_lead_time_ms,
+                min_buffer_ms: self.min_buffer_ms,
                 supported_commands: PLAYER_COMMANDS
                     .iter()
                     .map(|command| (*command).to_owned())
@@ -3656,6 +3663,8 @@ mod tests {
             max_backoff: Duration::from_secs(1),
             strict_group_id: false,
             unpaired_access: true,
+            required_lead_time_ms: 250,
+            min_buffer_ms: None,
             pairing_timeout: crate::client::DEFAULT_PAIRING_TIMEOUT,
             #[cfg(feature = "discovery")]
             inbound: None,
@@ -3714,6 +3723,7 @@ mod tests {
             shutdown: idle_shutdown(),
             volume: 50,
             muted: false,
+            min_buffer_ms: config.min_buffer_ms.unwrap_or(MIN_BUFFER_MS),
             sink_failed: false,
             group_id_tolerance_reported: false,
             controller_commands: None,

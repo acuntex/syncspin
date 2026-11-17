@@ -13,6 +13,13 @@ use crate::storage::Storage;
 /// Longest player name the protocol allows, in bytes of UTF-8.
 pub const MAX_PLAYER_NAME_LEN: usize = 64;
 
+/// Largest `min_buffer_ms` a configuration may pin, in milliseconds.
+///
+/// `roles/player/v1.md` bounds the reported buffer to 0-5000 ms, so a pinned value outside that
+/// range could not be reported; the shared configuration validation refuses it before a connection
+/// is attempted.
+const MAX_MIN_BUFFER_MS: u32 = 5_000;
+
 /// Longest delay between reconnect attempts a configuration starts with.
 ///
 /// [`ClientConfig::new`] uses it; a host that wants a longer or shorter ceiling sets
@@ -276,6 +283,31 @@ pub struct ClientConfig {
     ///
     /// Reported in the first `client/state`; a host without a stored state passes `false`.
     pub muted: bool,
+    /// Minimum start-up lead the server must give this player, in milliseconds.
+    ///
+    /// This is the host's own start-up cost: launching the output (`gst-launch`, `pacat`), the
+    /// decoder's warm-up, and whatever the backend needs before the first sample is audible. The
+    /// server schedules the first sample of a stream this far ahead of the playout deadline.
+    ///
+    /// A host must keep it at least as large as the buffer its backend still plays after a
+    /// `stream/clear`: the clear discards that audio, and a shorter lead would schedule the
+    /// replacement audio while the old audio is still audible.
+    ///
+    /// The default is 250, the value every release before this field reported, which covers a
+    /// pipeline that starts within a quarter of a second. The protocol gives the field no upper
+    /// bound beyond the type, so the configuration accepts every `u32`.
+    pub required_lead_time_ms: u32,
+    /// Buffer duration the server should keep filled, in milliseconds, or `None` to derive it.
+    ///
+    /// `Some(n)` pins the value: every `client/state` reports `n` and the session never derives one
+    /// from arriving audio. A host pins it when it knows its backend's tolerance and wants the
+    /// value to stay put. The protocol bounds the reported buffer to 0-5000 ms, and a configuration
+    /// outside that range is refused before a connection is attempted.
+    ///
+    /// `None` leaves the value to the session, which derives it from the arrival delay of audio
+    /// chunks as `roles/player/v1.md` asks: the first report is 250, and the value follows the
+    /// upper tail of the measured distribution once enough samples exist.
+    pub min_buffer_ms: Option<u32>,
     /// Limits applied to every volume request.
     ///
     /// The session applies the policy to a command from the server and to a level the host sets
@@ -396,6 +428,8 @@ impl fmt::Debug for ClientConfig {
             .field("audio_mode", &self.audio_mode)
             .field("volume", &self.volume)
             .field("muted", &self.muted)
+            .field("required_lead_time_ms", &self.required_lead_time_ms)
+            .field("min_buffer_ms", &self.min_buffer_ms)
             .field("volume_policy", &self.volume_policy)
             .field("max_backoff", &self.max_backoff)
             .field("strict_group_id", &self.strict_group_id)
@@ -425,6 +459,7 @@ impl ClientConfig {
     ///
     /// Everything a host rarely changes starts at a documented value: no device description, no
     /// pairing store, [`AudioMode::Decode`], volume 100 and unmuted, [`VolumePolicy::default`],
+    /// a 250 ms start-up lead, a buffer the session derives rather than a pinned one,
     /// [`DEFAULT_MAX_BACKOFF`], the tolerated foreign `group_id`, unpaired access admitted, and
     /// [`DEFAULT_PAIRING_TIMEOUT`](crate::DEFAULT_PAIRING_TIMEOUT). A
     /// host that restores a level or a mute state sets [`ClientConfig::volume`] and
@@ -445,6 +480,11 @@ impl ClientConfig {
             audio_mode: AudioMode::Decode,
             volume: 100,
             muted: false,
+            // Every release before this field asked the server for a quarter of a second; a host
+            // whose output starts slower sets its own.
+            required_lead_time_ms: 250,
+            // `None` leaves the buffer to the session, which derives it from arrival delay.
+            min_buffer_ms: None,
             volume_policy: VolumePolicy::default(),
             max_backoff: DEFAULT_MAX_BACKOFF,
             // The documented tolerance is the default: a foreign group id does not close the
@@ -517,6 +557,16 @@ impl ClientConfig {
         if self.max_backoff.is_zero() {
             bail!("ClientConfig::max_backoff must not be zero");
         }
+        // The protocol bounds the reported buffer to 0-5000 ms. `required_lead_time_ms` has no
+        // counterpart: the spec gives it no upper bound, so the field's type is the only one.
+        if let Some(min_buffer_ms) = self.min_buffer_ms {
+            if min_buffer_ms > MAX_MIN_BUFFER_MS {
+                bail!(
+                    "ClientConfig::min_buffer_ms is {min_buffer_ms}, outside the \
+                     0-{MAX_MIN_BUFFER_MS} ms the protocol defines"
+                );
+            }
+        }
         if self.pairing_timeout.is_zero() {
             bail!("ClientConfig::pairing_timeout must not be zero");
         }
@@ -586,6 +636,8 @@ mod tests {
             audio_mode: AudioMode::Passthrough,
             volume: 100,
             muted: false,
+            required_lead_time_ms: 250,
+            min_buffer_ms: None,
             volume_policy: VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             strict_group_id: false,
@@ -615,6 +667,14 @@ mod tests {
         assert_eq!(config.audio_mode, AudioMode::Decode);
         assert_eq!(config.volume, 100);
         assert!(!config.muted);
+        assert_eq!(
+            config.required_lead_time_ms, 250,
+            "the constructor must keep the lead every release before this field reported"
+        );
+        assert!(
+            config.min_buffer_ms.is_none(),
+            "the constructor leaves the buffer to the session instead of pinning one"
+        );
         assert_eq!(config.max_backoff, DEFAULT_MAX_BACKOFF);
         assert!(
             !config.strict_group_id,
@@ -658,6 +718,40 @@ mod tests {
         let config = valid();
         assert_eq!(config.pairing_timeout, crate::DEFAULT_PAIRING_TIMEOUT);
         config
+    }
+
+    /// The protocol bounds the reported buffer to 0-5000 ms; the lead has no bound beyond its type.
+    #[test]
+    fn a_pinned_buffer_is_bounded_by_the_protocol_range() {
+        for min_buffer_ms in [0, 250, 5_000] {
+            ClientConfig {
+                min_buffer_ms: Some(min_buffer_ms),
+                ..valid()
+            }
+            .validate()
+            .unwrap_or_else(|error| panic!("{min_buffer_ms} is inside 0-5000: {error:#}"));
+        }
+
+        let config = ClientConfig {
+            min_buffer_ms: Some(MAX_MIN_BUFFER_MS + 1),
+            ..valid()
+        };
+        let error = config
+            .validate()
+            .expect_err("a value above the protocol's range cannot be reported");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("min_buffer_ms") && message.contains(&MAX_MIN_BUFFER_MS.to_string()),
+            "the error must name the field and the range, got: {message}"
+        );
+
+        // The lead is a start-up time, not a buffer: the spec gives it no upper bound.
+        ClientConfig {
+            required_lead_time_ms: 6_000,
+            ..valid()
+        }
+        .validate()
+        .expect("the lead accepts every value its type can hold");
     }
 
     #[test]
