@@ -141,6 +141,10 @@ pub trait PairingStore: Send + Sync + 'static {
 
 /// Returns the long-term PSK the store holds for `client_id`, or `None`.
 ///
+/// A record whose PSK is [`SENTINEL_PSK`] is treated as absent: the Sentinel key is published, so
+/// it is not a credential and cannot authenticate a paired connection. The record is not deleted -
+/// the store belongs to the host, and removing a record is the host's decision.
+///
 /// A store that cannot be read is an error and never a reason to continue with fewer keys:
 /// falling back to the Sentinel key would silently downgrade a paired connection to an unpaired
 /// one, and the client would see a credential mismatch the server never intended.
@@ -157,7 +161,8 @@ pub(crate) fn record_for(
     Ok(records
         .into_iter()
         .find(|record| record.client_id == client_id)
-        .map(|record| record.psk))
+        .map(|record| record.psk)
+        .filter(|psk| *psk != SENTINEL_PSK))
 }
 
 /// Persists a record a completed flow produced.

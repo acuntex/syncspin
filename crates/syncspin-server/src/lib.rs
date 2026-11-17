@@ -224,13 +224,17 @@ impl ServerConfig {
 /// it leaves; a stream is reported when it starts and when it ends, whoever ended it. Pairing is
 /// reported when the operator has something to do and when a record is stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// A client completed the handshake and sent `client/hello`.
     ///
     /// `client_id` is the client's static public key and stays the same across reconnections;
     /// `name` is the friendly name from `client/hello`. `approved` is whether the connection is
     /// authenticated by a pairing record or by an approval the operator gave; an unapproved
-    /// client is held at empty activities until [`ServerHandle::approve`] or a pairing.
+    /// client is held at empty activities until [`ServerHandle::approve`] or a pairing. A client
+    /// whose record exists but did not seal the connection is reported `false` and the
+    /// [`Event::CredentialMismatch`] follows: there, an approval is refused until the record is
+    /// gone or replaced, so re-pairing is the operator's path.
     ClientConnected {
         /// Static public key of the client, as 43 unpadded base64url characters.
         client_id: String,
@@ -238,6 +242,17 @@ pub enum Event {
         name: String,
         /// Whether the connection may carry roles now.
         approved: bool,
+    },
+    /// A pairing record exists for this client, but the connection was not sealed by it.
+    ///
+    /// Emitted once per connection, before the first [`Event::ClientActivated`]: message 2 did
+    /// not authenticate under the record's key, so the server retried it under the published
+    /// Sentinel key and the client was admitted without roles. The record is never touched. The
+    /// event is repeated on every reconnection for as long as the record exists; re-pairing is the
+    /// operator's path back to a paired session.
+    CredentialMismatch {
+        /// Static public key of the client.
+        client_id: String,
     },
     /// A `server/activate` declaring roles was sent to the client.
     ///
