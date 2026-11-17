@@ -3306,3 +3306,188 @@ async fn an_empty_activation_leaves_an_unpaired_session_open() {
         Err(_) => {}
     }
 }
+
+#[tokio::test]
+async fn initial_hello_advertises_the_configured_unpaired_access() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    // Both are bound, not dropped: dropping the event stream ends the session.
+    let (_handle, _events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+    let hello = server
+        .wait_for_client_hello()
+        .await
+        .expect("client/hello arrives");
+    assert!(
+        !hello.unpaired_access.enabled,
+        "the hello must carry the configured value before any live change"
+    );
+}
+
+#[tokio::test]
+async fn turning_it_off_closes_a_relying_session() {
+    // The harness's default activation declares `playback` and carries roles, so this unpaired
+    // session relies on unpaired access through both limbs the spec names.
+    let mut server = FakeServer::start(ServerOptions {
+        connections: 2,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    handle
+        .control()
+        .set_unpaired_access(false)
+        .await
+        .expect("the live change must be accepted");
+
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("pairing_required"),
+        "the client says why it closes a relying connection"
+    );
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => assert!(
+            reason.contains("stopped admitting unpaired access"),
+            "the reason must name the host's choice, got: {reason}"
+        ),
+        other => panic!(
+            "the close must be the next event, so no PairingRequired can precede it, got {other:?}"
+        ),
+    }
+    let hello = tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_hello())
+        .await
+        .expect("the client reconnects after the close")
+        .expect("the second connection announces itself");
+    assert!(
+        !hello.unpaired_access.enabled,
+        "the next hello must advertise the value the host set"
+    );
+    drop(handle);
+}
+
+#[tokio::test]
+async fn turning_it_off_closes_a_playback_only_session() {
+    // Dropping the default player role leaves an activation that declares only `playback` and no
+    // roles: the declared activity is the limb that makes this session rely on unpaired access.
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.cancel_pairing(&[]);
+    match next_event(&mut events).await {
+        Event::StreamEnd { reason } => assert_eq!(reason, StreamEndReason::RoleRemoved),
+        other => panic!("expected StreamEnd for the dropped player role, got {other:?}"),
+    }
+
+    handle
+        .control()
+        .set_unpaired_access(false)
+        .await
+        .expect("the live change must be accepted");
+
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("pairing_required"),
+        "a declared playback activity is enough to rely on the setting"
+    );
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => assert!(
+            reason.contains("stopped admitting unpaired access"),
+            "the reason must name the host's choice, got: {reason}"
+        ),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    drop(handle);
+}
+
+#[tokio::test]
+async fn turning_it_off_leaves_an_idle_session() {
+    // `[]` with no roles is admissible for a guest whatever the setting, so nothing in the session
+    // relies on unpaired access and turning the setting off must leave it open.
+    let mut server = FakeServer::start(ServerOptions {
+        activate_override: Some(
+            r#"{"type":"server/activate","payload":{"activities":[]}}"#.to_owned(),
+        ),
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    handle
+        .control()
+        .set_unpaired_access(false)
+        .await
+        .expect("the live change must be accepted");
+    assert_no_goodbye(&mut server).await;
+
+    // The value is in force, so the activation that needs it is refused by the existing guard.
+    server.activate(&["player@v1"]);
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("pairing_required"),
+        "the guard refuses the later activation on the open connection"
+    );
+    drop(handle);
+}
+
+#[tokio::test]
+async fn turning_it_off_leaves_a_paired_session() {
+    let psk: [u8; 32] = std::array::from_fn(|index| (index as u8) ^ 0x5a);
+    let options = ServerOptions {
+        psk_id: psk_id_for(&psk),
+        psk_category: "lt".to_owned(),
+        psk,
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let stored = StoredPsk {
+        category: PskCategory::LongTerm,
+        psk,
+        server_id: server.server_id().to_owned(),
+    };
+    let config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    let (handle, mut events) = connect_with_psks(config, sink, vec![stored])
+        .await
+        .expect("the client must connect");
+    expect_connected(&mut events, &server).await;
+    // Consume the initial report, so the one after the change is unambiguously the new level.
+    wait_for_client_state(&mut server).await;
+
+    handle
+        .control()
+        .set_unpaired_access(false)
+        .await
+        .expect("the live change must be accepted");
+    assert_no_goodbye(&mut server).await;
+
+    // A host-set level has no Event::Volume, so the answer and the next report are the proof the
+    // paired session still runs.
+    assert_eq!(
+        handle
+            .control()
+            .set_volume(20)
+            .await
+            .expect("the paired session must stay live"),
+        20
+    );
+    let state = wait_for_client_state(&mut server).await;
+    assert_eq!(
+        state.player.expect("the player role stays active").volume,
+        Some(20)
+    );
+}

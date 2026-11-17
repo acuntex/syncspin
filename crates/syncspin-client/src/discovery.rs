@@ -264,7 +264,7 @@ pub use mdns::MdnsDiscovery;
 mod inbound {
     use std::fmt;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::{AtomicBool, AtomicU8};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -430,6 +430,7 @@ mod inbound {
             volume: config.volume,
             muted: config.muted,
             active_roles: Vec::new(),
+            unpaired_access: Arc::new(AtomicBool::new(config.unpaired_access)),
             #[cfg(feature = "pairing-code")]
             failed_rounds,
         };
@@ -526,6 +527,10 @@ mod inbound {
             // in a task of its own and it is rejected with `concurrent_attempt`, as `connection.md`
             // requires. The task owns no state of the admitted session, so a slow rejection cannot
             // hold up playback.
+            //
+            // The rejection task runs while the admitted session owns the carried state, so it
+            // gets the shared unpaired-access value as a handle of its own.
+            let unpaired_access = Arc::clone(&carried.unpaired_access);
             let mut rejections = JoinSet::new();
             let mut attempt = Box::pin(session::attempt(
                 transport,
@@ -550,6 +555,7 @@ mod inbound {
                             config.clone(),
                             path.to_owned(),
                             pairing,
+                            Arc::clone(&unpaired_access),
                         ));
                     }
                     joined = rejections.join_next(), if !rejections.is_empty() => {
@@ -587,6 +593,7 @@ mod inbound {
                     session::Ending::Closed
                     | session::Ending::Unpaired
                     | session::Ending::PairingRequired
+                    | session::Ending::UnpairedAccessOff
                     | session::Ending::Unauthorized
                     | session::Ending::Shutdown => Err(anyhow!("the audio sink failed")),
                 };
@@ -606,13 +613,14 @@ mod inbound {
         config: ClientConfig,
         path: String,
         pairing: Option<PairingPsk>,
+        unpaired_access: Arc<AtomicBool>,
     ) {
         let Ok(Some(transport)) = upgrade(stream, &path).await else {
             return;
         };
         let _ = tokio::time::timeout(
             REJECT_TIMEOUT,
-            session::reject_concurrent(transport, &config, pairing, &[]),
+            session::reject_concurrent(transport, &config, pairing, &[], &unpaired_access),
         )
         .await;
     }
