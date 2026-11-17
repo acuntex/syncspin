@@ -1290,6 +1290,13 @@ mod tests {
             error.downcast_ref::<snow::Error>(),
             Some(&snow::Error::Input)
         );
+        // `Input` is the same error whether the frame was retried or not, so only the context
+        // separates the two paths: the retry wraps its failure with this phrase, the guard does
+        // not. This assertion is what kills the mutant that retries unconditionally.
+        assert!(
+            !format!("{error:#}").contains("under the Sentinel key"),
+            "a frame in the input band must not reach the retry, got: {error:#}"
+        );
     }
 
     #[test]
