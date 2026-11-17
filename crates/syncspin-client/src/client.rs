@@ -363,9 +363,9 @@ pub enum Event {
     },
     /// The server asked to drop buffered audio without ending the stream.
     ///
-    /// Reported before the sink is flushed, so a host can restart its output or drop the matching
-    /// part of its own queue first. The announced format stays open, and chunks that follow still
-    /// belong to it.
+    /// Reported before the buffered audio is discarded or flushed, so a host can restart its
+    /// output or drop the matching part of its own queue first. The announced format stays open,
+    /// and chunks that follow still belong to it.
     StreamClear {
         /// Server timestamp the audio should resume from, when the server named one.
         from_timestamp: Option<i64>,

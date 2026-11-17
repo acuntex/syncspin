@@ -10,25 +10,25 @@ harmless.
 
 ## Summary
 
-| #   | Area                                                                   | Spec section                                                                                                                                                                      | Status                                      |
-| --- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
-| 1   | Server-initiated connections: last-playback server not persisted       | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Open, no last-playback record               |
-| 3   | `psk_id` validation deferred to the session layer                      | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`                      |
-| 4   | Code pairing behind a feature; CPace layer unaudited                   | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`                    |
-| 6   | Approval is not persisted across restarts                              | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, server lifetime                       |
-| 7   | Scheduled metadata applied immediately                                 | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                                    |
-| 8   | In-place format change flushes buffered audio                          | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                                    |
-| 9   | `Sink::underruns()` reported but never used                            | — (library contract, no wire field)                                                                                                                                               | Stage 1b                                    |
-| 10  | `stream/clear` with `from_timestamp` flushes everything                | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Stage 1b                                    |
-| 11  | Playout deadlines begin after three clock bursts                       | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                                  |
-| 12  | A player volume above 100 is capped, not rejected                      | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`               |
-| 13  | A transport command before the controller state is not checked         | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`                   |
-| 14  | A reconnect keeps the last known `active_roles` while playback-capable | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`                       |
-| 15  | A malformed control message is ignored, not fatal                      | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message`          |
-| 16  | A server keeps an unavailable client in the group                      | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                      | Open, one group                             |
-| 17  | The server's stream start lead is one fixed value                      | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline                       |
-| 19  | A foreign `group_id` is accepted unless strict mode is set             | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Accepted, `strict_group_id`                 |
-| 20  | Live unpaired-access changes are not applied to a running connection   | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, `pairing_required`/`restart` goodbyes |
+| #   | Area                                                                             | Spec section                                                                                                                                                                      | Status                                      |
+| --- | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| 1   | Server-initiated connections: last-playback server not persisted                 | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Open, no last-playback record               |
+| 3   | `psk_id` validation deferred to the session layer                                | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`                      |
+| 4   | Code pairing behind a feature; CPace layer unaudited                             | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`                    |
+| 6   | Approval is not persisted across restarts                                        | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, server lifetime                       |
+| 7   | Scheduled metadata applied immediately                                           | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                                    |
+| 8   | In-place format change flushes buffered audio                                    | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                                    |
+| 9   | `Sink::underruns()` reported but never used                                      | — (library contract, no wire field)                                                                                                                                               | Stage 1b                                    |
+| 10  | A stream-clear timestamp is honoured only by sinks that implement `discard_from` | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Accepted, `Sink::discard_from`              |
+| 11  | Playout deadlines begin after three clock bursts                                 | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                                  |
+| 12  | A player volume above 100 is capped, not rejected                                | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`               |
+| 13  | A transport command before the controller state is not checked                   | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`                   |
+| 14  | A reconnect keeps the last known `active_roles` while playback-capable           | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`                       |
+| 15  | A malformed control message is ignored, not fatal                                | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message`          |
+| 16  | A server keeps an unavailable client in the group                                | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                      | Open, one group                             |
+| 17  | The server's stream start lead is one fixed value                                | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline                       |
+| 19  | A foreign `group_id` is accepted unless strict mode is set                       | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Accepted, `strict_group_id`                 |
+| 20  | Live unpaired-access changes are not applied to a running connection             | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, `pairing_required`/`restart` goodbyes |
 
 ## 1. Server-initiated connections: the last-playback server is not persisted
 
@@ -224,25 +224,34 @@ number into playback would be an unverified control loop.
 `min_buffer_ms` (bounded) when the count rises, and test the reported value against a fake sink that
 returns a fixed count.
 
-## 10. `stream/clear` with `from_timestamp` flushes everything
+## 10. A stream-clear timestamp is honoured only by sinks that implement `discard_from`
 
 **Spec:** `messaging.md`, `stream/clear`. A `from_timestamp` asks the client to discard the buffered
 audio from that server time onward and keep what is earlier; an absent timestamp clears everything.
 
-**What we do:** `handle_stream_clear` flushes the sink regardless of `from_timestamp`, so audio
-before the timestamp is dropped too. The announced format stays open for the chunks that follow,
-because a clear does not end the stream. The client keeps no timestamped queue of its own; the sink
-does, and `Sink::flush` has no "drop from a timestamp" mode. `Event::StreamClear` carries the
-timestamp to the host before the flush, so a host that owns a timestamped queue can discard the
-suffix itself; the client's own flush still drops everything.
+**What we do:** `handle_stream_clear` emits `Event::StreamClear` and then calls
+`Sink::discard_from` with the timestamp mapped through the clock estimate, so a sink that implements
+it drops only the audio due at or after that deadline. While no estimate is ready, for a timestamp
+already in the past, and when the mapping would overflow, the deadline is `Instant::now()`, which
+drops everything buffered; a clear without a timestamp still flushes. The
+provided default calls `Sink::flush`, so a sink without its own timestamped queue keeps dropping
+everything. The announced format stays open for the chunks that follow, because a clear does not end
+the stream. `a_clear_with_a_timestamp_maps_the_deadline_once_the_clock_is_ready`,
+`a_clear_before_the_clock_is_ready_discards_from_now` and
+`a_sink_without_its_own_discard_flushes_everything` pin the mapped deadline, the no-estimate
+fallback and the default.
 
 **Why:** a partial drop needs the sink to map server timestamps to its own buffer and discard a
-suffix of it; the current trait can only drop everything. The full flush is audible as a short gap
-at a seek, but leaving stale audio buffered would be worse.
+suffix of it. The crate holds no timestamped queue - the sink owns the buffered audio and its
+deadlines - so it cannot discard that suffix itself; the hook is the one operation only the sink can
+perform. A sink that does not override it still drops everything, which is audible as a short gap at
+a seek.
 
-**Removing it:** add a `Sink::discard_from(&mut self, due: Instant)` (or move the timestamped queue
-into the session) and discard only frames whose deadline is at or after the mapped timestamp; test a
-clear in the middle of a burst of buffered frames.
+**Conforming sink:** implement `discard_from` by comparing `due` with the playout deadline of each
+buffered frame, dropping the frames at or after it and keeping the earlier ones. It must succeed when
+no stream is open or no queue exists — a clear can arrive before `stream/start` or after `stream/end`
+— and an empty queue discards nothing. The default already matches `flush`, so a sink that leaves it
+out is the documented everything-drop, not a silent failure.
 
 ## 11. Playout deadlines begin after three clock bursts
 
