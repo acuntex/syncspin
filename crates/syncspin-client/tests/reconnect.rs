@@ -118,6 +118,8 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         max_backoff: MAX_BACKOFF,
         strict_group_id: false,
         unpaired_access: true,
+        required_lead_time_ms: 250,
+        min_buffer_ms: None,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -295,6 +297,8 @@ async fn an_unreachable_server_is_an_event_and_not_an_error() {
         max_backoff: MAX_BACKOFF,
         strict_group_id: false,
         unpaired_access: true,
+        required_lead_time_ms: 250,
+        min_buffer_ms: None,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -572,6 +576,8 @@ async fn the_retry_delay_is_awaited_before_the_next_attempt() {
         max_backoff: retry,
         strict_group_id: false,
         unpaired_access: true,
+        required_lead_time_ms: 250,
+        min_buffer_ms: None,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,

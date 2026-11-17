@@ -115,7 +115,7 @@ struct RecordingSink {
     fail_on_flush: Option<usize>,
     fail_on_discard: Option<usize>,
     fail_on_open: bool,
-    latency: Option<Duration>,
+    output_delay: Option<Duration>,
     writes: usize,
     discards: usize,
     /// Flush call that holds the session until the gate is released.
@@ -131,7 +131,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -146,7 +146,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -162,7 +162,7 @@ impl RecordingSink {
             fail_on_flush: Some(flush),
             fail_on_discard: None,
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -178,7 +178,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: true,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -186,14 +186,14 @@ impl RecordingSink {
         }
     }
 
-    fn with_latency(recordings: Recordings, latency: Duration) -> RecordingSink {
+    fn with_output_delay(recordings: Recordings, output_delay: Duration) -> RecordingSink {
         RecordingSink {
             recordings,
             fail_on_write: None,
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: false,
-            latency: Some(latency),
+            output_delay: Some(output_delay),
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -208,7 +208,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: Some(hold_flush),
@@ -224,7 +224,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: Some(discard),
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -303,8 +303,8 @@ impl Sink for RecordingSink {
         Ok(())
     }
 
-    fn latency(&self) -> Option<Duration> {
-        self.latency
+    fn output_delay(&self) -> Option<Duration> {
+        self.output_delay
     }
 }
 
@@ -315,11 +315,11 @@ fn recording_sink() -> (Recordings, Box<dyn Sink>) {
 }
 
 /// Creates a recording sink that reports a fixed output delay.
-fn sink_with_latency(latency: Duration) -> (Recordings, Box<dyn Sink>) {
+fn sink_with_output_delay(output_delay: Duration) -> (Recordings, Box<dyn Sink>) {
     let recordings = Recordings::default();
     (
         recordings.clone(),
-        Box::new(RecordingSink::with_latency(recordings, latency)),
+        Box::new(RecordingSink::with_output_delay(recordings, output_delay)),
     )
 }
 
@@ -350,6 +350,8 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
         unpaired_access: true,
+        required_lead_time_ms: 250,
+        min_buffer_ms: None,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -1449,6 +1451,277 @@ async fn the_initial_state_is_sent_after_two_time_replies() {
 }
 
 #[tokio::test]
+async fn the_initial_state_carries_the_configured_timing() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.required_lead_time_ms = 400;
+    config.min_buffer_ms = Some(600);
+    let (_handle, _events) = connect(config, sink)
+        .await
+        .expect("the client must connect to the fake server");
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.required_lead_time_ms, 400,
+        "the lead the host configured must reach the server"
+    );
+    assert_eq!(
+        player.min_buffer_ms, 600,
+        "a pinned buffer must be reported exactly as configured"
+    );
+}
+
+#[tokio::test]
+async fn an_auto_min_buffer_starts_at_250() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (_handle, _events) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.min_buffer_ms, 250,
+        "an unpinned buffer starts at the value every release before this field reported"
+    );
+    assert_eq!(
+        player.required_lead_time_ms, 250,
+        "a host that configures nothing keeps the lead earlier releases reported"
+    );
+}
+
+#[tokio::test]
+async fn a_pin_above_five_seconds_is_refused() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.min_buffer_ms = Some(5_001);
+
+    match connect(config, sink).await {
+        Ok(_) => panic!("a pin above the protocol's 5000 ms range must be refused"),
+        Err(error) => {
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("min_buffer_ms") && message.contains("5000"),
+                "the error must name the field and the range, got: {message}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_lead_above_five_seconds_is_accepted() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.required_lead_time_ms = 6_000;
+    let (_handle, _events) = connect(config, sink)
+        .await
+        .expect("the lead has no upper bound, so 6000 ms is a valid configuration");
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.required_lead_time_ms, 6_000,
+        "the lead reaches the wire unchanged"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_value_is_not_overwritten() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.min_buffer_ms = Some(400);
+    let (_handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect to the fake server");
+    expect_connected(&mut events, &server).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.min_buffer_ms, 400,
+        "the pin is what the host asked for"
+    );
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    // A start-from-empty burst does not represent steady-state delay, so wait past the warmup the
+    // estimator applies. Then send more chunks than its window needs and a change needs two
+    // evaluations to apply (128 minimum samples plus two 32-sample steps), so 200 covers both: a
+    // session that derived would have reported a new value by the end of this.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    // A send-ahead of 50 ms maps each chunk to a transmit time 50 ms before now, so the measured
+    // arrival delay is about 50 ms: far from the pin, and far from the 250 ms an unpinned session
+    // starts at. A pinned session that was accidentally treated as auto would derive ~50 ms and
+    // report it, which the timeout below catches.
+    for _ in 0..200 {
+        server.audio(now_us(), 50_000, vec![0x5a; 64]);
+    }
+    wait_for_writes(&recordings, 200).await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server.wait_for_client_state())
+            .await
+            .is_err(),
+        "a pinned session must not report another state once audio arrives"
+    );
+}
+
+#[tokio::test]
+async fn a_saturated_send_ahead_produces_no_update() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (_handle, _events) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    wait_for_client_state(&mut server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    // Past the estimator's warmup: a start-from-empty burst is not steady-state delay.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    // `0` and `u32::MAX` are the protocol's saturation values for `send_ahead`, meaning "no
+    // measurement". The `0` half is the one that discriminates the saturation filter: with the
+    // timestamp half a second in the past, an unfiltered sample would derive ~500 ms and raise the
+    // buffer after 160 samples. The `u32::MAX` half cannot: it maps the transmit time ~4300 s into
+    // the past, so the delay falls outside the ±60 s plausibility bound and is discarded with or
+    // without the saturation check. It stays as the wire-shape regression.
+    for (sent, send_ahead) in [(200, 0), (400, u32::MAX)] {
+        for _ in 0..200 {
+            server.audio(now_us() - 500_000, send_ahead, vec![0x5a; 64]);
+        }
+        wait_for_writes(&recordings, sent).await;
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server.wait_for_client_state())
+            .await
+            .is_err(),
+        "a saturated send_ahead is no measurement and must not change the buffer"
+    );
+}
+
+#[tokio::test]
+async fn an_auto_value_updates_after_a_window() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.min_buffer_ms, 250,
+        "an unpinned session starts at the value it reports before any derivation"
+    );
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    // Samples inside the first second of a stream are discarded as start-burst noise.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    // A stable synthetic arrival pattern: each chunk claims a transmit time 50 ms ahead of a
+    // timestamp half a second in the past, so the measured arrival delay is around 550 ms - far
+    // from the 250 ms start value. 160 samples are enough for two evaluations; 200 leaves margin.
+    for _ in 0..200 {
+        server.audio(now_us() - 500_000, 50_000, vec![0x5a; 64]);
+    }
+    wait_for_writes(&recordings, 200).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the derived report carries the player object");
+    assert_ne!(
+        player.min_buffer_ms, 250,
+        "a sustained arrival delay must replace the start value"
+    );
+    assert!(
+        player.min_buffer_ms <= 5_000,
+        "the derived value stays inside the protocol's range, got {}",
+        player.min_buffer_ms
+    );
+}
+
+#[tokio::test]
+async fn a_start_burst_inside_the_warmup_is_not_sampled() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (_handle, _events) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    wait_for_client_state(&mut server).await;
+    // The state report follows the first reply, but the clock estimate needs three accepted
+    // samples. Wait for the initial bursts, so the chunks below are sampleable and the row
+    // discriminates the warmup rather than the clock. This happens before `stream/start`, so it
+    // does not eat into the window.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_time_replies(24))
+            .await
+            .expect("the fake server must answer the initial bursts"),
+        "the connection must stay open while the clock estimate forms"
+    );
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    // A start-from-empty burst is transmitted back-to-back, so its arrival delay says nothing about
+    // the steady state. These chunks carry a plausible 50 ms delay - far from the 250 ms start value
+    // and from any pin - and 200 of them would apply it at sample 160 (two same-direction
+    // evaluations after the 128-sample minimum) if the warmup did not discard every one of them.
+    // They go out immediately after `stream/start`, well inside the one-second window, and the quiet
+    // period below catches the report a missing guard would produce.
+    for _ in 0..200 {
+        server.audio(now_us(), 50_000, vec![0x5a; 64]);
+    }
+    wait_for_writes(&recordings, 200).await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server.wait_for_client_state())
+            .await
+            .is_err(),
+        "chunks inside the warmup must not move the buffer"
+    );
+
+    // An in-place `stream/start` only swaps the format of a running stream: the arrival distribution
+    // is unchanged, so it must not re-arm the warmup. Once the first window has elapsed, the same
+    // pattern with a ~550 ms delay has to produce a report; an implementation that restarted the
+    // warmup on every `stream/start` would send nothing within the default timeout.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    server.stream_start("pcm", 48_000, 2, 16);
+    for _ in 0..200 {
+        server.audio(now_us() - 500_000, 50_000, vec![0x5a; 64]);
+    }
+    wait_for_writes(&recordings, 400).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the derived report carries the player object");
+    assert_ne!(
+        player.min_buffer_ms, 250,
+        "an in-place stream start must not re-arm the warmup"
+    );
+}
+
+#[tokio::test]
 async fn a_burst_with_a_sample_does_not_wait_for_a_lost_last_reply() {
     let options = ServerOptions {
         manual_time: true,
@@ -1576,6 +1849,8 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
         unpaired_access: true,
+        required_lead_time_ms: 250,
+        min_buffer_ms: None,
         pairing_timeout: DEFAULT_PAIRING_TIMEOUT,
         #[cfg(feature = "discovery")]
         inbound: None,
@@ -2362,7 +2637,7 @@ async fn the_track_event_carries_the_playback_speed() {
 #[tokio::test]
 async fn a_short_playout_delay_is_reported() {
     let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
-    let (_recordings, sink) = sink_with_latency(Duration::from_secs(60));
+    let (_recordings, sink) = sink_with_output_delay(Duration::from_secs(60));
     let (mut events, _handle) =
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
@@ -2371,7 +2646,7 @@ async fn a_short_playout_delay_is_reported() {
     let player = state.player.expect("the player state follows the role");
     assert_eq!(
         player.output_delay_ms, 5_000,
-        "an absurd sink latency is clamped before it reaches the server"
+        "an absurd sink output delay is clamped before it reaches the server"
     );
 }
 

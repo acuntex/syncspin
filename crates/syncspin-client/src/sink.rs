@@ -182,11 +182,17 @@ pub trait Sink: Send + 'static {
         self.flush()
     }
 
-    /// Reports the output delay the sink adds beyond the audio port.
+    /// Reports the delay the output adds **after** the audio port: external speakers, amplifiers, a
+    /// chain after the DAC. Decoder, pipeline and device-internal buffer latency belong in the host's
+    /// playout scheduling, not here. A conformant server factors this value into its send-ahead, so
+    /// reporting a buffer here raises the lead instead of compensating it; the server in this
+    /// workspace ignores the reported timing until `docs/spec-deviations.md` #17 closes.
     ///
-    /// The client uses it when it reports its timing to the server. `None` means the sink does not
-    /// know, which the client treats as no additional delay.
-    fn latency(&self) -> Option<Duration> {
+    /// The host restores the same value across restarts and reconnections: the protocol requires
+    /// `output_delay_ms` to persist, and this trait is the only place the client learns it.
+    ///
+    /// `None` means the sink does not know, which the client treats as no additional delay.
+    fn output_delay(&self) -> Option<Duration> {
         None
     }
 

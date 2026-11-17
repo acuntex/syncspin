@@ -132,13 +132,15 @@ pub enum AudioFrame<'a> {
 
 pub trait Sink: Send + 'static {
     fn open(&mut self, format: AudioFormat) -> Result<()>;
-    /// `due` is the playout deadline the crate computed from the server timestamp,
-    /// the time filter and `output_delay_ms`. The sink honours it and reports back.
+    /// `due` is the playout deadline the crate computed from the server timestamp and the time
+    /// filter; the sink applies its own post-port delay.
     fn write(&mut self, frame: AudioFrame<'_>, due: Instant) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
     /// Drops the audio due at or after `due`; the default flushes everything.
     fn discard_from(&mut self, due: Instant) -> Result<()> { self.flush() }
-    fn latency(&self) -> Option<Duration> { None }
+    /// The delay the output adds after the audio port (external speakers, amplifiers).
+    /// Pipeline, decoder and DAC latency belong in the host's own scheduling.
+    fn output_delay(&self) -> Option<Duration> { None }
     fn underruns(&self) -> u64 { 0 }
 }
 
@@ -170,8 +172,11 @@ impl Client {
 Decisions: events as an async stream (no callback trait), reconnect/backoff and volume reporting
 inside the crate, `Sink` receives audio frames (decoded or pass-through) with a playout deadline,
 pushback via blocking `write` on its own task. The crate owns the time filter and therefore the
-deadline; the sink owns real rendering latency, reported back through `latency()`/`underruns()` so
-the crate can hold `min_buffer_ms` and apply soft corrections.
+deadline; the sink owns the real rendering latency, and the part beyond the audio port reaches
+`output_delay_ms` through `output_delay()`, while `underruns()` waits for a correction loop the
+session does not use yet (see `docs/spec-deviations.md` #9). `min_buffer_ms` belongs to the crate: a
+host may pin it in `ClientConfig`, and otherwise the session derives it from the arrival delay of
+audio chunks and reports each sustained change in a `client/state`.
 
 ## Pairing
 
@@ -353,8 +358,13 @@ not stage 3:
 ## Decisions taken after the builder check
 
 - **Playout timing:** the crate owns the time filter and emits each frame with a playout deadline; the
-  sink honours it and reports latency and underruns back. Sync accuracy is therefore a contract
-  between crate and sink, and the spec's ±1 ms claim only holds for sinks that implement `latency()`.
+  sink honours it and reports its post-port output delay back through `output_delay()`, while
+  `underruns()` waits for a correction loop the session does not use yet. Sync accuracy is therefore
+  a contract between crate and sink: it depends on the sink writing each frame at its playout
+  deadline and compensating its own pre-port latency, while `output_delay()` only tells the server
+  what to add beyond the port. `min_buffer_ms` is derived from arrival delay unless the host pins it,
+  and `required_lead_time_ms` is the host's start-up cost: the client reports both, but the server's
+  stream start still uses one fixed lead until `docs/spec-deviations.md` #17 closes.
 - **0.1 measures against the spec, not MA:** the five spec mandates found in the check are part of
   stage 1, not a later stage. Where MA disagrees with the spec, the spec wins and MA compatibility is
   verified by test.

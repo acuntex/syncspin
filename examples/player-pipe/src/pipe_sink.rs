@@ -61,7 +61,7 @@ impl Sink for PipeSink {
             .context("failed to flush stdout")
     }
 
-    fn latency(&self) -> Option<Duration> {
+    fn output_delay(&self) -> Option<Duration> {
         // A pipe reports no additional delay; the samples are already written when the sink
         // returns.
         None
