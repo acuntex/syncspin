@@ -2213,6 +2213,7 @@ impl Session<'_> {
                 self.playback.supported_commands = controller.supported_commands;
                 self.playback.volume = controller.volume;
                 self.playback.muted = controller.muted;
+                self.playback.seek_max_ms = controller.seek_max_ms;
                 self.emit(Event::State(self.playback.clone()));
             }
         }
@@ -2320,6 +2321,14 @@ impl Session<'_> {
                 .send_transport_command(command)
                 .await
                 .map(|()| self.volume),
+            ControlAction::Seek(position_ms) => self
+                .send_controller_command("seek", Some(position_ms), None)
+                .await
+                .map(|()| self.volume),
+            ControlAction::SeekRelative(offset_ms) => self
+                .send_controller_command("seek_relative", None, Some(offset_ms))
+                .await
+                .map(|()| self.volume),
             ControlAction::Volume(level) => self.apply_volume(level).await,
             ControlAction::ReportVolume(level) => {
                 self.apply_report_volume(level).await.map(|()| self.volume)
@@ -2346,27 +2355,35 @@ impl Session<'_> {
 
     /// Rejects a control request the connection cannot carry out right now.
     ///
-    /// Transport commands need the controller role, and once the server reported the commands it
-    /// accepts, a command outside that set is refused as well: a server ignores what it did not
-    /// advertise, so sending it would only look like it worked. The window before the first
-    /// controller state is left open, because nothing is known yet. A level the host reports above
-    /// the protocol range is refused here as well, since `client/state` cannot carry it.
+    /// Transport commands and seeks need the controller role, and once the server reported the
+    /// commands it accepts, a command outside that set is refused as well: a server ignores what it
+    /// did not advertise, so sending it would only look like it worked. The window before the
+    /// first controller state is left open for those, because nothing is known yet. An absolute
+    /// seek is the exception on top of that: its target is checked against the reported range, and
+    /// before the first controller state there is no range, so the seek is refused instead of
+    /// being sent unvalidated. A relative seek needs no range and keeps the open window. A level
+    /// the host reports above the protocol range is refused here as well, since `client/state`
+    /// cannot carry it.
     fn check_control(&self, action: &ControlAction) -> Result<()> {
         if self.rehandshake.is_some() {
             bail!("the connection is switching keys and cannot send yet");
         }
         match action {
-            ControlAction::Transport(command) => {
-                if !self.role_active(CONTROLLER_ROLE) {
-                    bail!("the server did not activate {CONTROLLER_ROLE}");
-                }
-                if let Some(commands) = &self.controller_commands {
-                    if !commands.iter().any(|supported| supported == command) {
-                        bail!("the server does not accept the command {command:?}");
-                    }
+            ControlAction::Transport(command) => self.check_controller_command(command),
+            ControlAction::Seek(position_ms) => {
+                self.check_controller_command("seek")?;
+                let Some(max) = self.playback.seek_max_ms else {
+                    bail!(
+                        "the server reported no seekable range, so the absolute seek target \
+                         {position_ms} cannot be checked"
+                    );
+                };
+                if *position_ms > max {
+                    bail!("the seek target {position_ms} is beyond the seekable range {max}");
                 }
                 Ok(())
             }
+            ControlAction::SeekRelative(_) => self.check_controller_command("seek_relative"),
             ControlAction::Volume(_) | ControlAction::Mute(_) => {
                 if !self.player_active() {
                     bail!("the server did not activate {PLAYER_ROLE}");
@@ -2389,11 +2406,43 @@ impl Session<'_> {
         }
     }
 
+    /// Rejects a controller command the connection cannot send right now.
+    ///
+    /// The role comes first, so a client without it never depends on the advertised set, and the
+    /// window before the first controller state stays open: nothing is known yet, so a command is
+    /// allowed.
+    fn check_controller_command(&self, command: &str) -> Result<()> {
+        if !self.role_active(CONTROLLER_ROLE) {
+            bail!("the server did not activate {CONTROLLER_ROLE}");
+        }
+        if let Some(commands) = &self.controller_commands {
+            if !commands.iter().any(|supported| supported == command) {
+                bail!("the server does not accept the command {command:?}");
+            }
+        }
+        Ok(())
+    }
+
     /// Sends one controller command as a `client/command` envelope.
     async fn send_transport_command(&mut self, command: &'static str) -> Result<()> {
+        self.send_controller_command(command, None, None).await
+    }
+
+    /// Sends one controller command, carrying the parameter the command defines.
+    ///
+    /// `position_ms` belongs to `seek` and `offset_ms` to `seek_relative`; every other command
+    /// carries neither, so the envelope names no parameter the command does not have.
+    async fn send_controller_command(
+        &mut self,
+        command: &'static str,
+        position_ms: Option<u64>,
+        offset_ms: Option<i64>,
+    ) -> Result<()> {
         let message = Incoming::ClientCommand(ClientCommand {
             controller: Some(ControllerCommand {
                 command: command.to_owned(),
+                position_ms,
+                offset_ms,
                 ..ControllerCommand::default()
             }),
         });

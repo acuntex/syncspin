@@ -13,11 +13,11 @@
 //! retry run in that task and reach the caller through the [`EventStream`]. Only an invalid
 //! configuration or an address this build cannot use returns an error - an unreachable server is
 //! reported as [`Event::Disconnected`]. The [`ClientHandle`] waits for the connection to end and
-//! hands out a [`ControlHandle`] for transport commands, the volume level and mute state. The level
-//! follows [`ClientConfig::volume_policy`] - see [`clamp_volume_with`], and [`clamp_volume`] for the
-//! default - and the value the server receives is the applied one. [`ClientConfig::volume`] and
-//! [`ClientConfig::muted`] are the level and mute state the first report carries, so a host passes
-//! the values it restored instead of letting the server see a baseline the output is not at.
+//! hands out a [`ControlHandle`] for transport commands, seek, the volume level and mute state. The
+//! level follows [`ClientConfig::volume_policy`] - see [`clamp_volume_with`], and [`clamp_volume`]
+//! for the default - and the value the server receives is the applied one. [`ClientConfig::volume`]
+//! and [`ClientConfig::muted`] are the level and mute state the first report carries, so a host
+//! passes the values it restored instead of letting the server see a baseline the output is not at.
 //! [`ControlHandle::report_volume`] is the other direction: a level the host reads from its own
 //! output is recorded and sent unchanged, because the policy limits requests rather than the level
 //! the device is at.

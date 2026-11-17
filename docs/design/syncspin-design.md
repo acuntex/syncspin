@@ -162,7 +162,7 @@ impl Client {
     pub fn builder() -> ClientBuilder;           // name, server, roles, format, storage, sink
     pub async fn connect(&mut self) -> Result<ConnectInfo>;
     pub fn events(&self) -> impl Stream<Item = Event> + Send;
-    pub fn control(&self) -> ControlHandle;      // play/pause/skip/volume/mute
+    pub fn control(&self) -> ControlHandle;      // play/pause/skip/seek/volume/mute
     pub fn state(&self) -> PlayerState;          // last known state, no await
 }
 ```

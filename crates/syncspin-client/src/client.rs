@@ -629,6 +629,14 @@ pub struct PlaybackState {
     pub volume: Option<u8>,
     /// Group mute state, when the server reports one.
     pub muted: Option<bool>,
+    /// Highest absolute position [`ControlHandle::seek`] may target, in milliseconds.
+    ///
+    /// [`supported_commands`](PlaybackState::supported_commands) says whether the server offers
+    /// absolute or relative seek; this says how far an absolute target may go. It is `None`
+    /// before the first controller state and when the server advertised `seek` without naming a
+    /// range, and in both cases [`ControlHandle::seek`] refuses rather than sending a target it
+    /// cannot check. A `group/update` leaves it alone, because it belongs to the controller state.
+    pub seek_max_ms: Option<u64>,
     /// Playback state of the group, once a `group/update` arrived.
     ///
     /// `playing` and `stopped` are the values this revision defines; a paused group reports
@@ -703,13 +711,14 @@ impl Drop for ClientHandle {
 
 /// Playback controls for a live connection.
 ///
-/// A call returns once the connection has handled it: a transport command has been written to the
-/// server, and a level or mute change has been recorded and included in the next state report. It
-/// is an error when the connection has ended, when no session is established at that moment, and
-/// when the server did not activate the role the command belongs to: transport commands need
-/// `controller@v1`, volume and mute state need `player@v1`. A transport command the server did not
-/// list in its controller state is refused as well, so a host can offer exactly the buttons the
-/// server accepts.
+/// A call returns once the connection has handled it: a transport command or a seek has been
+/// written to the server, and a level or mute change has been recorded and included in the next
+/// state report. It is an error when the connection has ended, when no session is established at
+/// that moment, and when the server did not activate the role the command belongs to: transport
+/// commands and seeks need `controller@v1`, volume and mute state need `player@v1`. A transport
+/// command or seek the server did not list in its controller state is refused as well, so a host
+/// can offer exactly the buttons the server accepts. An absolute seek needs the reported range on
+/// top of that, so it is refused before the first controller state.
 #[derive(Debug, Clone)]
 pub struct ControlHandle {
     pub(crate) commands: mpsc::UnboundedSender<ControlRequest>,
@@ -749,6 +758,41 @@ impl ControlHandle {
     /// Skips to the previous track.
     pub async fn previous(&self) -> Result<()> {
         self.transport("previous").await
+    }
+
+    /// Seeks to an absolute position in milliseconds.
+    ///
+    /// The server must offer `seek` and report a range: the target is checked against
+    /// [`PlaybackState::seek_max_ms`], so a position beyond it is refused and nothing is sent.
+    /// Before the first controller state neither the command nor the range is known, so an
+    /// absolute seek is refused; [`ControlHandle::seek_relative`] follows the open-window rule of
+    /// the other transport commands instead, because an offset needs no range.
+    ///
+    /// # Errors
+    /// Returns an error when the connection has ended, when no session is established, when the
+    /// server did not activate `controller@v1`, when it did not offer `seek`, when it reported no
+    /// seekable range, and when `position_ms` is beyond that range. The last error names both the
+    /// target and the range.
+    pub async fn seek(&self, position_ms: u64) -> Result<()> {
+        self.send(ControlAction::Seek(position_ms))
+            .await
+            .map(|_level| ())
+    }
+
+    /// Seeks by an offset in milliseconds from the current position; a negative offset rewinds.
+    ///
+    /// The server must offer `seek_relative`. The window before its first controller state is
+    /// open, as it is for the other transport commands: an offset needs no known range, so there
+    /// is nothing to check it against. An absolute [`ControlHandle::seek`] is different and is
+    /// refused until the range is known.
+    ///
+    /// # Errors
+    /// Returns an error when the connection has ended, when no session is established, when the
+    /// server did not activate `controller@v1`, and when it did not offer `seek_relative`.
+    pub async fn seek_relative(&self, offset_ms: i64) -> Result<()> {
+        self.send(ControlAction::SeekRelative(offset_ms))
+            .await
+            .map(|_level| ())
     }
 
     /// Sets the output level, limited by [`ClientConfig::volume_policy`] against the level in
@@ -876,6 +920,10 @@ impl ControlHandle {
 pub(crate) enum ControlAction {
     /// A controller command, by wire name.
     Transport(&'static str),
+    /// Seek to an absolute position in milliseconds.
+    Seek(u64),
+    /// Seek by an offset in milliseconds; negative rewinds.
+    SeekRelative(i64),
     /// Set the output level, subject to the volume limit.
     Volume(u8),
     /// Record the level the output is actually at, without the volume limit.
