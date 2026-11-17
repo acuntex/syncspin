@@ -429,10 +429,10 @@ each role's stream configuration is derived from what the client reports - for t
 
 **What we do:** the stream waits for the update (the group announces nothing to a member without its
 `player` object) but schedules the first sample at `START_LEAD`, 200 ms after the stream opens, for
-every member. The reported lead and buffer are read but not used. The group fans one timeline out to
-every member, so all of them share the timestamps; the tests
-`two_players_receive_the_same_frames` and `a_player_hears_nothing_before_it_reports_its_state` pin
-that.
+every member. The reported lead and buffer are received but not used, and `output_delay_ms` is
+ignored as well. The group fans one timeline out to every member, so all of them share the
+timestamps; the tests `two_players_receive_the_same_frames` and
+`a_player_hears_nothing_before_it_reports_its_state` pin that.
 
 **Why:** a stream is one timeline: starting it at each member's own reported lead would give the
 members different timestamps for the same audio, which the server fan-out and the group design do

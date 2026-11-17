@@ -251,7 +251,7 @@ it found and passes one URL to `connect`, which the spec leaves implementation-d
   server it last admitted with `playback`, and the server keeps operator approval for its lifetime
   only. A restart asks the operator again.
 - **Playout lead.** Every member shares one timeline whose first sample is 200 ms after the stream
-  opens. The reported `required_lead_time_ms` and `min_buffer_ms` are read but do not move it.
+  opens. The reported `required_lead_time_ms` and `min_buffer_ms` are received but do not move it.
 - **TLS.** No TLS stack: a `wss://` address is rejected when the client is configured, and nothing
   is downgraded to `ws://`. A TLS backend is out of scope.
 

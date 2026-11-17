@@ -184,8 +184,9 @@ pub trait Sink: Send + 'static {
 
     /// Reports the delay the output adds **after** the audio port: external speakers, amplifiers, a
     /// chain after the DAC. Decoder, pipeline and device-internal buffer latency belong in the host's
-    /// playout scheduling, not here; the server multiplies this value into its send-ahead, so reporting
-    /// a buffer here raises the lead instead of compensating it.
+    /// playout scheduling, not here. A conformant server factors this value into its send-ahead, so
+    /// reporting a buffer here raises the lead instead of compensating it; the server in this
+    /// workspace ignores the reported timing until `docs/spec-deviations.md` #17 closes.
     ///
     /// The host restores the same value across restarts and reconnections: the protocol requires
     /// `output_delay_ms` to persist, and this trait is the only place the client learns it.

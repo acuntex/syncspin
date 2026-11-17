@@ -132,8 +132,8 @@ pub enum AudioFrame<'a> {
 
 pub trait Sink: Send + 'static {
     fn open(&mut self, format: AudioFormat) -> Result<()>;
-    /// `due` is the playout deadline the crate computed from the server timestamp,
-    /// the time filter and `output_delay_ms`. The sink honours it and reports its own delay back.
+    /// `due` is the playout deadline the crate computed from the server timestamp and the time
+    /// filter; the sink applies its own post-port delay.
     fn write(&mut self, frame: AudioFrame<'_>, due: Instant) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
     /// Drops the audio due at or after `due`; the default flushes everything.
