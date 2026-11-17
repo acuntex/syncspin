@@ -1583,6 +1583,85 @@ async fn a_pinned_value_is_not_overwritten() {
 }
 
 #[tokio::test]
+async fn a_saturated_send_ahead_produces_no_update() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (_handle, _events) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    wait_for_client_state(&mut server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    // Past the estimator's warmup: a start-from-empty burst is not steady-state delay.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    // `0` and `u32::MAX` are the protocol's saturation values for `send_ahead`, meaning "no
+    // measurement". The timestamp is half a second in the past, so an unfiltered sample would
+    // derive ~500 ms and raise the buffer after 128 samples; 200 chunks per value make the row
+    // discriminating, and the quiet window below catches any state that would follow.
+    for (sent, send_ahead) in [(200, 0), (400, u32::MAX)] {
+        for _ in 0..200 {
+            server.audio(now_us() - 500_000, send_ahead, vec![0x5a; 64]);
+        }
+        wait_for_writes(&recordings, sent).await;
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server.wait_for_client_state())
+            .await
+            .is_err(),
+        "a saturated send_ahead is no measurement and must not change the buffer"
+    );
+}
+
+#[tokio::test]
+async fn an_auto_value_updates_after_a_window() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the first state carries the player object");
+    assert_eq!(
+        player.min_buffer_ms, 250,
+        "an unpinned session starts at the value it reports before any derivation"
+    );
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    // Samples inside the first second of a stream are discarded as start-burst noise.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    // A stable synthetic arrival pattern: each chunk claims a transmit time 50 ms ahead of a
+    // timestamp half a second in the past, so the measured arrival delay is around 550 ms - far
+    // from the 250 ms start value. 160 samples are enough for two evaluations; 200 leaves margin.
+    for _ in 0..200 {
+        server.audio(now_us() - 500_000, 50_000, vec![0x5a; 64]);
+    }
+    wait_for_writes(&recordings, 200).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the derived report carries the player object");
+    assert_ne!(
+        player.min_buffer_ms, 250,
+        "a sustained arrival delay must replace the start value"
+    );
+    assert!(
+        player.min_buffer_ms <= 5_000,
+        "the derived value stays inside the protocol's range, got {}",
+        player.min_buffer_ms
+    );
+}
+
+#[tokio::test]
 async fn a_burst_with_a_sample_does_not_wait_for_a_lost_last_reply() {
     let options = ServerOptions {
         manual_time: true,

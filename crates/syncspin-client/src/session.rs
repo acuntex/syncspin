@@ -53,6 +53,7 @@ use syncspin_core::noise::{
 #[cfg(feature = "pairing-code")]
 use syncspin_core::pairing::pake::TAG_LEN;
 
+use crate::buffer::{BufferEstimator, PLAUSIBLE_US, WARMUP};
 use crate::client::{
     check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, GoodbyeReason,
     PairingFailure, PairingRequiredReason, PlaybackState, StreamEndReason, NORMAL_PLAYBACK_SPEED,
@@ -132,12 +133,6 @@ const SUPPORTED_ROLES: [&str; 3] = [PLAYER_ROLE, CONTROLLER_ROLE, METADATA_ROLE]
 
 /// Largest output delay reported to the server, in milliseconds.
 const MAX_OUTPUT_DELAY_MS: u32 = 5_000;
-
-/// Buffer duration a session starts with when the configuration does not pin one, in milliseconds.
-///
-/// The first `client/state` goes out after one clock sample, before the arrival-delay distribution
-/// holds enough samples to derive a value, so the session reports this until it can derive one.
-const MIN_BUFFER_MS: u32 = 250;
 
 /// Largest total size of outstanding audio chunks this client accepts.
 const BUFFER_CAPACITY: u64 = 131_072;
@@ -564,6 +559,11 @@ pub(crate) struct Session<'a> {
     /// unpaired access, which is the condition the spec gives for a `pairing_required` close.
     playback_declared: bool,
     stream: Option<AudioFormat>,
+    /// When the current stream started, for the estimator's warmup, or `None` without one.
+    ///
+    /// An in-place `stream/start` keeps the value it already has: arrival delay is a property of
+    /// the path, not of the format.
+    stream_started: Option<Instant>,
     /// Remaining `client/time` messages of the current burst (0 = no burst running).
     sync_remaining: usize,
     /// Deadline for the current burst, or `None` when no burst is running.
@@ -595,10 +595,13 @@ pub(crate) struct Session<'a> {
     muted: bool,
     /// Buffer duration in force, in milliseconds.
     ///
-    /// Starts at the configured pin, or at [`MIN_BUFFER_MS`] when the configuration leaves the value
-    /// to the session. Every `client/state` reports it; a pinned session leaves it alone, and an
-    /// unpinned one replaces it with a value derived from arrival delay.
+    /// Starts at the configured pin, or at [`MIN_BUFFER_MS`](crate::buffer::MIN_BUFFER_MS) when the
+    /// configuration leaves the value to the session. Every `client/state` reports it; a pinned
+    /// session leaves it alone, and an unpinned one replaces it with a value derived from arrival
+    /// delay.
     min_buffer_ms: u32,
+    /// Arrival-delay estimator behind [`Self::min_buffer_ms`] when the host did not pin it.
+    estimator: BufferEstimator,
     /// Whether a sink call failed, which the host has to repair before another attempt.
     sink_failed: bool,
     /// Whether this connection already reported a non-canonical `group_id`.
@@ -751,6 +754,9 @@ pub(crate) async fn attempt(
     // The host may have changed the value while no session was live, so the snapshot starts from
     // the shared value rather than from the configuration.
     let unpaired_access_snapshot = carried.unpaired_access.load(Ordering::Relaxed);
+    // The estimator owns the initial value: the pin when the host set one, otherwise the value an
+    // unpinned session starts at.
+    let estimator = BufferEstimator::new(config.min_buffer_ms);
     let mut session = Session {
         transport: ready.transport,
         noise: ready.noise,
@@ -765,6 +771,7 @@ pub(crate) async fn attempt(
         unpaired_access_snapshot,
         playback_declared: false,
         stream: None,
+        stream_started: None,
         sync_remaining: 0,
         burst_deadline: None,
         reply_deadline: None,
@@ -777,7 +784,8 @@ pub(crate) async fn attempt(
         shutdown,
         volume: carried.volume,
         muted: carried.muted,
-        min_buffer_ms: config.min_buffer_ms.unwrap_or(MIN_BUFFER_MS),
+        min_buffer_ms: estimator.value(),
+        estimator,
         sink_failed: false,
         group_id_tolerance_reported: false,
         controller_commands: None,
@@ -1122,6 +1130,9 @@ impl Session<'_> {
     /// server before it processed message 2: the spec allows discarding it, and it must not end a
     /// connection that is otherwise fine.
     async fn receive(&mut self, ciphertext: &[u8]) -> Result<()> {
+        // Arrival belongs at the transport read, before decryption and parsing can add their own
+        // time to the delay the estimator measures.
+        let arrival_us = now_us();
         let plaintext = match self.noise.decrypt(ciphertext) {
             Ok(plaintext) => plaintext,
             Err(error) => {
@@ -1145,7 +1156,7 @@ impl Session<'_> {
         // not decode is ignored, while a malformed audio chunk stays a protocol error.
         match MessageKind::of(id) {
             MessageKind::Control => self.handle_control_message(&body).await,
-            MessageKind::Audio => self.handle_audio(&body),
+            MessageKind::Audio => self.handle_audio(&body, arrival_us).await,
             // A message id belongs to a role this client does not implement.
             MessageKind::Unknown => Ok(()),
         }
@@ -2093,6 +2104,12 @@ impl Session<'_> {
             );
         }
 
+        // Only a stream that was not open yet restarts the warmup: an in-place `stream/start`
+        // replaces the format of a running stream, whose arrival distribution is unchanged.
+        if self.stream.is_none() {
+            self.stream_started = Some(Instant::now());
+        }
+
         self.flush_sink()?;
         self.open_sink(format.clone())?;
         self.stream = Some(format.clone());
@@ -2103,8 +2120,9 @@ impl Session<'_> {
     /// Delivers one audio chunk whose 13-byte header the reassembler handed over separately.
     ///
     /// The header is protocol syntax even when the frame is not playable: a short or malformed
-    /// chunk closes the connection whether or not a stream is open.
-    fn handle_audio(&mut self, body: &[u8]) -> Result<()> {
+    /// chunk closes the connection whether or not a stream is open. `arrival_us` is the wall clock
+    /// reading taken when the transport frame arrived, before decryption.
+    async fn handle_audio(&mut self, body: &[u8], arrival_us: i64) -> Result<()> {
         // The reassembler removes the message id, which the chunk parser expects.
         let mut message = Vec::with_capacity(1 + body.len());
         message.push(AUDIO_CHUNK_ID);
@@ -2130,8 +2148,48 @@ impl Session<'_> {
             }
         };
 
+        self.record_arrival_delay(&header, arrival_us).await?;
         let due = self.playout_deadline(header.timestamp_us);
         self.write_sink(frame, due)
+    }
+
+    /// Feeds one chunk's arrival delay into the buffer estimator and reports a derived change.
+    ///
+    /// Only reached for an active player with an open stream, because [`Self::handle_audio`]
+    /// returned early otherwise. A sample is skipped inside the warmup after `stream/start` (a
+    /// start-from-empty burst is transmitted back-to-back and does not represent steady-state
+    /// delay), when `send_ahead` carries one of the protocol's saturation values, before the clock
+    /// estimate exists, and for a delay outside the plausibility bound.
+    async fn record_arrival_delay(
+        &mut self,
+        header: &AudioChunkHeader,
+        arrival_us: i64,
+    ) -> Result<()> {
+        let Some(started) = self.stream_started else {
+            return Ok(());
+        };
+        if started.elapsed() < WARMUP {
+            return Ok(());
+        }
+        let send_ahead = header.send_ahead;
+        if send_ahead == 0 || send_ahead == u32::MAX {
+            // The protocol reserves these for "no measurement".
+            return Ok(());
+        }
+        let mapped_transmit_us = header.timestamp_us.saturating_sub(i64::from(send_ahead));
+        let Some(mapped_transmit_us) = self.clock.client_time_us(mapped_transmit_us) else {
+            return Ok(());
+        };
+        let delay_us = arrival_us.saturating_sub(mapped_transmit_us);
+        if !(0..=PLAUSIBLE_US).contains(&delay_us) {
+            return Ok(());
+        }
+        self.estimator.sample(delay_us);
+        if let Some(value) = self.estimator.evaluate() {
+            self.min_buffer_ms = value;
+            self.report_state().await?;
+        }
+        Ok(())
     }
 
     /// Drops buffered audio and forgets the open stream.
@@ -2141,6 +2199,7 @@ impl Session<'_> {
     /// session, like any other sink error.
     fn stop_stream(&mut self, reason: StreamEndReason) -> Result<()> {
         self.stream = None;
+        self.stream_started = None;
         self.emit(Event::StreamEnd { reason });
         self.flush_sink()
     }
@@ -3697,6 +3756,7 @@ mod tests {
         noise: NoiseTransport,
         control: Option<mpsc::UnboundedReceiver<ControlRequest>>,
     ) -> Session<'a> {
+        let estimator = BufferEstimator::new(config.min_buffer_ms);
         Session {
             transport,
             noise,
@@ -3711,6 +3771,7 @@ mod tests {
             unpaired_access_snapshot: config.unpaired_access,
             playback_declared: false,
             stream: None,
+            stream_started: None,
             sync_remaining: 0,
             burst_deadline: None,
             reply_deadline: None,
@@ -3723,7 +3784,8 @@ mod tests {
             shutdown: idle_shutdown(),
             volume: 50,
             muted: false,
-            min_buffer_ms: config.min_buffer_ms.unwrap_or(MIN_BUFFER_MS),
+            min_buffer_ms: estimator.value(),
+            estimator,
             sink_failed: false,
             group_id_tolerance_reported: false,
             controller_commands: None,

@@ -91,6 +91,7 @@
 //! The connection keeps running until the audio sink fails, which the host has to repair, or until
 //! the handle or the event stream is dropped.
 
+mod buffer;
 mod client;
 mod config;
 mod discovery;
