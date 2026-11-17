@@ -280,6 +280,18 @@ connection regardless of the client's hello. Expected: the client sends `client/
 activation stays admissible so pairing still works. This paragraph records how to check it, not a
 performed run.
 
+The setting also changes on a live connection: `ControlHandle::set_unpaired_access` stores the value
+the next `client/hello` advertises and acts on the running session at once. Turning it off on an
+unpaired session that holds roles or declared `playback` sends `client/goodbye` reason
+`pairing_required` and reports `Event::Disconnected` with "the client stopped admitting unpaired
+access"; the client reconnects and the new hello advertises `false`. Turning it on restarts an
+unpaired session with `client/goodbye` reason `restart`, so the reconnected hello advertises `true`.
+A paired session is neither closed nor restarted, because the setting never applied to it.
+
+`player-pipe` calls the control handle only for `open_pairing_window`, so this check needs a host
+around the library that exposes the call, as with the Sentinel fallback below. **This run has not been
+performed.**
+
 ### Pairing (performed 2026-11-16)
 
 **Run against a real Music Assistant server with the Sendspin provider enabled.** Observed:
