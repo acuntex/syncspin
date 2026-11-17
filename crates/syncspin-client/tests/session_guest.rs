@@ -15,12 +15,12 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use syncspin_client::{
     connect, connect_with_psks, AudioFormat, AudioFrame, ClientConfig, ClientHandle, Codec, Event,
-    EventStream, PskCategory, Sink, StoredPsk, StreamEndReason, VolumePolicy,
+    EventStream, PlaybackState, PskCategory, Sink, StoredPsk, StreamEndReason, VolumePolicy,
     DEFAULT_PAIRING_TIMEOUT, NORMAL_PLAYBACK_SPEED,
 };
 use syncspin_core::messages::{
-    ClientState, ControllerState, GroupUpdate, Incoming, PairingActivation, PlayerCommand,
-    Progress, ServerActivate, ServerCommand, ServerState,
+    ClientState, ControllerCommand, ControllerState, GroupUpdate, Incoming, PairingActivation,
+    PlayerCommand, Progress, ServerActivate, ServerCommand, ServerState,
 };
 use syncspin_core::noise::{psk_id_for, Identity, SENTINEL_PSK};
 
@@ -489,6 +489,58 @@ async fn wait_for_client_state(server: &mut FakeServer) -> ClientState {
         .await
         .expect("the client must report its state")
         .expect("the connection must not close before the state report")
+}
+
+/// Builds the `server/state` that advertises the controller commands and range the server offers.
+fn controller_state(commands: &[&str], seek_max_ms: Option<u64>) -> String {
+    serde_json::to_string(&Incoming::ServerState(ServerState {
+        metadata: None,
+        controller: Some(ControllerState {
+            supported_commands: commands
+                .iter()
+                .map(|command| (*command).to_owned())
+                .collect(),
+            volume: Some(100),
+            muted: Some(false),
+            repeat: None,
+            shuffle: None,
+            seek_max_ms,
+        }),
+    }))
+    .expect("the state must encode")
+}
+
+/// Waits for the next client command and returns its controller object.
+async fn next_controller_command(server: &mut FakeServer) -> ControllerCommand {
+    let command = tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_command())
+        .await
+        .expect("the client must send a command")
+        .expect("the connection must not close before the command");
+    command
+        .controller
+        .expect("a controller command carries a controller object")
+}
+
+/// Consumes the [`Event::State`] a `server/state` produces.
+///
+/// The control request reaches the session loop through a channel while the state travels through
+/// the socket, so a test that calls `control()` before the event arrived can still see the range
+/// the previous state left behind.
+async fn expect_controller_state(stream: &mut EventStream) -> PlaybackState {
+    match next_event(stream).await {
+        Event::State(state) => state,
+        other => panic!("expected State, got {other:?}"),
+    }
+}
+
+/// Asserts that the client sends no client command within the bound.
+async fn assert_no_client_command(server: &mut FakeServer) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), server.wait_for_client_command())
+            .await
+            .is_err(),
+        "a refused command must not be sent"
+    );
 }
 
 /// Asserts that a transient failure left the connection reconnecting instead of ending it.
@@ -1737,6 +1789,7 @@ async fn controller_state_is_reported() {
             muted: Some(false),
             repeat: None,
             shuffle: None,
+            seek_max_ms: Some(245_000),
         }),
     }))
     .unwrap();
@@ -1747,9 +1800,230 @@ async fn controller_state_is_reported() {
             assert_eq!(state.supported_commands, vec!["play".to_owned()]);
             assert_eq!(state.volume, Some(40));
             assert_eq!(state.muted, Some(false));
+            assert_eq!(
+                state.seek_max_ms,
+                Some(245_000),
+                "the seekable range reaches the host"
+            );
         }
         other => panic!("expected State, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_controller_seek_sends_the_position() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.json(controller_state(&["play", "seek"], Some(245_000)));
+    let state = expect_controller_state(&mut events).await;
+    assert_eq!(state.seek_max_ms, Some(245_000));
+
+    handle
+        .control()
+        .seek(123_456)
+        .await
+        .expect("an advertised seek inside the range is sent");
+    let command = next_controller_command(&mut server).await;
+    assert_eq!(command.command, "seek");
+    assert_eq!(command.position_ms, Some(123_456));
+    assert_eq!(
+        command.offset_ms, None,
+        "an absolute seek carries no offset"
+    );
+}
+
+#[tokio::test]
+async fn a_relative_seek_sends_the_offset() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.json(controller_state(&["seek_relative"], None));
+    let state = expect_controller_state(&mut events).await;
+    assert_eq!(
+        state.seek_max_ms, None,
+        "a relative seek needs no range, so none is reported"
+    );
+
+    handle
+        .control()
+        .seek_relative(-15_000)
+        .await
+        .expect("an advertised relative seek is sent");
+    let command = next_controller_command(&mut server).await;
+    assert_eq!(command.command, "seek_relative");
+    assert_eq!(command.offset_ms, Some(-15_000));
+    assert_eq!(
+        command.position_ms, None,
+        "a relative seek carries no absolute position"
+    );
+}
+
+#[tokio::test]
+async fn a_seek_the_server_did_not_offer_is_refused() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.json(controller_state(&["play"], None));
+    expect_controller_state(&mut events).await;
+
+    let error = handle
+        .control()
+        .seek(1)
+        .await
+        .expect_err("a command the server does not advertise must not be sent");
+    assert!(
+        format!("{error:#}").contains("does not accept the command \"seek\""),
+        "the error names the advertised gate and the refused command, got: {error:#}"
+    );
+    assert_no_client_command(&mut server).await;
+}
+
+#[tokio::test]
+async fn a_seek_at_the_upper_bound_is_sent() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.json(controller_state(&["seek"], Some(12_000)));
+    let state = expect_controller_state(&mut events).await;
+    assert_eq!(state.seek_max_ms, Some(12_000));
+
+    handle
+        .control()
+        .seek(12_000)
+        .await
+        .expect("the range is inclusive, so a target at it is sent");
+    let command = next_controller_command(&mut server).await;
+    assert_eq!(command.command, "seek");
+    assert_eq!(
+        command.position_ms,
+        Some(12_000),
+        "the bound itself is a valid target"
+    );
+}
+
+#[tokio::test]
+async fn a_seek_beyond_the_range_is_refused() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.json(controller_state(&["seek"], Some(12_000)));
+    let state = expect_controller_state(&mut events).await;
+    assert_eq!(state.seek_max_ms, Some(12_000));
+
+    let error = handle
+        .control()
+        .seek(12_001)
+        .await
+        .expect_err("a target beyond the range must be refused");
+    assert!(
+        format!("{error:#}").contains("12000"),
+        "the error names the range, got: {error:#}"
+    );
+    assert_no_client_command(&mut server).await;
+}
+
+#[tokio::test]
+async fn a_seek_without_a_range_is_refused() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.json(controller_state(&["seek"], None));
+    let state = expect_controller_state(&mut events).await;
+    assert_eq!(
+        state.seek_max_ms, None,
+        "the server offered seek without naming a range"
+    );
+
+    let error = handle
+        .control()
+        .seek(1)
+        .await
+        .expect_err("a target without a range cannot be checked");
+    assert!(
+        format!("{error:#}").contains("range"),
+        "the error names the missing range, got: {error:#}"
+    );
+    assert_no_client_command(&mut server).await;
+}
+
+#[tokio::test]
+async fn a_seek_before_the_first_state_is_refused_while_a_relative_seek_is_sent() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // No `server/state` has arrived, so the range is unknown and an absolute seek has no target
+    // it could be checked against: the open window does not extend to it.
+    let error = handle
+        .control()
+        .seek(1)
+        .await
+        .expect_err("an absolute seek needs the range the first controller state carries");
+    assert!(
+        format!("{error:#}").contains("range"),
+        "the error names the missing range, got: {error:#}"
+    );
+    assert_no_client_command(&mut server).await;
+
+    // A relative seek needs no range, so it keeps the open window of the transport commands.
+    handle
+        .control()
+        .seek_relative(-1_000)
+        .await
+        .expect("a relative seek needs no known range");
+    let command = next_controller_command(&mut server).await;
+    assert_eq!(command.command, "seek_relative");
+    assert_eq!(command.offset_ms, Some(-1_000));
+}
+
+#[tokio::test]
+async fn a_group_update_does_not_clear_the_seekable_range() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    server.json(controller_state(&["play", "seek"], Some(245_000)));
+    let state = expect_controller_state(&mut events).await;
+    assert_eq!(state.seek_max_ms, Some(245_000));
+
+    // `group/update` replaces only the group fields, so the controller picture stays.
+    let update = serde_json::to_string(&Incoming::GroupUpdate(GroupUpdate {
+        playback_state: "playing".to_owned(),
+        group_id: "A".repeat(43),
+        group_name: "Living room".to_owned(),
+    }))
+    .unwrap();
+    server.json(update);
+    let state = expect_controller_state(&mut events).await;
+    assert_eq!(state.playback_state.as_deref(), Some("playing"));
+    assert_eq!(
+        state.seek_max_ms,
+        Some(245_000),
+        "a group update keeps the seekable range the controller state reported"
+    );
 }
 
 #[tokio::test]
@@ -1773,6 +2047,7 @@ async fn group_update_is_the_authoritative_playback_state() {
             muted: Some(false),
             repeat: None,
             shuffle: None,
+            seek_max_ms: None,
         }),
     }))
     .unwrap();
@@ -2397,6 +2672,7 @@ async fn metadata_is_ignored_when_its_role_is_inactive() {
                 muted: Some(false),
                 repeat: None,
                 shuffle: None,
+                seek_max_ms: None,
             }),
         }))
         .unwrap(),
@@ -2430,6 +2706,7 @@ async fn controller_state_is_ignored_when_its_role_is_inactive() {
                 muted: Some(false),
                 repeat: None,
                 shuffle: None,
+                seek_max_ms: None,
             }),
         }))
         .unwrap(),

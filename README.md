@@ -258,8 +258,8 @@ while let Some(event) = events.next().await {
 }
 ```
 
-`handle.control()` returns the play/pause/skip, volume and mute controls; dropping the handle or the
-event stream ends the connection.
+`handle.control()` returns the play/pause/skip, seek, volume and mute controls; dropping the handle
+or the event stream ends the connection.
 
 ## Integrating a server
 

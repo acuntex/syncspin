@@ -22,7 +22,7 @@ harmless.
 | 10  | A stream-clear timestamp is honoured only by sinks that implement `discard_from` | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Accepted, `Sink::discard_from`              |
 | 11  | Playout deadlines begin after three clock bursts                                 | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                                  |
 | 12  | A player volume above 100 is capped, not rejected                                | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`               |
-| 13  | A transport command before the controller state is not checked                   | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`                   |
+| 13  | A controller command before the controller state is not checked                  | [`roles/controller/v1.md` — `client/command` controller object](https://github.com/Sendspin/spec/blob/main/roles/controller/v1.md#client--server-clientcommand-controller-object) | Accepted, `check_control`                   |
 | 14  | A reconnect keeps the last known `active_roles` while playback-capable           | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                       | Accepted, `handshake`                       |
 | 15  | A malformed control message is ignored, not fatal                                | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message`          |
 | 16  | A server keeps an unavailable client in the group                                | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                      | Open, one group                             |
@@ -299,17 +299,21 @@ the failure mode that keeps the player usable.
 connection with a protocol-error reason once that path exists, or reject the value at the parser
 with the same effect. Test the closed connection instead of the capped level.
 
-## 13. A transport command before the controller state is not checked
+## 13. A controller command before the controller state is not checked
 
 **Spec:** `roles/controller/v1.md`, `client/command` controller object. `command` MUST be one of
 the values listed in `supported_commands` from the latest controller state the client received in
 `server/state`.
 
 **What we do:** the session records `controller.supported_commands` whenever a controller state
-arrives and refuses a transport command outside that set (`check_control`,
+arrives and refuses a controller command outside that set (`check_control`,
 `a_transport_command_must_be_advertised_by_the_server`). Before the first controller state the set
 is unknown, so a command is sent instead of refused; the server ignores a command it does not
 accept, so the observable outcome is the same, but the client has broken the MUST in that window.
+`seek_relative` shares that window: an offset needs no range, so nothing has to be known first.
+Absolute `seek` is the deliberate exception - it additionally requires the seekable range from the
+same controller state, and with no range known yet it is refused before the first controller state
+rather than sent unvalidated.
 
 **Why:** a host may offer a play button before the first `server/state` arrives - it has no other
 source of truth - and refusing there would make the button dead for an unbounded time. The window

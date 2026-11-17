@@ -523,6 +523,7 @@ impl Inner {
             muted: Some(self.muted),
             repeat: None,
             shuffle: None,
+            seek_max_ms: None,
         }
     }
 

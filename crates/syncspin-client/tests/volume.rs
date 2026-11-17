@@ -163,6 +163,7 @@ fn controller_state(commands: &[&str]) -> String {
             muted: Some(false),
             repeat: None,
             shuffle: None,
+            seek_max_ms: None,
         }),
     }))
     .expect("the state must encode")
