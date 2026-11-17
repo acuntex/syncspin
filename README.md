@@ -123,6 +123,13 @@ A level above the protocol maximum of 100 is refused and nothing is recorded or 
 software version and MAC address - and is announced in `client/hello`, so the server can show the
 hardware rather than only the player name. A host that describes no device passes `None`.
 
+`ClientConfig::required_lead_time_ms` is the host's own start-up cost - launching the output,
+warming the decoder - and reaches the server in `client/state`; it defaults to 250 ms and has no
+upper bound beyond its type. `ClientConfig::min_buffer_ms` pins the buffer the server should keep
+filled; with the default `None` the client derives it from the arrival delay of audio chunks, starts
+from 250 ms, and reports an applied change in a `client/state`. A pin above the protocol's 5000 ms
+is refused before a connection is attempted.
+
 The stream lifecycle is visible on the event stream: `Event::StreamStart` announces a new format,
 `Event::StreamEnd` reports a pause or a removed player role, and `Event::StreamClear` reports a seek
 with its timestamp. The end and clear events arrive before the client discards or flushes buffered
@@ -244,7 +251,7 @@ it found and passes one URL to `connect`, which the spec leaves implementation-d
   server it last admitted with `playback`, and the server keeps operator approval for its lifetime
   only. A restart asks the operator again.
 - **Playout lead.** Every member shares one timeline whose first sample is 200 ms after the stream
-  opens. The reported `required_lead_time_ms` and `min_buffer_ms` are read but do not move it.
+  opens. The reported `required_lead_time_ms` and `min_buffer_ms` are received but do not move it.
 - **TLS.** No TLS stack: a `wss://` address is rejected when the client is configured, and nothing
   is downgraded to `ws://`. A TLS backend is out of scope.
 
@@ -255,9 +262,11 @@ and the work that closes them in [docs/spec-deviations.md](docs/spec-deviations.
 
 A host supplies a [`Sink`](crates/syncspin-client/src/sink.rs): `open` for a new format, `write` for
 every chunk with the playout deadline the client computed, `discard_from` for a seek with a
-timestamp, `flush` at each boundary the crate announces, and optionally `latency` and `underruns` so
-the client can hold its buffer and report timing. The crate owns the connection, the clock and the
-reconnect loop; the host owns the output device, the identity file and everything below the pipe.
+timestamp, `flush` at each boundary the crate announces, and optionally `output_delay` for the delay
+the output adds beyond the audio port, which the client reports to the server, and `underruns` for
+diagnostics. The buffer the session asks for comes from its configuration or from arriving audio,
+so it needs no sink hook. The crate owns the connection, the clock and the reconnect loop; the host
+owns the output device, the identity file and everything below the pipe.
 Pairing needs a [`Storage`](crates/syncspin-client/src/storage.rs) as well; without one the client
 offers no pairing method, and a host that already holds records can pass them to `connect_with_psks`
 instead.
