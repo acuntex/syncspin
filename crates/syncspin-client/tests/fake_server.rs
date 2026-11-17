@@ -21,6 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use snow::{Builder, HandshakeState, Keypair, TransportState as SnowTransport};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::{protocol::Role, Error as WsError, Message};
 use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream, WebSocketStream};
@@ -127,6 +128,12 @@ pub struct ServerOptions {
     /// The spec requires an activation under the new keys, and the shape a test needs there can differ
     /// from the playback activation a connected session gets.
     pub rehandshake_activate: Option<ServerActivate>,
+    /// Whether the activation after a re-handshake waits for [`FakeServer::release_rehandshake_activate`].
+    ///
+    /// The window between message 2 and that activation is the one in which the client may send no
+    /// application message. A test that acts inside it holds the activation instead of racing the
+    /// harness; it must release it well inside the client's five-second handshake deadline.
+    pub hold_rehandshake_activate: bool,
     /// The static pairing code this server expects, which selects the static flow when set.
     ///
     /// The harness plays the server's CPace side with the code as `PRS`. A test that plays an
@@ -192,6 +199,7 @@ impl Default for ServerOptions {
             acknowledge_pairing: true,
             stale_message_on_rehandshake: false,
             rehandshake_activate: None,
+            hold_rehandshake_activate: false,
             #[cfg(feature = "pairing-code")]
             static_pairing_code: None,
             #[cfg(feature = "pairing-code")]
@@ -352,6 +360,8 @@ pub struct FakeServer {
     ///
     /// A test compares these bytes; nothing formats them, because `h` must never reach a log.
     hashes: Arc<Mutex<Vec<[u8; 32]>>>,
+    /// Released to let a held post-re-handshake activation through.
+    rehandshake_activate: Arc<Notify>,
 }
 
 impl FakeServer {
@@ -371,8 +381,10 @@ impl FakeServer {
         // The server-side record of one completed pairing: the key the next handshake announces.
         let paired = Arc::new(Mutex::new(None));
         let hashes = Arc::new(Mutex::new(Vec::new()));
+        let rehandshake_activate = Arc::new(Notify::new());
         let task = tokio::spawn({
             let hashes = Arc::clone(&hashes);
+            let rehandshake_activate = Arc::clone(&rehandshake_activate);
             async move {
                 if let Err(error) = serve(
                     listener,
@@ -382,6 +394,7 @@ impl FakeServer {
                     observation_tx,
                     paired,
                     hashes,
+                    &rehandshake_activate,
                 )
                 .await
                 {
@@ -399,6 +412,7 @@ impl FakeServer {
             observations,
             task,
             hashes,
+            rehandshake_activate,
         })
     }
 
@@ -417,9 +431,11 @@ impl FakeServer {
         let (observation_tx, observations) = mpsc::unbounded_channel();
         let paired = Arc::new(Mutex::new(None));
         let hashes = Arc::new(Mutex::new(Vec::new()));
+        let rehandshake_activate = Arc::new(Notify::new());
         let url = url.to_owned();
         let task = tokio::spawn({
             let hashes = Arc::clone(&hashes);
+            let rehandshake_activate = Arc::clone(&rehandshake_activate);
             async move {
                 let outcome = async {
                     let (socket, _response) = connect_async(&url)
@@ -434,6 +450,7 @@ impl FakeServer {
                         true,
                         &paired,
                         &hashes,
+                        &rehandshake_activate,
                     )
                     .await
                 };
@@ -450,6 +467,7 @@ impl FakeServer {
             observations,
             task,
             hashes,
+            rehandshake_activate,
         })
     }
 
@@ -599,6 +617,16 @@ impl FakeServer {
                 Some(_) => continue,
             }
         }
+    }
+
+    /// Lets the activation held after a re-handshake through.
+    ///
+    /// Only a harness started with
+    /// [`hold_rehandshake_activate`](ServerOptions::hold_rehandshake_activate) waits; the release
+    /// does nothing otherwise, and a release sent before the server reaches the hold is remembered
+    /// instead of lost.
+    pub fn release_rehandshake_activate(&self) {
+        self.rehandshake_activate.notify_one();
     }
 
     /// The handshake hash `h` of every Noise handshake on this connection, oldest first.
@@ -872,6 +900,7 @@ impl FakeServer {
 }
 
 /// Accepts the configured number of connections and serves each until it closes.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     listener: TcpListener,
     keypair: Keypair,
@@ -880,6 +909,7 @@ async fn serve(
     observations: UnboundedSender<Observation>,
     paired: Arc<Mutex<Option<[u8; 32]>>>,
     hashes: Arc<Mutex<Vec<[u8; 32]>>>,
+    rehandshake_activate: &Notify,
 ) -> Result<()> {
     for index in 0..options.connections {
         let (tcp, _peer) = listener
@@ -901,6 +931,7 @@ async fn serve(
             announce_roles,
             &paired,
             &hashes,
+            rehandshake_activate,
         )
         .await?;
     }
@@ -947,6 +978,7 @@ async fn serve_connection(
     announce_roles: bool,
     paired: &Arc<Mutex<Option<[u8; 32]>>>,
     hashes: &Arc<Mutex<Vec<[u8; 32]>>>,
+    rehandshake_activate: &Notify,
 ) -> Result<()> {
     // 1. client/init, whose exact bytes start the Noise prologue.
     let client_init_text = read_text(&mut socket).await?;
@@ -1308,6 +1340,9 @@ async fn serve_connection(
                             active_roles: Some(options.active_roles.clone()),
                             pairing: None,
                         });
+                if options.hold_rehandshake_activate {
+                    rehandshake_activate.notified().await;
+                }
                 send_encrypted(
                     &mut socket,
                     &mut noise,
