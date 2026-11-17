@@ -58,6 +58,15 @@ exclude_re = [
   # `base32_len` sizes a `String::with_capacity` and nothing else. A wrong capacity reallocates,
   # it cannot change the encoded bytes, so every mutant of this line is equivalent.
   '^crates/syncspin-core/src/pairing/token\.rs:284:',
+
+  # `while text.len() % 8 != 0` with `%` replaced by `/` or `+` never stops padding, in
+  # `decode_body` and in `base32_encode` alike. Nothing to assert, only a loop to bound - the same
+  # class as the two loops in `pake.rs`, and the guards bound them.
+  '^crates/syncspin-core/src/pairing/token\.rs:206:22: replace % with (/|\+) in ',
+  '^crates/syncspin-core/src/pairing/token\.rs:230:22: replace % with (/|\+) in ',
+  # The base32 decoder's accumulator holds fewer than eight pending bits, so the shift by five
+  # leaves the incoming five bits no overlap: `|` and `^` agree on every input.
+  '^crates/syncspin-core/src/pairing/token\.rs:253:32: replace \| with \^ in ',
   # The base64 decoder rejects non-canonical trailing bits itself, so by the time the re-encode
   # comparison runs, the value is either already rejected or canonical. `||` and `&&` agree on
   # every input that reaches it.
