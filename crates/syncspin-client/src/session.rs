@@ -2032,8 +2032,8 @@ impl Session<'_> {
     /// `supported_commands` list is what makes a conformant server send player commands at all.
     async fn send_client_state(&mut self) -> Result<()> {
         self.state_sent = true;
-        let output_delay_ms = self.sink.latency().map_or(0, |latency| {
-            u32::try_from(latency.as_millis())
+        let output_delay_ms = self.sink.output_delay().map_or(0, |delay| {
+            u32::try_from(delay.as_millis())
                 .map_or(MAX_OUTPUT_DELAY_MS, |delay| delay.min(MAX_OUTPUT_DELAY_MS))
         });
         let state = Incoming::ClientState(ClientState {

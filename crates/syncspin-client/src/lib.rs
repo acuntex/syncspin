@@ -148,7 +148,7 @@ pub(crate) mod test_support {
     use crate::sink::{AudioFormat, AudioFrame, Sink};
     use crate::storage::Storage;
 
-    /// A sink that accepts every call and keeps the trait's default latency and underrun count.
+    /// A sink that accepts every call and keeps the trait's default output delay and underrun count.
     pub(crate) struct NullSink;
 
     impl Sink for NullSink {
@@ -180,7 +180,7 @@ pub(crate) mod test_support {
             .expect("the test sink accepts a frame");
         sink.flush().expect("the test sink flushes");
         assert_eq!(
-            sink.latency(),
+            sink.output_delay(),
             None,
             "a sink that does not report a delay adds none"
         );

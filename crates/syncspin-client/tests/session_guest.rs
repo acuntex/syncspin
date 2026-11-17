@@ -115,7 +115,7 @@ struct RecordingSink {
     fail_on_flush: Option<usize>,
     fail_on_discard: Option<usize>,
     fail_on_open: bool,
-    latency: Option<Duration>,
+    output_delay: Option<Duration>,
     writes: usize,
     discards: usize,
     /// Flush call that holds the session until the gate is released.
@@ -131,7 +131,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -146,7 +146,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -162,7 +162,7 @@ impl RecordingSink {
             fail_on_flush: Some(flush),
             fail_on_discard: None,
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -178,7 +178,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: true,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -186,14 +186,14 @@ impl RecordingSink {
         }
     }
 
-    fn with_latency(recordings: Recordings, latency: Duration) -> RecordingSink {
+    fn with_output_delay(recordings: Recordings, output_delay: Duration) -> RecordingSink {
         RecordingSink {
             recordings,
             fail_on_write: None,
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: false,
-            latency: Some(latency),
+            output_delay: Some(output_delay),
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -208,7 +208,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: None,
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: Some(hold_flush),
@@ -224,7 +224,7 @@ impl RecordingSink {
             fail_on_flush: None,
             fail_on_discard: Some(discard),
             fail_on_open: false,
-            latency: None,
+            output_delay: None,
             writes: 0,
             discards: 0,
             hold_flush: None,
@@ -303,8 +303,8 @@ impl Sink for RecordingSink {
         Ok(())
     }
 
-    fn latency(&self) -> Option<Duration> {
-        self.latency
+    fn output_delay(&self) -> Option<Duration> {
+        self.output_delay
     }
 }
 
@@ -315,11 +315,11 @@ fn recording_sink() -> (Recordings, Box<dyn Sink>) {
 }
 
 /// Creates a recording sink that reports a fixed output delay.
-fn sink_with_latency(latency: Duration) -> (Recordings, Box<dyn Sink>) {
+fn sink_with_output_delay(output_delay: Duration) -> (Recordings, Box<dyn Sink>) {
     let recordings = Recordings::default();
     (
         recordings.clone(),
-        Box::new(RecordingSink::with_latency(recordings, latency)),
+        Box::new(RecordingSink::with_output_delay(recordings, output_delay)),
     )
 }
 
@@ -2362,7 +2362,7 @@ async fn the_track_event_carries_the_playback_speed() {
 #[tokio::test]
 async fn a_short_playout_delay_is_reported() {
     let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
-    let (_recordings, sink) = sink_with_latency(Duration::from_secs(60));
+    let (_recordings, sink) = sink_with_output_delay(Duration::from_secs(60));
     let (mut events, _handle) =
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
@@ -2371,7 +2371,7 @@ async fn a_short_playout_delay_is_reported() {
     let player = state.player.expect("the player state follows the role");
     assert_eq!(
         player.output_delay_ms, 5_000,
-        "an absurd sink latency is clamped before it reaches the server"
+        "an absurd sink output delay is clamped before it reaches the server"
     );
 }
 
