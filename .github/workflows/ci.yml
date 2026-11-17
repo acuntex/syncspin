@@ -189,8 +189,14 @@ jobs:
           if-no-files-found: ignore
 
   mutants:
-    # Weekly only: one full test run per mutant. `syncspin-core` first - it holds the
-    # protocol and crypto code where a silent behaviour change would be worst.
+    # Every pull request, the weekly schedule and a manual dispatch: one full test run per
+    # mutant. `syncspin-core` first - it holds the protocol and crypto code where a silent
+    # behaviour change would be worst.
+    #
+    # Running on every PR costs the four shards below a few minutes each, in parallel; a PR
+    # therefore pays roughly one extra job's wall-clock for a check the weekly run would only
+    # report days later. Every PR includes a core change's blast radius, so the run is not
+    # conditional on the paths a PR touches.
     #
     # One runner cannot finish this in the timeout below. `syncspin-core` has 553 mutants and
     # each one costs a build plus the suite; the first scheduled run got through a few dozen of
@@ -199,7 +205,7 @@ jobs:
     #
     # Every shard must be invoked with identical arguments and the same denominator, or the
     # shards disagree about which mutant belongs to whom and the results are meaningless.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
