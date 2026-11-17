@@ -45,6 +45,25 @@ scripts/coverage.sh                                    # coverage, all features,
 The ARMv7 build is the one that decides whether this library is usable where it is needed: it must
 stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
 
+## Changes land through a pull request
+
+`main` requires seven checks (`lint`, `test`, `msrv`, `arm`, `deny`, `docs`, `secrets`) and has
+`enforce_admins` off. A push from the owner therefore bypasses them, and GitHub says so in the push
+output: `Bypassed rule violations ... required status checks are expected`. The bypass works; it is
+not to be used. No commit goes to `main` directly - not a one-line documentation fix, not a runner
+label bump, not a commit whose checks you expect to pass.
+
+```sh
+git switch -c docs/<topic>
+# commit on the branch, then
+git push -u origin docs/<topic>
+# open the pull request, let the seven checks run, merge squashed
+```
+
+Wait for the checks before merging: a green run after the merge proves nothing was gated. A push
+straight to `main` is the one mistake that leaves the gates decorative, which is why it is a rule
+here rather than a preference.
+
 ## Hard rules
 
 - **No unencrypted path, ever.** A peer that does not complete the Noise handshake is refused.
