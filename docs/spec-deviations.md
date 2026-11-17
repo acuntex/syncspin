@@ -177,7 +177,8 @@ change rather than apply it on arrival.
 
 **What we do:** `handle_state` emits `Event::Track` as soon as the message is decoded, so the
 timestamp is ignored. A title or artwork overlay can be ahead of the audible position by the buffer
-depth (at least the 250 ms the client asks for, more when the sink buffers).
+depth: the `min_buffer_ms` the client asks for - 250 ms until it has enough arrival-delay samples to
+derive one, then the upper tail of the measured distribution - plus whatever the sink buffers.
 
 **Why:** scheduling needs a per-role event queue with a timer tied to the clock filter, which the
 session does not have yet; the extracted consumer treated metadata as immediate. Applying it late
@@ -210,18 +211,21 @@ that records the boundary.
 **Spec:** none; this is the design's sink contract (`docs/design/syncspin-design.md`, _Playout
 timing_), which expects underrun counts to feed buffer corrections.
 
-**What we do:** `Sink::underruns` has a default of zero and the session never calls it. "The sink
-reports latency and underruns back" is therefore half true: `latency()` fills `output_delay_ms`,
-while `underruns()` is inert. A host can implement it for its own diagnostics, but the crate makes
-no decision from it.
+**What we do:** `Sink::underruns` has a default of zero and the session never calls it. A host can
+implement it for its own diagnostics, but the crate makes no decision from it. The `min_buffer_ms`
+the session reports is derived from the arrival delay of audio chunks instead, which needs no sink
+hook at all.
 
-**Why:** adapting `min_buffer_ms` needs the re-sync and state-reporting loop plus a sink whose
-buffers the crate understands; the guest session only reports its initial state. Wiring an unused
-number into playback would be an unverified control loop.
+**Why:** underruns say that the buffer was too small, but growing it from the count needs a re-sync
+and state-reporting loop per sink plus knowledge of the sink's internal buffer, which the crate does
+not have. The arrival delay the server's own send-ahead produces is the measurement the spec names
+for the value, and it is available to the session alone. Wiring a second, unverified input into a
+derived value would risk the two controls fighting each other.
 
-**Removing it:** read `underruns()` at each `client/state` report and after a clock burst, grow
-`min_buffer_ms` (bounded) when the count rises, and test the reported value against a fake sink that
-returns a fixed count.
+**Removing it:** read `underruns()` at each `client/state` report and after a clock burst, and raise
+the derived `min_buffer_ms` (bounded) when the count rises, leaving the arrival-delay estimate in
+place while the count is flat. Test the reported value against a fake sink that returns a fixed
+count.
 
 ## 10. A stream-clear timestamp is honoured only by sinks that implement `discard_from`
 
