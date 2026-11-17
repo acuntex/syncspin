@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 
+## [0.4.0] - 2026-11-17
+
+### Added
+
+- **core:** `PskOutcome` and `Initiator::read_message_with_sentinel`, so an initiator can retry a failed Noise message 2 under the Sentinel key.
+- **server:** a client whose pairing record did not seal the handshake is admitted as an unpaired session, reported once per connection as `Event::CredentialMismatch`, and held at no roles until it re-pairs; `approve` and `unpair` are refused on that session while the record exists.
+- **client:** `ControlHandle::seek` and `seek_relative`, and `PlaybackState::seek_max_ms`, for controller scrubbing bounded by the server's advertised range.
+- **client:** `ControlHandle::set_unpaired_access` changes the setting on a live connection: turning it off closes a relying unpaired session with `client/goodbye` `pairing_required`, turning it on closes an unpaired session with `restart` so the next `client/hello` advertises the value.
+- **client:** `Sink::discard_from`, a provided method defaulting to `flush`, so a `stream/clear` carrying `from_timestamp` can keep the audio before the cut.
+- **examples:** `player-pipe --pairing-required`, which refuses an unpaired activation at the client.
+
+### Changed
+
+- `Event` is now `#[non_exhaustive]` and gains `CredentialMismatch`; a downstream exhaustive `match` needs a wildcard arm.
+- `ControllerState` gains `seek_max_ms`, one 0.x break for struct literals; `PlaybackState` gains the same field additively because it is `#[non_exhaustive]`.
+- `ServerHandle::approve` and `unpair` write the registry only after the session confirms, so a failed call leaves the approval and the record as they were.
+- Sessions register before `ClientConnected`, so a host reacting to an event can reach the live connection.
+- `snow` is pinned `=0.10.0`: the Sentinel retry relies on its error-path checkpoint, and a bump waits for the core test that re-verifies it.
+- Mutation testing runs on every pull request in four core shards, in addition to the weekly schedule; it reports but is not a required check.
+
+### Notes
+
+- Against Music Assistant 2.11 a seek restarts the item with `stream/end` + `stream/start`, so `Sink::discard_from` stays unused there; it applies to a server that sends `stream/clear` with `from_timestamp`.
+- The Sentinel fallback's manual device check has not been performed; it needs a host that keeps server-side pairing records.
+
 ## [0.3.1] - 2026-11-16
 
 ### Fixed
