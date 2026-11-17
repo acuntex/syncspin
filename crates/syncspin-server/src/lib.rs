@@ -640,7 +640,7 @@ impl ServerHandle {
     /// every unapproved client at empty activities until then. The approval is remembered for as
     /// long as this server runs, so the next connection of the same client is served without
     /// asking again, and it is dropped when a pairing completes. A client that is already paired,
-    /// or already approved, keeps its roles.
+    /// or already approved and not credential-mismatched, keeps its roles.
     ///
     /// A live connection whose record did not seal the handshake is refused with an error naming
     /// the credential mismatch: the client holds no credential the server trusts, so the operator
