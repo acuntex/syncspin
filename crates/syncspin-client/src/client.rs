@@ -844,8 +844,8 @@ impl ControlHandle {
     ///
     /// The value is what `client/hello` advertises and what the activation guard enforces.
     /// [`ClientConfig::unpaired_access`] is the value a `connect` call starts from. A live change is
-    /// carried into the subsequent connections of this call - the next `client/hello` advertises it -
-    /// until the handle is dropped or a new `connect` starts from the configuration again.
+    /// carried for the rest of that call - the next `client/hello` advertises it - and a new
+    /// `connect` starts from the configuration again.
     ///
     /// Turning it off closes a connection that relies on it - an unpaired session with active roles
     /// or with the `playback` activity declared by an accepted activation - after saying goodbye
@@ -856,7 +856,8 @@ impl ControlHandle {
     /// reason [`GoodbyeReason::Restart`]: `client/hello` is the only carrier of the advertisement,
     /// so a live connection cannot advertise the new value without a new one. A paired session is
     /// neither closed nor restarted, because the setting never applied to it. Pairing stays
-    /// admissible in both directions, because both flows run over a Sentinel-keyed session.
+    /// admissible in both directions, because the setting gates only roles and the `playback`
+    /// activity, never pairing.
     ///
     /// # Errors
     /// Returns an error when the connection has ended, and when the connection is switching keys at

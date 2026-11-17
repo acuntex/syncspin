@@ -307,8 +307,8 @@ pub struct ClientConfig {
     /// it. With `false` this client refuses to activate a session that is not keyed by a long-term
     /// PSK for playback: such a `server/activate` ends the connection with `client/goodbye` reason
     /// `pairing_required`. A server that honours the advertisement grants no roles to an unpaired
-    /// client whose hello says `false`. Pairing is unaffected: both pairing flows run over a
-    /// Sentinel-keyed session and stay admissible.
+    /// client whose hello says `false`. Pairing is unaffected: the setting gates only roles and the
+    /// `playback` activity, never pairing.
     ///
     /// The value can change while the client runs:
     /// [`ControlHandle::set_unpaired_access`](crate::ControlHandle::set_unpaired_access) stores a new

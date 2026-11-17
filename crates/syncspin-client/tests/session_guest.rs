@@ -3451,6 +3451,8 @@ async fn turning_it_off_leaves_a_paired_session() {
         psk_id: psk_id_for(&psk),
         psk_category: "lt".to_owned(),
         psk,
+        // The second connection is what the setting must reach after this one ends.
+        connections: 2,
         ..ServerOptions::default()
     };
     let mut server = FakeServer::start(options).await.unwrap();
@@ -3465,6 +3467,14 @@ async fn turning_it_off_leaves_a_paired_session() {
         .await
         .expect("the client must connect");
     expect_connected(&mut events, &server).await;
+    let first = server
+        .wait_for_client_hello()
+        .await
+        .expect("the first connection announces itself");
+    assert!(
+        first.unpaired_access.enabled,
+        "the first hello carries the configured default"
+    );
     // Consume the initial report, so the one after the change is unambiguously the new level.
     wait_for_client_state(&mut server).await;
 
@@ -3490,6 +3500,23 @@ async fn turning_it_off_leaves_a_paired_session() {
         state.player.expect("the player role stays active").volume,
         Some(20)
     );
+
+    // Leaving the session open is only half of it: the value must also reach the next connection,
+    // because the hello of that connection is where it is advertised.
+    server.close();
+    match next_event(&mut events).await {
+        Event::Disconnected { .. } => {}
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    let hello = tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_hello())
+        .await
+        .expect("the client reconnects after the server closes the connection")
+        .expect("the second connection announces itself");
+    assert!(
+        !hello.unpaired_access.enabled,
+        "the next connection must advertise the value the host set"
+    );
+    drop(handle);
 }
 
 #[tokio::test]
