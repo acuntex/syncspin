@@ -1530,7 +1530,7 @@ impl Session<'_> {
     /// `server/pair-finalize` is already on the wire, so the client has stored its side. The
     /// re-handshake follows immediately and its activation is the first message under the new
     /// keys, as `connection.md` requires. The record is stored by now, so `approved`, the dropped
-    /// approval and [`Event::Paired`] are true before it; `paired` and the cleared mismatch are
+    /// approval and [`Event::Paired`] all happen before it; `paired` and the cleared mismatch are
     /// not, until the new key has actually sealed the connection.
     async fn complete_pairing(&mut self, noise: &mut TransportState, psk: [u8; 32]) -> Result<()> {
         self.attempt = None;

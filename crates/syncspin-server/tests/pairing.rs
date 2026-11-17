@@ -479,6 +479,12 @@ async fn a_real_client_that_lost_its_record_connects_and_can_pair() -> Result<()
             Event::CredentialMismatch { .. } => {
                 panic!("the re-paired connection reported a second credential mismatch")
             }
+            Event::ClientLeft { reason } => {
+                panic!("the recovered session left before its activation: {reason}")
+            }
+            Event::ClientConnected { .. } => {
+                panic!("the activation arrived on a new connection, not the recovered one")
+            }
             _ => continue,
         }
     }
