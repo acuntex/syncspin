@@ -1093,7 +1093,25 @@ impl Session<'_> {
     }
 
     /// Activates the roles the operator's approval admits.
+    ///
+    /// A connection whose record did not seal the handshake is not approved while the store still
+    /// holds that record: its approval is refused with an error naming the mismatch, because the
+    /// client holds no credential the server trusts. Once the record is gone from the store, the
+    /// flag is cleared and the approval activates the roles - the recovery path for a live session
+    /// whose record the host removed.
     async fn approve(&mut self, noise: &mut TransportState) -> Result<()> {
+        if self.credential_mismatch {
+            if pairing::record_for(self.config.storage.as_deref(), &self.client_id)?.is_some() {
+                bail!(
+                    "the client's pairing record did not seal this connection (a credential \
+                     mismatch), so an approval is refused; re-pair the client, or remove the \
+                     record through the store and approve again"
+                );
+            }
+            self.credential_mismatch = false;
+            self.approved = true;
+            return self.activate_roles(noise).await;
+        }
         if self.approved {
             return Ok(());
         }
@@ -1509,11 +1527,12 @@ impl Session<'_> {
     ///
     /// `server/pair-finalize` is already on the wire, so the client has stored its side. The
     /// re-handshake follows immediately and its activation is the first message under the new
-    /// keys, as `connection.md` requires.
+    /// keys, as `connection.md` requires. The record is stored by now, so `approved`, the dropped
+    /// approval and [`Event::Paired`] are true before it; `paired` and the cleared mismatch are
+    /// not, until the new key has actually sealed the connection.
     async fn complete_pairing(&mut self, noise: &mut TransportState, psk: [u8; 32]) -> Result<()> {
         self.attempt = None;
         self.discarding_pairing_messages = true;
-        self.paired = true;
         self.approved = true;
         // `pairing.md` discards an approval when a pairing succeeds: the record replaces it.
         self.registry.forget_approval(&self.client_id);
@@ -1533,6 +1552,10 @@ impl Session<'_> {
             self.ending = Some("connection lost".to_owned());
             return Ok(());
         }
+        // The new key sealed the connection, so the record now authenticates it and the
+        // credential mismatch it recovered from is over.
+        self.paired = true;
+        self.credential_mismatch = false;
         self.pairing_index = 0;
         self.activate_roles(noise).await?;
         if let Some(reply) = self.pending_pair_reply.take() {
@@ -1602,8 +1625,25 @@ impl Session<'_> {
     }
 
     /// Removes the record, tells the client and ends the connection.
+    ///
+    /// A connection whose record did not seal the handshake may not remove that record: the
+    /// mismatch is a signal, and a session that never authenticated with the record must not
+    /// destroy it. The removal is refused with an error naming the mismatch. Once the record is
+    /// gone from the store, there is nothing left to remove and the unpair only ends the
+    /// connection.
     async fn unpair(&mut self, noise: &mut TransportState) -> Result<()> {
-        pairing::remove_record(self.config.storage.as_deref(), &self.client_id)?;
+        if self.credential_mismatch {
+            if pairing::record_for(self.config.storage.as_deref(), &self.client_id)?.is_some() {
+                bail!(
+                    "the client's pairing record did not seal this connection (a credential \
+                     mismatch), so the record is left alone; re-pair the client, or remove the \
+                     record through the store and unpair again"
+                );
+            }
+            self.credential_mismatch = false;
+        } else {
+            pairing::remove_record(self.config.storage.as_deref(), &self.client_id)?;
+        }
         self.connection
             .send_json(noise, &Incoming::ServerUnpair(Default::default()))
             .await?;

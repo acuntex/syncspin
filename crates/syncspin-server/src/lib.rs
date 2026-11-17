@@ -637,21 +637,32 @@ impl ServerHandle {
     /// asking again, and it is dropped when a pairing completes. A client that is already paired,
     /// or already approved, keeps its roles.
     ///
+    /// A live connection whose record did not seal the handshake is refused with an error naming
+    /// the credential mismatch: the client holds no credential the server trusts, so the operator
+    /// re-pairs it, or removes the record through the store and calls this again - the second call
+    /// is the recovery path and activates the session. With no live connection the approval is
+    /// remembered at once, for the client's next one.
+    ///
     /// # Errors
-    /// Returns an error when the activation cannot be sent, which means the connection ended while
-    /// the approval arrived. The approval itself is remembered either way, for the next connection.
+    /// Returns an error for a client whose record exists but did not seal its live connection, for
+    /// a store that cannot be read, and when the connection ended before the session confirmed the
+    /// activation. A failed call remembers nothing; a later attempt with no live connection takes
+    /// the direct path and remembers the approval at once.
     pub async fn approve(&self, client_id: &str) -> Result<()> {
+        let Some(sender) = self.registry.sender_for(client_id) else {
+            self.registry.approve(client_id);
+            return Ok(());
+        };
+        let (reply, response) = oneshot::channel();
+        sender
+            .send(Command::Approve { reply })
+            .map_err(|_| anyhow::anyhow!("the connection ended before it could be approved"))?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("the connection ended before it could be approved"))??;
+        // Only a confirmed activation is remembered, so a refused or lost call leaves the registry
+        // as it was.
         self.registry.approve(client_id);
-        if let Some(sender) = self.registry.sender_for(client_id) {
-            let (reply, response) = oneshot::channel();
-            if sender.send(Command::Approve { reply }).is_ok() {
-                // A connection that ended between the lookup and the send has nothing left to
-                // activate; the approval stands for its next one.
-                if let Ok(result) = response.await {
-                    result?;
-                }
-            }
-        }
         Ok(())
     }
 
@@ -805,22 +816,34 @@ impl ServerHandle {
     /// and closes with `client/goodbye` reason `unpaired`. A client with no live connection has its
     /// record removed if the store holds one.
     ///
+    /// A live connection whose record did not seal the handshake is refused with an error naming
+    /// the credential mismatch: the record is left alone, because a session that never
+    /// authenticated with it must not remove it. Once the record is gone from the store the call
+    /// proceeds and ends the connection, which is the recovery path for a live session whose
+    /// record the host removed.
+    ///
     /// # Errors
-    /// Returns an error when the store refuses the removal.
+    /// Returns an error for a client whose record exists but did not seal its live connection, for
+    /// a store that cannot be read or cannot remove the record, and when the connection ended
+    /// before it answered. A refused or failed call leaves both the registry and the record
+    /// untouched; without a live connection the removal happens first, so a failed removal keeps
+    /// the approval as well.
     pub async fn unpair(&self, client_id: &str) -> Result<()> {
+        let Some(sender) = self.registry.sender_for(client_id) else {
+            pairing::remove_record(self.storage.as_deref(), client_id)?;
+            // Only a completed removal ends the approval: a failed one leaves both where they are.
+            self.registry.forget_approval(client_id);
+            return Ok(());
+        };
+        let (reply, response) = oneshot::channel();
+        sender
+            .send(Command::Unpair { reply })
+            .map_err(|_| anyhow::anyhow!("the connection ended before it answered"))?;
+        response
+            .await
+            .map_err(|_| anyhow::anyhow!("the connection ended before it answered"))??;
         self.registry.forget_approval(client_id);
-        match self.registry.sender_for(client_id) {
-            Some(sender) => {
-                let (reply, response) = oneshot::channel();
-                sender
-                    .send(Command::Unpair { reply })
-                    .map_err(|_| anyhow::anyhow!("the connection ended before it answered"))?;
-                response
-                    .await
-                    .map_err(|_| anyhow::anyhow!("the connection ended before it answered"))?
-            }
-            None => pairing::remove_record(self.storage.as_deref(), client_id),
-        }
+        Ok(())
     }
 
     /// Sends one command to the live connection of `client_id` and awaits its answer.
