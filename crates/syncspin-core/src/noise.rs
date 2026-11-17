@@ -408,8 +408,12 @@ pub struct Initiator {
     handshake: snow::HandshakeState,
     /// The suite this handshake runs, kept for the transport and for callers that report it.
     suite: Suite,
-    /// Whether the key [`Initiator::set_psk`] currently installed is a key other than
+    /// Whether the last key selected through [`Initiator::set_psk`] is a key other than
     /// [`SENTINEL_PSK`].
+    ///
+    /// The retry inside [`Initiator::read_message_with_sentinel`] installs the Sentinel key
+    /// directly on the handshake state, so it does not change this field: the field describes the
+    /// selection `set_psk` made, not the key the state currently holds.
     ///
     /// [`Initiator::read_message_with_sentinel`] has nothing to retry under when the selected key
     /// is the Sentinel key itself.
@@ -562,7 +566,10 @@ impl Initiator {
         ensure_message_len(msg.len(), "handshake message")?;
         let mut payload = vec![0u8; plaintext_capacity(msg.len(), "handshake message")?];
         match self.handshake.read_message(msg, &mut payload) {
-            Ok(len) => return Ok((PskOutcome::SelectedKey, payload[..len].to_vec())),
+            Ok(len) => {
+                payload.truncate(len);
+                return Ok((PskOutcome::SelectedKey, payload));
+            }
             // The failed read restored the symmetric state, so the same bytes can be read again
             // under the key the peer sealed with.
             Err(error) if should_retry_under_sentinel(&error) => {}
@@ -575,7 +582,8 @@ impl Initiator {
             .handshake
             .read_message(msg, &mut payload)
             .context("failed to read the Noise handshake message under the Sentinel key")?;
-        Ok((PskOutcome::SentinelFallback, payload[..len].to_vec()))
+        payload.truncate(len);
+        Ok((PskOutcome::SentinelFallback, payload))
     }
 
     /// Returns whether both handshake messages have been processed.

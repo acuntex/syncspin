@@ -244,7 +244,8 @@ pub enum Event {
         client_id: String,
         /// Friendly name the client announced.
         name: String,
-        /// Whether the connection may carry roles now.
+        /// Whether the connection is authenticated by its pairing record or by an approval the
+        /// operator gave.
         approved: bool,
     },
     /// A pairing record exists for this client, but the connection was not sealed by it.
