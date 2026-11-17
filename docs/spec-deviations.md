@@ -27,7 +27,6 @@ harmless.
 | 15  | A malformed control message is ignored, not fatal                      | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                           | Accepted, `handle_control_message`          |
 | 16  | A server keeps an unavailable client in the group                      | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                      | Open, one group                             |
 | 17  | The server's stream start lead is one fixed value                      | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Open, shared timeline                       |
-| 18  | The server does not try the Sentinel key after a record fails          | [`connection.md` — Sentinel Fallback](https://github.com/Sendspin/spec/blob/main/connection.md#sentinel-fallback)                                                                 | Accepted, `snow` state                      |
 | 19  | A foreign `group_id` is accepted unless strict mode is set             | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                             | Accepted, `strict_group_id`                 |
 | 20  | Live unpaired-access changes are not applied to a running connection   | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, `pairing_required`/`restart` goodbyes |
 
@@ -427,36 +426,6 @@ announcement ahead of the shared first sample.
 **Removing it:** schedule a new stream at the largest `required_lead_time_ms` among the players that
 are ready when it opens, wait for a late member's report before announcing to it, and test a stream
 with two members whose reported leads differ.
-
-## 18. The server does not try the Sentinel key after a record fails
-
-**Spec:** `connection.md`, _Sentinel Fallback_. After a server announces a `psk_id`, "if [the second
-handshake message] fails and the referenced PSK was not the Sentinel, it verifies the same message
-against the Sentinel PSK before treating the handshake as failed". A message that validates there is
-an authenticated credential-mismatch signal: the session proceeds as an ordinary unpaired,
-Sentinel-keyed one, and the server must not activate roles or declare `playback` while its record
-exists.
-
-**What we do:** `listener::converse` selects the PSK from the record the store holds and reads Noise
-message 2 once. A message that does not authenticate under that key is a silent failure: the
-connection closes, no event is reported and the record is left untouched. A client that lost its
-record therefore cannot reach an unpaired session through this server, and the operator has to
-re-pair it. The client-side counterpart is the `pairing_required` close the activation guard sends
-when a client's own setting refuses an unpaired session; it never fires on this server, which closes
-before any activation arrives. `a_client_that_cannot_use_its_record_is_refused` pins the refusal and
-the untouched record.
-
-**Why:** trying a second key needs a second handshake state for the _same_ message 1 bytes, because
-the second message's key is derived from the handshake hash and the PSK. `snow`'s `HandshakeState`
-cannot be cloned and exposes no way to replay the token stream with another PSK, so both attempts
-cannot share one transcript. Building the fallback any other way would mean a second Noise
-implementation just for this path.
-
-**Removing it:** either get a clonable or re-playable handshake state from `snow` (or pin a
-handshake state into `syncspin-core` itself), then verify message 2 against the record and, on
-failure, against the Sentinel key, mark the session unpaired and report the mismatch to the host;
-or accept the client's fallback by starting the handshake with the Sentinel key when the client
-advertises that it lost the record, which the wire does not signal.
 
 ## 19. A foreign `group_id` is accepted unless strict mode is set
 

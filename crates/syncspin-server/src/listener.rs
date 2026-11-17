@@ -900,8 +900,10 @@ impl Session<'_> {
     ///
     /// An unapproved, unpaired client gets an empty role list: `pairing.md` forbids activating
     /// roles on an unpaired connection its operator has not approved. A client that admits no
-    /// unpaired access gets none either, because it would have to reject the activation. A paired
-    /// client needs no approval and no unpaired access.
+    /// unpaired access gets none either, because it would have to reject the activation. A
+    /// connection whose record did not seal the handshake gets none either, approval or not: it
+    /// holds no credential the server trusts, so re-pairing is the way back. A paired client needs
+    /// no approval and no unpaired access.
     async fn activate_roles(&mut self, noise: &mut TransportState) -> Result<()> {
         let (roles, withheld) = self.effective_roles();
         self.roles = roles.clone();

@@ -20,11 +20,14 @@
 //! # Pairing and approval
 //!
 //! A client whose `client_id` the host's [`PairingStore`] holds a record for is authenticated by
-//! that record and activated at once. Every other client is unpaired: `pairing.md` requires the
-//! operator to approve it before the server may activate roles or declare `playback`, so it is
-//! admitted at empty activities, reported to the host with `approved: false`, and activated by
-//! [`ServerHandle::approve`]. Approval is remembered per `client_id` and dropped on a successful
-//! pairing.
+//! that record when the record seals the handshake, and activated at once. A client whose record
+//! did not seal it and that falls back to the Sentinel key is admitted unpaired and reported with
+//! [`Event::CredentialMismatch`]: the record stays and an approval of that live connection is
+//! refused until the record is gone or replaced, so re-pairing is the way back. Every other client
+//! is unpaired: `pairing.md` requires the operator to approve it before the server may activate
+//! roles or declare `playback`, so it is admitted at empty activities, reported to the host with
+//! `approved: false`, and activated by [`ServerHandle::approve`]. Approval is remembered per
+//! `client_id` and dropped on a successful pairing.
 //!
 //! All three methods are here. [`ServerHandle::pair`] takes the version-0 token an operator copies
 //! from the client, re-handshakes the live connection to the pairing PSK it carries and runs the
@@ -232,9 +235,10 @@ pub enum Event {
     /// `name` is the friendly name from `client/hello`. `approved` is whether the connection is
     /// authenticated by a pairing record or by an approval the operator gave; an unapproved
     /// client is held at empty activities until [`ServerHandle::approve`] or a pairing. A client
-    /// whose record exists but did not seal the connection is reported `false` and the
-    /// [`Event::CredentialMismatch`] follows: there, an approval is refused until the record is
-    /// gone or replaced, so re-pairing is the operator's path.
+    /// whose record exists but did not seal the connection, and whose message 2 authenticated
+    /// under the Sentinel key instead, is reported `false` and the [`Event::CredentialMismatch`]
+    /// follows: there, an approval is refused until the record is gone or replaced, so re-pairing
+    /// is the operator's path.
     ClientConnected {
         /// Static public key of the client, as 43 unpadded base64url characters.
         client_id: String,
@@ -825,9 +829,10 @@ impl ServerHandle {
     /// # Errors
     /// Returns an error for a client whose record exists but did not seal its live connection, for
     /// a store that cannot be read or cannot remove the record, and when the connection ended
-    /// before it answered. A refused or failed call leaves both the registry and the record
-    /// untouched; without a live connection the removal happens first, so a failed removal keeps
-    /// the approval as well.
+    /// before it answered. A refused call, or a failure before the record is removed, leaves both
+    /// untouched. A call that fails after the session removed the record keeps the approval,
+    /// because the record is already gone; without a live connection the removal happens first, so
+    /// a failed removal keeps the approval as well.
     pub async fn unpair(&self, client_id: &str) -> Result<()> {
         let Some(sender) = self.registry.sender_for(client_id) else {
             pairing::remove_record(self.storage.as_deref(), client_id)?;
