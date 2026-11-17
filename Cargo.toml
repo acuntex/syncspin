@@ -34,7 +34,11 @@ serde_json = "1.0.154"
 sha2 = "0.10.9"
 # `std` is off on purpose: snow 0.10's `std` feature turns on its optional `ring` dependency,
 # which `deny.toml` bans for the ARMv7 build. The two features below are otherwise its defaults.
-snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "default-resolver-crypto"] }
+# Pinned exactly: the Sentinel fallback re-reads a failed handshake message on the same state, which
+# relies on `read_message` restoring its symmetric checkpoint on every error and on the replay's `E`
+# token re-installing the cipher key with nonce 0. A patch release is re-verified by
+# `a_failed_read_can_be_retried_with_another_psk` in `syncspin-core` before the pin moves.
+snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "default-resolver-crypto"] }
 x25519-dalek = "3.0.0"
 tokio = "1.54.1"
 tokio-tungstenite = "0.30.0"

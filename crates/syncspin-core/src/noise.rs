@@ -338,8 +338,11 @@ impl Responder {
     /// the same value and the initiator rejects a message sealed with another one.
     ///
     /// # Errors
-    /// Fails when the handshake has already mixed in the key, which makes a late change
-    /// impossible.
+    /// The call is forwarded to `snow`, which refuses only a key of the wrong length or an
+    /// out-of-range location; both are fixed here, so this does not fail in practice. `snow` does
+    /// not refuse a late call either: the key must be set before [`Responder::write_message`]
+    /// seals message 2, and a later call has no effect on the handshake or on the message already
+    /// sealed.
     pub fn set_psk(&mut self, psk: &[u8; 32]) -> Result<()> {
         self.handshake
             .set_psk(2, psk)
@@ -376,6 +379,21 @@ impl Responder {
     }
 }
 
+/// Which key sealed the handshake message 2 the initiator just read.
+///
+/// [`Initiator::read_message_with_sentinel`] reports this so the session layer can tell a peer
+/// that holds the selected key from one that sealed with the published Sentinel key. It is a fact
+/// about the wire, not a verdict: what an unpaired peer may do is the caller's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PskOutcome {
+    /// The key selected with [`Initiator::set_psk`], which for a server is the pairing record's
+    /// key.
+    SelectedKey,
+    /// The published [`SENTINEL_PSK`]: the selected key did not seal this handshake, so the peer
+    /// does not hold it.
+    SentinelFallback,
+}
+
 /// Noise initiator state for one connection: the server half.
 ///
 /// The server always sends the first handshake message, so this type produces message 1 and
@@ -390,6 +408,12 @@ pub struct Initiator {
     handshake: snow::HandshakeState,
     /// The suite this handshake runs, kept for the transport and for callers that report it.
     suite: Suite,
+    /// Whether the key [`Initiator::set_psk`] currently installed is a key other than
+    /// [`SENTINEL_PSK`].
+    ///
+    /// [`Initiator::read_message_with_sentinel`] has nothing to retry under when the selected key
+    /// is the Sentinel key itself.
+    selected_non_sentinel: bool,
 }
 
 impl Initiator {
@@ -462,7 +486,11 @@ impl Initiator {
             .context("failed to set the Noise prologue")?
             .build_initiator()
             .context("failed to build the Noise initiator")?;
-        Ok(Initiator { handshake, suite })
+        Ok(Initiator {
+            handshake,
+            suite,
+            selected_non_sentinel: false,
+        })
     }
 
     /// Returns the cipher suite this handshake runs.
@@ -476,10 +504,16 @@ impl Initiator {
     /// when the handshake announces a private key, because message 1's payload names the key this
     /// call selects; noise mixes the key into message 2 either way, so both sides must use the
     /// same value or the peer's message 2 does not authenticate.
+    ///
+    /// That is the contract: before message 1, or once on the same state after a failed read, which
+    /// is what [`Initiator::read_message_with_sentinel`] does. Those are the only two call sites
+    /// this crate has; any other call replaces a key the handshake has already used.
     pub fn set_psk(&mut self, psk: &[u8; 32]) -> Result<()> {
         self.handshake
             .set_psk(2, psk)
-            .context("failed to set the Noise handshake PSK")
+            .context("failed to set the Noise handshake PSK")?;
+        self.selected_non_sentinel = psk != &SENTINEL_PSK;
+        Ok(())
     }
 
     /// Writes Noise handshake message 1 with `payload` and returns the message.
@@ -497,6 +531,51 @@ impl Initiator {
     /// message sealed with another PSK, a changed byte and a truncation.
     pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
         read_handshake_payload(&mut self.handshake, msg)
+    }
+
+    /// Reads Noise handshake message 2, retrying the same bytes under [`SENTINEL_PSK`] when they
+    /// do not authenticate.
+    ///
+    /// This is [`Initiator::read_message`] with the recovery a server needs after announcing a key
+    /// its peer does not hold: a message 2 sealed with the Sentinel key fails under the selected
+    /// key, and the same bytes then authenticate under the published one. `snow` restores its
+    /// symmetric state when a read fails, so the retry sees the handshake position the first
+    /// attempt left; the payload buffer is reused and returned verbatim, as
+    /// [`Initiator::read_message`] returns it.
+    ///
+    /// The outcome reports which key sealed the message. A message that authenticates is never
+    /// retried, whatever payload it carries, and a failure that is not an authentication failure is
+    /// returned as it comes. This is for the first handshake of a server that selected a key; a
+    /// re-handshake has no fallback and its caller keeps [`Initiator::read_message`].
+    ///
+    /// # Errors
+    /// Fails when the selected key is [`SENTINEL_PSK`] itself, because there is no second key to
+    /// retry under; when the message is shorter than the authentication tag; when it does not
+    /// authenticate under either key; and on everything else [`Initiator::read_message`] reports.
+    pub fn read_message_with_sentinel(&mut self, msg: &[u8]) -> Result<(PskOutcome, Vec<u8>)> {
+        if !self.selected_non_sentinel {
+            bail!(
+                "the selected PSK is the Sentinel key, so a failed read cannot be retried under \
+                 the Sentinel key"
+            );
+        }
+        ensure_message_len(msg.len(), "handshake message")?;
+        let mut payload = vec![0u8; plaintext_capacity(msg.len(), "handshake message")?];
+        match self.handshake.read_message(msg, &mut payload) {
+            Ok(len) => return Ok((PskOutcome::SelectedKey, payload[..len].to_vec())),
+            // The failed read restored the symmetric state, so the same bytes can be read again
+            // under the key the peer sealed with.
+            Err(error) if should_retry_under_sentinel(&error) => {}
+            Err(error) => return Err(error).context("failed to read the Noise handshake message"),
+        }
+        self.handshake
+            .set_psk(2, &SENTINEL_PSK)
+            .context("failed to set the Noise handshake PSK")?;
+        let len = self
+            .handshake
+            .read_message(msg, &mut payload)
+            .context("failed to read the Noise handshake message under the Sentinel key")?;
+        Ok((PskOutcome::SentinelFallback, payload[..len].to_vec()))
     }
 
     /// Returns whether both handshake messages have been processed.
@@ -523,6 +602,16 @@ fn read_handshake_payload(handshake: &mut snow::HandshakeState, msg: &[u8]) -> R
         .context("failed to read the Noise handshake message")?;
     payload.truncate(len);
     Ok(payload)
+}
+
+/// Returns whether a failed handshake read is worth retrying under [`SENTINEL_PSK`].
+///
+/// Only an authentication failure means "the peer sealed this with another key". Everything else -
+/// a malformed length, a wrong handshake position, a failed DH - would fail the same way under the
+/// Sentinel key, so a retry could only hide the real fault. `snow::Error` is `#[non_exhaustive]`,
+/// and a variant added later is not a decryption failure: every one of them means "no retry".
+fn should_retry_under_sentinel(error: &snow::Error) -> bool {
+    matches!(error, snow::Error::Decrypt)
 }
 
 /// Writes one handshake message carrying `payload`.
@@ -802,6 +891,86 @@ mod tests {
         bytes
     }
 
+    /// The prologue the Sentinel tests mix in. It is not JSON, so `Initiator::new` sees no suite
+    /// announcement and takes the one it is passed - the same rule a re-handshake relies on.
+    const TEST_PROLOGUE: &[u8] = b"client/init{}server/init{}";
+
+    /// A pairing record's PSK, distinct from [`SENTINEL_PSK`] so the two outcomes cannot be
+    /// confused.
+    const RECORD_PSK: [u8; 32] = [0x11; 32];
+
+    /// The metadata message 1 carries. This layer never interprets it, so its content is arbitrary.
+    const MESSAGE_1_PAYLOAD: &[u8] = br#"{"psk_id":"test","psk_category":"sn"}"#;
+
+    /// Builds the client half of the handshake on `snow` directly, as `tests/noise_handshake.rs`
+    /// does, with `psk` in the message-2 slot.
+    fn peer_responder(
+        client: &Identity,
+        server: &Identity,
+        psk: &[u8; 32],
+    ) -> snow::HandshakeState {
+        snow::Builder::new(
+            Suite::ChaChaPoly
+                .params()
+                .parse()
+                .expect("valid Noise parameters"),
+        )
+        .local_private_key(&client.secret)
+        .expect("set the local static key")
+        .remote_public_key(&server.public)
+        .expect("set the peer static key")
+        .psk(2, psk)
+        .expect("set the handshake PSK")
+        .prologue(TEST_PROLOGUE)
+        .expect("set the Noise prologue")
+        .build_responder()
+        .expect("build the Noise responder")
+    }
+
+    fn peer_write(peer: &mut snow::HandshakeState, payload: &[u8]) -> Vec<u8> {
+        let mut message = vec![0u8; MAX_MESSAGE_LEN];
+        let len = peer
+            .write_message(payload, &mut message)
+            .expect("write a Noise handshake message");
+        message.truncate(len);
+        message
+    }
+
+    fn peer_read(peer: &mut snow::HandshakeState, message: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0u8; MAX_MESSAGE_LEN];
+        let len = peer
+            .read_message(message, &mut payload)
+            .expect("read a Noise handshake message");
+        payload.truncate(len);
+        payload
+    }
+
+    /// Builds both halves with their own PSK and exchanges message 1, which no PSK seals.
+    fn handshake_after_message_1(
+        initiator_psk: &[u8; 32],
+        peer_psk: &[u8; 32],
+    ) -> (Initiator, snow::HandshakeState) {
+        let server = Identity::generate();
+        let client = Identity::generate();
+        let mut initiator =
+            Initiator::new(&server, &client.public, Suite::ChaChaPoly, TEST_PROLOGUE)
+                .expect("build the initiator");
+        initiator
+            .set_psk(initiator_psk)
+            .expect("select the initiator PSK");
+        let mut peer = peer_responder(&client, &server, peer_psk);
+
+        let message_1 = initiator
+            .write_message(MESSAGE_1_PAYLOAD)
+            .expect("write message 1");
+        assert_eq!(
+            peer_read(&mut peer, &message_1),
+            MESSAGE_1_PAYLOAD,
+            "message 1 must reach the peer whichever key each side selected"
+        );
+        (initiator, peer)
+    }
+
     #[test]
     fn the_prologue_carries_the_initiator_static_key() {
         let identity = Identity::generate();
@@ -937,5 +1106,196 @@ mod tests {
         assert!(text.contains(&identity.public_base64()));
         assert!(!text.contains(&identity.secret_base64()));
         assert!(text.contains("<redacted>"));
+    }
+
+    #[test]
+    fn a_failed_read_can_be_retried_with_another_psk() {
+        // The initiator announced the record's key, but the peer sealed message 2 with the
+        // Sentinel key: the read fails under the record's key and succeeds on the same bytes under
+        // the Sentinel key.
+        let (mut initiator, mut peer) = handshake_after_message_1(&RECORD_PSK, &SENTINEL_PSK);
+        let message_2 = peer_write(&mut peer, b"{}");
+
+        let error = initiator
+            .read_message(&message_2)
+            .expect_err("a message 2 sealed with the Sentinel key must not authenticate");
+        assert_eq!(
+            error.downcast_ref::<snow::Error>(),
+            Some(&snow::Error::Decrypt),
+            "a wrong PSK is an authentication failure, not a length or state failure"
+        );
+
+        let (outcome, payload) = initiator
+            .read_message_with_sentinel(&message_2)
+            .expect("the same bytes authenticate under the Sentinel key");
+        assert_eq!(outcome, PskOutcome::SentinelFallback);
+        assert_eq!(payload, b"{}");
+        assert!(initiator.handshake_finished());
+
+        // The retry must leave both sides on the same keys. The peer's `h` is captured before
+        // `into_transport_mode` consumes the state that holds it.
+        let peer_hash = peer.get_handshake_hash().to_vec();
+        let mut ours = initiator.into_transport().expect("initiator transport");
+        assert_eq!(
+            ours.handshake_hash().to_vec(),
+            peer_hash,
+            "the retried handshake derived a hash the peer does not share"
+        );
+        let mut theirs = peer.into_transport_mode().expect("the peer's transport");
+
+        let ciphertext = ours.encrypt(b"from the initiator").expect("encrypt");
+        let mut plaintext = vec![0u8; MAX_MESSAGE_LEN];
+        let len = theirs
+            .read_message(&ciphertext, &mut plaintext)
+            .expect("the peer decrypts");
+        assert_eq!(&plaintext[..len], b"from the initiator");
+
+        let mut ciphertext = vec![0u8; MAX_MESSAGE_LEN];
+        let len = theirs
+            .write_message(b"from the responder", &mut ciphertext)
+            .expect("the peer encrypts");
+        assert_eq!(
+            ours.decrypt(&ciphertext[..len]).expect("decrypt"),
+            b"from the responder"
+        );
+    }
+
+    #[test]
+    fn a_successful_read_is_not_retried() {
+        let (mut initiator, mut peer) = handshake_after_message_1(&RECORD_PSK, &RECORD_PSK);
+        let message_2 = peer_write(&mut peer, b"{}");
+
+        let (outcome, payload) = initiator
+            .read_message_with_sentinel(&message_2)
+            .expect("message 2 authenticates under the selected key");
+        assert_eq!(outcome, PskOutcome::SelectedKey);
+        assert_eq!(payload, b"{}");
+        assert!(initiator.handshake_finished());
+    }
+
+    #[test]
+    fn a_successful_read_returns_a_foreign_payload() {
+        // A message that authenticates is never a reason to retry, whatever it carries: this layer
+        // returns the payload verbatim and the session layer rejects a non-`{}` one.
+        let (mut initiator, mut peer) = handshake_after_message_1(&RECORD_PSK, &RECORD_PSK);
+        let message_2 = peer_write(&mut peer, b"not-empty");
+
+        let (outcome, payload) = initiator
+            .read_message_with_sentinel(&message_2)
+            .expect("message 2 authenticates under the selected key");
+        assert_eq!(outcome, PskOutcome::SelectedKey);
+        assert_eq!(payload, b"not-empty");
+    }
+
+    #[test]
+    fn the_sentinel_key_cannot_be_the_selected_key() {
+        let server = Identity::generate();
+        let client = Identity::generate();
+        let mut initiator =
+            Initiator::new(&server, &client.public, Suite::ChaChaPoly, TEST_PROLOGUE)
+                .expect("build the initiator");
+        initiator
+            .set_psk(&SENTINEL_PSK)
+            .expect("the Sentinel key is a valid PSK");
+
+        // Four bytes are too short even for a tag: the refusal must come from the key, which means
+        // the guard runs before anything is read.
+        let error = initiator
+            .read_message_with_sentinel(&[0u8; 4])
+            .expect_err("there is no second key to retry under");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("Sentinel"),
+            "the error must name the Sentinel key, got: {text}"
+        );
+        assert!(!initiator.handshake_finished());
+    }
+
+    #[test]
+    fn the_last_psk_write_wins() {
+        let server = Identity::generate();
+        let client = Identity::generate();
+        let mut initiator =
+            Initiator::new(&server, &client.public, Suite::ChaChaPoly, TEST_PROLOGUE)
+                .expect("build the initiator");
+        initiator
+            .set_psk(&RECORD_PSK)
+            .expect("select the record's key");
+        initiator
+            .set_psk(&SENTINEL_PSK)
+            .expect("select the Sentinel key again");
+
+        let error = initiator
+            .read_message_with_sentinel(&[0u8; 4])
+            .expect_err("the Sentinel key was the last write, so there is nothing to retry under");
+        assert!(
+            format!("{error:#}").contains("Sentinel"),
+            "the error must name the Sentinel key, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn only_a_decrypt_failure_is_retried() {
+        assert!(should_retry_under_sentinel(&snow::Error::Decrypt));
+
+        for error in [
+            snow::Error::Input,
+            snow::Error::Dh,
+            snow::Error::Rng,
+            snow::Error::State(snow::error::StateProblem::NotTurnToRead),
+        ] {
+            assert!(
+                !should_retry_under_sentinel(&error),
+                "{error:?} is not an authentication failure and must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_shorter_than_the_tag_is_not_retried() {
+        let (mut initiator, _peer) = handshake_after_message_1(&RECORD_PSK, &RECORD_PSK);
+
+        let error = initiator
+            .read_message_with_sentinel(&[0u8; 12])
+            .expect_err("12 bytes cannot carry an authentication tag");
+        assert!(
+            error.downcast_ref::<snow::Error>().is_none(),
+            "the capacity guard, not snow, must reject a frame below the tag length"
+        );
+        assert!(
+            format!("{error:#}").contains("16-byte"),
+            "the error must name the tag length, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_frame_in_the_input_band_is_not_retried() {
+        let (mut initiator, _peer) = handshake_after_message_1(&RECORD_PSK, &RECORD_PSK);
+
+        // 20 bytes leave no room for the 32-byte `e` token, so `snow` rejects the shape without
+        // authenticating anything; retrying that under another key could only hide a malformed
+        // frame.
+        let error = initiator
+            .read_message_with_sentinel(&[0u8; 20])
+            .expect_err("20 bytes cannot carry a message-2 ephemeral key");
+        assert_eq!(
+            error.downcast_ref::<snow::Error>(),
+            Some(&snow::Error::Input)
+        );
+    }
+
+    #[test]
+    fn a_truncated_tag_is_retried_and_still_fails() {
+        let (mut initiator, _peer) = handshake_after_message_1(&RECORD_PSK, &RECORD_PSK);
+
+        // 40 bytes carry the 32-byte `e` token but only 8 bytes where a 16-byte tag belongs, so
+        // both keys fail as `Decrypt`; the caller sees the retry's failure.
+        let error = initiator
+            .read_message_with_sentinel(&[0u8; 40])
+            .expect_err("a truncated tag must not authenticate");
+        assert_eq!(
+            error.downcast_ref::<snow::Error>(),
+            Some(&snow::Error::Decrypt)
+        );
     }
 }
