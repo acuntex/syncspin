@@ -242,6 +242,42 @@ async fn an_inbound_server_runs_the_normal_session() {
     handle.finished().await.expect("the client closes cleanly");
 }
 
+/// A change made while the listener waits reaches the hello of the connection a server dials in.
+#[tokio::test]
+async fn discovery_advertises_a_value_set_while_waiting() {
+    let discovery = Arc::new(RecordingDiscovery::default());
+    let mut config = inbound_config(discovery.clone());
+    // Starting from `false` is what makes the assertion prove the live write: the configured value
+    // alone would already produce `false` after the flip.
+    config.unpaired_access = false;
+    let (mut handle, _events) = advertise(config, Box::new(NullSink))
+        .await
+        .expect("the client must be able to advertise");
+    let record = discovery.only_record();
+    let url = format!("ws://127.0.0.1:{}{}", record.port, record.path);
+
+    handle
+        .control()
+        .set_unpaired_access(true)
+        .await
+        .expect("a change between connections is stored, not refused");
+
+    let mut server = FakeServer::dial(&url, ServerOptions::default())
+        .await
+        .expect("the server must reach the advertised endpoint");
+    let hello = server
+        .wait_for_client_hello()
+        .await
+        .expect("the client answers with client/hello");
+    assert!(
+        hello.unpaired_access.enabled,
+        "the waiting client's flip must reach the hello of the dialled connection"
+    );
+
+    handle.close(GoodbyeReason::Shutdown);
+    handle.finished().await.expect("the client closes cleanly");
+}
+
 /// A second server that arrives while one is admitted is rejected, not left waiting in the backlog.
 #[tokio::test]
 async fn a_second_server_is_rejected_with_concurrent_attempt() {

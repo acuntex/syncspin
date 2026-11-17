@@ -1205,6 +1205,71 @@ async fn a_rehandshake_to_the_pairing_psk_removes_the_player_role() {
     );
 }
 
+#[tokio::test]
+async fn a_flip_during_a_rehandshake_is_refused() {
+    // The server rotates the live connection to the pairing PSK - the flow a pairing finishes with -
+    // and holds the activation that must follow, so the window in which the client may send nothing
+    // stays open long enough for the host to try a change inside it.
+    let pairing_psk = [0x4e; 32];
+    let storage = MemoryStorage::holding(pairing_psk);
+    let mut server = FakeServer::start(ServerOptions {
+        hold_rehandshake_activate: true,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (mut events, handle) = connect_to(&server, Some(storage)).await;
+    expect_connected(&mut events, &server).await;
+    wait_for_hello(&mut server).await;
+
+    server.rehandshake(pairing_psk, "pr");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_rehandshake())
+            .await
+            .expect("the client must answer the re-handshake"),
+        "the re-handshake must complete its Noise messages"
+    );
+
+    let error = handle
+        .control()
+        .set_unpaired_access(false)
+        .await
+        .expect_err("a change during a key switch must be refused");
+    assert!(
+        format!("{error:#}").contains("switching keys"),
+        "the refusal must name the re-handshake, got: {error:#}"
+    );
+
+    // The refusal is answered before the value is touched, so the unpaired relying session is still
+    // the one in force. Releasing the activation lets it carry on and the client's window is five
+    // seconds, so the release comes here rather than after any further assertion.
+    server.release_rehandshake_activate();
+    server.metadata("After the refusal", "An artist");
+    match next_event(&mut events).await {
+        Event::Track { title, .. } => assert_eq!(
+            title, "After the refusal",
+            "the refused change must leave the session serving"
+        ),
+        other => panic!("expected Track after the key switch, got {other:?}"),
+    }
+
+    // Nothing was written by the refused call, so the retry applies the value and closes the relying
+    // session instead of finding the change already in force and doing nothing.
+    handle
+        .control()
+        .set_unpaired_access(false)
+        .await
+        .expect("the retry after the key switch must be accepted");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_goodbye())
+            .await
+            .expect("the client must say goodbye"),
+        Some("pairing_required".to_owned()),
+        "the retry turns off the setting the refusal left in force"
+    );
+    assert_still_reconnecting(handle).await;
+}
+
 /// Waits for the [`Event::Disconnected`] that ends an attempt.
 async fn expect_disconnected(stream: &mut EventStream) {
     match next_event(stream).await {

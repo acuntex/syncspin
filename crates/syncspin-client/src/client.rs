@@ -3,7 +3,7 @@
 use std::fmt;
 #[cfg(feature = "pairing-code")]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -467,11 +467,14 @@ pub enum Event {
     /// connection lasts. A plain guest handshake - an unpaired connection whose server announced the
     /// Sentinel key - is not a mismatch and reports nothing.
     ///
-    /// The second situation is a refused activation: [`ClientConfig::unpaired_access`] is off and
-    /// the server sent a `server/activate` that would be admissible if it were on. That report fires
-    /// at most once, immediately before the client closes the connection with `client/goodbye`
-    /// reason `pairing_required`, and never for a session whose setting admits unpaired access. One
-    /// connection can therefore report this event twice, once per reason, when the handshake found a
+    /// The second situation is a refused activation: unpaired access is off and the server sent a
+    /// `server/activate` that would be admissible if it were on. The value is
+    /// [`ClientConfig::unpaired_access`] unless [`ControlHandle::set_unpaired_access`] changed it on
+    /// this connection. That report fires at most once, immediately before the client closes the
+    /// connection with `client/goodbye` reason `pairing_required`, and never for a session whose
+    /// setting admits unpaired access. A connection the host closes because it turned the setting
+    /// off reports no such event: that is a host choice, not a refused activation. One connection
+    /// can therefore report this event twice, once per reason, when the handshake found a
     /// credential mismatch and the activation is then refused.
     ///
     /// In the credential-mismatch case nothing is removed or replaced on either side, and the
@@ -837,6 +840,36 @@ impl ControlHandle {
         self.send(ControlAction::Mute(muted)).await.map(|_level| ())
     }
 
+    /// Enables or disables unpaired access on the live connection.
+    ///
+    /// The value is what `client/hello` advertises and what the activation guard enforces.
+    /// [`ClientConfig::unpaired_access`] is the value a `connect` call starts from. A live change is
+    /// carried for the rest of that call - the next `client/hello` advertises it - and a new
+    /// `connect` starts from the configuration again.
+    ///
+    /// Turning it off closes a connection that relies on it - an unpaired session with active roles
+    /// or with the `playback` activity declared by an accepted activation - after saying goodbye
+    /// with [`GoodbyeReason::PairingRequired`]. An unpaired session that relies on nothing yet stays
+    /// open, and the existing activation guard refuses the next activation that would need unpaired
+    /// access. A paired session is never closed by the setting, because the setting never applied to
+    /// it. Turning it on stores the value and restarts an unpaired session with `client/goodbye`
+    /// reason [`GoodbyeReason::Restart`]: `client/hello` is the only carrier of the advertisement,
+    /// so a live connection cannot advertise the new value without a new one. A paired session is
+    /// neither closed nor restarted, because the setting never applied to it. Pairing stays
+    /// admissible in both directions, because the setting gates only roles and the `playback`
+    /// activity, never pairing.
+    ///
+    /// # Errors
+    /// Returns an error when the connection has ended, and when the connection is switching keys at
+    /// that moment: the request is refused then, before anything is written, and the host can retry.
+    /// A change made while the client is between connections is stored, not refused: it is what the
+    /// next `client/hello` advertises.
+    pub async fn set_unpaired_access(&self, enabled: bool) -> Result<()> {
+        self.send(ControlAction::SetUnpairedAccess(enabled))
+            .await
+            .map(|_level| ())
+    }
+
     /// Returns the volume level in force.
     ///
     /// The value follows every change the connection made or received, including a mute, which
@@ -930,6 +963,8 @@ pub(crate) enum ControlAction {
     ReportVolume(u8),
     /// Set the mute state, keeping the level.
     Mute(bool),
+    /// Whether the connection admits an unpaired session, applied to the shared value.
+    SetUnpairedAccess(bool),
     /// Open a pairing window for this connection and start a waiting static-code attempt.
     #[cfg(feature = "pairing-code")]
     OpenPairingWindow,
@@ -1097,6 +1132,7 @@ pub async fn connect_with_psks(
         volume: config.volume,
         muted: config.muted,
         active_roles: Vec::new(),
+        unpaired_access: Arc::new(AtomicBool::new(config.unpaired_access)),
         #[cfg(feature = "pairing-code")]
         failed_rounds,
     };
@@ -1162,23 +1198,26 @@ enum Wakeup {
 /// Answers a request that arrived while no session was established.
 ///
 /// A pairing window belongs to a connection and is refused; releasing the round hold-back belongs
-/// to the process and is honoured, so an operator gesture made between connections is not lost.
+/// to the process and is honoured, and a change of the unpaired-access setting is stored for the
+/// next `client/hello`, so an operator gesture made between connections is not lost.
 pub(crate) fn answer_without_session(carried: &Carried, request: ControlRequest) {
+    if let ControlAction::SetUnpairedAccess(enabled) = &request.action {
+        carried.unpaired_access.store(*enabled, Ordering::Relaxed);
+        let _ = request.reply.send(Ok(carried.volume));
+        return;
+    }
     #[cfg(feature = "pairing-code")]
     if matches!(request.action, ControlAction::ReleaseHoldback) {
         carried.failed_rounds.store(0, Ordering::SeqCst);
         let _ = request.reply.send(Ok(carried.volume));
         return;
     }
-    // Without the feature there is no hold-back to release: every request is refused.
-    #[cfg(not(feature = "pairing-code"))]
-    let _ = carried;
     let _ = request
         .reply
         .send(Err(anyhow!("no connection is established")));
 }
 
-/// Waits before the next attempt, refusing control requests meanwhile.
+/// Waits before the next attempt, answering control requests meanwhile.
 ///
 /// Returns `false` when the host dropped the event stream and the connection should end.
 async fn wait_before_retry(
@@ -1306,6 +1345,8 @@ async fn serve_until_dropped(
                 session::Ending::Closed
                 | session::Ending::Unpaired
                 | session::Ending::PairingRequired
+                | session::Ending::UnpairedAccessOff
+                | session::Ending::Restart
                 | session::Ending::Unauthorized
                 | session::Ending::Shutdown => Err(anyhow!("the audio sink failed")),
             };
@@ -1610,6 +1651,7 @@ mod tests {
             volume: 42,
             muted: false,
             active_roles: Vec::new(),
+            unpaired_access: Arc::new(AtomicBool::new(true)),
             #[cfg(feature = "pairing-code")]
             failed_rounds: Arc::new(AtomicU32::new(0)),
         }

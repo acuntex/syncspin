@@ -15,8 +15,7 @@ use std::collections::BTreeSet;
 use std::future::pending;
 #[cfg(feature = "pairing-code")]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicU8, Ordering};
-#[cfg(feature = "pairing-code")]
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -430,6 +429,13 @@ pub(crate) struct Carried {
     pub(crate) muted: bool,
     /// Roles the last session had active.
     pub(crate) active_roles: Vec<String>,
+    /// Whether this client admits an unpaired session.
+    ///
+    /// One value serves the whole `connect` call: every attempt's `client/hello`, the activation
+    /// checks and a host's live change all read or write it. The session writes it after a
+    /// validated [`ControlAction::SetUnpairedAccess`]; while no session is live, the reconnect wait
+    /// and the inbound listener write it through `answer_without_session`.
+    pub(crate) unpaired_access: Arc<AtomicBool>,
     /// Failed dynamic pairing rounds since the last verified `server_kc`.
     ///
     /// The count belongs to the process, not to the connection: `pairing.md` does not partition it
@@ -448,6 +454,10 @@ pub(crate) enum Ending {
     Unpaired,
     /// The server wanted an unpaired session and this client does not admit one.
     PairingRequired,
+    /// The host stopped admitting unpaired access, and this session relied on it.
+    UnpairedAccessOff,
+    /// The host turned unpaired access on, and this unpaired session restarted to advertise it.
+    Restart,
     /// The server's activation is not allowed for the key that sealed this connection.
     Unauthorized,
     /// The host closed the connection deliberately, after saying why.
@@ -464,6 +474,11 @@ impl Ending {
             Self::Unpaired => "the server dropped this client's pairing record".to_owned(),
             Self::PairingRequired => {
                 "the server wanted an unpaired session and this client does not admit one"
+                    .to_owned()
+            }
+            Self::UnpairedAccessOff => "the client stopped admitting unpaired access".to_owned(),
+            Self::Restart => {
+                "the client restarted the connection to advertise its unpaired-access setting"
                     .to_owned()
             }
             Self::Unauthorized => {
@@ -539,6 +554,15 @@ pub(crate) struct Session<'a> {
     clock: ClockFilter,
     reassembler: Reassembler,
     active_roles: Vec<String>,
+    /// Whether this client admits an unpaired session, shared with every attempt.
+    unpaired_access: Arc<AtomicBool>,
+    /// The value this session last applied; a request that repeats it sends nothing.
+    unpaired_access_snapshot: bool,
+    /// Whether an accepted activation declared the `playback` activity.
+    ///
+    /// Together with a non-empty role set this is what makes an unpaired connection rely on
+    /// unpaired access, which is the condition the spec gives for a `pairing_required` close.
+    playback_declared: bool,
     stream: Option<AudioFormat>,
     /// Remaining `client/time` messages of the current burst (0 = no burst running).
     sync_remaining: usize,
@@ -667,7 +691,13 @@ pub(crate) async fn attempt(
     let handshake = tokio::select! {
         result = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            handshake(transport, config, &candidates, &carried.active_roles),
+            handshake(
+                transport,
+                config,
+                &candidates,
+                &carried.active_roles,
+                &carried.unpaired_access,
+            ),
         ) => result,
         // The host closed while the handshake was running. There is no session to say goodbye on
         // yet, and the attempt must not report a failure or schedule a reconnect.
@@ -712,6 +742,9 @@ pub(crate) async fn attempt(
         }
     };
 
+    // The host may have changed the value while no session was live, so the snapshot starts from
+    // the shared value rather than from the configuration.
+    let unpaired_access_snapshot = carried.unpaired_access.load(Ordering::Relaxed);
     let mut session = Session {
         transport: ready.transport,
         noise: ready.noise,
@@ -722,6 +755,9 @@ pub(crate) async fn attempt(
         clock: ClockFilter::new(),
         reassembler: Reassembler::new(MAX_REASSEMBLED_LEN),
         active_roles: ready.active_roles,
+        unpaired_access: carried.unpaired_access,
+        unpaired_access_snapshot,
+        playback_declared: false,
         stream: None,
         sync_remaining: 0,
         burst_deadline: None,
@@ -802,6 +838,7 @@ impl Session<'_> {
             volume: self.volume,
             muted: self.muted,
             active_roles: self.active_roles,
+            unpaired_access: self.unpaired_access,
             #[cfg(feature = "pairing-code")]
             failed_rounds: self.failed_rounds,
         }
@@ -1288,18 +1325,17 @@ impl Session<'_> {
         // the declared method is acceptable on this connection. A malformed pairing activation
         // (declares `pairing` without its parameters) stays `true` so the guard decides first and
         // the protocol error still surfaces below.
+
+        // One activation is judged against one value, even though the host may change it while
+        // the session runs.
+        let unpaired_access = self.unpaired_access.load(Ordering::Relaxed);
         let pairing_admissible = match admits_pairing(&activate) {
             Ok(None) => true,
             Ok(Some(activation)) => self.admitted_method(&activation).is_some(),
             Err(_) => true,
         };
-        if let Some(refusal) = admit_activation(
-            self.matched,
-            self.config.unpaired_access,
-            pairing_admissible,
-            &activate,
-        )
-        .refusal()
+        if let Some(refusal) =
+            admit_activation(self.matched, unpaired_access, pairing_admissible, &activate).refusal()
         {
             return self.refuse_activation(refusal).await;
         }
@@ -1308,6 +1344,15 @@ impl Session<'_> {
         // stale, and a new attempt has not started yet.
         self.discarding_pairing_messages = false;
         let pairing = admits_pairing(&activate)?;
+
+        // The spec's second limb: an accepted activation that declares `playback` makes an unpaired
+        // connection rely on unpaired access even without roles. Assigned, not accumulated, so an
+        // activation that omits the activity clears it.
+        self.playback_declared = activate
+            .activities
+            .iter()
+            .any(|activity| activity == PLAYBACK);
+
         if pairing.is_none() {
             // A cancelling activation discards the attempt and anything it already received. An
             // attempt that existed may still have messages on the wire, and those are discarded;
@@ -1324,11 +1369,7 @@ impl Session<'_> {
         // a later activation for them: a connection that can no longer carry playback loses its
         // roles, and `had_player` above is what turns that loss into `StreamEnd` below.
         if activate.active_roles.is_none()
-            && !playback_capable_for(
-                self.matched,
-                self.config.unpaired_access,
-                &activate.activities,
-            )
+            && !playback_capable_for(self.matched, unpaired_access, &activate.activities)
         {
             self.active_roles.clear();
         }
@@ -2334,6 +2375,10 @@ impl Session<'_> {
                 self.apply_report_volume(level).await.map(|()| self.volume)
             }
             ControlAction::Mute(muted) => self.apply_mute(muted).await.map(|()| self.volume),
+            ControlAction::SetUnpairedAccess(enabled) => self
+                .apply_unpaired_access(enabled)
+                .await
+                .map(|()| self.volume),
             #[cfg(feature = "pairing-code")]
             ControlAction::OpenPairingWindow => {
                 self.open_pairing_window().await.map(|()| self.volume)
@@ -2399,6 +2444,10 @@ impl Session<'_> {
                 }
                 Ok(())
             }
+            // The setting is local state and needs no role. The re-handshake guard above already
+            // refuses it, because the change may have to say goodbye and no application message
+            // may be sent while the keys switch.
+            ControlAction::SetUnpairedAccess(_) => Ok(()),
             // The window and the hold-back release are local state: neither sends anything itself,
             // and whatever they start needs no role.
             #[cfg(feature = "pairing-code")]
@@ -2476,6 +2525,35 @@ impl Session<'_> {
     async fn apply_mute(&mut self, muted: bool) -> Result<()> {
         self.muted = muted;
         self.report_state().await
+    }
+
+    /// Applies a live change of the unpaired-access setting.
+    ///
+    /// The shared value is written only after the request was accepted, so a refused request leaves
+    /// it unchanged. Turning it off closes a connection that relies on it - an unpaired session
+    /// with roles, or with the `playback` activity declared by an accepted activation - after
+    /// saying goodbye with `pairing_required`. An idle unpaired session stays open, and the
+    /// activation guard refuses whatever needs the setting later. A paired session is never closed
+    /// by the setting, because the setting never applied to it. Turning it on stores the value and
+    /// restarts an unpaired session, because `client/hello` is where the client advertises it; the
+    /// restart is the only way the server learns of the change on a live connection.
+    async fn apply_unpaired_access(&mut self, enabled: bool) -> Result<()> {
+        if enabled == self.unpaired_access_snapshot {
+            return Ok(());
+        }
+        self.unpaired_access.store(enabled, Ordering::Relaxed);
+        self.unpaired_access_snapshot = enabled;
+        if is_paired(self.matched) {
+            return Ok(());
+        }
+        if enabled {
+            self.send_goodbye(GoodbyeReason::Restart).await;
+            self.ending = Some(Ending::Restart);
+        } else if !self.active_roles.is_empty() || self.playback_declared {
+            self.send_goodbye(GoodbyeReason::PairingRequired).await;
+            self.ending = Some(Ending::UnpairedAccessOff);
+        }
+        Ok(())
     }
 
     /// Records the level in force and publishes it to the control handles.
@@ -2582,6 +2660,7 @@ async fn handshake(
     config: &ClientConfig,
     candidates: &Candidates,
     previous_roles: &[String],
+    unpaired_access: &AtomicBool,
 ) -> Result<Ready, HandshakeError> {
     // 1. client/init. Its exact bytes are the first half of the Noise prologue.
     let client_init = Incoming::ClientInit(ClientInit {
@@ -2661,7 +2740,7 @@ async fn handshake(
     }
 
     // 6. client/hello.
-    let hello = client_hello(config);
+    let hello = client_hello(config, unpaired_access);
     let ciphertext = encrypt_json(&mut noise, &hello)?;
     transport.send_binary(ciphertext).await?;
 
@@ -2712,9 +2791,18 @@ pub(crate) async fn reject_concurrent(
     config: &ClientConfig,
     pairing_psk: Option<PairingPsk>,
     previous_roles: &[String],
+    unpaired_access: &AtomicBool,
 ) -> Result<()> {
     let candidates = Candidates::load(config.storage.as_deref(), &[], pairing_psk)?;
-    let mut ready = match handshake(transport, config, &candidates, previous_roles).await {
+    let mut ready = match handshake(
+        transport,
+        config,
+        &candidates,
+        previous_roles,
+        unpaired_access,
+    )
+    .await
+    {
         Ok(ready) => ready,
         Err(HandshakeError::ServerRejected(_) | HandshakeError::Failed(_)) => return Ok(()),
     };
@@ -2739,7 +2827,10 @@ pub(crate) async fn reject_concurrent(
 }
 
 /// Builds the `client/hello` the client announces itself with.
-fn client_hello(config: &ClientConfig) -> Incoming {
+///
+/// The unpaired-access value is read here, from the atomic the whole connection shares: the hello
+/// is what advertises the value a host may have changed while no session was live.
+fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool) -> Incoming {
     let codec = match config.audio_mode {
         AudioMode::Decode => "pcm",
         AudioMode::Passthrough => "flac",
@@ -2767,7 +2858,7 @@ fn client_hello(config: &ClientConfig) -> Incoming {
         }),
         supported_pair_methods: pair_methods(config),
         unpaired_access: UnpairedAccess {
-            enabled: config.unpaired_access,
+            enabled: unpaired_access.load(Ordering::Relaxed),
         },
     })
 }
@@ -3296,6 +3387,14 @@ mod tests {
             Ending::Unauthorized.reason(),
             "the server's activation is not allowed for the key that sealed this connection"
         );
+        assert_eq!(
+            Ending::Restart.reason(),
+            "the client restarted the connection to advertise its unpaired-access setting"
+        );
+        assert_eq!(
+            Ending::UnpairedAccessOff.reason(),
+            "the client stopped admitting unpaired access"
+        );
     }
 
     /// Builds a metadata payload with the Sentinel id and the given category.
@@ -3599,6 +3698,9 @@ mod tests {
             clock: ClockFilter::new(),
             reassembler: Reassembler::new(MAX_REASSEMBLED_LEN),
             active_roles: vec![CONTROLLER_ROLE.to_owned()],
+            unpaired_access: Arc::new(AtomicBool::new(config.unpaired_access)),
+            unpaired_access_snapshot: config.unpaired_access,
+            playback_declared: false,
             stream: None,
             sync_remaining: 0,
             burst_deadline: None,

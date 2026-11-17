@@ -336,6 +336,50 @@ async fn a_pending_message_carries_the_hosts_text() {
 }
 
 #[tokio::test]
+async fn a_flip_during_a_static_code_attempt_closes_a_relying_session() {
+    // The activation declares `playback`, `pairing` and the player role, so the session carries
+    // roles and has declared playback: it relies on unpaired access while the attempt is held back.
+    let mut server = FakeServer::start(ServerOptions {
+        first_activate: Some(ServerActivate {
+            activities: vec!["playback".to_owned(), "pairing".to_owned()],
+            active_roles: Some(vec!["player@v1".to_owned()]),
+            pairing: Some(PairingActivation {
+                method: "static_pairing_code".to_owned(),
+                format: None,
+            }),
+        }),
+        static_pairing_code: Some(CODE.to_owned()),
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (mut events, handle) = connect_to(&server, Some(Arc::new(MemoryStorage::default()))).await;
+    expect_connected(&mut events, &server).await;
+
+    let (index, _message) = observed(server.wait_for_pair_pending())
+        .await
+        .expect("the client must report the held-back attempt")
+        .expect("the connection must not close before client/pair-pending");
+    assert_eq!(index, 1, "the first pairing activation of the connection");
+
+    handle
+        .control()
+        .set_unpaired_access(false)
+        .await
+        .expect("the live change must be accepted");
+
+    assert_eq!(
+        observed(server.wait_for_goodbye())
+            .await
+            .expect("the client must say goodbye")
+            .as_deref(),
+        Some("pairing_required"),
+        "a held-back pairing does not stop a relying session from closing"
+    );
+    drop(handle);
+}
+
+#[tokio::test]
 async fn a_wrong_server_code_aborts_with_a_mismatch() {
     let storage = Arc::new(MemoryStorage::default());
     let mut server = FakeServer::start(static_options(WRONG_CODE)).await.unwrap();

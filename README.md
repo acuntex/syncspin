@@ -186,6 +186,17 @@ pairing window the host opens or by the process-wide round limit. The dynamic fl
 a six-digit code or a version-1 token; both flows deliver the long-term key sealed under the CPace
 output. The CPace layer is unaudited — see [Status](#status).
 
+Unpaired access is a client setting: `ClientConfig::unpaired_access` is the value each `connect`
+starts from and what `client/hello` advertises, and `ControlHandle::set_unpaired_access` changes it on
+a running client. Turning it off closes a session that relied on it — an unpaired session with active
+roles, or with `playback` among the activities of its accepted activation — after a `client/goodbye`
+with reason `pairing_required`; an idle unpaired session stays open and the activation guard refuses
+the next activation that would need the setting. Turning it on restarts an unpaired session with
+`client/goodbye` reason `restart`, because `client/hello` is the only carrier of the advertisement and
+only a new connection can send a new one. A paired session is untouched in both directions: the
+setting never applied to it, so it is neither closed nor restarted. The value the host set is what
+every later `client/hello` in that `connect` advertises.
+
 The server's side is symmetric. `ServerConfig::storage` is the host's `PairingStore`, keyed by
 `client_id`; the listener seals a client's first handshake with the record it holds. A client with no
 record is reported with `approved: false`, gets no roles and no audio, and stays that way until
