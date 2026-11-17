@@ -237,6 +237,49 @@ run taught that the checklist below did not know:
   playback resumes without a restart; only a failed sink, a dropped event stream or a dropped handle
   ends the loop.
 
+### Keepalive (performed 2026-11-16)
+
+The client pings after 15 s of silence and drops the session after 10 s more without any frame. The
+ping is the only traffic an idle session sends, and it exists for the half-open link: a peer whose
+process is gone but whose sockets stay open answers nothing, so without the ping neither side would
+ever notice the loss.
+
+To make a half-open link deterministically without touching either peer's code, freeze the peer's
+processes while their sockets stay open — `docker pause <container>` for a containerised Music
+Assistant, or a local TCP proxy between the two that is stopped with `SIGSTOP` (which is how this run
+did it). A frozen process sends no close and answers no ping, so the link falls silent with both
+sockets still open.
+
+**Performed 2026-11-16** against a Music Assistant 2.10 server through a frozen proxy:
+
+- The client reported
+  `disconnected: no WebSocket frame arrived within 10s of a keepalive ping, so the connection is dead; retrying in 1s`
+  about 25 s after the freeze, kept retrying with backoff, and re-registered within seconds of the
+  thaw.
+- A 70 s silent session with an answering server produced no disconnect at all, so the ping is not a
+  false positive on an idle but healthy link.
+
+### Unpaired-access refusal (how to check)
+
+`--pairing-required` turns off the client's `unpaired_access` switch, so a session the server
+activates without a pairing record is refused: the client sends `client/goodbye` with reason
+`pairing_required`, reports `pairing required for server <id>: UnpairedAccessDisabled`, and the
+session ends. Pairing itself is unaffected — a `['pairing']` activation stays admissible under the
+Sentinel key — so the client can still pair with the server and then play.
+
+Two limits on checking it:
+
+- Music Assistant 2.10 never activates playback on an unpaired client, so there is no unpaired
+  activation for the client to refuse.
+- The crate's own `server-demo` honours `unpaired_access: false` and grants an unpaired client no
+  roles, so it leaves the player connected but silent rather than triggering the refusal.
+
+To check it, point `player-pipe --pairing-required` at a server that activates roles on an unpaired
+connection regardless of the client's hello. Expected: the client sends `client/goodbye` reason
+`pairing_required`, reports the `PairingRequired` event, and ends the session, while a `['pairing']`
+activation stays admissible so pairing still works. This paragraph records how to check it, not a
+performed run.
+
 ### Pairing (performed 2026-11-16)
 
 **Run against a real Music Assistant server with the Sendspin provider enabled.** Observed:
@@ -276,7 +319,7 @@ Steps, for the next run:
 
 4. Unpair the client in the server. Expected: `unpaired: ...`, the record disappears from
    `./pairing.json`, and the connection ends. The next start is a guest; a server that still holds
-   its half reports `pairing required by ...: CredentialMismatch`.
+   its half reports `pairing required for server <id>: CredentialMismatch`.
 
 5. The example offers only the static code flow. It has no display and no speaker, so it advertises
    neither an emission format nor an out-channel, and a server that activates
