@@ -843,16 +843,20 @@ impl ControlHandle {
     /// Enables or disables unpaired access on the live connection.
     ///
     /// The value is what `client/hello` advertises and what the activation guard enforces.
-    /// [`ClientConfig::unpaired_access`] is the value a connection starts from, and a new
-    /// connection starts from it again, so a live change lives as long as this connection.
+    /// [`ClientConfig::unpaired_access`] is the value a `connect` call starts from. A live change is
+    /// carried into the subsequent connections of this call - the next `client/hello` advertises it -
+    /// until the handle is dropped or a new `connect` starts from the configuration again.
     ///
     /// Turning it off closes a connection that relies on it - an unpaired session with active roles
     /// or with the `playback` activity declared by an accepted activation - after saying goodbye
     /// with [`GoodbyeReason::PairingRequired`]. An unpaired session that relies on nothing yet stays
     /// open, and the existing activation guard refuses the next activation that would need unpaired
     /// access. A paired session is never closed by the setting, because the setting never applied to
-    /// it. Turning it on stores the value for the next `client/hello`; pairing stays admissible in
-    /// both directions, because both flows run over a Sentinel-keyed session.
+    /// it. Turning it on stores the value and restarts an unpaired session with `client/goodbye`
+    /// reason [`GoodbyeReason::Restart`]: `client/hello` is the only carrier of the advertisement,
+    /// so a live connection cannot advertise the new value without a new one. A paired session is
+    /// neither closed nor restarted, because the setting never applied to it. Pairing stays
+    /// admissible in both directions, because both flows run over a Sentinel-keyed session.
     ///
     /// # Errors
     /// Returns an error when the connection has ended, and when the connection is switching keys at
@@ -1341,6 +1345,7 @@ async fn serve_until_dropped(
                 | session::Ending::Unpaired
                 | session::Ending::PairingRequired
                 | session::Ending::UnpairedAccessOff
+                | session::Ending::Restart
                 | session::Ending::Unauthorized
                 | session::Ending::Shutdown => Err(anyhow!("the audio sink failed")),
             };

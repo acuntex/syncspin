@@ -456,6 +456,8 @@ pub(crate) enum Ending {
     PairingRequired,
     /// The host stopped admitting unpaired access, and this session relied on it.
     UnpairedAccessOff,
+    /// The host turned unpaired access on, and this unpaired session restarted to advertise it.
+    Restart,
     /// The server's activation is not allowed for the key that sealed this connection.
     Unauthorized,
     /// The host closed the connection deliberately, after saying why.
@@ -475,6 +477,10 @@ impl Ending {
                     .to_owned()
             }
             Self::UnpairedAccessOff => "the client stopped admitting unpaired access".to_owned(),
+            Self::Restart => {
+                "the client restarted the connection to advertise its unpaired-access setting"
+                    .to_owned()
+            }
             Self::Unauthorized => {
                 "the server's activation is not allowed for the key that sealed this connection"
                     .to_owned()
@@ -2528,18 +2534,22 @@ impl Session<'_> {
     /// with roles, or with the `playback` activity declared by an accepted activation - after
     /// saying goodbye with `pairing_required`. An idle unpaired session stays open, and the
     /// activation guard refuses whatever needs the setting later. A paired session is never closed
-    /// by the setting, because the setting never applied to it. Turning it on stores the value; it
-    /// is what the next `client/hello` advertises.
+    /// by the setting, because the setting never applied to it. Turning it on stores the value and
+    /// restarts an unpaired session, because `client/hello` is where the client advertises it; the
+    /// restart is the only way the server learns of the change on a live connection.
     async fn apply_unpaired_access(&mut self, enabled: bool) -> Result<()> {
         if enabled == self.unpaired_access_snapshot {
             return Ok(());
         }
         self.unpaired_access.store(enabled, Ordering::Relaxed);
         self.unpaired_access_snapshot = enabled;
-        if !enabled
-            && !is_paired(self.matched)
-            && (!self.active_roles.is_empty() || self.playback_declared)
-        {
+        if is_paired(self.matched) {
+            return Ok(());
+        }
+        if enabled {
+            self.send_goodbye(GoodbyeReason::Restart).await;
+            self.ending = Some(Ending::Restart);
+        } else if !self.active_roles.is_empty() || self.playback_declared {
             self.send_goodbye(GoodbyeReason::PairingRequired).await;
             self.ending = Some(Ending::UnpairedAccessOff);
         }
@@ -3376,6 +3386,14 @@ mod tests {
         assert_eq!(
             Ending::Unauthorized.reason(),
             "the server's activation is not allowed for the key that sealed this connection"
+        );
+        assert_eq!(
+            Ending::Restart.reason(),
+            "the client restarted the connection to advertise its unpaired-access setting"
+        );
+        assert_eq!(
+            Ending::UnpairedAccessOff.reason(),
+            "the client stopped admitting unpaired access"
         );
     }
 

@@ -312,8 +312,9 @@ pub struct ClientConfig {
     ///
     /// The value can change while the client runs:
     /// [`ControlHandle::set_unpaired_access`](crate::ControlHandle::set_unpaired_access) stores a new
-    /// value, which the next `client/hello` advertises and the activation guard enforces. This field
-    /// is the value each new connection starts from.
+    /// value, which the next `client/hello` advertises and the activation guard enforces. Enabling it
+    /// on an unpaired session forces that hello by reconnecting. This field is the value each
+    /// `connect` call starts from.
     ///
     /// `pairing.md` leaves the default to the manufacturer and recommends `false` for a client whose
     /// input a stranger could reach, such as a microphone. The default here is `true`, which is what

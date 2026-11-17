@@ -3491,3 +3491,278 @@ async fn turning_it_off_leaves_a_paired_session() {
         Some(20)
     );
 }
+
+#[tokio::test]
+async fn turning_it_on_restarts_an_unpaired_session() {
+    // `[]` with no roles is admissible whatever the setting, so the session is still open when the
+    // host turns unpaired access on: the restart is the only reason this connection ends.
+    let mut server = FakeServer::start(ServerOptions {
+        connections: 2,
+        activate_override: Some(
+            r#"{"type":"server/activate","payload":{"activities":[]}}"#.to_owned(),
+        ),
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+    expect_connected(&mut events, &server).await;
+    let first = server
+        .wait_for_client_hello()
+        .await
+        .expect("the first connection announces itself");
+    assert!(
+        !first.unpaired_access.enabled,
+        "the first hello carries the configured value"
+    );
+
+    handle
+        .control()
+        .set_unpaired_access(true)
+        .await
+        .expect("the live change must be accepted");
+
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("restart"),
+        "the hello is where the client advertises the setting, so it restarts to send one"
+    );
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => assert!(
+            reason.contains("restarted the connection"),
+            "the reason must name the restart, got: {reason}"
+        ),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    let hello = tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_hello())
+        .await
+        .expect("the client reconnects after the restart")
+        .expect("the second connection announces itself");
+    assert!(
+        hello.unpaired_access.enabled,
+        "the next hello must advertise the value the host set"
+    );
+    drop(handle);
+}
+
+#[tokio::test]
+async fn turning_it_on_leaves_a_paired_session() {
+    // The setting never applied to a paired session, so turning it on must not restart one either.
+    let psk: [u8; 32] = std::array::from_fn(|index| (index as u8) ^ 0x5a);
+    let options = ServerOptions {
+        psk_id: psk_id_for(&psk),
+        psk_category: "lt".to_owned(),
+        psk,
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let stored = StoredPsk {
+        category: PskCategory::LongTerm,
+        psk,
+        server_id: server.server_id().to_owned(),
+    };
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (handle, mut events) = connect_with_psks(config, sink, vec![stored])
+        .await
+        .expect("the client must connect");
+    expect_connected(&mut events, &server).await;
+    let first = server
+        .wait_for_client_hello()
+        .await
+        .expect("the first connection announces itself");
+    assert!(
+        !first.unpaired_access.enabled,
+        "the first hello carries the configured value"
+    );
+
+    handle
+        .control()
+        .set_unpaired_access(true)
+        .await
+        .expect("the live change must be accepted");
+    assert_no_goodbye(&mut server).await;
+
+    // The harness accepts one connection, so a restart would have nowhere to go; a second hello
+    // within the window is what a restart would have produced.
+    let hello =
+        tokio::time::timeout(Duration::from_millis(300), server.wait_for_client_hello()).await;
+    assert!(
+        hello.is_err(),
+        "a paired session must not restart to advertise the setting"
+    );
+    drop(handle);
+}
+
+#[tokio::test]
+async fn setting_the_same_value_sends_nothing() {
+    // An idle unpaired session whose setting is already off: the request repeats the value in
+    // force, so it neither closes nor restarts anything.
+    let mut server = FakeServer::start(ServerOptions {
+        activate_override: Some(
+            r#"{"type":"server/activate","payload":{"activities":[]}}"#.to_owned(),
+        ),
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+    expect_connected(&mut events, &server).await;
+
+    handle
+        .control()
+        .set_unpaired_access(false)
+        .await
+        .expect("a repeated value is accepted");
+    assert_no_goodbye(&mut server).await;
+    drop(handle);
+
+    // The paired half repeats the value a paired session starts from, so a restart would be wrong
+    // twice: the setting never applied to it, and the value did not change.
+    let psk: [u8; 32] = std::array::from_fn(|index| (index as u8) ^ 0x5a);
+    let options = ServerOptions {
+        psk_id: psk_id_for(&psk),
+        psk_category: "lt".to_owned(),
+        psk,
+        ..ServerOptions::default()
+    };
+    let mut server = FakeServer::start(options).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let stored = StoredPsk {
+        category: PskCategory::LongTerm,
+        psk,
+        server_id: server.server_id().to_owned(),
+    };
+    let config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    let (handle, mut events) = connect_with_psks(config, sink, vec![stored])
+        .await
+        .expect("the client must connect");
+    expect_connected(&mut events, &server).await;
+
+    handle
+        .control()
+        .set_unpaired_access(true)
+        .await
+        .expect("a repeated value is accepted");
+    assert_no_goodbye(&mut server).await;
+    drop(handle);
+}
+
+#[tokio::test]
+async fn changing_while_disconnected_reaches_the_next_hello() {
+    // The empty activation keeps the first session open under `false`, so the server's close is the
+    // only reason it ends and the change lands while the client is between attempts.
+    let mut server = FakeServer::start(ServerOptions {
+        connections: 2,
+        activate_override: Some(
+            r#"{"type":"server/activate","payload":{"activities":[]}}"#.to_owned(),
+        ),
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (_recordings, sink) = recording_sink();
+    let mut config = config_for(&server, syncspin_client::AudioMode::Passthrough);
+    config.unpaired_access = false;
+    let (handle, mut events) = connect(config, sink)
+        .await
+        .expect("the client must connect");
+    expect_connected(&mut events, &server).await;
+    let first = server
+        .wait_for_client_hello()
+        .await
+        .expect("the first connection announces itself");
+    assert!(
+        !first.unpaired_access.enabled,
+        "the first hello carries the configured value, so the second can prove the write"
+    );
+
+    server.close();
+    match next_event(&mut events).await {
+        Event::Disconnected { .. } => {}
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    handle
+        .control()
+        .set_unpaired_access(true)
+        .await
+        .expect("a change between connections is stored, not refused");
+
+    let hello = tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_hello())
+        .await
+        .expect("the client reconnects on its own")
+        .expect("the second connection announces itself");
+    assert!(
+        hello.unpaired_access.enabled,
+        "the reconnect wait must store the value the next hello advertises"
+    );
+    drop(handle);
+}
+
+#[tokio::test]
+async fn off_then_on_ends_with_on() {
+    // The default activation declares `playback` and carries roles, so turning the setting off
+    // closes this session; the flip back on is queued and answered while the client waits.
+    let mut server = FakeServer::start(ServerOptions {
+        connections: 2,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+    let first = server
+        .wait_for_client_hello()
+        .await
+        .expect("the first connection announces itself");
+    assert!(
+        first.unpaired_access.enabled,
+        "the default configuration admits unpaired access, so the flip is what decides the second hello"
+    );
+
+    handle
+        .control()
+        .set_unpaired_access(false)
+        .await
+        .expect("the first change must be accepted");
+    handle
+        .control()
+        .set_unpaired_access(true)
+        .await
+        .expect("the queued change must be answered between connections");
+
+    assert_eq!(
+        goodbye_from(&mut server).await.as_deref(),
+        Some("pairing_required"),
+        "the request in force when the relying session ended is the one that closed it"
+    );
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => assert!(
+            reason.contains("stopped admitting unpaired access"),
+            "the close is the off change, not the queued on change, got: {reason}"
+        ),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    let hello = tokio::time::timeout(Duration::from_secs(5), server.wait_for_client_hello())
+        .await
+        .expect("the client reconnects after the close")
+        .expect("the second connection announces itself");
+    assert!(
+        hello.unpaired_access.enabled,
+        "the queued flip must win over the close it follows"
+    );
+    drop(handle);
+}
