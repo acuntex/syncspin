@@ -44,6 +44,13 @@ exclude_re = [
   # be set twice: `byte | 0x80` and `byte ^ 0x80` are the same byte. The neighbouring `&` mutant
   # is a real bug for lengths above 127 and is caught by the unit test beside this function.
   '^crates/syncspin-core/src/pairing/pake\.rs:346:23: replace \| with \^ in ',
+  # The two borrows in `subtract` cannot both be set: a byte that wraps leaves `value` at 256 or
+  # more, which is never below a borrow of one, and a byte that does not wrap sets no borrow. OR
+  # and XOR therefore agree on every input.
+  '^crates/syncspin-core/src/pairing/pake\.rs:387:39: replace \| with \^ in ',
+  # `while len >= 0x80` turned into `<` never terminates, so no test can report on it. The test
+  # timeout bounds it; it is not a survivor and not a gap.
+  '^crates/syncspin-core/src/pairing/pake\.rs:354:15: replace >= with < in ',
   # The base64 decoder rejects non-canonical trailing bits itself, so by the time the re-encode
   # comparison runs, the value is either already rejected or canonical. `||` and `&&` agree on
   # every input that reaches it.
