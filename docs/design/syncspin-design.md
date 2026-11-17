@@ -176,7 +176,7 @@ deadline; the sink owns the real rendering latency, and the part beyond the audi
 `output_delay_ms` through `output_delay()`, while `underruns()` waits for a correction loop the
 session does not use yet (see `docs/spec-deviations.md` #9). `min_buffer_ms` belongs to the crate: a
 host may pin it in `ClientConfig`, and otherwise the session derives it from the arrival delay of
-audio chunks and carries each sustained change into `client/state`.
+audio chunks and reports each sustained change in a `client/state`.
 
 ## Pairing
 
@@ -360,9 +360,10 @@ not stage 3:
 - **Playout timing:** the crate owns the time filter and emits each frame with a playout deadline; the
   sink honours it and reports its post-port output delay back through `output_delay()`, while
   `underruns()` waits for a correction loop the session does not use yet. Sync accuracy is therefore
-  a contract between crate and sink, and the spec's ±1 ms claim only holds for sinks that implement
-  `output_delay()`. `min_buffer_ms` is derived from arrival delay unless the host pins it, and
-  `required_lead_time_ms` is the host's start-up cost: the client reports both, but the server's
+  a contract between crate and sink: it depends on the sink writing each frame at its playout
+  deadline and compensating its own pre-port latency, while `output_delay()` only tells the server
+  what to add beyond the port. `min_buffer_ms` is derived from arrival delay unless the host pins it,
+  and `required_lead_time_ms` is the host's start-up cost: the client reports both, but the server's
   stream start still uses one fixed lead until `docs/spec-deviations.md` #17 closes.
 - **0.1 measures against the spec, not MA:** the five spec mandates found in the check are part of
   stage 1, not a later stage. Where MA disagrees with the spec, the spec wins and MA compatibility is

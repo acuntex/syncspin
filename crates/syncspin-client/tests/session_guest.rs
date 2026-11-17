@@ -1595,9 +1595,11 @@ async fn a_saturated_send_ahead_produces_no_update() {
     tokio::time::sleep(Duration::from_millis(1_100)).await;
 
     // `0` and `u32::MAX` are the protocol's saturation values for `send_ahead`, meaning "no
-    // measurement". The timestamp is half a second in the past, so an unfiltered sample would
-    // derive ~500 ms and raise the buffer after 128 samples; 200 chunks per value make the row
-    // discriminating, and the quiet window below catches any state that would follow.
+    // measurement". The `0` half is the one that discriminates the saturation filter: with the
+    // timestamp half a second in the past, an unfiltered sample would derive ~500 ms and raise the
+    // buffer after 160 samples. The `u32::MAX` half cannot: it maps the transmit time ~4300 s into
+    // the past, so the delay falls outside the ±60 s plausibility bound and is discarded with or
+    // without the saturation check. It stays as the wire-shape regression.
     for (sent, send_ahead) in [(200, 0), (400, u32::MAX)] {
         for _ in 0..200 {
             server.audio(now_us() - 500_000, send_ahead, vec![0x5a; 64]);
@@ -1658,6 +1660,64 @@ async fn an_auto_value_updates_after_a_window() {
         player.min_buffer_ms <= 5_000,
         "the derived value stays inside the protocol's range, got {}",
         player.min_buffer_ms
+    );
+}
+
+#[tokio::test]
+async fn a_start_burst_inside_the_warmup_is_not_sampled() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (recordings, sink) = recording_sink();
+    let (_handle, _events) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    wait_for_client_state(&mut server).await;
+    // The state report follows the first reply, but the clock estimate needs three accepted
+    // samples. Wait for the initial bursts, so the chunks below are sampleable and the row
+    // discriminates the warmup rather than the clock. This happens before `stream/start`, so it
+    // does not eat into the window.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), server.wait_for_time_replies(24))
+            .await
+            .expect("the fake server must answer the initial bursts"),
+        "the connection must stay open while the clock estimate forms"
+    );
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    // A start-from-empty burst is transmitted back-to-back, so its arrival delay says nothing about
+    // the steady state. These chunks carry a plausible 50 ms delay - far from the 250 ms start value
+    // and from any pin - and 200 of them would apply it at sample 160 (two same-direction
+    // evaluations after the 128-sample minimum) if the warmup did not discard every one of them.
+    // They go out immediately after `stream/start`, well inside the one-second window, and the quiet
+    // period below catches the report a missing guard would produce.
+    for _ in 0..200 {
+        server.audio(now_us(), 50_000, vec![0x5a; 64]);
+    }
+    wait_for_writes(&recordings, 200).await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), server.wait_for_client_state())
+            .await
+            .is_err(),
+        "chunks inside the warmup must not move the buffer"
+    );
+
+    // An in-place `stream/start` only swaps the format of a running stream: the arrival distribution
+    // is unchanged, so it must not re-arm the warmup. Once the first window has elapsed, the same
+    // pattern with a ~550 ms delay has to produce a report; an implementation that restarted the
+    // warmup on every `stream/start` would send nothing within the default timeout.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    server.stream_start("pcm", 48_000, 2, 16);
+    for _ in 0..200 {
+        server.audio(now_us() - 500_000, 50_000, vec![0x5a; 64]);
+    }
+    wait_for_writes(&recordings, 400).await;
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the derived report carries the player object");
+    assert_ne!(
+        player.min_buffer_ms, 250,
+        "an in-place stream start must not re-arm the warmup"
     );
 }
 

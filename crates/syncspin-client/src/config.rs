@@ -287,7 +287,9 @@ pub struct ClientConfig {
     ///
     /// This is the host's own start-up cost: launching the output (`gst-launch`, `pacat`), the
     /// decoder's warm-up, and whatever the backend needs before the first sample is audible. The
-    /// server schedules the first sample of a stream this far ahead of the playout deadline.
+    /// client asks the server to schedule the first sample of a stream this far ahead of the
+    /// playout deadline; the value is a hint, and the server in this workspace ignores it until
+    /// `docs/spec-deviations.md` #17 closes.
     ///
     /// A host must keep it at least as large as the buffer its backend still plays after a
     /// `stream/clear`: the clear discards that audio, and a shorter lead would schedule the

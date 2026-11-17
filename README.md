@@ -127,8 +127,8 @@ hardware rather than only the player name. A host that describes no device passe
 warming the decoder - and reaches the server in `client/state`; it defaults to 250 ms and has no
 upper bound beyond its type. `ClientConfig::min_buffer_ms` pins the buffer the server should keep
 filled; with the default `None` the client derives it from the arrival delay of audio chunks, starts
-from 250 ms, and carries an applied change into the next `client/state`. A pin above the protocol's
-5000 ms is refused before a connection is attempted.
+from 250 ms, and reports an applied change in a `client/state`. A pin above the protocol's 5000 ms
+is refused before a connection is attempted.
 
 The stream lifecycle is visible on the event stream: `Event::StreamStart` announces a new format,
 `Event::StreamEnd` reports a pause or a removed player role, and `Event::StreamClear` reports a seek
@@ -263,10 +263,10 @@ and the work that closes them in [docs/spec-deviations.md](docs/spec-deviations.
 A host supplies a [`Sink`](crates/syncspin-client/src/sink.rs): `open` for a new format, `write` for
 every chunk with the playout deadline the client computed, `discard_from` for a seek with a
 timestamp, `flush` at each boundary the crate announces, and optionally `output_delay` for the delay
-the output adds beyond the audio port, which the client reports to the server. The buffer the
-session asks for comes from its configuration or from arriving audio, so it needs no sink hook. The
-crate owns the connection, the clock and the reconnect loop; the host owns the output device, the
-identity file and everything below the pipe.
+the output adds beyond the audio port, which the client reports to the server, and `underruns` for
+diagnostics. The buffer the session asks for comes from its configuration or from arriving audio,
+so it needs no sink hook. The crate owns the connection, the clock and the reconnect loop; the host
+owns the output device, the identity file and everything below the pipe.
 Pairing needs a [`Storage`](crates/syncspin-client/src/storage.rs) as well; without one the client
 offers no pairing method, and a host that already holds records can pass them to `connect_with_psks`
 instead.
