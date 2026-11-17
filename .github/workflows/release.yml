@@ -39,7 +39,7 @@ env:
 jobs:
   verify:
     name: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -68,7 +68,7 @@ jobs:
   publish:
     name: publish
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # A protected environment puts a human between a pushed tag and a public
     # crate. Create it in Settings → Environments and add the secret there.
     environment: release
@@ -166,7 +166,7 @@ jobs:
     # Only a tag has release notes and a version; a manual dispatch on a branch
     # would otherwise try to publish a release named after the branch.
     if: github.ref_type == 'tag'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:

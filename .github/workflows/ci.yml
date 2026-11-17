@@ -7,6 +7,9 @@
 # Actions are pinned by commit SHA with the version in a trailing comment, which is
 # what Renovate's `helpers:pinGitHubActionDigests` preset (see `renovate.json5`)
 # maintains. A version tag is mutable; a SHA is not.
+#
+# Runners are pinned by label, not `ubuntu-latest`: an image promotion must not
+# change a job's toolchain without a commit. Renovate bumps the label.
 
 name: CI
 
@@ -37,7 +40,7 @@ concurrency:
 jobs:
   lint:
     name: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -51,7 +54,7 @@ jobs:
 
   test:
     name: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -72,7 +75,7 @@ jobs:
 
   msrv:
     name: msrv
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # `rust-toolchain.toml` pins `stable` and wins over a job-level toolchain
     # selection, so this job must override the file explicitly. Without
     # `RUSTUP_TOOLCHAIN` the MSRV gate would silently test the current stable
@@ -97,7 +100,7 @@ jobs:
 
   arm:
     name: arm
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -118,7 +121,7 @@ jobs:
         run: cargo check -p syncspin-core -p syncspin-client -p syncspin-server --all-features --target armv7-unknown-linux-gnueabihf --locked
 
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -164,7 +167,7 @@ jobs:
     # Every shard must be invoked with identical arguments and the same denominator, or the
     # shards disagree about which mutant belongs to whom and the results are meaningless.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 90
     strategy:
       # A surviving mutant in one shard must not stop the others from finishing: the point of
@@ -214,7 +217,7 @@ jobs:
 
   deny:
     name: deny
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -231,7 +234,7 @@ jobs:
 
   package:
     name: package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Publishing is the only moment a broken manifest, a missing README, a licence
     # path or an unused dependency is noticed today. `syncspin-client` and
     # `syncspin-server` cannot be packaged until `syncspin-core` is on crates.io,
@@ -246,7 +249,7 @@ jobs:
 
   docs:
     name: docs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -268,7 +271,7 @@ jobs:
     # Not `if: always()`: a cancelled run should stay cancelled, but a failed
     # sibling job must not hide a leaked-secret finding.
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
