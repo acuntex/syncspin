@@ -474,6 +474,62 @@ mod tests {
         let mut trailing = [0u8; 32];
         trailing[31] = 1;
         assert!(!is_all_zero(&trailing), "a non-zero last byte counts");
+
+        // A peer that repeats one non-zero byte is not the zero element either. Accumulating with
+        // XOR would cancel an even number of identical bytes and call this a low-order point.
+        assert!(
+            !is_all_zero(&[1u8; 32]),
+            "32 identical non-zero bytes are not zero"
+        );
+    }
+
+    #[test]
+    fn the_lexicographical_order_is_bytes_then_a_prefix() {
+        // §A.3.1 orders byte by byte, and only a proper prefix counts as smaller. Both sides of
+        // the comparison come from peers, so an equal pair must not be "larger" and a prefix must
+        // not win: that would break the symmetry the role assignment depends on.
+        assert!(
+            !lexicographically_larger(&[1, 2], &[1, 2]),
+            "equal slices are not larger"
+        );
+        assert!(
+            lexicographically_larger(&[1, 3], &[1, 2]),
+            "byte order decides"
+        );
+        assert!(!lexicographically_larger(&[1, 2], &[1, 3]));
+        assert!(
+            !lexicographically_larger(&[1, 2], &[1, 2, 0]),
+            "a proper prefix is smaller"
+        );
+        assert!(
+            lexicographically_larger(&[1, 2, 0], &[1, 2]),
+            "the longer slice is larger when the shorter one is its prefix"
+        );
+    }
+
+    #[test]
+    fn a_length_prefix_is_leb128_above_a_single_byte() {
+        // `lv_cat` writes lengths as unsigned LEB128, so 127 fits in one byte and 128 needs two.
+        // Every length this transcript passes today is below 128 - a 32-byte field, a short DSI, a
+        // pad under the block size - so the multi-byte branch has no caller to reach it. The
+        // encoding still has to be right for the lengths the format allows: a pad or an identifier
+        // one byte longer would otherwise produce a transcript the peer cannot parse.
+        for (len, expected) in [
+            (0usize, vec![0x00]),
+            (127, vec![0x7f]),
+            (128, vec![0x80, 0x01]),
+            (300, vec![0xac, 0x02]),
+            (16_384, vec![0x80, 0x80, 0x01]),
+        ] {
+            let mut out = Vec::new();
+            push_len(&mut out, len);
+            assert_eq!(out, expected, "LEB128 encoding of {len}");
+            assert_eq!(
+                prepend_len_len(len),
+                expected.len(),
+                "prefix width for {len}"
+            );
+        }
     }
 
     #[test]

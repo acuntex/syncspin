@@ -1,0 +1,98 @@
+# Settings for `cargo mutants`, used by the weekly CI job and by a local run alike.
+#
+# A surviving mutant is a test gap or an exemption, never a number to accept. This file holds the
+# exemptions and the reason for each one; everything else has to be killed by a test.
+
+# `pairing-code` is off by default, and without it `pairing/pake.rs`, `pairing/wrap.rs` and
+# `pairing/code.rs` are compiled away. cargo-mutants generates mutants from the source tree, not
+# from the build, so those 122 mutants would build unchanged and every one would be reported as
+# missed.
+#
+# This is the only place the flag lives: the workflow does not repeat it, because cargo rejects a
+# duplicate `--all-features` and the baseline fails.
+additional_cargo_args = ["--all-features"]
+
+# Mutants that cannot be caught because they do not change behaviour.
+#
+# Each pattern names one mutant, replacement included: `clock.rs:199:70` produces three variants
+# and only the `>=` one is equivalent, so a pattern that stopped at the line would also silence the
+# `==` and `<` variants the suite does catch today.
+#
+# The names carry a line and a column, so an edit above one of these makes its pattern stale. That
+# is deliberate: a stale pattern stops matching, the mutant comes back as a survivor, and the red
+# run points at the exemption that needs a new line number. It never hides a real gap.
+exclude_re = [
+  # `PROCESS_STD_DEV` is 0.0, so the process-noise term is exactly zero whether it is added or
+  # subtracted, multiplied or divided.
+  '^crates/syncspin-core/src/clock\.rs:192:68: replace \+ with - in ',
+  '^crates/syncspin-core/src/clock\.rs:192:94: replace \* with / in ',
+  # The drift diffusion is 1e-11 per sqrt(us): divided by dt it is 4e-28 against a variance near
+  # 8e-6. Multiplying by dt is caught; dividing by it cannot be.
+  '^crates/syncspin-core/src/clock\.rs:194:68: replace \* with / in ',
+  # `>` against `>=` where the two sides are floats that would have to land exactly on each other:
+  # a residual on exactly three times the error bound, and a variance on exactly a quarter of the
+  # squared drift. Both are measure-zero, not untested.
+  '^crates/syncspin-core/src/clock\.rs:199:70: replace > with >= in ',
+  '^crates/syncspin-core/src/clock\.rs:216:50: replace > with >= in ',
+  # `base32_decode` strips every trailing `=`, so padding a body to eight characters or leaving it
+  # unpadded decodes to the same bytes.
+  '^crates/syncspin-core/src/pairing/token\.rs:206:26: replace != with == in ',
+  # The accumulator holds fewer than five pending bits, so shifting it left by eight leaves its low
+  # byte zero and the incoming byte cannot overlap it: `|` and `^` agree on every input.
+  '^crates/syncspin-core/src/pairing/token\.rs:218:32: replace \| with \^ in ',
+  # In the LEB128 writer the low seven bits are already masked off, so the continuation bit cannot
+  # be set twice: `byte | 0x80` and `byte ^ 0x80` are the same byte. The neighbouring `&` mutant
+  # is a real bug for lengths above 127 and is caught by the unit test beside this function.
+  '^crates/syncspin-core/src/pairing/pake\.rs:346:23: replace \| with \^ in ',
+  # The two borrows in `subtract` cannot both be set: a byte that wraps leaves `value` at 256 or
+  # more, which is never below a borrow of one, and a byte that does not wrap sets no borrow. OR
+  # and XOR therefore agree on every input.
+  '^crates/syncspin-core/src/pairing/pake\.rs:387:39: replace \| with \^ in ',
+  # `while len >= 0x80` turned into `<` never terminates, so no test can report on it. The test
+  # timeout bounds it; it is not a survivor and not a gap.
+  '^crates/syncspin-core/src/pairing/pake\.rs:354:15: replace >= with < in ',
+  # The same for `if len == 0` turned into `!=`: the loop appends to a `Vec` without bound and the
+  # address-space guard in the workflow kills it. There is no behaviour to assert, only a runaway.
+  '^crates/syncspin-core/src/pairing/pake\.rs:342:16: replace == with != in ',
+
+  # `base32_len` sizes a `String::with_capacity` and nothing else. A wrong capacity reallocates,
+  # it cannot change the encoded bytes, so every mutant of this line is equivalent.
+  '^crates/syncspin-core/src/pairing/token\.rs:284:',
+
+  # `while text.len() % 8 != 0` with `%` replaced by `/` or `+` never stops padding, in
+  # `decode_body` and in `base32_encode` alike. Nothing to assert, only a loop to bound - the same
+  # class as the two loops in `pake.rs`, and the guards bound them.
+  '^crates/syncspin-core/src/pairing/token\.rs:206:22: replace % with (/|\+) in ',
+  '^crates/syncspin-core/src/pairing/token\.rs:230:22: replace % with (/|\+) in ',
+  # The base32 decoder's accumulator holds fewer than eight pending bits, so the shift by five
+  # leaves the incoming five bits no overlap: `|` and `^` agree on every input.
+  '^crates/syncspin-core/src/pairing/token\.rs:253:32: replace \| with \^ in ',
+  # The base64 decoder rejects non-canonical trailing bits itself, so by the time the re-encode
+  # comparison runs, the value is either already rejected or canonical. `||` and `&&` agree on
+  # every input that reaches it.
+  '^crates/syncspin-core/src/noise\.rs:781:26: replace \|\| with && in ',
+
+  # The Kalman weights below are the filter's internals, not its contract. The contract is the
+  # error bound the estimate promises: after convergence it holds, and every assertion in
+  # tests/clock.rs passes under each of these mutants, including the 2 ms and round-trip bounds.
+  # Pinning them would mean asserting private state or a golden float sequence, and the latter
+  # would fail on any regrouping of the same arithmetic.
+  #
+  # The measurement weight: `MAX_ERROR_SCALE * max_error` versus `+ max_error` changes the
+  # measurement variance by a factor of sixteen, which the gains absorb.
+  '^crates/syncspin-core/src/clock\.rs:170:34: replace \* with \+ in ',
+  # The covariance seed at the second sample: `(p_oo + r) / (dt * dt)`. `+` to `*` multiplies the
+  # seed by 250,000, and `/` to `%` leaves it at the dividend; both are corrected within a sample,
+  # and neither moves the settled estimate.
+  '^crates/syncspin-core/src/clock\.rs:182:36: replace \+ with \* in ',
+  '^crates/syncspin-core/src/clock\.rs:182:41: replace / with % in ',
+  '^crates/syncspin-core/src/clock\.rs:182:47: replace \* with \+ in ',
+  '^crates/syncspin-core/src/clock\.rs:182:47: replace \* with / in ',
+  # Adaptive forgetting scales the covariances by `FORGET_FACTOR^2`. Deflating instead of
+  # inflating changes only the path: after a 1 s step at the cutoff, three samples land at 775,527
+  # us instead of 787,186, eight at 999,773 instead of 1,003,962, and by fifteen samples the two
+  # agree to 91 us either way. The test that covers the branch asserts what the protocol promises
+  # - that the step is followed at all - and no tolerance it can honestly use separates the two.
+  '^crates/syncspin-core/src/clock\.rs:202:20: replace \*= with /= in ',
+  '^crates/syncspin-core/src/clock\.rs:203:20: replace \*= with /= in ',
+]

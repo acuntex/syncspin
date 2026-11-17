@@ -182,16 +182,26 @@ jobs:
         with:
           tool: cargo-mutants
       - name: Mutation testing (core, shard ${{ matrix.shard }}/4)
-        # `--all-features` is not optional here. `pairing-code` is off by default, so without it
-        # `pairing/pake.rs`, `wrap.rs` and `code.rs` are compiled away: their 122 mutants build
-        # unchanged, the suite passes, and every one of them is reported as missed. The mutants
-        # are generated from the source tree, not from the build.
+        # The feature set comes from `.cargo/mutants.toml`, which turns on `pairing-code`: without
+        # it `pairing/pake.rs`, `wrap.rs` and `code.rs` are compiled away, their 122 mutants build
+        # unchanged, and every one is reported as missed. That file is the single place the flag
+        # lives, so a local run and this job test the same crate - passing it here as well makes
+        # cargo reject the duplicate and the baseline fails.
         #
         # `--jobs 2` runs two mutants at a time on the four-core runner; the jobserver
         # cargo-mutants starts keeps the concurrent rustc processes within the CPU budget.
-        run: >
-          cargo mutants -p syncspin-core --all-features --timeout 120 --no-times
-          --shard ${{ matrix.shard }}/4 --jobs 2
+        #
+        # Two guards, both learned from runs that died. `if len == 0` mutated to `!=` in
+        # `pairing/pake.rs::push_len` makes the loop append to a `Vec` forever: with the old
+        # 120-second timeout the mutant ate the runner's memory long before the timeout fired, and
+        # each "runner has received a shutdown signal" in this job was that mutant. The address
+        # space limit kills it on allocation instead. The shorter test timeout bounds the mutants
+        # that only spin, like `prepend_len_len`'s `while len >= 0x80` turned into `<`; thirty
+        # seconds still leaves room for the 8-second proptest in the suite.
+        run: |
+          ulimit -v 8000000
+          cargo mutants -p syncspin-core --timeout 30 --no-times \
+            --shard ${{ matrix.shard }}/4 --jobs 2
       - name: Upload the surviving mutants
         # `always()` and a per-shard name: a shard that is interrupted still has results worth
         # reading, and four shards cannot share one artifact name.
