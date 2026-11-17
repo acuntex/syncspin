@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 
-## [0.4.0] - 2026-11-17
+## [0.4.0] - 2026-11-18
 
 ### Added
 
@@ -15,6 +15,8 @@ Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 - **client:** `ControlHandle::seek` and `seek_relative`, and `PlaybackState::seek_max_ms`, for controller scrubbing bounded by the server's advertised range.
 - **client:** `ControlHandle::set_unpaired_access` changes the setting on a live connection: turning it off closes a relying unpaired session with `client/goodbye` `pairing_required`, turning it on closes an unpaired session with `restart` so the next `client/hello` advertises the value.
 - **client:** `Sink::discard_from`, a provided method defaulting to `flush`, so a `stream/clear` carrying `from_timestamp` can keep the audio before the cut.
+- **client:** `Sink::output_delay` (the former `latency`), which reports only delay after the audio port, and `ClientConfig::required_lead_time_ms` / `min_buffer_ms` for the host's start-up lead and an optional buffer pin.
+- **client:** when `min_buffer_ms` is not pinned, the client derives it from the arrival-delay distribution of `send_ahead`, reports changes in `client/state`, and starts from 250 ms.
 - **examples:** `player-pipe --pairing-required`, which refuses an unpaired activation at the client.
 
 ### Changed
@@ -24,6 +26,8 @@ Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 - `ServerHandle::approve` and `unpair` write the registry only after the session confirms, so a failed call leaves the approval and the record as they were.
 - Sessions register before `ClientConnected`, so a host reacting to an event can reach the live connection.
 - `snow` is pinned `=0.10.0`: the Sentinel retry relies on its error-path checkpoint, and a bump waits for the core test that re-verifies it.
+- `Sink::latency` is removed in favour of `Sink::output_delay`; every in-tree sink and example is renamed, and downstream sinks need the same one-line edit.
+- `ClientConfig` gains `required_lead_time_ms` and `min_buffer_ms`; `..Default` constructors keep working, full struct literals need both fields.
 - Mutation testing runs on every pull request in four core shards, in addition to the weekly schedule; it reports but is not a required check.
 
 ### Notes
