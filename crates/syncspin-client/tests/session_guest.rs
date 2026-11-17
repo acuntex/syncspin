@@ -1737,6 +1737,7 @@ async fn controller_state_is_reported() {
             muted: Some(false),
             repeat: None,
             shuffle: None,
+            seek_max_ms: None,
         }),
     }))
     .unwrap();
@@ -1773,6 +1774,7 @@ async fn group_update_is_the_authoritative_playback_state() {
             muted: Some(false),
             repeat: None,
             shuffle: None,
+            seek_max_ms: None,
         }),
     }))
     .unwrap();
@@ -2397,6 +2399,7 @@ async fn metadata_is_ignored_when_its_role_is_inactive() {
                 muted: Some(false),
                 repeat: None,
                 shuffle: None,
+                seek_max_ms: None,
             }),
         }))
         .unwrap(),
@@ -2430,6 +2433,7 @@ async fn controller_state_is_ignored_when_its_role_is_inactive() {
                 muted: Some(false),
                 repeat: None,
                 shuffle: None,
+                seek_max_ms: None,
             }),
         }))
         .unwrap(),

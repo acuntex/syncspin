@@ -973,6 +973,36 @@ fn client_command_roundtrips_on_the_wire() {
 }
 
 #[test]
+fn a_controller_state_carries_the_seekable_range() {
+    // A server that accepts an absolute position names the end of the range it allows.
+    let message: Incoming = serde_json::from_str(
+        r#"{"type":"server/state","payload":{"controller":{"supported_commands":["seek"],"seek_max_ms":245000}}}"#,
+    )
+    .unwrap();
+    let state = match message {
+        Incoming::ServerState(state) => state,
+        other => panic!("classified as {other:?}"),
+    };
+    let controller = state.controller.expect("controller object");
+    assert_eq!(controller.supported_commands, vec!["seek".to_owned()]);
+    assert_eq!(controller.seek_max_ms, Some(245_000));
+
+    // A server without an absolute seek position leaves the field out, which reads as no range.
+    let message: Incoming = serde_json::from_str(
+        r#"{"type":"server/state","payload":{"controller":{"supported_commands":["seek"]}}}"#,
+    )
+    .unwrap();
+    let state = match message {
+        Incoming::ServerState(state) => state,
+        other => panic!("classified as {other:?}"),
+    };
+    assert_eq!(
+        state.controller.expect("controller object").seek_max_ms,
+        None
+    );
+}
+
+#[test]
 fn stream_start_and_audio_chunk_header_roundtrip() {
     let start = StreamStart {
         server_transmitted: 1_760_000_000_000_000,

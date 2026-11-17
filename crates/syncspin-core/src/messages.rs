@@ -610,6 +610,12 @@ pub struct ControllerState {
     /// Whether shuffle is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shuffle: Option<bool>,
+    /// Maximum absolute position a `seek` may target, in milliseconds.
+    ///
+    /// A server that advertises `seek` includes it; absent means the server offers no absolute seek
+    /// position, so only `seek_relative` is meaningful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seek_max_ms: Option<u64>,
 }
 
 /// `server/state`: the state of each active server role.
