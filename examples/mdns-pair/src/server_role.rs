@@ -24,8 +24,9 @@ const PLAYER_ROLE: &str = "player@v1";
 /// The run waits for `ready` before it browses, so a listener that cannot start is an error here
 /// rather than a discovery timeout there. The loop ends only on the stop signal or when the event
 /// stream ends: `ClientLeft` carries no client id, so it cannot tell this run's departure from any
-/// other LAN client's, and a foreign departure must not end the server. A departure is printed and
-/// reported on `departure` (best effort) after the goodbye that produced it.
+/// other LAN client's, and a foreign departure must not end the server. A departure is printed on
+/// every `ClientLeft`; `departure` (best effort) is reported only when the last live connection has
+/// gone, so a foreign client leaving first cannot stand in for this run's goodbye.
 pub async fn serve(
     config: ServerConfig,
     ready: oneshot::Sender<SocketAddr>,
@@ -45,9 +46,12 @@ pub async fn serve(
     let mut events = server.events();
     let mut stream: Option<StreamWriter> = None;
     let mut written = 0;
-    // One departure is all the run listens for, so the sender is taken on the first `ClientLeft`.
-    // The loop keeps serving whether or not anyone is waiting for it.
+    // One departure is all the run listens for, so the sender is taken once. `ClientLeft` names no
+    // client, so the run counts live connections instead: the signal goes out when the count falls
+    // back to zero. With a foreign connection still open it stays silent, and the run's bounded
+    // wait covers it. The loop keeps serving whether or not anyone is waiting for it.
     let mut departure = Some(departure);
+    let mut live = 0usize;
     let silence = vec![0u8; CHUNK_BYTES];
     let mut pace = interval(Duration::from_millis(CHUNK_MS));
     // A late wakeup writes one chunk, not a burst: the frames are meaningless once the run is over.
@@ -62,15 +66,16 @@ pub async fn serve(
                     name,
                     approved,
                 }) => {
+                    live += 1;
                     // The TXT `name` is on the LAN and anyone can claim it; the static public key
                     // is what the handshake proves, so only that decides who joins. A foreign
                     // connection is printed and stays unapproved.
                     if client_id == expected_client_id {
                         match server.approve(&client_id).await {
                             Ok(()) => println!(
-                                "approved {name} as {client_id} (approved on arrival: {approved})"
+                                "approved {name:?} as {client_id} (approved on arrival: {approved})"
                             ),
-                            Err(error) => println!("could not approve {name}: {error:#}"),
+                            Err(error) => println!("could not approve {name:?}: {error:#}"),
                         }
                     } else {
                         // A peer chooses its own name; `Debug` escapes control characters
@@ -82,7 +87,7 @@ pub async fn serve(
                     }
                 }
                 Some(Event::ClientActivated { client_id, roles }) => {
-                    println!("activated with roles: {}", roles.join(", "));
+                    println!("activated with roles: {roles:?}");
                     // Only this run's client opens the stream; another connection's activation
                     // must not start one.
                     if stream.is_none()
@@ -103,12 +108,19 @@ pub async fn serve(
                     }
                 }
                 Some(Event::ClientLeft { reason }) => {
-                    println!("client left: {reason}");
-                    if let Some(departure) = departure.take() {
-                        let _ = departure.send(());
+                    // The reason can be a peer's `client/goodbye` text; `Debug` escapes control
+                    // characters instead of letting them reach the terminal.
+                    println!("client left: {reason:?}");
+                    live = live.saturating_sub(1);
+                    if live == 0 {
+                        if let Some(departure) = departure.take() {
+                            let _ = departure.send(());
+                        }
                     }
                 }
-                // Never print an event's payload: a later event may carry pairing material.
+                Some(Event::StreamStarted) => println!("stream started"),
+                Some(Event::StreamEnded) => println!("stream ended"),
+                // Never print any other event's payload: a later event may carry pairing material.
                 Some(_) => println!("server event"),
                 None => break,
             },
@@ -186,7 +198,7 @@ mod tests {
         let format = AudioFormat::pcm(48_000, 2, 16);
 
         // The approved client: the key the server compares against.
-        let (sink, counters) = CountingSink::new(GATE_FRAMES, format.clone());
+        let (sink, approved_counters) = CountingSink::new(GATE_FRAMES, format.clone());
         let (mut handle, mut events) =
             connect_session("approved", &endpoint, identity, Box::new(sink))
                 .await
@@ -196,7 +208,7 @@ mod tests {
             .expect("the approved handshake completes");
         timeout(
             Duration::from_secs(5),
-            wait_for_gate(&mut events, &counters),
+            wait_for_gate(&mut events, &approved_counters),
         )
         .await
         .expect("the gate arrives")
@@ -212,19 +224,23 @@ mod tests {
         )
         .await
         .expect("the foreign session starts");
-        // The handshake completing proves the server processed this connection; the gate it never
-        // reaches is what would prove approval.
+        // The handshake completing proves the server processed this connection. The stream is
+        // still running (100 chunks at 20 ms outlast the window below), so a client the server had
+        // approved would receive frames now: the approved client's count must keep growing while
+        // the foreign one's stays at zero, which a slow server cannot fake into a pass.
         wait_for_connection(&mut other_events, &endpoint)
             .await
             .expect("the foreign handshake completes");
+        let before = approved_counters.frames();
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(
-            timeout(
-                Duration::from_millis(500),
-                wait_for_gate(&mut other_events, &counters)
-            )
-            .await
-            .is_err(),
-            "a foreign key must not be approved"
+            approved_counters.frames() > before,
+            "the stream must still be live while the foreign client is checked"
+        );
+        assert_eq!(
+            counters.frames(),
+            0,
+            "a foreign key must not receive the stream"
         );
 
         handle.close(GoodbyeReason::Shutdown);

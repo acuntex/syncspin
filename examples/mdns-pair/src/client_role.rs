@@ -58,7 +58,8 @@ pub async fn discover(run_name: &str) -> Result<String> {
         .context("the discovery task ended")??;
         for server in matching_servers(&servers, run_name) {
             if let Some(endpoint) = reachable_endpoint(server).await {
-                println!("discovered {endpoint} on browse {attempt}");
+                // The path comes from a TXT record any LAN host can publish; `Debug` escapes it.
+                println!("discovered {endpoint:?} on browse {attempt}");
                 return Ok(endpoint);
             }
         }
@@ -126,9 +127,9 @@ pub async fn wait_for_connection(events: &mut EventStream, endpoint: &str) -> Re
                 // The library has no unencrypted path; asserting it here keeps a future downgrade
                 // from turning this smoke test green.
                 if !encrypted {
-                    bail!("the connection to {server_id} is not encrypted");
+                    bail!("the connection to {server_id:?} is not encrypted");
                 }
-                println!("connected to {server_id} at {endpoint} (encrypted)");
+                println!("connected to {server_id:?} at {endpoint:?} (encrypted)");
                 return Ok(());
             }
             Some(Event::Disconnected { reason, .. }) => {

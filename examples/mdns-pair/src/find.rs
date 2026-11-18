@@ -54,6 +54,11 @@ fn probe_address(endpoint: &str) -> Option<&str> {
 /// first address is still served: a previous run's record, or a host that bound one family only,
 /// can leave a dead entry at the front. The probe is one TCP connect with a short timeout, and the
 /// returned endpoint is the one the session then dials, so the choice is not made twice.
+///
+/// The probe never reaches the server's event stream: the server reports a connection only after
+/// the WebSocket upgrade and the Noise handshake, so a probe that closes at once is neither a
+/// `ClientConnected` nor a `ClientLeft`. It repeats only while no address answers, and stops at
+/// the first one that does.
 pub(crate) async fn reachable_endpoint(server: &DiscoveredServer) -> Option<String> {
     for endpoint in server.endpoints() {
         let Some(address) = probe_address(&endpoint) else {

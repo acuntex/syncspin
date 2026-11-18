@@ -98,6 +98,10 @@ const BYTES_PER_FRAME: usize = CHANNELS as usize * BIT_DEPTH as usize / 8;
 /// 20 ms sits in the middle of the range, and it is also the pace the server writes at.
 const CHUNK_MS: u64 = 20;
 
+// The bound is the specification's (`roles/player/v1.md`, Server Audio Send Constraints), so a
+// change to `CHUNK_MS` that leaves it fails the build rather than a run.
+const _: () = assert!(CHUNK_MS >= 15 && CHUNK_MS <= 150);
+
 /// Frames in one chunk at [`SAMPLE_RATE`].
 const CHUNK_FRAMES: usize = SAMPLE_RATE as usize / 1000 * CHUNK_MS as usize;
 
@@ -258,7 +262,8 @@ The run appends its PID to the name unless --name is given, publishes
 _sendspin-server._tcp under it, discovers that same name and approves only the
 client whose static key this run generated. Silent frames go to a counting
 sink, which exits once the stream has delivered enough of them. Status lines
-go to standard output.
+go to standard output. The server listens on all interfaces for the length of
+the run.
 "
     )
 }
@@ -325,7 +330,12 @@ async fn run(options: Options) -> Result<RunOutcome> {
     let (sink, counters) = CountingSink::new(GATE_FRAMES, expected.clone());
     let mut config = ServerConfig::new(run_name.clone(), Identity::generate());
     // Port 0: the operating system picks the port, so two runs on one host do not fight over a
-    // fixed one, and the record names the port that was actually bound.
+    // fixed one, and the record names the port that was actually bound. The wildcard address is
+    // deliberate: the record resolves to this host's non-loopback interfaces, and a loopback-only
+    // listener would be advertised at addresses nothing listens on. The consequence is that the
+    // listener is reachable from the LAN for the length of the run; it admits a connection only
+    // after the Noise handshake and approves one static key (see `server_role`), and the run is
+    // bounded by `--timeout`.
     config.bind = SocketAddr::from(([0, 0, 0, 0], 0));
     config.discovery = Some(Arc::new(AdvertiseOnly::new(Arc::new(ServerMdns::new()?))));
 
@@ -349,11 +359,19 @@ async fn run(options: Options) -> Result<RunOutcome> {
         client_id.clone(),
     ));
     tokio::select! {
-        ready = ready_rx => {
-            if ready.is_err() {
-                return Err(server_start_error(&mut server_task).await);
+        // The start has the run's own budget: a bind or an advertisement that never returns is a
+        // failed run with a named stage, not a hang that only Ctrl-C ends.
+        ready = timeout(options.timeout, ready_rx) => match ready {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => return Err(server_start_error(&mut server_task).await),
+            Err(_) => {
+                server_task.abort();
+                bail!(
+                    "the server did not publish its record within {} s",
+                    options.timeout.as_secs()
+                );
             }
-        }
+        },
         _ = interrupt.wait_for(|fired| *fired) => {
             let _ = stop_tx.send(());
             let _ = timeout(TEARDOWN, &mut server_task).await;
@@ -655,6 +673,16 @@ mod tests {
         assert_eq!(BYTES_PER_FRAME, 4);
         assert_eq!((CHUNK_BYTES, GATE_BYTES), (3_840, 76_800));
         assert_eq!(GATE_BYTES, GATE_FRAMES * CHUNK_BYTES);
+    }
+
+    #[test]
+    fn a_chunk_stays_inside_the_specified_duration_bounds() {
+        let chunk_ms = CHUNK_FRAMES as u64 * 1000 / SAMPLE_RATE as u64;
+        assert_eq!(chunk_ms, CHUNK_MS, "the byte geometry matches the duration");
+        assert!(
+            (15..=150).contains(&chunk_ms),
+            "a chunk is at least 15 ms and at most 150 ms"
+        );
     }
 
     #[test]
