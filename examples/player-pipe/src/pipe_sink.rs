@@ -2,8 +2,8 @@
 //!
 //! The example has no decoder, so it asks the server for PCM; an encoded stream stops the session
 //! with an error that names what is missing, instead of writing compressed bytes into the pipe.
-//! Because stdout is a pipe and not a scheduled audio device, playout deadlines are ignored and
-//! frames are written as they arrive.
+//! The client owns the schedule and calls the sink at each frame's write time, so the pipe writes
+//! on call; it reports no pre-port delay, because stdout adds none the client could compensate.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};

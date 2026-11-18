@@ -370,6 +370,25 @@ pub enum Event {
         /// Server timestamp the audio should resume from, when the server named one.
         from_timestamp: Option<i64>,
     },
+    /// Audio was dropped as late or because the playout queue was full.
+    ///
+    /// `roles/player/v1.md` lets a client drop a chunk whose deadline already passed instead of
+    /// playing it late, and this client does. `late_by` is the worst lateness in the reporting
+    /// window; it is zero when only a full queue dropped frames, which were not late themselves.
+    /// `dropped` counts every frame the window dropped - late arrivals and capacity overruns
+    /// together.
+    ///
+    /// Reported at most once per second while it happens, and never for a frame that was merely
+    /// due. A burst of drops is one report; when the interval elapses with no further drop, the
+    /// frames accumulated since the last report follow as one more event, so the tail of a burst
+    /// is not lost. Diagnostic only: the frames are dropped either way, and the host has nothing
+    /// to recover.
+    LateAudio {
+        /// Worst lateness in the window.
+        late_by: Duration,
+        /// Frames dropped in the window.
+        dropped: u64,
+    },
     /// Now-playing metadata changed.
     ///
     /// Absent text fields are reported as empty strings, so a host can clear its display; absent
@@ -554,6 +573,11 @@ impl fmt::Debug for Event {
             Self::StreamClear { from_timestamp } => formatter
                 .debug_struct("StreamClear")
                 .field("from_timestamp", from_timestamp)
+                .finish(),
+            Self::LateAudio { late_by, dropped } => formatter
+                .debug_struct("LateAudio")
+                .field("late_by", late_by)
+                .field("dropped", dropped)
                 .finish(),
             Self::Track {
                 title,

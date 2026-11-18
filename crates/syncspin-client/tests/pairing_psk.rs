@@ -955,13 +955,14 @@ async fn audio_survives_a_rehandshake_mid_stream() {
         next_event(&mut events).await,
         Event::StreamStart { .. }
     ));
+    let started = Instant::now();
     server.audio(now_us() + 250_000, 250_000, vec![0x11; 64]);
     let written = wait_for_writes(&recordings, 1).await;
     assert_eq!(written[0].0, vec![0x11; 64]);
     assert!(
-        written[0].1 > Instant::now() + Duration::from_millis(100),
+        written[0].1 >= started + Duration::from_millis(100),
         "the frame before the swap must be scheduled from the clock estimate, got {:?}",
-        written[0].1
+        written[0].1 - started
     );
 
     // The server rotates the live connection to the pairing PSK, mid-stream, and activates under
@@ -975,6 +976,7 @@ async fn audio_survives_a_rehandshake_mid_stream() {
         "the re-handshake must complete instead of closing"
     );
 
+    let started = Instant::now();
     server.audio(now_us() + 250_000, 250_000, vec![0x22; 64]);
     let written = wait_for_writes(&recordings, 2).await;
     assert_eq!(
@@ -983,9 +985,9 @@ async fn audio_survives_a_rehandshake_mid_stream() {
         "audio must arrive again under the new keys"
     );
     assert!(
-        written[1].1 > Instant::now() + Duration::from_millis(100),
+        written[1].1 >= started + Duration::from_millis(100),
         "the clock estimate must survive the key swap, got {:?}",
-        written[1].1
+        written[1].1 - started
     );
     assert_eq!(
         recordings.opened(),

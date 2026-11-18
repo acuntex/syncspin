@@ -66,6 +66,7 @@ use crate::pairing::{
     pake_sid, TagOutcome, METHOD_DYNAMIC_PAIRING_CODE, METHOD_STATIC_PAIRING_CODE,
 };
 use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_PAIRING_PSK};
+use crate::playout::{Dropped, OwnedFrame, PlayoutQueue, BUFFER_CAPACITY};
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 use crate::storage::persist_pairing;
 
@@ -134,8 +135,15 @@ const SUPPORTED_ROLES: [&str; 3] = [PLAYER_ROLE, CONTROLLER_ROLE, METADATA_ROLE]
 /// Largest output delay reported to the server, in milliseconds.
 const MAX_OUTPUT_DELAY_MS: u32 = 5_000;
 
-/// Largest total size of outstanding audio chunks this client accepts.
-const BUFFER_CAPACITY: u64 = 131_072;
+/// How far past its pre-port write time a frame may be before it is dropped instead of written.
+///
+/// `roles/player/v1.md` calls for late chunks to be dropped so they cannot break the sync they
+/// were scheduled for. The window absorbs scheduling noise without letting an audibly late frame
+/// through.
+const LATE_TOLERANCE: Duration = Duration::from_millis(10);
+
+/// Minimum spacing between two [`Event::LateAudio`] reports.
+const LATE_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sample rate of the formats this client advertises, in hertz.
 const SUPPORTED_SAMPLE_RATE: u32 = 48_000;
@@ -506,6 +514,10 @@ enum Wakeup {
     Socket(Result<SocketMessage>),
     /// The host closed the connection and gave the reason to send.
     Shutdown(GoodbyeReason),
+    /// A queued frame reached its pre-port write time.
+    Playout,
+    /// The interval elapsed with drops still in the late-audio window.
+    LateFlush,
     /// The clock deadline elapsed.
     Clock,
     /// The keepalive deadline elapsed: a ping is due, or the one on the wire timed out.
@@ -537,6 +549,19 @@ impl MessageKind {
     }
 }
 
+/// Drops accumulated for the next [`Event::LateAudio`] report.
+#[derive(Debug, Default)]
+struct LateAudioWindow {
+    /// When the last report went out, or `None` before the first.
+    last_reported: Option<Instant>,
+    /// When a pending window must be flushed without waiting for another drop, or `None`.
+    flush_at: Option<Instant>,
+    /// Worst lateness collected since that report.
+    worst: Duration,
+    /// Frames dropped since that report.
+    dropped: u64,
+}
+
 /// A running session.
 pub(crate) struct Session<'a> {
     transport: Transport,
@@ -564,6 +589,19 @@ pub(crate) struct Session<'a> {
     /// An in-place `stream/start` keeps the value it already has: arrival delay is a property of
     /// the path, not of the format.
     stream_started: Option<Instant>,
+    /// Frames waiting for their pre-port write time.
+    queue: PlayoutQueue,
+    /// When the playout branch next has work, the pre-port delay already subtracted, or `None`
+    /// while the queue is empty.
+    next_playout: Option<Instant>,
+    /// Delay between [`Sink::write`] and the audio port, as the sink last reported it.
+    pre_port_delay: Duration,
+    /// Post-port delay the sink last reported; part of every mapped deadline.
+    output_delay: Option<Duration>,
+    /// `required_lead_time_ms` as the last `client/state` reported it.
+    reported_lead_ms: Option<u32>,
+    /// Drops not yet reported through [`Event::LateAudio`].
+    late_audio: LateAudioWindow,
     /// Remaining `client/time` messages of the current burst (0 = no burst running).
     sync_remaining: usize,
     /// Deadline for the current burst, or `None` when no burst is running.
@@ -757,6 +795,10 @@ pub(crate) async fn attempt(
     // The estimator owns the initial value: the pin when the host set one, otherwise the value an
     // unpinned session starts at.
     let estimator = BufferEstimator::new(config.min_buffer_ms);
+    // The trait has no change notification, so the values are snapshotted here and polled at the
+    // points named on `Sink::pre_port_delay` and `Sink::output_delay`.
+    let pre_port_delay = carried.sink.pre_port_delay();
+    let output_delay = carried.sink.output_delay();
     let mut session = Session {
         transport: ready.transport,
         noise: ready.noise,
@@ -772,6 +814,12 @@ pub(crate) async fn attempt(
         playback_declared: false,
         stream: None,
         stream_started: None,
+        queue: PlayoutQueue::new(BUFFER_CAPACITY, LATE_TOLERANCE),
+        next_playout: None,
+        pre_port_delay,
+        output_delay,
+        reported_lead_ms: None,
+        late_audio: LateAudioWindow::default(),
         sync_remaining: 0,
         burst_deadline: None,
         reply_deadline: None,
@@ -910,6 +958,8 @@ impl Session<'_> {
             // The control receiver outlives individual handles: dropping the last one disables the
             // branch instead of ending the session.
             let control = &mut self.control;
+            let next_playout = self.next_playout;
+            let late_flush = self.late_audio.flush_at;
             let wakeup = tokio::select! {
                 biased;
                 request = async {
@@ -921,6 +971,22 @@ impl Session<'_> {
                 reason = &mut *self.shutdown => {
                     Wakeup::Shutdown(reason.unwrap_or(GoodbyeReason::Shutdown))
                 }
+                // Playout comes before the socket read: a server that fills the buffer keeps the
+                // read ready, and `biased;` would starve a timer placed after it.
+                () = async {
+                    match next_playout {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => pending().await,
+                    }
+                } => Wakeup::Playout,
+                // The tail of a late-drop burst comes before the socket read for the same reason:
+                // a busy server must not keep the report waiting for another drop that never comes.
+                () = async {
+                    match late_flush {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => pending().await,
+                    }
+                } => Wakeup::LateFlush,
                 message = self.transport.read() => Wakeup::Socket(message),
                 () = async {
                     match deadline {
@@ -947,8 +1013,16 @@ impl Session<'_> {
                     // The caller turns the end into a Disconnected event and schedules the next
                     // attempt, so the sink, the level and the roles survive the drop.
                     SocketMessage::Closed => return Ok(Ending::Closed),
-                    SocketMessage::Binary(ciphertext) => self.receive(&ciphertext).await?,
+                    SocketMessage::Binary(ciphertext) => {
+                        self.receive(&ciphertext).await?;
+                        // A socket that just delivered a burst may have kept a now-due frame
+                        // waiting; the next loop iteration would catch it too, but draining here
+                        // keeps the write off the socket's schedule.
+                        self.drain_playout()?;
+                    }
                 },
+                Wakeup::Playout => self.drain_playout()?,
+                Wakeup::LateFlush => self.flush_late_audio(),
                 Wakeup::Clock => {
                     if self.rehandshake.is_some() {
                         // The server must send its activation under the new keys; staying silent
@@ -1113,14 +1187,24 @@ impl Session<'_> {
         self.reply_deadline = None;
         self.outstanding_sent_us = None;
         self.burst_sent_us.clear();
-        if let Some(sample) = best_sample(&self.burst_samples) {
+        let pushed = if let Some(sample) = best_sample(&self.burst_samples) {
             self.clock.push(sample);
-        }
+            true
+        } else {
+            false
+        };
         self.burst_samples.clear();
+        if pushed {
+            // A clock update moves every queued deadline; re-map before the timing poll, which
+            // only re-maps when the sink's post-port delay changed.
+            self.remap_playout();
+        }
         if !self.state_sent && self.clock.sample_count() >= 1 && self.player_active() {
             self.send_client_state().await?;
         }
-        Ok(())
+        // A burst is one of the three poll points, whether or not it produced a report: the clock
+        // moved and a changed timing has to re-map or re-arm from it.
+        self.poll_timing().await
     }
 
     /// Decrypts one transport message and dispatches the message it carries.
@@ -1227,7 +1311,7 @@ impl Session<'_> {
             }
             Incoming::GroupUpdate(update) => self.handle_group_update(update),
             Incoming::ServerCommand(command) => self.handle_command(command).await,
-            Incoming::StreamStart(start) => self.handle_stream_start(start),
+            Incoming::StreamStart(start) => self.handle_stream_start(start).await,
             Incoming::StreamEnd(end) if !affects_player(end.roles.as_deref()) => Ok(()),
             Incoming::StreamEnd(_) => self.stop_stream(StreamEndReason::End),
             Incoming::StreamClear(clear) if !affects_player(clear.roles.as_deref()) => Ok(()),
@@ -2049,18 +2133,41 @@ impl Session<'_> {
     /// role was removed and re-added, and on every change to the level or mute state. The
     /// `supported_commands` list is what makes a conformant server send player commands at all.
     async fn send_client_state(&mut self) -> Result<()> {
+        self.write_client_state().await?;
+        // The state report is one of the three poll points; after it, a changed timing sends the
+        // state that reports the new value.
+        self.poll_timing().await
+    }
+
+    /// Sends one `client/state` message from the values in force.
+    ///
+    /// This is the single owner of the timing caches: it reads the sink once, stores both values,
+    /// re-maps the queue when `output_delay` changed, and reports the same reading. A live second
+    /// read could disagree with the cache and make `poll_timing` report a value twice.
+    async fn write_client_state(&mut self) -> Result<()> {
         self.state_sent = true;
-        let output_delay_ms = self.sink.output_delay().map_or(0, |delay| {
+        let pre_port_delay = self.sink.pre_port_delay();
+        let output_delay = self.sink.output_delay();
+        let output_changed = output_delay != self.output_delay;
+        self.pre_port_delay = pre_port_delay;
+        self.output_delay = output_delay;
+        if output_changed {
+            self.remap_playout();
+        }
+        self.arm_playout();
+        let output_delay_ms = output_delay.map_or(0, |delay| {
             u32::try_from(delay.as_millis())
                 .map_or(MAX_OUTPUT_DELAY_MS, |delay| delay.min(MAX_OUTPUT_DELAY_MS))
         });
+        let required_lead_time_ms = self.required_lead_ms(pre_port_delay);
+        self.reported_lead_ms = Some(required_lead_time_ms);
         let state = Incoming::ClientState(ClientState {
             available: true,
             player: Some(PlayerState {
                 volume: Some(self.volume),
                 muted: Some(self.muted),
                 output_delay_ms,
-                required_lead_time_ms: self.config.required_lead_time_ms,
+                required_lead_time_ms,
                 min_buffer_ms: self.min_buffer_ms,
                 supported_commands: PLAYER_COMMANDS
                     .iter()
@@ -2073,7 +2180,11 @@ impl Session<'_> {
     }
 
     /// Opens the sink for a newly announced player stream.
-    fn handle_stream_start(&mut self, start: StreamStart) -> Result<()> {
+    ///
+    /// The queue is cleared with the flush, including for an in-place `stream/start` that only
+    /// replaces the format: a frame queued for the previous announcement must not reach the sink
+    /// after the new one opened it.
+    async fn handle_stream_start(&mut self, start: StreamStart) -> Result<()> {
         if !self.player_active() {
             return Ok(());
         }
@@ -2113,15 +2224,22 @@ impl Session<'_> {
         self.flush_sink()?;
         self.open_sink(format.clone())?;
         self.stream = Some(format.clone());
+        // One of the three poll points the trait's rustdoc names: the host may have changed the
+        // values since the previous stream.
+        self.poll_timing().await?;
         self.emit(Event::StreamStart { format });
         Ok(())
     }
 
-    /// Delivers one audio chunk whose 13-byte header the reassembler handed over separately.
+    /// Queues one audio chunk whose 13-byte header the reassembler handed over separately.
     ///
     /// The header is protocol syntax even when the frame is not playable: a short or malformed
     /// chunk closes the connection whether or not a stream is open. `arrival_us` is the wall clock
     /// reading taken when the transport frame arrived, before decryption.
+    ///
+    /// The chunk's payload is owned from here on, because a borrowed [`AudioFrame`] cannot outlive
+    /// the message it was parsed from. The queue stores the raw server timestamp beside the local
+    /// deadline, so a later `stream/clear` can cut by the stamp a clock update does not move.
     async fn handle_audio(&mut self, body: &[u8], arrival_us: i64) -> Result<()> {
         // The reassembler removes the message id, which the chunk parser expects.
         let mut message = Vec::with_capacity(1 + body.len());
@@ -2138,10 +2256,10 @@ impl Session<'_> {
         };
 
         let frame = match (self.config.audio_mode, &format.codec) {
-            (_, Codec::Pcm) => AudioFrame::Pcm(data),
-            (AudioMode::Passthrough, codec) => AudioFrame::Encoded {
+            (_, Codec::Pcm) => OwnedFrame::Pcm(data.to_vec()),
+            (AudioMode::Passthrough, codec) => OwnedFrame::Encoded {
                 codec: codec.clone(),
-                data,
+                data: data.to_vec(),
             },
             (AudioMode::Decode, codec) => {
                 bail!("the server sent a `{codec}` frame although only pcm was requested")
@@ -2149,8 +2267,140 @@ impl Session<'_> {
         };
 
         self.record_arrival_delay(&header, arrival_us).await?;
-        let due = self.playout_deadline(header.timestamp_us);
-        self.write_sink(frame, due)
+        match self.mapped_deadline(header.timestamp_us) {
+            Some(due) => self.enqueue(header.timestamp_us, due, frame),
+            // Without a clock estimate there is no deadline to schedule: the frame is written at
+            // once and the queue stays empty until the estimate is ready.
+            None => self.write_sink(frame.as_frame(), Instant::now())?,
+        }
+        Ok(())
+    }
+
+    /// Queues one owned frame for its pre-port write time.
+    ///
+    /// The frame is dropped here when that time is already at or beyond the lateness tolerance:
+    /// playing it would break the sync it was scheduled for, and the queue has nothing to gain from
+    /// holding it. The queue's own `push` still guards against capacity overruns; those drops feed
+    /// the same report.
+    fn enqueue(&mut self, server_us: i64, due: Instant, frame: OwnedFrame) {
+        // A subtraction that underflows has no honest write time: falling back to the port
+        // deadline would delay the frame, so the conservative outcome is "now" instead.
+        let write_at = due
+            .checked_sub(self.pre_port_delay)
+            .unwrap_or_else(Instant::now);
+        if let Some(late) = Instant::now().checked_duration_since(write_at) {
+            if late >= LATE_TOLERANCE {
+                self.record_drops(&[Dropped {
+                    late_by: late,
+                    count: 1,
+                }]);
+                return;
+            }
+        }
+        let dropped = self.queue.push(server_us, due, frame);
+        self.record_drops(&dropped);
+        self.arm_playout();
+    }
+
+    /// Writes every queued frame whose pre-port write time has arrived.
+    ///
+    /// The queue is cut at `now + pre_port_delay`, because a frame reaches the sink one pre-port
+    /// delay before its port deadline. Each frame is re-checked against the tolerance: the loop may
+    /// have been held up by the socket or by a blocking sink, and a frame that is now too late is
+    /// dropped rather than written. Its count and lateness join the same report as a late arrival.
+    fn drain_playout(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let cut = now.checked_add(self.pre_port_delay).unwrap_or(now);
+        let frames = self.queue.pop_due(cut);
+        self.arm_playout();
+        let mut dropped = Vec::new();
+        for queued in frames {
+            // An underflowing subtraction has no honest write time; "now" is the conservative
+            // outcome because it drops a frame rather than delaying it behind the port deadline.
+            let write_at = queued
+                .due
+                .checked_sub(self.pre_port_delay)
+                .unwrap_or_else(Instant::now);
+            // Read the clock per frame: a blocking `Sink::write` may hold the loop past this
+            // frame's write time, and a value read before the batch would call it on time.
+            let now = Instant::now();
+            if let Some(late) = now.checked_duration_since(write_at) {
+                if late >= LATE_TOLERANCE {
+                    dropped.push(Dropped {
+                        late_by: late,
+                        count: 1,
+                    });
+                    continue;
+                }
+            }
+            self.write_sink(queued.frame.as_frame(), queued.due)?;
+        }
+        self.record_drops(&dropped);
+        Ok(())
+    }
+
+    /// Recomputes the instant the playout branch next has work.
+    ///
+    /// Called after every queue mutation and every pre-port change; `None` means the queue is empty
+    /// and the branch waits without a deadline. A subtraction that underflows falls back to
+    /// "now": the timer fires at once instead of waiting for the later port instant.
+    fn arm_playout(&mut self) {
+        self.next_playout = self.queue.next_due().map(|due| {
+            due.checked_sub(self.pre_port_delay)
+                .unwrap_or_else(Instant::now)
+        });
+    }
+
+    /// Collects dropped frames and reports them at most once per [`LATE_REPORT_INTERVAL`].
+    ///
+    /// `late_by` is the worst lateness in the window and `dropped` the total, so a burst of late
+    /// frames becomes one event instead of a stream of them. A window that only saw capacity drops
+    /// reports zero lateness: those frames were not late, their queue was full. A window that fills
+    /// without reaching the interval is flushed by the [`Wakeup::LateFlush`] timer, so its tail is
+    /// not lost when no further frame is dropped.
+    fn record_drops(&mut self, dropped: &[Dropped]) {
+        if dropped.is_empty() {
+            return;
+        }
+        for drop in dropped {
+            self.late_audio.worst = self.late_audio.worst.max(drop.late_by);
+            self.late_audio.dropped = self.late_audio.dropped.saturating_add(drop.count);
+        }
+        let report_due = self
+            .late_audio
+            .last_reported
+            .is_none_or(|last| last.elapsed() >= LATE_REPORT_INTERVAL);
+        if !report_due {
+            // A report went out inside the interval: the rest waits for another drop, or for the
+            // timer when none comes.
+            self.late_audio.flush_at = self
+                .late_audio
+                .last_reported
+                .map(|last| last + LATE_REPORT_INTERVAL);
+            return;
+        }
+        self.emit_late_audio();
+    }
+
+    /// Emits the pending late-audio window and restarts the reporting interval.
+    fn emit_late_audio(&mut self) {
+        self.emit(Event::LateAudio {
+            late_by: self.late_audio.worst,
+            dropped: self.late_audio.dropped,
+        });
+        self.late_audio.last_reported = Some(Instant::now());
+        self.late_audio.flush_at = None;
+        self.late_audio.worst = Duration::ZERO;
+        self.late_audio.dropped = 0;
+    }
+
+    /// Emits a window that saw no further drop before the interval elapsed.
+    fn flush_late_audio(&mut self) {
+        if self.late_audio.dropped > 0 {
+            self.emit_late_audio();
+        } else {
+            self.late_audio.flush_at = None;
+        }
     }
 
     /// Feeds one chunk's arrival delay into the buffer estimator and reports a derived change.
@@ -2206,11 +2456,12 @@ impl Session<'_> {
 
     /// Drops buffered audio without ending the stream.
     ///
-    /// A clear that carries a `from_timestamp` becomes a [`Sink::discard_from`]: the client maps
-    /// the server timestamp through its clock estimate and the sink drops only the audio due at or
-    /// after it. Without a timestamp the sink is flushed; while no estimate is ready the deadline
-    /// is now, which drops everything the sink buffered. The announced format stays open, because
-    /// the spec lets the stream continue and the chunks that follow a seek still belong to it.
+    /// A clear that carries a `from_timestamp` becomes a [`Sink::discard_from`]: the client drops
+    /// its own queued frames from that server stamp on, then maps the stamp through its clock
+    /// estimate for the sink's own buffer, which keeps only the audio due before it. Without a
+    /// timestamp both queues are flushed. While no estimate is ready the sink deadline is now,
+    /// which drops everything the sink buffered. The announced format stays open, because the spec
+    /// lets the stream continue and the chunks that follow a seek still belong to it.
     ///
     /// The event goes out before the sink call, so a host can restart its output and re-prime a
     /// decoder before the buffered audio is dropped.
@@ -2219,13 +2470,19 @@ impl Session<'_> {
             from_timestamp: clear.from_timestamp,
         });
         match clear.from_timestamp {
-            Some(timestamp) => self.discard_sink(self.playout_deadline(timestamp)),
+            Some(timestamp) => self.discard_sink(timestamp),
             None => self.flush_sink(),
         }
     }
 
-    /// Flushes the sink, recording a failure the caller has to treat as fatal.
+    /// Flushes the sink and drops every queued frame, recording a failure the caller has to treat
+    /// as fatal.
+    ///
+    /// The queue goes first: a frame that is written between the sink's flush and the queue's clear
+    /// would already be audible after the flush.
     fn flush_sink(&mut self) -> Result<()> {
+        self.queue.clear();
+        self.arm_playout();
         match self.sink.flush() {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -2235,9 +2492,15 @@ impl Session<'_> {
         }
     }
 
-    /// Discards the sink's audio due at or after `due`, recording a failure the caller has to
-    /// treat as fatal.
-    fn discard_sink(&mut self, due: Instant) -> Result<()> {
+    /// Discards queued and sink-buffered audio due at or after `server_us`.
+    ///
+    /// The queue is cut by the raw server timestamp, because a clock update moves local deadlines
+    /// but not the stamps a `stream/clear` names. The sink receives the mapped deadline for the
+    /// same stamp, with the post-port delay subtracted, so both sides cut at the same audio.
+    fn discard_sink(&mut self, server_us: i64) -> Result<()> {
+        self.queue.discard_from(server_us);
+        self.arm_playout();
+        let due = self.playout_deadline(server_us);
         match self.sink.discard_from(due) {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -2269,24 +2532,94 @@ impl Session<'_> {
         }
     }
 
-    /// Converts a server timestamp into a local playout deadline.
+    /// Converts a server timestamp into the local instant its audio should reach the audio port.
     ///
-    /// Without a clock estimate the frame is delivered immediately and the deadline carries no
-    /// guarantee. A deadline that already passed is reported as now, not as a time in the past, so
-    /// a sink can compare it directly with its own clock.
+    /// The sink's post-port [`Sink::output_delay`] is subtracted here, once: the external chain
+    /// delays the sound after the port, so the client has to hand the frame over that much earlier.
+    /// The result is **not** clamped, so a deadline that already passed stays in the past and a
+    /// caller can tell a late frame from one that is merely due. `None` means no clock estimate is
+    /// ready, or that the mapping overflowed the instant range.
+    fn mapped_deadline(&self, server_us: i64) -> Option<Instant> {
+        map_deadline(&self.clock, self.output_delay, server_us)
+    }
+
+    /// Converts a server timestamp into a local playout deadline clamped to now.
+    ///
+    /// This is the sink-facing value: without a clock estimate, for a timestamp whose deadline
+    /// already passed and when the mapping overflows, it is [`Instant::now`], so a sink can compare
+    /// it with its own clock. The scheduler never uses the clamp - lateness is judged from the
+    /// unclamped [`Self::mapped_deadline`], because a clamped value is always "not early".
     fn playout_deadline(&self, server_us: i64) -> Instant {
         let now = Instant::now();
-        let Some(local_us) = self.clock.client_time_us(server_us) else {
-            return now;
-        };
-        let delta = local_us.saturating_sub(now_us());
-        if delta <= 0 {
-            return now;
+        match self.mapped_deadline(server_us) {
+            Some(due) if due > now => due,
+            _ => now,
         }
-        // A timestamp far outside the local clock range must not overflow the instant arithmetic;
-        // playing it now is the conservative outcome of an estimate this uncertain.
-        now.checked_add(Duration::from_micros(delta.unsigned_abs()))
-            .unwrap_or(now)
+    }
+
+    /// Recomputes every queued deadline from its server timestamp.
+    ///
+    /// Deadlines are a function of the stamp, the clock estimate and the sink's reported post-port
+    /// delay, so both a new clock sample and a changed delay move every frame that is waiting. The
+    /// stored stamps are unchanged, which is what lets a later clear still cut by them.
+    fn remap_playout(&mut self) {
+        let clock = &self.clock;
+        let output_delay = self.output_delay;
+        let fallback = Instant::now();
+        self.queue
+            .remap(|server_us| map_deadline(clock, output_delay, server_us).unwrap_or(fallback));
+        self.arm_playout();
+    }
+
+    /// Re-reads the delays the sink reports and reacts to a change.
+    ///
+    /// The trait has no change notification, so the session polls at three named points: stream
+    /// open, after every `client/state` report and after every clock burst.
+    ///
+    /// [`Sink::pre_port_delay`] only moves the timer: the deadlines are a function of the server
+    /// timestamp, the clock and the post-port delay. A change that moves `required_lead_time_ms` in
+    /// either direction sends a new `client/state`: it is a player field, and the wire value must
+    /// not go stale while the wave is still playing.
+    ///
+    /// A changed [`Sink::output_delay`] is part of every deadline: the queue is re-mapped and a
+    /// state is sent, since `output_delay_ms` is a player field the protocol requires the client to
+    /// report whenever it changes. The report path goes through [`Self::write_client_state`], which
+    /// owns the caches and reads the sink once, so the value that is stored, re-mapped and reported
+    /// is the same. Before the first state report exists, no state is sent here: the initial report
+    /// that follows the clock estimate carries the new values anyway.
+    async fn poll_timing(&mut self) -> Result<()> {
+        let pre_port_delay = self.sink.pre_port_delay();
+        let output_delay = self.sink.output_delay();
+        let lead = self.required_lead_ms(pre_port_delay);
+        let lead_changed = self
+            .reported_lead_ms
+            .is_some_and(|reported| reported != lead);
+        let output_changed = output_delay != self.output_delay;
+        if (output_changed || lead_changed) && self.state_sent {
+            // `write_client_state` stores the caches and re-maps from its own reading; this poll
+            // only decided that a report is due.
+            self.write_client_state().await?;
+        } else {
+            // Before the first report there is nothing to send, so the poll keeps the schedule in
+            // step with the sink itself.
+            self.pre_port_delay = pre_port_delay;
+            self.output_delay = output_delay;
+            if output_changed {
+                self.remap_playout();
+            }
+            self.arm_playout();
+        }
+        Ok(())
+    }
+
+    /// The lead this client reports with `pre_port_delay` in force.
+    ///
+    /// `roles/player/v1.md` makes the audio backend buffer a floor for `required_lead_time_ms`, and
+    /// the sink's pre-port delay is that backend. The host's configured value is a start-up floor,
+    /// not a ceiling, so the larger of the two is reported.
+    fn required_lead_ms(&self, pre_port_delay: Duration) -> u32 {
+        let pre_port_ms = u32::try_from(pre_port_delay.as_millis()).unwrap_or(u32::MAX);
+        self.config.required_lead_time_ms.max(pre_port_ms)
     }
 
     /// Reports one `server/state` message for the roles this client has active.
@@ -3429,6 +3762,31 @@ fn max_error_us(sample: &TimeSample) -> i128 {
     ((t4 - t1) - (t3 - t2)) / 2
 }
 
+/// Maps a server timestamp to the local instant its audio should reach the audio port.
+///
+/// The post-port delay is subtracted before the delta is applied, so it is compensated exactly
+/// once. The result is unclamped: a deadline in the past is a past [`Instant`], and `None` covers
+/// both "no estimate yet" and an overflow of the instant range.
+fn map_deadline(
+    clock: &ClockFilter,
+    output_delay: Option<Duration>,
+    server_us: i64,
+) -> Option<Instant> {
+    let delay_us =
+        i64::try_from(output_delay.unwrap_or(Duration::ZERO).as_micros()).unwrap_or(i64::MAX);
+    // The post-port delay is subtracted in the server's time domain, before the mapping, so the
+    // drift the clock applies is applied to the playout instant the delay produced.
+    let local_us = clock.client_time_us(server_us.saturating_sub(delay_us))?;
+    let now = Instant::now();
+    let delta_us = local_us.saturating_sub(now_us());
+    let magnitude = Duration::from_micros(delta_us.unsigned_abs());
+    if delta_us >= 0 {
+        now.checked_add(magnitude)
+    } else {
+        now.checked_sub(magnitude)
+    }
+}
+
 /// Current wall clock in microseconds since the Unix epoch, the domain of server timestamps.
 fn now_us() -> i64 {
     SystemTime::now()
@@ -3772,6 +4130,12 @@ mod tests {
             playback_declared: false,
             stream: None,
             stream_started: None,
+            queue: PlayoutQueue::new(BUFFER_CAPACITY, LATE_TOLERANCE),
+            next_playout: None,
+            pre_port_delay: Duration::ZERO,
+            output_delay: None,
+            reported_lead_ms: None,
+            late_audio: LateAudioWindow::default(),
             sync_remaining: 0,
             burst_deadline: None,
             reply_deadline: None,
@@ -3947,6 +4311,84 @@ mod tests {
         assert!(
             format!("{answer:#}").contains("WebSocket send failed"),
             "the caller sees the write failure, got: {answer:#}"
+        );
+    }
+
+    /// A frame queued before a clock update is re-mapped from the new estimate.
+    ///
+    /// The queue's deadlines are a function of the clock estimate, so a burst that moves the
+    /// estimate must move the frames that are already waiting. The row queues one frame under a
+    /// zero-offset estimate, folds in a two-second step, and expects the deadline to move earlier
+    /// by a visible amount.
+    #[tokio::test]
+    async fn a_clock_update_remaps_every_queued_frame() {
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        // Three zero-offset samples make the filter ready. A four-second round trip with equal
+        // server stamps keeps the measurement at zero and the error bound positive; the wide
+        // bound also keeps the artificial two-second step from looking like a drift measurement.
+        let base = now_us();
+        for step in 0..3 {
+            let sent = base + step * 1_000_000;
+            session.clock.push(TimeSample {
+                client_sent_us: sent,
+                server_received_us: sent + 2_000_000,
+                server_sent_us: sent + 2_000_000,
+                client_received_us: sent + 4_000_000,
+            });
+        }
+        assert!(
+            session.clock.is_ready(),
+            "three samples make the clock ready"
+        );
+
+        let server_us = now_us() + 1_000_000;
+        let before = session
+            .mapped_deadline(server_us)
+            .expect("the ready clock maps a timestamp");
+        session.enqueue(server_us, before, OwnedFrame::Pcm(vec![0x11; 4]));
+        assert_eq!(
+            session.queue.next_due(),
+            Some(before),
+            "the frame waits for its first deadline"
+        );
+
+        // A two-second offset step: the server now reads two seconds further ahead than before.
+        let sent = base + 3 * 1_000_000;
+        session.burst_samples.push(TimeSample {
+            client_sent_us: sent,
+            server_received_us: sent + 4_000_000,
+            server_sent_us: sent + 4_000_000,
+            client_received_us: sent + 4_000_000,
+        });
+        session.state_sent = true;
+        session
+            .finish_burst()
+            .await
+            .expect("a burst without I/O cannot fail");
+
+        let after = session
+            .queue
+            .next_due()
+            .expect("the queued frame survives the remap");
+        assert!(
+            after + Duration::from_millis(500) <= before,
+            "the two-second step must move the deadline earlier, was {before:?} now {after:?}"
+        );
+        assert_eq!(
+            session.next_playout,
+            Some(after),
+            "the playout timer must follow the re-mapped deadline"
         );
     }
 

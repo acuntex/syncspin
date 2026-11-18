@@ -96,6 +96,7 @@ mod client;
 mod config;
 mod discovery;
 mod pairing;
+mod playout;
 mod session;
 mod sink;
 

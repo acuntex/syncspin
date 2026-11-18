@@ -5,7 +5,7 @@
 //! could agree on a mistake and both tests would pass. This one connects the published client
 //! crate - its Noise responder, its `client/time` bursts, its clock filter and its playout
 //! scheduling - to the server's listener, clock and stream, and checks what reaches the client's
-//! sink: the server's bytes, and a playout deadline in the near future rather than in the past.
+//! sink: the server's bytes, and a frame written one pre-port delay before its port deadline.
 
 use std::time::{Duration, Instant};
 
@@ -17,9 +17,6 @@ use tokio::sync::mpsc;
 /// How long the test waits for anything at all.
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The lead the server schedules the first frame with, plus room for a busy machine.
-const MAX_LEAD: Duration = Duration::from_millis(400);
-
 /// How far behind its arrival a deadline may be before it counts as stale.
 ///
 /// A deadline the client cannot place in the future is reported as the instant it computed it,
@@ -27,13 +24,28 @@ const MAX_LEAD: Duration = Duration::from_millis(400);
 /// scheduled from a clock that no longer holds.
 const DEADLINE_SLACK: Duration = Duration::from_millis(50);
 
+/// The delay the reporting sink claims between `write` and the audio port.
+///
+/// A sink that buffers before the port reports it, and the client writes that much before the
+/// deadline. The value is large enough to separate a scheduled write from a write on arrival, which
+/// would see the server's whole start lead ahead of it.
+const PRE_PORT: Duration = Duration::from_millis(100);
+
 /// The playtime of one test chunk: 480 stereo frames of 16-bit PCM at 48 kHz.
 const CHUNK: Duration = Duration::from_millis(10);
 
+/// How often the test re-seeds the timeline while it waits for the clock estimate.
+///
+/// The client schedules only after three clock bursts, and before that it writes each frame on
+/// arrival. A seek re-seeds the server timeline one start lead ahead, so re-seeding until a
+/// scheduled write appears keeps a slow burst from pushing every later stamp into the past. Once
+/// the estimate is ready, the first queued frame is written well inside this window.
+const RESEED: Duration = Duration::from_millis(200);
+
 /// A sink that reports every frame to the test and plays nothing.
 ///
-/// The client's clock estimate is ready before the server announces the stream, so a frame that
-/// arrives after that carries the deadline the scheduling is about.
+/// It reports a pre-port delay so a scheduled write is distinguishable from a write on arrival: the
+/// client should call it one `PRE_PORT` before the frame's port deadline.
 struct ReportingSink {
     frames: mpsc::UnboundedSender<(Instant, Instant, usize)>,
 }
@@ -54,6 +66,10 @@ impl Sink for ReportingSink {
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+
+    fn pre_port_delay(&self) -> Duration {
+        PRE_PORT
     }
 }
 
@@ -111,21 +127,23 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
     }
 
     // 480 stereo frames of 16-bit PCM are 10 ms at 48 kHz. The server seeds the stream timeline one
-    // start lead ahead of now and advances it by the chunk playtime, so the lead lasts twenty chunks
-    // of audio. The client schedules from its clock estimate only after three bursts; a machine that
-    // delays those bursts longer than the lead leaves the timeline permanently behind, and every
-    // later stamp lands in the past, which the client plays immediately. Seeking re-seeds the
-    // timeline at now plus the lead and gives the estimate a fresh window, so what this loop waits
-    // for is the estimate, not the writer's luck. Each write is paced at the playtime of the chunk,
-    // because a writer that ran ahead of the timeline would push the deadlines into the past and
-    // prove nothing.
+    // start lead ahead of now and advances it by the chunk playtime, so a writer paced at the
+    // playtime keeps every frame ahead of the clock. The client schedules from its clock estimate
+    // only after three bursts; re-seeding the timeline until a scheduled write appears gives that
+    // estimate a fresh window without ever letting the writer outrun it. Each write is paced at the
+    // playtime of the chunk, because a writer that ran ahead would push the deadlines into the past
+    // and prove nothing.
     let chunk = [9u8; 480 * 4];
+    let mut last_seed = Instant::now() - RESEED;
     let give_up = Instant::now() + TIMEOUT;
     let (arrival, due) = 'frames: loop {
         if Instant::now() >= give_up {
-            bail!("no frame arrived with a playout deadline ahead of its arrival");
+            bail!("no frame was written one pre-port delay before its deadline");
         }
-        writer.seek(Duration::ZERO);
+        if last_seed.elapsed() >= RESEED {
+            writer.seek(Duration::ZERO);
+            last_seed = Instant::now();
+        }
         writer.write(&chunk);
         tokio::time::sleep(CHUNK).await;
         while let Ok((arrival, due, length)) = received.try_recv() {
@@ -146,8 +164,13 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
     };
     let lead = due.duration_since(arrival);
     assert!(
-        lead <= MAX_LEAD,
-        "the frame is due {lead:?} ahead, beyond the {MAX_LEAD:?} the server schedules with"
+        lead >= PRE_PORT / 2,
+        "the sink was called {lead:?} before the deadline, not the {PRE_PORT:?} pre-port delay"
+    );
+    assert!(
+        lead <= PRE_PORT + DEADLINE_SLACK,
+        "a {lead:?} lead is the server's start lead or a second schedule, not the {PRE_PORT:?} \
+         pre-port delay"
     );
 
     writer.end();

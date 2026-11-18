@@ -7,10 +7,12 @@
 //! A sink is moved into [`connect`](crate::connect) once and reused for every connection attempt
 //! the client makes, so a reconnect does not need the host to build another one. Calls are strictly
 //! ordered and come from the client's task: a flush and then [`Sink::open`] when a stream starts,
-//! [`Sink::write`] for every audio chunk, and a discard or a flush at each boundary listed on
-//! [`Sink::discard_from`] and [`Sink::flush`]. A sink may block only as long as it takes to
-//! enqueue the frame: a write that never returns stalls the connection, because the trait is
-//! synchronous and the client has no second thread to read the socket.
+//! [`Sink::write`] when a frame is due, and a discard or a flush at each boundary listed on
+//! [`Sink::discard_from`] and [`Sink::flush`]. The client owns the playout clock: it schedules each
+//! frame from its server timestamp and calls [`Sink::write`] when the frame's pre-port write time
+//! has arrived, so a sink writes on call instead of scheduling again. A sink may block only as long
+//! as it takes to enqueue the frame: a write that never returns stalls the connection, because the
+//! trait is synchronous and the client has no second thread to read the socket.
 //!
 //! An error from [`Sink::open`], [`Sink::write`], [`Sink::discard_from`] or [`Sink::flush`] is
 //! fatal for the connection: the client reports it and stops instead of retrying a broken output,
@@ -134,11 +136,18 @@ pub trait Sink: Send + 'static {
 
     /// Writes one frame.
     ///
-    /// `due` is the local instant at which the first sample of the frame should reach the
-    /// speakers. It is a playout deadline, not a wake-up call: a sink that buffers ahead compares
-    /// it with its own clock, and a deadline that is already past means "play as soon as
+    /// The client schedules playout and calls this at the frame's wake time, so the sink writes it
+    /// now and must not schedule it again - otherwise a frame whose sink buffers internally is
+    /// delayed twice. The call is already early enough to fill the sink's
+    /// [`Sink::pre_port_delay`].
+    ///
+    /// `due` is the local instant at which the first sample of the frame should reach the audio
+    /// port, with the sink's [`Sink::output_delay`] already subtracted. The sink's pre-port delay
+    /// is compensated by the instant of this call, not by this value. `due` is informational: a
+    /// sink that forwards the frame to its pipeline ignores it, one that buffers ahead may compare
+    /// it with its own clock, and a deadline that is already past means "write as soon as
     /// possible". The client reports [`std::time::Instant::now`] while its clock estimate is not
-    /// ready, so the deadline carries no guarantee in that state.
+    /// ready, so the value carries no guarantee in that state.
     ///
     /// An error ends the connection: the host cannot recover a broken output from here, and the
     /// client does not retry a sink that failed.
@@ -166,10 +175,13 @@ pub trait Sink: Send + 'static {
     /// Drops the buffered audio that is due at or after `due`, keeping what plays earlier.
     ///
     /// Called on a `stream/clear` that carries a `from_timestamp`, after
-    /// [`Event::StreamClear`](crate::Event::StreamClear). `due` is the server timestamp mapped
-    /// through the client's clock estimate. It is [`std::time::Instant::now`] while no estimate is
-    /// ready, for a timestamp that already lies in the past, and when the mapping would overflow —
-    /// each of which drops everything buffered and matches [`Sink::flush`].
+    /// [`Event::StreamClear`](crate::Event::StreamClear). The client already dropped its own queued
+    /// frames at or after that server timestamp; this call is for the audio the sink holds itself.
+    /// `due` is the server timestamp mapped through the client's clock estimate, with the sink's
+    /// [`Sink::output_delay`] subtracted: the local deadline the sink would have been given for that
+    /// server time. It is [`std::time::Instant::now`] while no estimate is ready, for a timestamp
+    /// that already lies in the past, and when the mapping would overflow — each of which drops
+    /// everything buffered and matches [`Sink::flush`].
     ///
     /// It must succeed when no stream is open or no queue exists: an empty queue discards nothing.
     /// A clear can arrive before `stream/start` or after `stream/end`, and the client does not
@@ -182,6 +194,24 @@ pub trait Sink: Send + 'static {
         self.flush()
     }
 
+    /// Reports the delay between [`Sink::write`] and the audio port: decoder, pipeline, driver and
+    /// device buffers inside the sink. Not the post-port delay reported to the server; that is
+    /// [`Sink::output_delay`].
+    ///
+    /// The client calls [`Sink::write`] this much before the frame's playout deadline, so the frame
+    /// reaches the port at `due`. A sink that forwards frames straight to its pipeline leaves this
+    /// at zero; one whose output buffers internally reports the buffer here so the client can fill
+    /// it. A value that belongs on the post-port side raises the lead the server sends ahead
+    /// instead of compensating it, because the server factors `output_delay` into that lead.
+    ///
+    /// The client polls this when a stream opens, after every `client/state` report and after every
+    /// clock burst; a change moves the timer, and because the reported lead is at least the
+    /// pre-port delay, a change that moves that lead in either direction sends an updated
+    /// `required_lead_time_ms`. The default is zero.
+    fn pre_port_delay(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// Reports the delay the output adds **after** the audio port: external speakers, amplifiers, a
     /// chain after the DAC. Decoder, pipeline and device-internal buffer latency belong in the host's
     /// playout scheduling, not here. A conformant server factors this value into its send-ahead, so
@@ -189,7 +219,9 @@ pub trait Sink: Send + 'static {
     /// workspace ignores the reported timing until `docs/spec-deviations.md` #17 closes.
     ///
     /// The host restores the same value across restarts and reconnections: the protocol requires
-    /// `output_delay_ms` to persist, and this trait is the only place the client learns it.
+    /// `output_delay_ms` to persist, and this trait is the only place the client learns it. The
+    /// client polls it at the same points as [`Sink::pre_port_delay`]; a change re-maps the queued
+    /// deadlines and sends a new `client/state`, because `output_delay_ms` is a player field.
     ///
     /// `None` means the sink does not know, which the client treats as no additional delay.
     fn output_delay(&self) -> Option<Duration> {
