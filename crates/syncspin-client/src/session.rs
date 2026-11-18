@@ -2559,9 +2559,9 @@ impl Session<'_> {
 
     /// Recomputes every queued deadline from its server timestamp.
     ///
-    /// Used when the sink's reported post-port delay changes: deadlines are a function of the
-    /// stamp, the clock estimate and that delay, so the delta moves every frame that is waiting.
-    /// The stored stamps are unchanged, which is what lets a later clear still cut by them.
+    /// Deadlines are a function of the stamp, the clock estimate and the sink's reported post-port
+    /// delay, so both a new clock sample and a changed delay move every frame that is waiting. The
+    /// stored stamps are unchanged, which is what lets a later clear still cut by them.
     fn remap_playout(&mut self) {
         let clock = &self.clock;
         let output_delay = self.output_delay;
