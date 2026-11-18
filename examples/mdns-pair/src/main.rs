@@ -37,10 +37,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-#[cfg(feature = "mdns")]
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-#[cfg(feature = "mdns")]
-use base64::Engine as _;
 use syncspin_client::AudioFormat;
 #[cfg(feature = "mdns")]
 use syncspin_client::{ClientHandle, EventStream, GoodbyeReason, Identity};
@@ -321,7 +317,7 @@ async fn run(options: Options) -> Result<RunOutcome> {
     // sees. The mDNS TXT record is readable by anyone on the LAN, so the key the handshake proves
     // - not the published name - is what decides who is approved.
     let identity = Identity::generate();
-    let client_id = URL_SAFE_NO_PAD.encode(identity.public);
+    let client_id = identity.public_base64();
     // The record is published through the real backend and the server's browsing half is the
     // wrapper: the server must not dial unrelated clients that advertise on the network.
     let (sink, counters) = CountingSink::new(GATE_FRAMES);
