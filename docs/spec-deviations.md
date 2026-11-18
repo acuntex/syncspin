@@ -397,17 +397,26 @@ received but not used, and the lead is not recomputed when a member joins or upd
 A player that reports `min_buffer_ms` + `output_delay_ms` above 200 ms is therefore started with
 less lead than the spec's MUST requires. The group fans one timeline out to every member, so all of
 them share the timestamps; the tests `two_players_receive_the_same_frames` and
-`a_player_hears_nothing_before_it_reports_its_state` pin that.
+`a_player_hears_nothing_before_it_reports_its_state` pin that, and
+`the_start_lead_ignores_the_reported_timing` pins that a player reporting `min_buffer_ms` +
+`output_delay_ms` above 200 ms still gets the fixed lead.
+
+Two neighbouring rules of the same section are not met either. A seek is a `stream/clear` without
+`from_timestamp`, and the spec requires the first timestamp after it to satisfy each player's
+send-ahead; the group uses `START_LEAD` there too. And the server MUST keep each player's queued
+duration at or above its `min_buffer_ms` during live playback; the group does not track queued
+duration at all, it only paces chunks on the shared timeline.
 
 **Why:** a stream is one timeline: starting it at each member's own reported lead would give the
 members different timestamps for the same audio, which the server fan-out and the group design do
 not allow. The spec's own answer is a common send-ahead equal to the group maximum, which is what
-removing this deviation implements.
+removing this deviation implements for stream starts.
 
 **Removing it:** schedule a new stream at the largest `min_buffer_ms` + `output_delay_ms` among the
 players that are ready when it opens (extending toward `required_lead_time_ms` only for buffered
-sources), recompute it when a member joins or updates its timing, wait for a late member's report
-before announcing to it, and test a stream with two members whose reported values differ.
+sources), apply the same lead to a seek, recompute it when a member joins or updates its timing,
+track queued duration against `min_buffer_ms`, wait for a late member's report before announcing to
+it, and test a stream with two members whose reported values differ.
 
 ## 19. A foreign `group_id` is accepted unless strict mode is set
 

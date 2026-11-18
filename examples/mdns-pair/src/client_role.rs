@@ -48,8 +48,8 @@ pub async fn discover(run_name: &str) -> Result<String> {
     loop {
         attempt += 1;
         // One browse blocks for the backend's one-second window. It runs on the blocking pool so
-        // the server keeps serving; the outer deadline cannot cancel it, which is why this loop
-        // also checks the deadline itself between attempts.
+        // the server keeps serving. The caller's deadline drops this future between awaits; the
+        // browse already in flight finishes on its own, so this loop keeps no clock.
         let servers = tokio::task::spawn_blocking({
             let discovery = Arc::clone(&discovery);
             move || discover_servers(discovery.as_ref())
@@ -65,8 +65,6 @@ pub async fn discover(run_name: &str) -> Result<String> {
         }
         println!("browse {attempt}: no reachable service named {run_name} yet");
         tokio::time::sleep(RETRY_PAUSE).await;
-        // The caller's deadline bounds this loop; one browse is not cancellable, so the loop owns
-        // no clock of its own.
     }
 }
 

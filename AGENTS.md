@@ -77,7 +77,9 @@ here rather than a preference.
   do not exist yet: the only tables today are `storage-file` (client), `pairing-code`
   (core/client/server), `discovery` (client) and `mdns` (client/server). `storage-file` is off in
   `syncspin-client` but on in `player-pipe`, so a workspace build enables it through feature
-  unification; `pairing-code`, `discovery` and `mdns` are off unless requested.
+  unification; `pairing-code`, `discovery` and `mdns` are off unless requested. `mdns-pair` has its
+  own `mdns` feature, which forwards to the client and server ones and is off by default: the flow
+  is built only with `--features mdns`.
 - **MSRV 1.85.** A dependency that demands more is pinned or replaced, not silently accepted; the
   `msrv` CI job is the gate.
 - **Names and licence are fixed:** crates `syncspin-core`, `syncspin-client` and `syncspin-server`;

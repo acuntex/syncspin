@@ -359,7 +359,12 @@ async fn run(options: Options) -> Result<RunOutcome> {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => return Err(server_start_error(&mut server_task).await),
             Err(_) => {
-                server_task.abort();
+                // Ask for a clean shutdown first so the record is withdrawn; abort only when the
+                // task does not answer, for instance because the start itself is stuck.
+                let _ = stop_tx.send(());
+                if timeout(TEARDOWN, &mut server_task).await.is_err() {
+                    server_task.abort();
+                }
                 bail!(
                     "the server did not publish its record within {} s",
                     options.timeout.as_secs()

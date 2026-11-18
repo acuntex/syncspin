@@ -228,12 +228,16 @@ mod tests {
         wait_for_connection(&mut other_events, &endpoint, &server_id)
             .await
             .expect("the foreign handshake completes");
+        // Wait for progress, not for a fixed time: the check below only means something once the
+        // approved client has received more frames after the foreign handshake finished.
         let before = approved_counters.frames();
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert!(
-            approved_counters.frames() > before,
-            "the stream must still be live while the foreign client is checked"
-        );
+        timeout(Duration::from_secs(5), async {
+            while approved_counters.frames() < before + 10 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stream must still be live while the foreign client is checked");
         assert_eq!(
             counters.frames(),
             0,
