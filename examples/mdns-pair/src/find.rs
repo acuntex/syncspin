@@ -3,10 +3,6 @@
 //! A browse blocks, so it is not here. Everything that happens to a record after it arrives is, so
 //! the filter, the endpoint parse and the diagnostics are decided without a daemon.
 
-// The client flow that calls these helpers is added after them; the example has no other consumer
-// of this module, so the allowance covers the gap between the two steps and goes away with it.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use syncspin_client::DiscoveredServer;
@@ -23,7 +19,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 /// The match is exact on purpose: the run name carries the PID, so a stale record from an earlier
 /// run and a differently cased look-alike both stay out, and only the service this run published is
 /// ever dialled.
-fn matching_servers<'a>(
+pub(crate) fn matching_servers<'a>(
     servers: &'a [DiscoveredServer],
     run_name: &str,
 ) -> Vec<&'a DiscoveredServer> {
@@ -58,7 +54,7 @@ fn probe_address(endpoint: &str) -> Option<&str> {
 /// first address is still served: a previous run's record, or a host that bound one family only,
 /// can leave a dead entry at the front. The probe is one TCP connect with a short timeout, and the
 /// returned endpoint is the one the session then dials, so the choice is not made twice.
-async fn reachable_endpoint(server: &DiscoveredServer) -> Option<String> {
+pub(crate) async fn reachable_endpoint(server: &DiscoveredServer) -> Option<String> {
     for endpoint in server.endpoints() {
         let Some(address) = probe_address(&endpoint) else {
             continue;
@@ -80,7 +76,7 @@ async fn reachable_endpoint(server: &DiscoveredServer) -> Option<String> {
 /// error arm, so the declaration order is the mapping: `Discovery` is 0, `Connection` is 1,
 /// `Stream` is 2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stage {
+pub(crate) enum Stage {
     Discovery,
     Connection,
     Stream,
@@ -91,7 +87,7 @@ enum Stage {
 /// The named causes are the ones that produce this failure on a real host: no multicast, or no
 /// non-loopback IPv4 interface for the advertisement to leave on. A connection or stream failure is
 /// reported under its own stage instead.
-fn no_service_message(run_name: &str, budget: Duration) -> String {
+pub(crate) fn no_service_message(run_name: &str, budget: Duration) -> String {
     format!(
         "no service named {run_name} found within {} s; multicast and one non-loopback IPv4 \
          interface are required",
@@ -100,7 +96,7 @@ fn no_service_message(run_name: &str, budget: Duration) -> String {
 }
 
 /// The diagnostic for a flow that timed out in `stage`.
-fn timeout_message(stage: Stage, run_name: &str, budget: Duration) -> String {
+pub(crate) fn timeout_message(stage: Stage, run_name: &str, budget: Duration) -> String {
     match stage {
         Stage::Discovery => no_service_message(run_name, budget),
         Stage::Connection => format!(

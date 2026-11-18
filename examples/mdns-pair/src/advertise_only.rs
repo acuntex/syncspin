@@ -1,9 +1,5 @@
 //! Advertise-only discovery: publish the server record, never dial a client.
 
-// Task 5 hands the wrapper to `Server::start`; until then this module's only consumer is its test,
-// so the allowance covers the gap between the two steps and goes away with it.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use anyhow::Result;

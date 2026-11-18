@@ -16,13 +16,30 @@
 //! one host apart, and it is also why an explicit name must fit the mDNS label with room to spare:
 //! a derived name grows by the suffix, an explicit one is published as given.
 
+mod advertise_only;
+mod client_role;
+mod find;
+mod server_role;
+mod sink;
+
+use std::net::SocketAddr;
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use syncspin_client::{AudioFormat, ClientHandle, EventStream, GoodbyeReason, Identity};
+// Both crates export an `MdnsDiscovery`; each role runs its own daemon, so each import names the
+// role. The client's alias lives in `client_role`.
+use syncspin_server::MdnsDiscovery as ServerMdns;
+use syncspin_server::ServerConfig;
+use tokio::sync::oneshot;
+use tokio::time::timeout;
 
-mod advertise_only;
-mod find;
-mod sink;
+use crate::advertise_only::AdvertiseOnly;
+use crate::find::{timeout_message, Stage};
+use crate::sink::{Counters, CountingSink};
 
 /// Base name the run announces unless `--name` says otherwise.
 const DEFAULT_NAME: &str = "mdns-pair";
@@ -38,6 +55,42 @@ const MAX_TIMEOUT_SECS: u64 = 120;
 
 /// Longest mDNS label, in bytes. The service name is one DNS label, so this is its ceiling.
 const MAX_MDNS_LABEL_LEN: usize = 63;
+
+/// Sample rate of the run's stream, the rate every player must support.
+const SAMPLE_RATE: u32 = 48_000;
+
+/// Channel count of the run's stream.
+const CHANNELS: u8 = 2;
+
+/// Bits per sample of the run's stream.
+const BIT_DEPTH: u8 = 16;
+
+/// Bytes in one interleaved frame: both channels of one sample.
+const BYTES_PER_FRAME: usize = CHANNELS as usize * BIT_DEPTH as usize / 8;
+
+/// Duration of one streamed chunk, in milliseconds.
+///
+/// The specification forbids a chunk shorter than 15 ms and longer than 150 ms, so 20 ms sits in
+/// the middle of the range, and it is also the pace the server writes at.
+const CHUNK_MS: u64 = 20;
+
+/// Frames in one chunk at [`SAMPLE_RATE`].
+const CHUNK_FRAMES: usize = SAMPLE_RATE as usize / 1000 * CHUNK_MS as usize;
+
+/// Payload bytes in one chunk.
+const CHUNK_BYTES: usize = CHUNK_FRAMES * BYTES_PER_FRAME;
+
+/// Chunks the server streams: 600 ms, enough for the gate and still a short run.
+const CHUNK_COUNT: usize = 30;
+
+/// Frames the sink must receive before the run counts as a success.
+const GATE_FRAMES: usize = 20;
+
+/// Payload bytes those frames carry: 76,800, the number the gate asserts rather than prints.
+const GATE_BYTES: usize = GATE_FRAMES * CHUNK_BYTES;
+
+/// Upper bound on each half of the teardown, so a stuck peer cannot hold the command open.
+const TEARDOWN: Duration = Duration::from_secs(2);
 
 /// What the command line asked for.
 struct Options {
@@ -177,26 +230,156 @@ the stream has delivered enough of them. Status lines go to standard output.
     )
 }
 
-fn main() -> anyhow::Result<()> {
+/// Runs the command line and turns the run's outcome into the process's exit code.
+///
+/// The runtime has two worker threads on purpose: a browse blocks its worker for one second per
+/// attempt, and the server has to keep serving on the other one even on a host with one vCPU.
+#[tokio::main(worker_threads = 2)]
+async fn main() -> ExitCode {
     let options = match parse_args(std::env::args().skip(1)) {
         Ok(Parse::Help) => {
             print!("{}", usage());
-            return Ok(());
+            return ExitCode::SUCCESS;
         }
         Ok(Parse::Run(options)) => options,
         Err(error) => {
             eprint!("error: {error}\n\n{}", usage());
-            std::process::exit(2);
+            return ExitCode::from(2);
         }
     };
-    let name = run_name(&options, std::process::id())?;
-    // The command line is all this step carries: advertising, discovery, approval and the stream
-    // are the subject of the example and are not wired up yet.
-    bail!(
-        "the run {name:?} (base name {:?}, {} s budget) has no discovery or stream flow yet",
-        options.name,
-        options.timeout.as_secs()
-    )
+    match run(options).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // The cause chain stays on one line: a captured smoke-test log shows which stage
+            // failed and why without a stack of separate lines.
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Runs one discovery, approval and stream pass, then tears both roles down.
+async fn run(options: Options) -> Result<()> {
+    let run_name = run_name(&options, std::process::id())?;
+    // The record is published through the real backend and the server's browsing half is the
+    // wrapper: the server must not dial unrelated clients that advertise on the network.
+    let (sink, counters) = CountingSink::new(GATE_FRAMES);
+    let mut config = ServerConfig::new(run_name.clone(), Identity::generate());
+    // Port 0: the operating system picks the port, so two runs on one host do not fight over a
+    // fixed one, and the record names the port that was actually bound.
+    config.bind = SocketAddr::from(([0, 0, 0, 0], 0));
+    config.discovery = Some(Arc::new(AdvertiseOnly::new(Arc::new(ServerMdns::new()?))));
+
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let server_task = tokio::spawn(server_role::serve(
+        config,
+        ready_tx,
+        stop_rx,
+        run_name.clone(),
+    ));
+    ready_rx
+        .await
+        .context("the server role ended before it published its record")?;
+
+    // One deadline covers the browse, the connection and the frames; the stage the flow reached is
+    // shared through an atomic so the timeout can name where it stopped.
+    let stage = Arc::new(AtomicU8::new(0));
+    let report = counters.clone();
+    let flow = {
+        let stage = Arc::clone(&stage);
+        let run_name = run_name.clone();
+        async move {
+            let endpoint = client_role::discover(&run_name, options.timeout).await?;
+            stage.store(1, Ordering::SeqCst);
+            let (handle, events) =
+                client_role::await_connected(&run_name, &endpoint, Box::new(sink)).await?;
+            stage.store(2, Ordering::SeqCst);
+            counters.wait().await;
+            Ok::<_, anyhow::Error>((handle, events))
+        }
+    };
+    let outcome: Result<Option<(ClientHandle, EventStream)>> = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            println!("interrupted");
+            Ok(None)
+        }
+        result = timeout(options.timeout, flow) => match result {
+            Ok(result) => result.map(Some),
+            Err(_) => Err(anyhow!(timeout_message(
+                stage_of(&stage),
+                &run_name,
+                options.timeout
+            ))),
+        },
+    };
+
+    // The client side of the teardown, in the order the session expects: the event stream goes
+    // first, then the goodbye, then the task. A `finished()` that outlives `TEARDOWN` is dropped,
+    // and a dropped handle detaches the task instead of aborting it; process exit is the real
+    // bound the design accepts.
+    let verdict = match outcome {
+        Ok(Some((mut handle, events))) => {
+            let verdict = verify_gate(&report);
+            drop(events);
+            handle.close(GoodbyeReason::Shutdown);
+            let _ = timeout(TEARDOWN, handle.finished()).await;
+            verdict
+        }
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+
+    // The record goes even when the flow failed: the run is a smoke test, not a service, and a
+    // withdrawn advertisement is what keeps the next run from finding this one.
+    let _ = stop_tx.send(());
+    let _ = timeout(TEARDOWN, server_task).await;
+    verdict
+}
+
+/// Reads back the stage the flow had reached, for the timeout's diagnostic.
+///
+/// The flow stores 0, 1 and 2 in order before each awaited stage, so the mapping from the counter
+/// to [`Stage`] is fixed here and nowhere else.
+fn stage_of(stage: &AtomicU8) -> Stage {
+    match stage.load(Ordering::SeqCst) {
+        0 => Stage::Discovery,
+        1 => Stage::Connection,
+        _ => Stage::Stream,
+    }
+}
+
+/// Checks the two properties that make this run a success: the format and the byte count.
+///
+/// This is an assertion, not a log line. A run that only printed the numbers would pass on a
+/// stream that delivered one chunk or announced another format, and the approval it demonstrates
+/// would be unproven.
+fn verify_gate(report: &Counters) -> Result<()> {
+    let expected = AudioFormat::pcm(SAMPLE_RATE, CHANNELS, BIT_DEPTH);
+    match report.format() {
+        Some(format) if format == expected => {}
+        Some(format) => bail!(
+            "the stream announced {} Hz, {} channels, {}-bit `{}`, but this run expects \
+             {SAMPLE_RATE} Hz, {CHANNELS} channels, {BIT_DEPTH}-bit `pcm`",
+            format.sample_rate,
+            format.channels,
+            format.bit_depth,
+            format.codec
+        ),
+        None => bail!("the stream never announced a format"),
+    }
+    if report.bytes() < GATE_BYTES {
+        bail!(
+            "the stream delivered {} bytes, fewer than the {GATE_BYTES} the gate requires",
+            report.bytes()
+        );
+    }
+    println!(
+        "received {} frames / {} bytes",
+        report.frames(),
+        report.bytes()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -308,5 +491,63 @@ mod tests {
                 "the usage must name {expected:?}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn the_chunk_and_gate_geometry_is_the_designed_one() {
+        // The numbers are pinned here, not derived from each other: 20 ms of stereo 16-bit PCM at
+        // 48 kHz is 3,840 bytes, and the gate is 20 of those chunks.
+        assert_eq!(BYTES_PER_FRAME, 4);
+        assert_eq!((CHUNK_BYTES, GATE_BYTES), (3_840, 76_800));
+        assert_eq!(GATE_BYTES, GATE_FRAMES * CHUNK_BYTES);
+    }
+
+    #[test]
+    fn the_stage_counter_maps_onto_the_three_stages() {
+        let stage = AtomicU8::new(0);
+        assert_eq!(stage_of(&stage), Stage::Discovery);
+        stage.store(1, Ordering::SeqCst);
+        assert_eq!(stage_of(&stage), Stage::Connection);
+        stage.store(2, Ordering::SeqCst);
+        assert_eq!(stage_of(&stage), Stage::Stream);
+    }
+
+    #[test]
+    fn the_gate_requires_the_format_and_the_byte_count() {
+        use std::time::Instant;
+
+        use syncspin_client::{AudioFrame, Sink};
+
+        fn feed(sink: &mut CountingSink, frames: usize) {
+            let chunk = vec![0u8; CHUNK_BYTES];
+            for _ in 0..frames {
+                sink.write(AudioFrame::Pcm(&chunk), Instant::now())
+                    .expect("the chunk is accepted");
+            }
+        }
+
+        let (mut sink, counters) = CountingSink::new(GATE_FRAMES);
+        sink.open(AudioFormat::pcm(SAMPLE_RATE, CHANNELS, BIT_DEPTH))
+            .expect("the stream format opens");
+        feed(&mut sink, GATE_FRAMES);
+        assert!(
+            verify_gate(&counters).is_ok(),
+            "the full gate passes and prints its count"
+        );
+
+        let (mut sink, counters) = CountingSink::new(GATE_FRAMES);
+        sink.open(AudioFormat::pcm(SAMPLE_RATE, CHANNELS, BIT_DEPTH))
+            .expect("the stream format opens");
+        feed(&mut sink, GATE_FRAMES - 1);
+        assert!(
+            verify_gate(&counters).is_err(),
+            "one chunk short fails the byte count"
+        );
+
+        let (_sink, counters) = CountingSink::new(GATE_FRAMES);
+        assert!(
+            verify_gate(&counters).is_err(),
+            "a sink that never opened a stream fails the format check"
+        );
     }
 }

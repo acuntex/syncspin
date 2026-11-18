@@ -4,10 +4,6 @@
 //! immediately - which, for a counter, means adding it up - and never schedules it again. No
 //! audio device is opened anywhere.
 
-// The client flow that uses this sink is added after it; the example has no other consumer of this
-// module, so the allowance covers the gap between the two steps and goes away with it.
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
