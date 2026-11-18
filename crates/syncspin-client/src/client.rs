@@ -379,8 +379,10 @@ pub enum Event {
     /// together.
     ///
     /// Reported at most once per second while it happens, and never for a frame that was merely
-    /// due. Diagnostic only: the frames are dropped either way, and the host has nothing to
-    /// recover.
+    /// due. A burst of drops is one report; when the interval elapses with no further drop, the
+    /// frames accumulated since the last report follow as one more event, so the tail of a burst
+    /// is not lost. Diagnostic only: the frames are dropped either way, and the host has nothing
+    /// to recover.
     LateAudio {
         /// Worst lateness in the window.
         late_by: Duration,

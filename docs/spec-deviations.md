@@ -189,7 +189,10 @@ estimate is ready, for a timestamp already in the past, and when the mapping wou
 sink deadline is `Instant::now()`, which drops everything the sink buffered; a clear without a
 timestamp flushes both queues. The provided default calls `Sink::flush`, so a sink without its own
 timestamped queue still drops everything. The announced format stays open for the chunks that
-follow, because a clear does not end the stream.
+follow, because a clear does not end the stream. The client relies on `Sink::discard_from` here:
+the default flushes and an error is fatal, so the specification's fallback - dropping chunks until
+the old audio ends, for a backend that cannot discard - is unreachable in this design, and the
+client does not implement it.
 `flush_and_a_timestamped_clear_keep_the_prefix`,
 `a_clear_with_a_timestamp_maps_the_deadline_once_the_clock_is_ready`,
 `a_clear_before_the_clock_is_ready_discards_from_now` and

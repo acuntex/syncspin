@@ -516,6 +516,8 @@ enum Wakeup {
     Shutdown(GoodbyeReason),
     /// A queued frame reached its pre-port write time.
     Playout,
+    /// The interval elapsed with drops still in the late-audio window.
+    LateFlush,
     /// The clock deadline elapsed.
     Clock,
     /// The keepalive deadline elapsed: a ping is due, or the one on the wire timed out.
@@ -552,6 +554,8 @@ impl MessageKind {
 struct LateAudioWindow {
     /// When the last report went out, or `None` before the first.
     last_reported: Option<Instant>,
+    /// When a pending window must be flushed without waiting for another drop, or `None`.
+    flush_at: Option<Instant>,
     /// Worst lateness collected since that report.
     worst: Duration,
     /// Frames dropped since that report.
@@ -955,6 +959,7 @@ impl Session<'_> {
             // branch instead of ending the session.
             let control = &mut self.control;
             let next_playout = self.next_playout;
+            let late_flush = self.late_audio.flush_at;
             let wakeup = tokio::select! {
                 biased;
                 request = async {
@@ -974,6 +979,14 @@ impl Session<'_> {
                         None => pending().await,
                     }
                 } => Wakeup::Playout,
+                // The tail of a late-drop burst comes before the socket read for the same reason:
+                // a busy server must not keep the report waiting for another drop that never comes.
+                () = async {
+                    match late_flush {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => pending().await,
+                    }
+                } => Wakeup::LateFlush,
                 message = self.transport.read() => Wakeup::Socket(message),
                 () = async {
                     match deadline {
@@ -1009,6 +1022,7 @@ impl Session<'_> {
                     }
                 },
                 Wakeup::Playout => self.drain_playout()?,
+                Wakeup::LateFlush => self.flush_late_audio(),
                 Wakeup::Clock => {
                     if self.rehandshake.is_some() {
                         // The server must send its activation under the new keys; staying silent
@@ -1173,10 +1187,18 @@ impl Session<'_> {
         self.reply_deadline = None;
         self.outstanding_sent_us = None;
         self.burst_sent_us.clear();
-        if let Some(sample) = best_sample(&self.burst_samples) {
+        let pushed = if let Some(sample) = best_sample(&self.burst_samples) {
             self.clock.push(sample);
-        }
+            true
+        } else {
+            false
+        };
         self.burst_samples.clear();
+        if pushed {
+            // A clock update moves every queued deadline; re-map before the timing poll, which
+            // only re-maps when the sink's post-port delay changed.
+            self.remap_playout();
+        }
         if !self.state_sent && self.clock.sample_count() >= 1 && self.player_active() {
             self.send_client_state().await?;
         }
@@ -2118,13 +2140,26 @@ impl Session<'_> {
     }
 
     /// Sends one `client/state` message from the values in force.
+    ///
+    /// This is the single owner of the timing caches: it reads the sink once, stores both values,
+    /// re-maps the queue when `output_delay` changed, and reports the same reading. A live second
+    /// read could disagree with the cache and make `poll_timing` report a value twice.
     async fn write_client_state(&mut self) -> Result<()> {
         self.state_sent = true;
-        let output_delay_ms = self.sink.output_delay().map_or(0, |delay| {
+        let pre_port_delay = self.sink.pre_port_delay();
+        let output_delay = self.sink.output_delay();
+        let output_changed = output_delay != self.output_delay;
+        self.pre_port_delay = pre_port_delay;
+        self.output_delay = output_delay;
+        if output_changed {
+            self.remap_playout();
+        }
+        self.arm_playout();
+        let output_delay_ms = output_delay.map_or(0, |delay| {
             u32::try_from(delay.as_millis())
                 .map_or(MAX_OUTPUT_DELAY_MS, |delay| delay.min(MAX_OUTPUT_DELAY_MS))
         });
-        let required_lead_time_ms = self.required_lead_ms(self.sink.pre_port_delay());
+        let required_lead_time_ms = self.required_lead_ms(pre_port_delay);
         self.reported_lead_ms = Some(required_lead_time_ms);
         let state = Incoming::ClientState(ClientState {
             available: true,
@@ -2248,7 +2283,11 @@ impl Session<'_> {
     /// holding it. The queue's own `push` still guards against capacity overruns; those drops feed
     /// the same report.
     fn enqueue(&mut self, server_us: i64, due: Instant, frame: OwnedFrame) {
-        let write_at = due.checked_sub(self.pre_port_delay).unwrap_or(due);
+        // A subtraction that underflows has no honest write time: falling back to the port
+        // deadline would delay the frame, so the conservative outcome is "now" instead.
+        let write_at = due
+            .checked_sub(self.pre_port_delay)
+            .unwrap_or_else(Instant::now);
         if let Some(late) = Instant::now().checked_duration_since(write_at) {
             if late >= LATE_TOLERANCE {
                 self.record_drops(&[Dropped {
@@ -2276,12 +2315,17 @@ impl Session<'_> {
         self.arm_playout();
         let mut dropped = Vec::new();
         for queued in frames {
+            // An underflowing subtraction has no honest write time; "now" is the conservative
+            // outcome because it drops a frame rather than delaying it behind the port deadline.
             let write_at = queued
                 .due
                 .checked_sub(self.pre_port_delay)
-                .unwrap_or(queued.due);
+                .unwrap_or_else(Instant::now);
+            // Read the clock per frame: a blocking `Sink::write` may hold the loop past this
+            // frame's write time, and a value read before the batch would call it on time.
+            let now = Instant::now();
             if let Some(late) = now.checked_duration_since(write_at) {
-                if late > LATE_TOLERANCE {
+                if late >= LATE_TOLERANCE {
                     dropped.push(Dropped {
                         late_by: late,
                         count: 1,
@@ -2298,19 +2342,22 @@ impl Session<'_> {
     /// Recomputes the instant the playout branch next has work.
     ///
     /// Called after every queue mutation and every pre-port change; `None` means the queue is empty
-    /// and the branch waits without a deadline.
+    /// and the branch waits without a deadline. A subtraction that underflows falls back to
+    /// "now": the timer fires at once instead of waiting for the later port instant.
     fn arm_playout(&mut self) {
-        self.next_playout = self
-            .queue
-            .next_due()
-            .map(|due| due.checked_sub(self.pre_port_delay).unwrap_or(due));
+        self.next_playout = self.queue.next_due().map(|due| {
+            due.checked_sub(self.pre_port_delay)
+                .unwrap_or_else(Instant::now)
+        });
     }
 
     /// Collects dropped frames and reports them at most once per [`LATE_REPORT_INTERVAL`].
     ///
     /// `late_by` is the worst lateness in the window and `dropped` the total, so a burst of late
     /// frames becomes one event instead of a stream of them. A window that only saw capacity drops
-    /// reports zero lateness: those frames were not late, their queue was full.
+    /// reports zero lateness: those frames were not late, their queue was full. A window that fills
+    /// without reaching the interval is flushed by the [`Wakeup::LateFlush`] timer, so its tail is
+    /// not lost when no further frame is dropped.
     fn record_drops(&mut self, dropped: &[Dropped]) {
         if dropped.is_empty() {
             return;
@@ -2324,15 +2371,36 @@ impl Session<'_> {
             .last_reported
             .is_none_or(|last| last.elapsed() >= LATE_REPORT_INTERVAL);
         if !report_due {
+            // A report went out inside the interval: the rest waits for another drop, or for the
+            // timer when none comes.
+            self.late_audio.flush_at = self
+                .late_audio
+                .last_reported
+                .map(|last| last + LATE_REPORT_INTERVAL);
             return;
         }
+        self.emit_late_audio();
+    }
+
+    /// Emits the pending late-audio window and restarts the reporting interval.
+    fn emit_late_audio(&mut self) {
         self.emit(Event::LateAudio {
             late_by: self.late_audio.worst,
             dropped: self.late_audio.dropped,
         });
         self.late_audio.last_reported = Some(Instant::now());
+        self.late_audio.flush_at = None;
         self.late_audio.worst = Duration::ZERO;
         self.late_audio.dropped = 0;
+    }
+
+    /// Emits a window that saw no further drop before the interval elapsed.
+    fn flush_late_audio(&mut self) {
+        if self.late_audio.dropped > 0 {
+            self.emit_late_audio();
+        } else {
+            self.late_audio.flush_at = None;
+        }
     }
 
     /// Feeds one chunk's arrival delay into the buffer estimator and reports a derived change.
@@ -2515,9 +2583,10 @@ impl Session<'_> {
     ///
     /// A changed [`Sink::output_delay`] is part of every deadline: the queue is re-mapped and a
     /// state is sent, since `output_delay_ms` is a player field the protocol requires the client to
-    /// report whenever it changes. Before the first state report exists, no state is sent here: the
-    /// initial report that follows the clock estimate carries the new values anyway, because
-    /// [`Self::write_client_state`] reads them live.
+    /// report whenever it changes. The report path goes through [`Self::write_client_state`], which
+    /// owns the caches and reads the sink once, so the value that is stored, re-mapped and reported
+    /// is the same. Before the first state report exists, no state is sent here: the initial report
+    /// that follows the clock estimate carries the new values anyway.
     async fn poll_timing(&mut self) -> Result<()> {
         let pre_port_delay = self.sink.pre_port_delay();
         let output_delay = self.sink.output_delay();
@@ -2526,16 +2595,19 @@ impl Session<'_> {
             .reported_lead_ms
             .is_some_and(|reported| reported != lead);
         let output_changed = output_delay != self.output_delay;
-        self.pre_port_delay = pre_port_delay;
-        self.output_delay = output_delay;
-        if output_changed {
-            self.remap_playout();
-        }
-        self.arm_playout();
         if (output_changed || lead_changed) && self.state_sent {
-            // The caches were updated before this send, so no second poll is needed: the next one
-            // sees no change.
+            // `write_client_state` stores the caches and re-maps from its own reading; this poll
+            // only decided that a report is due.
             self.write_client_state().await?;
+        } else {
+            // Before the first report there is nothing to send, so the poll keeps the schedule in
+            // step with the sink itself.
+            self.pre_port_delay = pre_port_delay;
+            self.output_delay = output_delay;
+            if output_changed {
+                self.remap_playout();
+            }
+            self.arm_playout();
         }
         Ok(())
     }
@@ -4239,6 +4311,84 @@ mod tests {
         assert!(
             format!("{answer:#}").contains("WebSocket send failed"),
             "the caller sees the write failure, got: {answer:#}"
+        );
+    }
+
+    /// A frame queued before a clock update is re-mapped from the new estimate.
+    ///
+    /// The queue's deadlines are a function of the clock estimate, so a burst that moves the
+    /// estimate must move the frames that are already waiting. The row queues one frame under a
+    /// zero-offset estimate, folds in a two-second step, and expects the deadline to move earlier
+    /// by a visible amount.
+    #[tokio::test]
+    async fn a_clock_update_remaps_every_queued_frame() {
+        let config = test_config();
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let reported_volume = AtomicU8::new(50);
+        let mut session = test_session(
+            &config,
+            &events,
+            &reported_volume,
+            reset_socket().await,
+            local_noise_transport(),
+            None,
+        );
+
+        // Three zero-offset samples make the filter ready. A four-second round trip with equal
+        // server stamps keeps the measurement at zero and the error bound positive; the wide
+        // bound also keeps the artificial two-second step from looking like a drift measurement.
+        let base = now_us();
+        for step in 0..3 {
+            let sent = base + step * 1_000_000;
+            session.clock.push(TimeSample {
+                client_sent_us: sent,
+                server_received_us: sent + 2_000_000,
+                server_sent_us: sent + 2_000_000,
+                client_received_us: sent + 4_000_000,
+            });
+        }
+        assert!(
+            session.clock.is_ready(),
+            "three samples make the clock ready"
+        );
+
+        let server_us = now_us() + 1_000_000;
+        let before = session
+            .mapped_deadline(server_us)
+            .expect("the ready clock maps a timestamp");
+        session.enqueue(server_us, before, OwnedFrame::Pcm(vec![0x11; 4]));
+        assert_eq!(
+            session.queue.next_due(),
+            Some(before),
+            "the frame waits for its first deadline"
+        );
+
+        // A two-second offset step: the server now reads two seconds further ahead than before.
+        let sent = base + 3 * 1_000_000;
+        session.burst_samples.push(TimeSample {
+            client_sent_us: sent,
+            server_received_us: sent + 4_000_000,
+            server_sent_us: sent + 4_000_000,
+            client_received_us: sent + 4_000_000,
+        });
+        session.state_sent = true;
+        session
+            .finish_burst()
+            .await
+            .expect("a burst without I/O cannot fail");
+
+        let after = session
+            .queue
+            .next_due()
+            .expect("the queued frame survives the remap");
+        assert!(
+            after + Duration::from_millis(500) <= before,
+            "the two-second step must move the deadline earlier, was {before:?} now {after:?}"
+        );
+        assert_eq!(
+            session.next_playout,
+            Some(after),
+            "the playout timer must follow the re-mapped deadline"
         );
     }
 

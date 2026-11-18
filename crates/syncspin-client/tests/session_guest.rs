@@ -136,6 +136,30 @@ impl FlushGate {
     }
 }
 
+/// A gate that holds one sink write until the test releases it.
+///
+/// It has the same release/wait shape as [`FlushGate`]: the session is blocked inside `write`, so
+/// a test on another worker proves that the drain only continues once it is released.
+#[derive(Clone, Default)]
+struct WriteGate {
+    release: Arc<AtomicBool>,
+}
+
+impl WriteGate {
+    /// Lets the held write return.
+    fn release(&self) {
+        self.release.store(true, Ordering::SeqCst);
+    }
+
+    /// Spins until the test released the gate, or the bound expires.
+    fn wait(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.release.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// A sink that records instead of playing, and can fail on a chosen write.
 struct RecordingSink {
     recordings: Recordings,
@@ -148,7 +172,10 @@ struct RecordingSink {
     discards: usize,
     /// Flush call that holds the session until the gate is released.
     hold_flush: Option<usize>,
+    /// Write call that holds the session until the gate is released.
+    hold_write: Option<usize>,
     gate: Option<FlushGate>,
+    write_gate: Option<WriteGate>,
 }
 
 impl RecordingSink {
@@ -163,7 +190,9 @@ impl RecordingSink {
             writes: 0,
             discards: 0,
             hold_flush: None,
+            hold_write: None,
             gate: None,
+            write_gate: None,
         }
     }
 
@@ -178,7 +207,9 @@ impl RecordingSink {
             writes: 0,
             discards: 0,
             hold_flush: None,
+            hold_write: None,
             gate: None,
+            write_gate: None,
         }
     }
 
@@ -194,7 +225,9 @@ impl RecordingSink {
             writes: 0,
             discards: 0,
             hold_flush: None,
+            hold_write: None,
             gate: None,
+            write_gate: None,
         }
     }
 
@@ -210,7 +243,9 @@ impl RecordingSink {
             writes: 0,
             discards: 0,
             hold_flush: None,
+            hold_write: None,
             gate: None,
+            write_gate: None,
         }
     }
 
@@ -225,7 +260,9 @@ impl RecordingSink {
             writes: 0,
             discards: 0,
             hold_flush: None,
+            hold_write: None,
             gate: None,
+            write_gate: None,
         }
     }
 
@@ -240,7 +277,9 @@ impl RecordingSink {
             writes: 0,
             discards: 0,
             hold_flush: None,
+            hold_write: None,
             gate: None,
+            write_gate: None,
         }
     }
 
@@ -255,7 +294,27 @@ impl RecordingSink {
             writes: 0,
             discards: 0,
             hold_flush: Some(hold_flush),
+            hold_write: None,
             gate: Some(gate),
+            write_gate: None,
+        }
+    }
+
+    /// Creates a sink that holds the `hold_write`th write until the gate is released.
+    fn write_gated(recordings: Recordings, gate: WriteGate, hold_write: usize) -> RecordingSink {
+        RecordingSink {
+            recordings,
+            fail_on_write: None,
+            fail_on_flush: None,
+            fail_on_discard: None,
+            fail_on_open: false,
+            timing: timing_handle(None, Duration::ZERO),
+            writes: 0,
+            discards: 0,
+            hold_flush: None,
+            hold_write: Some(hold_write),
+            gate: None,
+            write_gate: Some(gate),
         }
     }
 
@@ -271,7 +330,9 @@ impl RecordingSink {
             writes: 0,
             discards: 0,
             hold_flush: None,
+            hold_write: None,
             gate: None,
+            write_gate: None,
         }
     }
 }
@@ -311,6 +372,12 @@ impl Sink for RecordingSink {
                 due,
                 written,
             });
+        // Recorded before the hold so the test can see the in-flight write on its own worker.
+        if self.hold_write == Some(self.writes) {
+            if let Some(gate) = &self.write_gate {
+                gate.wait();
+            }
+        }
         Ok(())
     }
 
@@ -417,6 +484,18 @@ fn gated_sink(hold_flush: usize) -> (Recordings, FlushGate, Box<dyn Sink>) {
         recordings.clone(),
         gate.clone(),
         hold_flush,
+    ));
+    (recordings, gate, sink)
+}
+
+/// Creates a recording sink that holds the `hold_write`th write until the gate is released.
+fn write_gated_sink(hold_write: usize) -> (Recordings, WriteGate, Box<dyn Sink>) {
+    let recordings = Recordings::default();
+    let gate = WriteGate::default();
+    let sink = Box::new(RecordingSink::write_gated(
+        recordings.clone(),
+        gate.clone(),
+        hold_write,
     ));
     (recordings, gate, sink)
 }
@@ -1015,6 +1094,189 @@ async fn a_late_frame_is_dropped_and_reported() {
         recordings.written().is_empty(),
         "a frame beyond the tolerance must not reach the sink"
     );
+}
+
+#[tokio::test]
+async fn the_late_window_tail_is_reported_after_the_interval() {
+    let mut server = FakeServer::start(ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    establish_clock(&mut server).await;
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+
+    // Four frames a second in the past arrive back to back. The first drop reports at once; the
+    // other three wait in the window because the interval has not elapsed.
+    for _ in 0..4 {
+        server.audio(now_us() - 1_000_000, 250_000, vec![0x33; 4]);
+    }
+
+    match next_event(&mut events).await {
+        Event::LateAudio { late_by, dropped } => {
+            assert_eq!(dropped, 1, "the first drop is reported immediately");
+            assert!(
+                late_by >= Duration::from_millis(900),
+                "the report carries the worst lateness, saw {late_by:?}"
+            );
+        }
+        other => panic!("expected LateAudio, got {other:?}"),
+    }
+
+    // No further audio: the interval still elapses and the tail follows as one report.
+    match next_event_within(&mut events, Duration::from_secs(3)).await {
+        Event::LateAudio { late_by, dropped } => {
+            assert_eq!(dropped, 3, "the window tail is flushed as one report");
+            assert!(
+                late_by >= Duration::from_millis(900),
+                "the flushed report keeps the worst lateness, saw {late_by:?}"
+            );
+        }
+        other => panic!("expected the flushed LateAudio, got {other:?}"),
+    }
+    assert!(
+        recordings.written().is_empty(),
+        "late frames must not reach the sink"
+    );
+}
+
+#[tokio::test]
+async fn late_reports_are_spaced_by_the_interval() {
+    let mut server = FakeServer::start(ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    establish_clock(&mut server).await;
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+
+    // One late frame every 100 ms for 2.5 s. The first reports at once; later drops accumulate
+    // until the interval has elapsed, so the reports that arrive are about a second apart.
+    let mut observed = Vec::new();
+    let mut next_send = Instant::now();
+    for _ in 0..26 {
+        tokio::time::sleep_until(next_send.into()).await;
+        next_send += Duration::from_millis(100);
+        server.audio(now_us() - 1_000_000, 250_000, vec![0x44; 4]);
+        loop {
+            let remaining = next_send.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, events.next()).await {
+                Ok(Some(Event::LateAudio { dropped, .. })) => {
+                    observed.push((Instant::now(), dropped));
+                }
+                Ok(Some(other)) => panic!("expected LateAudio, got {other:?}"),
+                Ok(None) => panic!("the event stream ended"),
+                Err(_) => break,
+            }
+        }
+    }
+
+    assert!(
+        observed.len() >= 2,
+        "2.5 s of drops must produce more than one report, saw {observed:?}"
+    );
+    for pair in observed.windows(2) {
+        let gap = pair[1].0.duration_since(pair[0].0);
+        assert!(
+            gap >= Duration::from_millis(900),
+            "reports must be at least 900 ms apart, saw {gap:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_that_became_late_during_a_blocking_write_is_dropped() {
+    let mut server = FakeServer::start(ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let (recordings, gate, sink) = write_gated_sink(1);
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    establish_clock(&mut server).await;
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+
+    // Two frames from one server timestamp: the drain pops both. The local deadlines differ by
+    // sub-microsecond mapping jitter, so the queue order is not the send order; whichever frame is
+    // written first is held in the sink, and the other is the one that becomes late.
+    let timestamp = now_us() + 500_000;
+    server.audio(timestamp, 1_000_000, vec![0xa1; 4]);
+    server.audio(timestamp, 1_000_000, vec![0xa2; 4]);
+
+    // The held write occupies a worker, and the sink records the frame before it spins. Poll with
+    // an OS sleep: a tokio timer could be owned by the blocked worker and stall past the gate's
+    // bound, which would release the write before the test saw it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while recordings.written().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the held write"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let written = recordings.written();
+    assert_eq!(
+        written.len(),
+        1,
+        "only the first frame reached the sink so far"
+    );
+    let released_at = written[0].due + Duration::from_millis(50);
+    std::thread::sleep(released_at.saturating_duration_since(Instant::now()));
+    gate.release();
+
+    match next_event(&mut events).await {
+        Event::LateAudio { late_by, dropped } => {
+            assert_eq!(dropped, 1, "only the frame that became late is dropped");
+            assert!(
+                late_by >= Duration::from_millis(10),
+                "the drop happened during the blocking write, saw {late_by:?}"
+            );
+        }
+        other => panic!("expected LateAudio, got {other:?}"),
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let written = recordings.written();
+    assert_eq!(
+        written.len(),
+        1,
+        "the frame that became late during the write must not reach the sink"
+    );
+    match &written[0].frame {
+        Written::Pcm(data) => assert!(
+            data == &vec![0xa1; 4] || data == &vec![0xa2; 4],
+            "the one written frame is one of the two sent payloads, got {data:?}"
+        ),
+        other => panic!("expected PCM, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1851,26 +2113,35 @@ async fn removing_the_player_role_reports_role_removed() {
 
 #[tokio::test]
 async fn no_audio_is_written_after_stream_end() {
-    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let mut server = FakeServer::start(ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
     let (recordings, sink) = recording_sink();
     let (mut events, _handle) =
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
+    establish_clock(&mut server).await;
     server.stream_start("pcm", 48_000, 2, 16);
     assert!(matches!(
         next_event(&mut events).await,
         Event::StreamStart { .. }
     ));
+    // A frame queued before the end, still in the future, must not survive the flush either.
+    server.audio(now_us() + 800_000, 1_000_000, vec![0x44; 64]);
     server.stream_end();
     // The flush proves the end was processed; the audio below is sent after it.
     wait_for_flushes(&recordings, 2).await;
 
     server.audio(now_us(), 0, vec![0x55; 64]);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait beyond the queued frame's deadline: without the flush it would be written here.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
     assert!(
         recordings.written().is_empty(),
-        "a chunk after stream/end must not reach the sink"
+        "a chunk queued before or sent after stream/end must not reach the sink"
     );
 }
 
@@ -2008,22 +2279,31 @@ async fn a_failing_discard_ends_the_connection() {
 
 #[tokio::test]
 async fn removing_the_player_role_flushes_the_sink() {
-    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let mut server = FakeServer::start(ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
     let (recordings, sink) = recording_sink();
     let (mut events, _handle) =
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
+    establish_clock(&mut server).await;
     server.stream_start("pcm", 48_000, 2, 16);
     assert!(matches!(
         next_event(&mut events).await,
         Event::StreamStart { .. }
     ));
+    // A frame queued before the removal, still in the future, must not survive the flush.
+    server.audio(now_us() + 800_000, 1_000_000, vec![0x66; 64]);
     server.activate(&["metadata@v1"]);
     wait_for_flushes(&recordings, 2).await;
 
     server.audio(now_us(), 0, vec![0x77; 64]);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait beyond the queued frame's deadline: without the flush it would be written here.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
     assert!(
         recordings.written().is_empty(),
         "audio for an inactive player role must not reach the sink"
@@ -2730,10 +3010,15 @@ async fn a_start_burst_inside_the_warmup_is_not_sampled() {
     // warmup on every `stream/start` would send nothing within the default timeout.
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     server.stream_start("pcm", 48_000, 2, 16);
-    assert!(matches!(
-        next_event(&mut events).await,
-        Event::StreamStart { .. }
-    ));
+    // The chunks above are past their deadlines and their tail report is now flushed; the row is
+    // about the warmup, so those diagnostic events are skipped while waiting for the start.
+    loop {
+        match next_event(&mut events).await {
+            Event::LateAudio { .. } => continue,
+            Event::StreamStart { .. } => break,
+            other => panic!("expected StreamStart, got {other:?}"),
+        }
+    }
     for _ in 0..200 {
         server.audio(now_us() - 500_000, 50_000, vec![0x5a; 64]);
     }
