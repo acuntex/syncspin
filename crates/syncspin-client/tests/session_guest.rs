@@ -514,6 +514,7 @@ fn config_for(server: &FakeServer, mode: syncspin_client::AudioMode) -> ClientCo
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
+        output_delay_control: false,
         unpaired_access: true,
         required_lead_time_ms: 250,
         min_buffer_ms: None,
@@ -1361,7 +1362,7 @@ async fn a_change_of_output_delay_remaps_and_reports_state() {
     );
 
     // The host raises the reported post-port delay; the volume command makes the session report
-    // its state, which is one of the three points where the timing is polled.
+    // its state, which is one of the points where the timing is polled.
     timing
         .lock()
         .expect("the timing lock is not poisoned")
@@ -3161,6 +3162,7 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
+        output_delay_control: false,
         unpaired_access: true,
         required_lead_time_ms: 250,
         min_buffer_ms: None,
@@ -3216,6 +3218,7 @@ async fn an_invalid_configuration_is_rejected_before_connecting() {
             ClientConfig {
                 max_backoff: Duration::ZERO,
                 strict_group_id: false,
+                output_delay_control: false,
                 ..base("Test player")
             },
             "max_backoff",
@@ -4372,6 +4375,347 @@ async fn malformed_player_commands_are_ignored() {
             other => panic!("{body} must be ignored, got {other:?}"),
         }
     }
+}
+
+/// Connects with [`ClientConfig::output_delay_control`] set, so the command is advertised.
+async fn connect_with_output_delay_control(
+    server: &FakeServer,
+    sink: Box<dyn Sink>,
+) -> (EventStream, ClientHandle) {
+    let mut config = config_for(server, syncspin_client::AudioMode::Passthrough);
+    config.output_delay_control = true;
+    let (handle, events) = connect(config, sink)
+        .await
+        .expect("the client must connect to the fake server");
+    (events, handle)
+}
+
+/// Sends one `server/command` player object.
+fn send_player_command(server: &FakeServer, command: &str, output_delay_ms: Option<u32>) {
+    server.json(
+        serde_json::to_string(&Incoming::ServerCommand(ServerCommand {
+            player: Some(PlayerCommand {
+                command: command.to_owned(),
+                volume: None,
+                mute: None,
+                output_delay_ms,
+            }),
+        }))
+        .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn output_delay_is_advertised_only_when_the_host_opts_in() {
+    // Default: a host that cannot apply the delay must not advertise it.
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+    let state = wait_for_client_state(&mut server).await;
+    let player = state.player.expect("the player object is present");
+    assert!(
+        !player
+            .supported_commands
+            .iter()
+            .any(|command| command == "set_output_delay"),
+        "the default configuration must not advertise set_output_delay"
+    );
+
+    // Opt-in: the host can apply it, so the command is advertised.
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+    let state = wait_for_client_state(&mut server).await;
+    let player = state.player.expect("the player object is present");
+    assert!(
+        player
+            .supported_commands
+            .iter()
+            .any(|command| command == "set_output_delay"),
+        "the opt-in configuration advertises set_output_delay, got {:?}",
+        player.supported_commands
+    );
+    for command in ["volume", "mute"] {
+        assert!(
+            player.supported_commands.iter().any(|name| name == command),
+            "the base commands stay advertised, got {:?}",
+            player.supported_commands
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_output_delay_command_reports_the_clamped_value() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    for (requested, expected) in [(0, 0), (200, 200), (5_000, 5_000), (5_001, 5_000)] {
+        send_player_command(&server, "set_output_delay", Some(requested));
+        match next_event(&mut events).await {
+            Event::OutputDelay {
+                requested: sent,
+                applied,
+            } => {
+                assert_eq!(sent, requested);
+                assert_eq!(applied, expected, "the applied delay for {requested} ms");
+            }
+            other => panic!("expected OutputDelay for {requested} ms, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unadvertised_output_delay_command_is_ignored() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    send_player_command(&server, "set_output_delay", Some(200));
+    server.metadata("Still here", "An artist");
+    match next_event(&mut events).await {
+        Event::Track { title, .. } => assert_eq!(title, "Still here"),
+        other => panic!("an unadvertised command must be ignored, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_incomplete_output_delay_command_is_ignored() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // The advertised command without its required field: no event, no state, no disconnect.
+    server.json(r#"{"type":"server/command","payload":{"player":{"command":"set_output_delay"}}}"#);
+    server.metadata("Still here", "An artist");
+    match next_event(&mut events).await {
+        Event::Track { title, .. } => assert_eq!(title, "Still here"),
+        other => panic!("an incomplete command must be ignored, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_badly_typed_output_delay_command_is_ignored() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // A string where the field is an integer: the whole control message is dropped, as any
+    // malformed control message is, and the connection continues.
+    server.json(
+        r#"{"type":"server/command","payload":{"player":{"command":"set_output_delay","output_delay_ms":"fast"}}}"#,
+    );
+    server.metadata("Still here", "An artist");
+    match next_event(&mut events).await {
+        Event::Track { title, .. } => assert_eq!(title, "Still here"),
+        other => panic!("a malformed command must be ignored, got {other:?}"),
+    }
+
+    // A negative value does not decode into the `u32` field either: no event, no state change.
+    server.json(
+        r#"{"type":"server/command","payload":{"player":{"command":"set_output_delay","output_delay_ms":-5}}}"#,
+    );
+    server.metadata("Still here too", "An artist");
+    match next_event(&mut events).await {
+        Event::Track { title, .. } => assert_eq!(title, "Still here too"),
+        other => panic!("a negative delay must be ignored, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_applied_output_delay_is_reported_at_once() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let recordings = Recordings::default();
+    let timing = timing_handle(None, Duration::ZERO);
+    let sink = Box::new(RecordingSink::with_timing(recordings, timing.clone()));
+    let (mut events, handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+    let _first = wait_for_client_state(&mut server).await;
+
+    send_player_command(&server, "set_output_delay", Some(200));
+    match next_event(&mut events).await {
+        Event::OutputDelay { applied, .. } => assert_eq!(applied, 200),
+        other => panic!("expected OutputDelay, got {other:?}"),
+    }
+
+    // The host applies it to its output, then tells the session; nothing else triggers a report.
+    timing
+        .lock()
+        .expect("the timing lock is not poisoned")
+        .output_delay = Some(Duration::from_millis(200));
+    handle
+        .control()
+        .output_delay_applied()
+        .await
+        .expect("the player role is active");
+
+    let state = wait_for_client_state(&mut server).await;
+    let player = state.player.expect("the player object is present");
+    assert_eq!(
+        player.output_delay_ms, 200,
+        "the state carries the applied delay"
+    );
+}
+
+#[tokio::test]
+async fn an_applied_output_delay_is_reported_without_the_host_call() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let recordings = Recordings::default();
+    let timing = timing_handle(None, Duration::ZERO);
+    let sink = Box::new(RecordingSink::with_timing(recordings, timing.clone()));
+    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+    let _first = wait_for_client_state(&mut server).await;
+
+    send_player_command(&server, "set_output_delay", Some(200));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::OutputDelay { applied: 200, .. }
+    ));
+    // The host adopts the value but never calls `output_delay_applied`: the fallback read of the
+    // sink still reports it.
+    timing
+        .lock()
+        .expect("the timing lock is not poisoned")
+        .output_delay = Some(Duration::from_millis(200));
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the player object is present");
+    assert_eq!(player.output_delay_ms, 200);
+}
+
+#[tokio::test]
+async fn an_output_delay_change_with_queued_audio_keeps_the_session_operational() {
+    let mut server = FakeServer::start(ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let recordings = Recordings::default();
+    let timing = timing_handle(Some(Duration::from_millis(500)), Duration::ZERO);
+    let sink = Box::new(RecordingSink::with_timing(
+        recordings.clone(),
+        timing.clone(),
+    ));
+    let (mut events, handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+    establish_clock(&mut server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    // Two frames far enough out to stay queued while the delay changes. The metadata message
+    // follows them on the same socket, so both are queued by the time its event arrives.
+    let started = Instant::now();
+    server.audio(now_us() + 2_000_000, 2_000_000, vec![0x11; 4]);
+    server.audio(now_us() + 2_100_000, 2_100_000, vec![0x22; 4]);
+    server.metadata("queued", "queued");
+    assert!(matches!(next_event(&mut events).await, Event::Track { .. }));
+    assert!(recordings.written().is_empty(), "both frames are queued");
+
+    // The server lowers the delay: the queued frames move later by 400 ms and nothing is lost.
+    send_player_command(&server, "set_output_delay", Some(100));
+    match next_event(&mut events).await {
+        Event::OutputDelay { applied, .. } => assert_eq!(applied, 100),
+        other => panic!("expected OutputDelay, got {other:?}"),
+    }
+    timing
+        .lock()
+        .expect("the timing lock is not poisoned")
+        .output_delay = Some(Duration::from_millis(100));
+    handle
+        .control()
+        .output_delay_applied()
+        .await
+        .expect("the player role is active");
+    loop {
+        let player = wait_for_client_state(&mut server)
+            .await
+            .player
+            .expect("the player state follows the role");
+        if player.output_delay_ms == 100 {
+            break;
+        }
+    }
+
+    // The server raises it again while the frames are still queued.
+    send_player_command(&server, "set_output_delay", Some(300));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::OutputDelay { applied: 300, .. }
+    ));
+    timing
+        .lock()
+        .expect("the timing lock is not poisoned")
+        .output_delay = Some(Duration::from_millis(300));
+    handle
+        .control()
+        .output_delay_applied()
+        .await
+        .expect("the session is still operational");
+    loop {
+        let player = wait_for_client_state(&mut server)
+            .await
+            .player
+            .expect("the player state follows the role");
+        if player.output_delay_ms == 300 {
+            break;
+        }
+    }
+
+    // Both frames are still played, at the deadlines of the delay now in force (2.0 s - 300 ms).
+    let written = wait_for_writes(&recordings, 2).await;
+    assert_near(
+        written[0].due,
+        started + Duration::from_millis(1_700),
+        Duration::from_millis(150),
+        "the first frame follows the delay in force",
+    );
+    // The deadlines are computed, not measured: the second frame's follows the first by the
+    // 100 ms spacing of the timestamps, and both sit at the remapped (300 ms) position.
+    let spacing = written[1].due.duration_since(written[0].due);
+    assert!(
+        spacing >= Duration::from_millis(80) && spacing <= Duration::from_millis(120),
+        "the frames keep their 100 ms spacing, got {spacing:?}"
+    );
+    assert_near(
+        written[1].due,
+        started + Duration::from_millis(1_800),
+        Duration::from_millis(150),
+        "the second frame's deadline is remapped too",
+    );
+}
+
+#[tokio::test]
+async fn a_persisted_output_delay_is_reported_in_the_first_state() {
+    // The host restores the delay in its sink; the session reports what the sink returns, so a
+    // reconnect or restart keeps the value without the session storing anything.
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let recordings = Recordings::default();
+    let timing = timing_handle(None, Duration::ZERO);
+    timing
+        .lock()
+        .expect("the timing lock is not poisoned")
+        .output_delay = Some(Duration::from_millis(350));
+    let sink = Box::new(RecordingSink::with_timing(recordings, timing));
+    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+    let state = wait_for_client_state(&mut server).await;
+    let player = state.player.expect("the player object is present");
+    assert_eq!(player.output_delay_ms, 350);
 }
 
 #[tokio::test]

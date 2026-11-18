@@ -283,6 +283,27 @@ pub struct ClientConfig {
     ///
     /// Reported in the first `client/state`; a host without a stored state passes `false`.
     pub muted: bool,
+    /// Whether the server may set this player's output delay with `set_output_delay`.
+    ///
+    /// Off by default. A host that can change the delay after its audio port (external speakers,
+    /// an amplifier, a soundbar) opts in: the client then advertises the command, reports
+    /// [`Event::OutputDelay`](crate::Event::OutputDelay) for a command it accepts, and the host
+    /// applies the value to its sink and persists it. A host that cannot apply the command must
+    /// leave this off, because `roles/player/v1.md` lets a client advertise only what it applies.
+    ///
+    /// The command is an instruction to the host, not a value the session applies itself: the sink
+    /// remains the authority for `output_delay_ms`. Once the host applied the value it calls
+    /// [`ControlHandle::output_delay_applied`](crate::ControlHandle::output_delay_applied), and the
+    /// session reads the sink, re-maps queued deadlines and reports it. A host that never calls it
+    /// is still reported: the session reads the sink once, half a second after the command, and
+    /// sends a `client/state` if the sink adopted a new value by then. A host that applies the
+    /// value later than that must call `output_delay_applied`. Persisting the value, so it
+    /// survives restarts and reconnects, is the host's duty: the session never stores it.
+    ///
+    /// Adding this field is a 0.x break for a full `ClientConfig { .. }` literal (the changelog is
+    /// generated from the commit history at release time); [`ClientConfig::new`] and
+    /// [`ClientConfig::with_output_delay_control`] keep working.
+    pub output_delay_control: bool,
     /// Minimum start-up lead the server must give this player, in milliseconds.
     ///
     /// This is the host's own start-up cost: launching the output (`gst-launch`, `pacat`), the
@@ -435,6 +456,7 @@ impl fmt::Debug for ClientConfig {
             .field("volume_policy", &self.volume_policy)
             .field("max_backoff", &self.max_backoff)
             .field("strict_group_id", &self.strict_group_id)
+            .field("output_delay_control", &self.output_delay_control)
             .field("unpaired_access", &self.unpaired_access)
             .field("pairing_timeout", &self.pairing_timeout);
         // The static code is a credential, so it is named but never printed.
@@ -457,6 +479,13 @@ impl fmt::Debug for ClientConfig {
 }
 
 impl ClientConfig {
+    /// Lets the server set this player's output delay; see [`ClientConfig::output_delay_control`].
+    #[must_use]
+    pub fn with_output_delay_control(mut self, enabled: bool) -> Self {
+        self.output_delay_control = enabled;
+        self
+    }
+
     /// Builds a configuration for `server` with the crate's defaults.
     ///
     /// Everything a host rarely changes starts at a documented value: no device description, no
@@ -492,6 +521,8 @@ impl ClientConfig {
             // The documented tolerance is the default: a foreign group id does not close the
             // connection unless the host asks for the spec's strictness.
             strict_group_id: false,
+            // The command is advertised only by a host that opts in.
+            output_delay_control: false,
             // Earlier releases admitted every session, so the setting starts where they left off.
             unpaired_access: true,
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
@@ -643,6 +674,7 @@ mod tests {
             volume_policy: VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             strict_group_id: false,
+            output_delay_control: false,
             unpaired_access: true,
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
             #[cfg(feature = "discovery")]

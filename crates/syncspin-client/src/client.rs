@@ -450,6 +450,24 @@ pub enum Event {
         /// Mute state that was requested, absent for a volume command.
         muted: Option<bool>,
     },
+    /// The server asked this player to change its output delay.
+    ///
+    /// Sent only while [`ClientConfig::output_delay_control`] is set. A value above the protocol's
+    /// 0-5000 ms is capped to 5000 (deviation 21); a negative one is dropped with the malformed
+    /// message it arrives in. The host applies `applied` to its sink and persists it as
+    /// `roles/player/v1.md` requires. The session then reports what the sink returns in a
+    /// `client/state`: at once when the host calls [`ControlHandle::output_delay_applied`], and
+    /// otherwise from a single fallback read of the sink half a second after the command (a value
+    /// the sink has not adopted by then waits for the next timing poll, after a clock burst).
+    ///
+    /// The event follows every accepted command, also when `applied` equals the delay already in
+    /// force, so a host must tolerate repeats.
+    OutputDelay {
+        /// Delay the server asked for, as it arrived on the wire.
+        requested: u32,
+        /// Delay the host should apply, always in the range 0-5000 ms.
+        applied: u32,
+    },
     /// A pairing completed and the record is stored.
     ///
     /// Reported after `server/pair-finalize`, once [`Storage`](crate::storage::Storage) accepted
@@ -613,6 +631,11 @@ impl fmt::Debug for Event {
                 .field("requested", requested)
                 .field("applied", applied)
                 .field("muted", muted)
+                .finish(),
+            Self::OutputDelay { requested, applied } => formatter
+                .debug_struct("OutputDelay")
+                .field("requested", requested)
+                .field("applied", applied)
                 .finish(),
             Self::Paired { server_id } => formatter
                 .debug_struct("Paired")
@@ -856,6 +879,25 @@ impl ControlHandle {
             .map(|_level| ())
     }
 
+    /// Tells the session that the host applied an output delay, so it reports the new value.
+    ///
+    /// The host calls this after it applied the delay from [`Event::OutputDelay`] to its sink and
+    /// persisted it. The session reads [`Sink::output_delay`], re-maps the queued deadlines and
+    /// sends a `client/state` at once when the sink's timing differs from what was last reported,
+    /// so the server recomputes its send-ahead from the value in force. Without the call the
+    /// session makes one fallback read of the sink half a second after a server command; a host
+    /// that applies the value later, or that changes the delay on its own without a server
+    /// command, must call this, or the report waits for the next timing poll after a clock burst.
+    ///
+    /// # Errors
+    /// Returns an error for a connection that has ended, and when the server did not activate
+    /// `player@v1`.
+    pub async fn output_delay_applied(&self) -> Result<()> {
+        self.send(ControlAction::OutputDelayApplied)
+            .await
+            .map(|_level| ())
+    }
+
     /// Sets the mute state without changing the level.
     ///
     /// The reported level therefore stays what it was, and the server sees the mute in the
@@ -987,6 +1029,8 @@ pub(crate) enum ControlAction {
     ReportVolume(u8),
     /// Set the mute state, keeping the level.
     Mute(bool),
+    /// The host applied an output delay to its sink: read it and report it.
+    OutputDelayApplied,
     /// Whether the connection admits an unpaired session, applied to the shared value.
     SetUnpairedAccess(bool),
     /// Open a pairing window for this connection and start a waiting static-code attempt.
@@ -1646,6 +1690,7 @@ mod tests {
                 volume_policy: VolumePolicy::default(),
                 max_backoff: Duration::from_secs(30),
                 strict_group_id: false,
+                output_delay_control: false,
                 unpaired_access: true,
                 required_lead_time_ms: 250,
                 min_buffer_ms: None,

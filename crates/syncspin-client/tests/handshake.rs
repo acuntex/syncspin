@@ -44,6 +44,7 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         volume_policy: VolumePolicy::default(),
         max_backoff: Duration::from_secs(1),
         strict_group_id: false,
+        output_delay_control: false,
         unpaired_access: true,
         required_lead_time_ms: 250,
         min_buffer_ms: None,
