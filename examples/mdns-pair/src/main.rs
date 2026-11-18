@@ -31,6 +31,7 @@ mod sink;
 #[cfg(feature = "mdns")]
 use std::net::SocketAddr;
 use std::process::ExitCode;
+#[cfg(any(feature = "mdns", test))]
 use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(feature = "mdns")]
 use std::sync::Arc;
@@ -55,6 +56,7 @@ use tokio::time::timeout;
 use crate::advertise_only::AdvertiseOnly;
 #[cfg(feature = "mdns")]
 use crate::find::timeout_message;
+#[cfg(any(feature = "mdns", test))]
 use crate::find::Stage;
 use crate::sink::Counters;
 #[cfg(any(feature = "mdns", test))]
