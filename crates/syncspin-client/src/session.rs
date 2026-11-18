@@ -2761,8 +2761,10 @@ impl Session<'_> {
                         .any(|advertised| advertised == command) =>
             {
                 // The field is required for this command; a missing one is ignored like any other
-                // incomplete player command. A value outside the fixed 0-5000 range is a protocol
-                // error: `messaging.md` has the receiver close the connection.
+                // incomplete player command. A value above 5000 is outside the fixed range and a
+                // protocol error: `messaging.md` has the receiver close the connection. A negative
+                // or non-integer value never gets here: the `u32` field fails to decode and the
+                // whole message is ignored as malformed (deviation 15).
                 let Some(delay_ms) = player.output_delay_ms else {
                     return Ok(());
                 };

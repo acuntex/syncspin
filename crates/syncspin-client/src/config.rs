@@ -452,6 +452,7 @@ impl fmt::Debug for ClientConfig {
             .field("volume_policy", &self.volume_policy)
             .field("max_backoff", &self.max_backoff)
             .field("strict_group_id", &self.strict_group_id)
+            .field("output_delay_control", &self.output_delay_control)
             .field("unpaired_access", &self.unpaired_access)
             .field("pairing_timeout", &self.pairing_timeout);
         // The static code is a credential, so it is named but never printed.

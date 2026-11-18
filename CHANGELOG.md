@@ -6,16 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 
-## [Unreleased]
-
-### Added
-
-- **client:** `ClientConfig::output_delay_control` advertises `set_output_delay`; an accepted command is reported as `Event::OutputDelay`, and `ControlHandle::output_delay_applied` makes the session read the sink and send a `client/state`. A value outside 0-5000 ms ends the connection.
-
-### Changed
-
-- `ClientConfig` gains `output_delay_control`, one 0.x break for full struct literals; `ClientConfig::new` and `with_output_delay_control` keep working.
-
 ## [0.4.0] - 2026-11-18
 
 ### Added

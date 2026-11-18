@@ -453,7 +453,8 @@ pub enum Event {
     /// The server asked this player to change its output delay.
     ///
     /// Sent only while [`ClientConfig::output_delay_control`] is set, and only for a value inside
-    /// the protocol's 0-5000 ms; an out-of-range request is a protocol error that ends the connection. The host applies `delay_ms`
+    /// the protocol's 0-5000 ms; a value above 5000 is a protocol error that ends the connection, and a
+    /// negative one is dropped with the malformed message it arrives in. The host applies `delay_ms`
     /// to its sink, persists it as `roles/player/v1.md` requires, and then calls
     /// [`ControlHandle::output_delay_applied`], which reads the sink and reports the value to the
     /// server in a `client/state`.
