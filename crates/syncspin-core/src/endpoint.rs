@@ -95,8 +95,10 @@ fn is_local_ip(ip: IpAddr) -> bool {
 
 /// The IPv4 address an IPv6 one embeds, for the mapped, compatible and NAT64 forms.
 fn embedded_ipv4(ip: Ipv6Addr) -> Option<std::net::Ipv4Addr> {
-    let [a, b, c, d, e, f, g, h] = ip.segments();
-    let inner = std::net::Ipv4Addr::new((g >> 8) as u8, g as u8, (h >> 8) as u8, h as u8);
+    let [a, b, c, d, e, f, _, _] = ip.segments();
+    // The last four octets, taken as they are: no shift or mask for a mutant to hide in.
+    let [.., o1, o2, o3, o4] = ip.octets();
+    let inner = std::net::Ipv4Addr::new(o1, o2, o3, o4);
     let mapped = [a, b, c, d, e] == [0, 0, 0, 0, 0] && f == 0xffff;
     let compatible = [a, b, c, d, e, f] == [0; 6];
     let nat64 = [a, b, c, d, e, f] == [0x64, 0xff9b, 0, 0, 0, 0];
@@ -132,7 +134,7 @@ mod tests {
         }
     }
 
-    /// The embedded address is taken whole: a shift that keeps only the low byte would still
+    /// The embedded address is taken whole: an extraction that kept only one byte would still
     /// pass the local-address tests, because loopback depends on the first octet alone.
     #[test]
     fn an_embedded_ipv4_is_extracted_whole() {
@@ -187,6 +189,7 @@ mod tests {
             "192.0.2.1",
             "192.0.2.1:abc",
             "[1:2:3:4:5:ffff:7f00:1]:8927",
+            "[::1:7f00:1]:8927",
             "[2001:db8::1]:8927",
             "[fe80::1%eth0]:8927",
             "[64:ff9b::c000:201]:8927",
