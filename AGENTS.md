@@ -15,11 +15,13 @@ This file is for agents and contributors working in this repository.
 | `crates/syncspin-server/` | Listener, one group, roles, streams, pairing and discovery (`0.2`).             |
 | `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr.               |
 | `examples/server-demo/`   | Runnable reference server: approves one client and streams a tone.              |
+| `examples/mdns-pair/`     | One-command mDNS smoke test: advertises, discovers, approves, streams, exits.   |
 | `docs/`                   | Design, spec deviations and the testing handbook.                               |
 
 `player-pipe` is the reference `Sink`: it shows the event loop, the identity file and the reconnect
 policy without device code. `server-demo` is the reference host: it shows the approval gate, the
-event loop and the push data plane, and holds no files.
+event loop and the push data plane, and holds no files. `mdns-pair` is the smoke test: both roles in
+one process, two mDNS daemons, and a format-and-byte gate that decides the exit code.
 
 **Layering rule:** `syncspin-core` never imports `syncspin-client` or `syncspin-server`, and it
 never knows a transport. A dependency pointing from core towards a crate is a bug, not a shortcut.
@@ -29,6 +31,7 @@ never knows a transport. A dependency pointing from core towards a crate is a bu
 ```sh
 cargo test --workspace --locked
 cargo test --workspace --features pairing-code,storage-file --locked
+cargo test -p mdns-pair --features mdns --locked        # the flow behind mdns-pair's own feature
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 cargo package -p syncspin-core --locked                 # publishability, before a release
@@ -75,7 +78,9 @@ here rather than a preference.
   do not exist yet: the only tables today are `storage-file` (client), `pairing-code`
   (core/client/server), `discovery` (client) and `mdns` (client/server). `storage-file` is off in
   `syncspin-client` but on in `player-pipe`, so a workspace build enables it through feature
-  unification; `pairing-code`, `discovery` and `mdns` are off unless requested.
+  unification; `pairing-code`, `discovery` and `mdns` are off unless requested. `mdns-pair` has its
+  own `mdns` feature, which forwards to the client and server ones and is off by default: the flow
+  is built only with `--features mdns`.
 - **MSRV 1.85.** A dependency that demands more is pinned or replaced, not silently accepted; the
   `msrv` CI job is the gate.
 - **Names and licence are fixed:** crates `syncspin-core`, `syncspin-client` and `syncspin-server`;

@@ -198,17 +198,11 @@ impl ServerConfig {
                 self.name.len()
             );
         }
-        if !self.path.starts_with('/') || self.path.starts_with("//") {
+        if !syncspin_core::endpoint::is_path_absolute(&self.path) {
             bail!(
                 "the endpoint path {:?} is not a `path-absolute` (RFC 3986, section 3.3): it must \
-                 start with one `/` and not with `//`",
-                self.path
-            );
-        }
-        if self.path.contains('?') || self.path.contains('#') {
-            bail!(
-                "the endpoint path {:?} carries a query or a fragment, which is not part of a \
-                 `path-absolute`",
+                 start with one `/`, not `//`, and hold only unreserved characters, percent-encoded \
+                 octets, sub-delimiters, `:` and `@` - no query, fragment or space",
                 self.path
             );
         }

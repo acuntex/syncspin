@@ -1,0 +1,21 @@
+[package]
+name = "mdns-pair"
+description = "Example: one process discovers its own server over mDNS and streams to a counting sink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# The example's single mode: both roles need their mDNS backend. Off by default, so a plain
+# `cargo test --workspace` builds the crates without `mdns`, as no member enables it.
+mdns = ["syncspin-client/mdns", "syncspin-server/mdns"]
+
+[dependencies]
+syncspin-client = { version = "0.4.0", path = "../../crates/syncspin-client" }
+syncspin-server = { version = "0.4.0", path = "../../crates/syncspin-server" }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

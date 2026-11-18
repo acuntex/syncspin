@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use syncspin_core::endpoint::{is_local_address, is_path_absolute};
 use tokio::net::TcpStream;
 
 /// Service type a client publishes when it waits for a server to connect.
@@ -107,8 +108,11 @@ impl DiscoveredServer {
     /// The scheme is `ws://` even though the path is advertised: `connection.md` requires a
     /// connection to an advertised address to use plain `ws://`, with confidentiality and integrity
     /// provided by the Noise layer inside the payloads. An address that carries a scheme already,
-    /// a missing address and a path that is not `path-absolute` (RFC 3986) all yield nothing,
-    /// because dialling them would mean guessing what the advertiser meant.
+    /// a missing address, a path that is not `path-absolute` (RFC 3986) and a loopback or
+    /// unspecified address all yield nothing: the first three would mean guessing what the
+    /// advertiser meant, and `connection.md` says a client SHOULD NOT dial the last. The rule has no
+    /// opt-out: a test that needs a record to resolve uses a non-loopback address, such as one from
+    /// the documentation range `192.0.2.0/24`.
     ///
     /// An mDNS record commonly resolves to several addresses for one service - a dual-stack host
     /// publishes both. The IPv4 addresses come first so a server that listens on a single IPv4
@@ -125,17 +129,22 @@ impl DiscoveredServer {
 
     /// Returns the usable addresses, IPv4 first.
     ///
-    /// The path rule is part of the address rule because an endpoint is only dialable when both
-    /// hold; a record with a relative path yields no candidates at all.
+    /// Two rules of `connection.md` decide what is usable. The `path` must match the
+    /// `path-absolute` rule of RFC 3986, and an address must not be a loopback or unspecified one:
+    /// a record any LAN host can publish could otherwise point the client at a port on its own
+    /// machine. The path rule is part of the address rule because an endpoint is only dialable when
+    /// both hold; a record with a bad path yields no candidates at all. An address that is not a
+    /// literal socket address is kept, apart from the loopback host names
+    /// [`is_local_address`] lists, and the probe decides.
     fn ordered_addresses(&self) -> Vec<&str> {
-        if !self.path.starts_with('/') || self.path.starts_with("//") {
+        if !is_path_absolute(&self.path) {
             return Vec::new();
         }
         let mut addresses: Vec<&str> = self
             .addresses
             .iter()
             .map(String::as_str)
-            .filter(|address| !address.contains("://"))
+            .filter(|address| !address.contains("://") && !is_local_address(address))
             .collect();
         // A stable sort keeps the browser's order inside each family. A host name that is not a
         // literal socket address sorts with IPv6, after the addresses that are certainly IPv4.
@@ -144,6 +153,14 @@ impl DiscoveredServer {
             _ => 1u8,
         });
         addresses
+    }
+
+    /// Returns `(address, endpoint)` for every usable address, in dialling order.
+    fn candidates(&self) -> Vec<(String, String)> {
+        self.ordered_addresses()
+            .into_iter()
+            .map(|address| (address.to_owned(), format!("ws://{address}{}", self.path)))
+            .collect()
     }
 }
 
@@ -173,40 +190,81 @@ pub async fn discover_reachable_endpoint(discovery: &dyn Discovery) -> Result<St
     let servers = discover_servers(discovery)?;
     let candidates: Vec<(String, String)> = servers
         .iter()
-        .flat_map(|server| {
-            server
-                .ordered_addresses()
-                .into_iter()
-                .map(|address| (address.to_owned(), format!("ws://{address}{}", server.path)))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(DiscoveredServer::candidates)
         .collect();
-    if candidates.is_empty() {
-        bail!(
+    walk(
+        candidates,
+        PROBE_TIMEOUT,
+        &format!(
             "no server advertised {SERVER_SERVICE_TYPE} with a dialable address; start one with \
              `server-demo --mdns` or pass --server"
-        );
-    }
+        ),
+        "none of the discovered servers accepted a connection",
+    )
+    .await
+}
+
+/// Probes `candidates` in order and returns the endpoint of the first address that accepts.
+///
+/// Each candidate is `(address, endpoint)`. The error carries one line per failed attempt.
+async fn first_accepting(
+    candidates: Vec<(String, String)>,
+    timeout: Duration,
+) -> Result<String, Vec<String>> {
     let mut failures = Vec::new();
     for (address, endpoint) in candidates {
-        match probe(&address).await {
+        match probe(&address, timeout).await {
             Ok(()) => return Ok(endpoint),
             Err(error) => failures.push(format!("{address}: {error:#}")),
         }
     }
-    bail!(
-        "none of the discovered servers accepted a connection ({})",
-        failures.join("; ")
-    )
+    Err(failures)
 }
 
 /// Opens and immediately drops one TCP connection, to tell a reachable address from a dead one.
-async fn probe(address: &str) -> Result<()> {
+async fn probe(address: &str, timeout: Duration) -> Result<()> {
     // Dropping the stream closes the probe; it only decides reachability.
-    tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(address))
+    tokio::time::timeout(timeout, TcpStream::connect(address))
         .await
-        .with_context(|| format!("no answer within {} s", PROBE_TIMEOUT.as_secs()))??;
+        .with_context(|| format!("no answer within {} ms", timeout.as_millis()))??;
     Ok(())
+}
+
+/// Returns the first endpoint of one `server` record that accepts a TCP connection.
+///
+/// This is [`discover_reachable_endpoint`] for a host that has already chosen the record, for
+/// example by its `name`: the same IPv4-first walk and the same probe, with `timeout` as the budget
+/// for each address instead of the library's default.
+///
+/// # Errors
+/// Returns an error when the record names no dialable endpoint, and one naming every attempt when
+/// all addresses refused or timed out.
+pub async fn reachable_endpoint(server: &DiscoveredServer, timeout: Duration) -> Result<String> {
+    walk(
+        server.candidates(),
+        timeout,
+        "the record names no dialable endpoint",
+        "no address accepted a connection",
+    )
+    .await
+}
+
+/// Probes `candidates`; `empty` is the error for no candidates at all, and `failed` prefixes the
+/// list of attempts when none accepts.
+///
+/// Both entry points share this, so the walk and the shape of the error stay in one place.
+async fn walk(
+    candidates: Vec<(String, String)>,
+    timeout: Duration,
+    empty: &str,
+    failed: &str,
+) -> Result<String> {
+    if candidates.is_empty() {
+        bail!("{empty}");
+    }
+    first_accepting(candidates, timeout)
+        .await
+        .map_err(|failures| anyhow::anyhow!("{failed} ({})", failures.join("; ")))
 }
 
 /// How a service is published and how remote ones are found.
@@ -767,6 +825,81 @@ mod tests {
         );
     }
 
+    /// The probe walks the candidates in order and returns the first that answers.
+    #[tokio::test]
+    async fn the_probe_walks_past_a_dead_address() {
+        // An owned loopback listener, so the probe has something that accepts and closes. The
+        // public entry points refuse loopback records, so the walk is driven directly.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a loopback listener");
+        let address = listener.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let endpoint = first_accepting(
+            vec![
+                ("127.0.0.1:1".to_owned(), "ws://dead/sendspin".to_owned()),
+                (address.to_string(), format!("ws://{address}/sendspin")),
+            ],
+            Duration::from_millis(200),
+        )
+        .await
+        .expect("the second address accepts");
+        assert_eq!(endpoint, format!("ws://{address}/sendspin"));
+
+        let failures = first_accepting(
+            vec![("127.0.0.1:1".to_owned(), "ws://dead/sendspin".to_owned())],
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("an address that refuses is not a candidate");
+        assert_eq!(failures.len(), 1);
+    }
+
+    /// A record the spec says not to dial names no endpoint, so `reachable_endpoint` refuses it
+    /// without opening a socket.
+    #[tokio::test]
+    async fn reachable_endpoint_refuses_records_the_spec_says_not_to_dial() {
+        for (address, path) in [
+            ("127.0.0.1:8927", "/sendspin"),
+            ("[::1]:8927", "/sendspin"),
+            ("0.0.0.0:8927", "/sendspin"),
+            ("[::]:8927", "/sendspin"),
+            ("[::ffff:127.0.0.1]:8927", "/sendspin"),
+            ("[::ffff:0.0.0.0]:8927", "/sendspin"),
+            ("localhost:8927", "/sendspin"),
+            ("kitchen.localhost:8927", "/sendspin"),
+            ("localhost.localdomain:8927", "/sendspin"),
+            ("127.1:8927", "/sendspin"),
+            ("0x7f.1:8927", "/sendspin"),
+            ("2130706433:8927", "/sendspin"),
+            ("192.0.2.1:8927", "sendspin"),
+            ("192.0.2.1:8927", "//sendspin"),
+            ("192.0.2.1:8927", "/sendspin?x=1"),
+            ("192.0.2.1:8927", "/sendspin#frag"),
+            ("192.0.2.1:8927", "/send spin"),
+            ("192.0.2.1:8927", "/send%2"),
+        ] {
+            let record = DiscoveredServer {
+                addresses: vec![address.to_owned()],
+                path: path.to_owned(),
+                name: None,
+            };
+            assert!(record.endpoints().is_empty(), "{address} {path}");
+            let error = reachable_endpoint(&record, Duration::from_millis(50))
+                .await
+                .expect_err("nothing to dial");
+            assert!(
+                error.to_string().contains("no dialable endpoint"),
+                "{error}"
+            );
+        }
+    }
+
     /// A discovered record becomes a plain `ws://` endpoint, and nothing else.
     #[test]
     fn a_discovered_server_builds_a_plain_ws_endpoint() {
@@ -859,17 +992,15 @@ mod tests {
         let refusing = closed.local_addr().expect("the bound address is readable");
         drop(closed);
 
-        let discovery = MemoryDiscovery {
-            servers: vec![DiscoveredServer {
-                addresses: vec![refusing.to_string(), accepting.to_string()],
-                path: "/sendspin".to_owned(),
-                name: Some("A server".to_owned()),
-            }],
-            ..MemoryDiscovery::default()
-        };
-        let endpoint = discover_reachable_endpoint(&discovery)
-            .await
-            .expect("the second address accepts");
+        let endpoint = first_accepting(
+            vec![
+                (refusing.to_string(), format!("ws://{refusing}/sendspin")),
+                (accepting.to_string(), format!("ws://{accepting}/sendspin")),
+            ],
+            PROBE_TIMEOUT,
+        )
+        .await
+        .expect("the second address accepts");
         assert_eq!(endpoint, format!("ws://{accepting}/sendspin"));
         accept.await.expect("the accepting task finishes");
     }
@@ -894,18 +1025,18 @@ mod tests {
         drop(first_listener);
         drop(second_listener);
 
-        let discovery = MemoryDiscovery {
-            servers: vec![DiscoveredServer {
-                addresses: vec![first.to_string(), second.to_string()],
-                path: "/sendspin".to_owned(),
-                name: None,
-            }],
-            ..MemoryDiscovery::default()
-        };
-        let Err(error) = discover_reachable_endpoint(&discovery).await else {
+        let Err(failures) = first_accepting(
+            vec![
+                (first.to_string(), format!("ws://{first}/sendspin")),
+                (second.to_string(), format!("ws://{second}/sendspin")),
+            ],
+            PROBE_TIMEOUT,
+        )
+        .await
+        else {
             panic!("both addresses refuse");
         };
-        let text = format!("{error:#}");
+        let text = failures.join("; ");
         assert!(text.contains(&first.to_string()), "got: {text}");
         assert!(text.contains(&second.to_string()), "got: {text}");
     }

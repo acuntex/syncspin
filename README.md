@@ -30,13 +30,14 @@ project; the name describes only the protocol the code speaks.
 
 ## Crates
 
-| Path                      | Version                                                                                                       | Contents                                                                        |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| `crates/syncspin-core/`   | [![crates.io](https://img.shields.io/crates/v/syncspin-core.svg)](https://crates.io/crates/syncspin-core)     | Noise handshake, framing, messages, clock filter. No transport, no device code. |
-| `crates/syncspin-client/` | [![crates.io](https://img.shields.io/crates/v/syncspin-client.svg)](https://crates.io/crates/syncspin-client) | Session loop, `Sink` trait, event stream, pairing and its `Storage` trait.      |
-| `crates/syncspin-server/` | [![crates.io](https://img.shields.io/crates/v/syncspin-server.svg)](https://crates.io/crates/syncspin-server) | Listener, one group, roles, host-fed streams, pairing and discovery.            |
-| `examples/player-pipe/`   | —                                                                                                             | Runnable reference player: PCM on stdout, status lines on stderr, pairing.      |
-| `examples/server-demo/`   | —                                                                                                             | Runnable reference server: approves the first client and streams a tone.        |
+| Path                      | Version                                                                                                       | Contents                                                                                |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `crates/syncspin-core/`   | [![crates.io](https://img.shields.io/crates/v/syncspin-core.svg)](https://crates.io/crates/syncspin-core)     | Noise handshake, framing, messages, clock filter. No transport, no device code.         |
+| `crates/syncspin-client/` | [![crates.io](https://img.shields.io/crates/v/syncspin-client.svg)](https://crates.io/crates/syncspin-client) | Session loop, `Sink` trait, event stream, pairing and its `Storage` trait.              |
+| `crates/syncspin-server/` | [![crates.io](https://img.shields.io/crates/v/syncspin-server.svg)](https://crates.io/crates/syncspin-server) | Listener, one group, roles, host-fed streams, pairing and discovery.                    |
+| `examples/player-pipe/`   | —                                                                                                             | Runnable reference player: PCM on stdout, status lines on stderr, pairing.              |
+| `examples/server-demo/`   | —                                                                                                             | Runnable reference server: approves the first client and streams a tone.                |
+| `examples/mdns-pair/`     | —                                                                                                             | One-command mDNS smoke test: advertises, discovers, approves and streams one short run. |
 
 `syncspin-core` never depends on `syncspin-client` or `syncspin-server`; every protocol and crypto
 decision lives in one place.
@@ -52,8 +53,8 @@ syncspin-server = "0.4.0"
 Every release is tagged, and the tag carries the source it was published from. `syncspin-core` is
 published first; the other two depend on it through the registry.
 
-The two examples can talk to each other, with no music server in between. Start the demo server and
-note the address it prints:
+`server-demo` and `player-pipe` can talk to each other, with no music server in between. Start the
+demo server and note the address it prints:
 
 ```sh
 cargo run -p server-demo
@@ -82,9 +83,11 @@ directly and keep it out of logs and issues. A server that admits unpaired clien
 player as a guest. `--features pairing-code` adds `--static-code` and `--open-window` for the static
 code flow.
 
-Both examples are meant to be read. `player-pipe/src/main.rs` holds the event loop, the identity
+The examples are meant to be read. `player-pipe/src/main.rs` holds the event loop, the identity
 handling and the pairing token, and `player-pipe/src/pipe_sink.rs` the `Sink` implementation.
 `server-demo/src/main.rs` holds the approval gate, the event loop and the push data plane.
+`mdns-pair/src/main.rs` runs a whole discovery, approval and stream pass in one process, and exits
+on the format and the byte count; run it with `cargo run -p mdns-pair --features mdns`.
 
 ## What works today
 

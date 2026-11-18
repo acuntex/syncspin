@@ -36,9 +36,8 @@ const BROWSE_WINDOW: Duration = Duration::from_secs(1);
 /// The mDNS implementation of [`Discovery`].
 ///
 /// One daemon serves both directions. A host creates it once, passes it to
-/// [`ClientConfig::inbound`](crate::ClientConfig::inbound) or to
-/// [`discover_servers`](super::discover_servers), and keeps it alive for as long as discovery
-/// should work: dropping it shuts the daemon down.
+/// `ClientConfig::inbound` or to [`discover_servers`](super::discover_servers), and keeps it alive
+/// for as long as discovery should work: dropping it shuts the daemon down.
 pub struct MdnsDiscovery {
     /// The library's daemon, cloned into every call that talks to it.
     daemon: ServiceDaemon,

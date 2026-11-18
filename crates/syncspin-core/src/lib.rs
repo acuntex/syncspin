@@ -13,6 +13,7 @@
 //! the `syncspin-client` and `syncspin-server` crates.
 
 pub mod clock;
+pub mod endpoint;
 pub mod framing;
 pub mod messages;
 pub mod noise;

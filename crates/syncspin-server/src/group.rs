@@ -56,10 +56,11 @@ const PLAYBACK_ACTIVITY: &str = "playback";
 
 /// How far ahead of now the first sample of a stream is scheduled.
 ///
-/// The specification derives this lead from each player's `required_lead_time_ms` and
-/// `min_buffer_ms`; the group schedules one shared timeline for every member, so it uses one fixed
-/// lead for all of them. Doing better means announcing the stream at the slowest ready player's
-/// reported lead, which is the change `docs/spec-deviations.md` names.
+/// The specification requires at least `min_buffer_ms` + `output_delay_ms` per player, and the
+/// maximum across the group for grouped playback; the group schedules one shared timeline for every
+/// member, so it uses one fixed lead for all of them. Doing better means deriving the lead from
+/// the largest of those values among the ready players, which is the change
+/// `docs/spec-deviations.md` names.
 pub(crate) const START_LEAD: Duration = Duration::from_millis(200);
 
 /// The controller commands the group acts on itself.

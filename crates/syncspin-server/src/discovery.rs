@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use syncspin_core::endpoint::is_path_absolute;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -86,15 +87,17 @@ impl DiscoveredClient {
     /// The scheme is `ws://` even though the path is advertised: `connection.md` requires a
     /// connection to an advertised address to use plain `ws://`, with confidentiality and integrity
     /// provided by the Noise layer inside the payloads. An address that carries a scheme already,
-    /// a missing address and a path that is not `path-absolute` (RFC 3986) all yield `None`,
-    /// because dialling them would mean guessing what the advertiser meant.
+    /// a missing address and a path that is not `path-absolute` (RFC 3986, so no query, fragment or
+    /// space) all yield `None`, because dialling them would mean guessing what the advertiser
+    /// meant. A loopback or unspecified address is not refused here: the mDNS backend drops those
+    /// before a record exists, and a test's fake may deliberately report a loopback endpoint.
     #[must_use]
     pub fn endpoint(&self) -> Option<String> {
-        let address = self.addresses.first()?;
-        if address.contains("://") {
+        if !is_path_absolute(&self.path) {
             return None;
         }
-        if !self.path.starts_with('/') || self.path.starts_with("//") {
+        let address = self.addresses.first()?;
+        if address.contains("://") {
             return None;
         }
         Some(format!("ws://{address}{}", self.path))
@@ -128,9 +131,11 @@ pub trait Discovery: Send + Sync {
 /// Returns the clients `discovery` currently reports.
 ///
 /// This is the browsing half of the server-initiated mode: the server dials every
-/// [`DiscoveredClient::endpoint`] it does not already serve. A host that implements the trait over
-/// mDNS should filter loopback and unspecified addresses, as `connection.md` recommends; the
-/// crate does not filter here, because a test's fake may deliberately report a loopback endpoint.
+/// [`DiscoveredClient::endpoint`] it does not already serve. The record is returned as the backend
+/// reported it; [`DiscoveredClient::endpoint`] is where a path that is not a `path-absolute` is
+/// refused. A host that implements the trait over mDNS should filter loopback and unspecified
+/// addresses, as `connection.md` recommends; the crate does not filter here, because a test's fake
+/// may deliberately report a loopback endpoint.
 ///
 /// # Errors
 /// Returns the backend's error, and nothing when it cannot browse at all; an empty list means no
@@ -300,6 +305,14 @@ mod tests {
             },
             DiscoveredClient {
                 path: "//sendspin".to_owned(),
+                ..client.clone()
+            },
+            DiscoveredClient {
+                path: "/sendspin?x=1".to_owned(),
+                ..client.clone()
+            },
+            DiscoveredClient {
+                path: "/send spin".to_owned(),
                 ..client.clone()
             },
             DiscoveredClient {

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use syncspin_core::messages::{
-    ClientCommand, ControllerCommand, ServerError, ServerState, StreamEnd,
+    ClientCommand, ControllerCommand, Incoming, ServerError, ServerState, StreamEnd,
 };
 use syncspin_server::TrackInfo;
 #[tokio::test]
@@ -239,6 +239,37 @@ async fn a_closed_socket_is_reported_as_a_leave() -> Result<()> {
         }
     );
     server.shutdown().await?;
+    Ok(())
+}
+
+/// A client that vanishes right after the handshake may break the first activation. Whichever way
+/// the connection ends, the host that saw `ClientConnected` gets exactly one `ClientLeft`.
+#[tokio::test]
+async fn a_client_that_vanishes_before_activation_still_leaves_once() -> Result<()> {
+    let (server, port, mut events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.handshake(Suite::ChaChaPoly).await?;
+    // The hello makes the server announce the connection; the socket goes before the activation
+    // is read, so the server's first write may already fail.
+    client.send_json(&client_hello()).await?;
+    client.close().await?;
+
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    loop {
+        match next_event(&mut events).await {
+            Event::ClientLeft { .. } => break,
+            Event::ClientActivated { .. } => {}
+            other => panic!("expected ClientLeft, got {other:?}"),
+        }
+    }
+    server.shutdown().await?;
+    assert!(
+        events.next().await.is_none(),
+        "no second ClientLeft follows the first"
+    );
     Ok(())
 }
 
@@ -802,6 +833,42 @@ async fn two_players_receive_the_same_frames() -> Result<()> {
     writer.end();
     first.goodbye("shutdown").await?;
     second.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_start_lead_ignores_the_reported_timing() -> Result<()> {
+    // Pins `docs/spec-deviations.md`, entry 17: the group schedules one fixed lead and does not
+    // derive it from `min_buffer_ms` + `output_delay_ms`. When the group starts honouring them,
+    // this test is the one to change.
+    let (server, port, _events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.handshake(Suite::ChaChaPoly).await?;
+    client.activate().await?;
+    server.approve(&client.identity.public_base64()).await?;
+    client.read_activate(|_| true).await?;
+    let Incoming::ClientState(mut state) = player_state(true, 100, false) else {
+        unreachable!("player_state builds a client/state");
+    };
+    let player = state.player.as_mut().expect("the player object is present");
+    player.min_buffer_ms = 3_000;
+    player.output_delay_ms = 500;
+    player.required_lead_time_ms = 3_000;
+    client.send_json(&Incoming::ClientState(state)).await?;
+
+    let mut writer = server.open_stream(TrackInfo::default());
+    client.read_stream_start().await?;
+    writer.write(&[0u8; 480 * 4]);
+    let (header, _payload) = client.read_audio().await?;
+    assert!(
+        (100_000..=200_000).contains(&header.send_ahead),
+        "the first chunk is sent about the fixed 200 ms ahead, not the reported 3500 ms, got {} us",
+        header.send_ahead
+    );
+
+    writer.end();
+    client.goodbye("shutdown").await?;
     server.shutdown().await?;
     Ok(())
 }

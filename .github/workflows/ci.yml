@@ -74,6 +74,10 @@ jobs:
         run: cargo test --workspace --features pairing-code,storage-file --locked
       - name: cargo test (library defaults)
         run: cargo test -p syncspin-core -p syncspin-client --locked
+      # The mDNS flow of `mdns-pair` is behind its own feature, so none of the runs
+      # above builds or tests it. The tests need no multicast socket.
+      - name: cargo test (mdns-pair flow)
+        run: cargo test -p mdns-pair --features mdns --locked
 
   msrv:
     name: msrv
