@@ -70,8 +70,9 @@ const DEFAULT_NAME: &str = "mdns-pair";
 /// Seconds of discovery and stream budget unless `--timeout` says otherwise.
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
-/// Shortest accepted budget; below a second, no mDNS query completes.
-const MIN_TIMEOUT_SECS: u64 = 1;
+/// Shortest accepted budget: a browse alone blocks for about a second, so a smaller budget cannot
+/// cover discovery, the connection and the frame gate.
+const MIN_TIMEOUT_SECS: u64 = 5;
 
 /// Longest accepted budget; a smoke test that waits longer has hung, not failed slowly.
 const MAX_TIMEOUT_SECS: u64 = 120;
@@ -535,10 +536,10 @@ mod tests {
 
     #[test]
     fn flags_accept_inline_and_separate_values() {
-        let inline = options(&["--name=Kitchen", "--timeout=3"]);
+        let inline = options(&["--name=Kitchen", "--timeout=5"]);
         assert_eq!(inline.name, "Kitchen");
         assert!(inline.explicit_name);
-        assert_eq!(inline.timeout, Duration::from_secs(3));
+        assert_eq!(inline.timeout, Duration::from_secs(5));
 
         let separate = options(&["--name", "Hall", "--timeout", "7"]);
         assert_eq!(separate.name, "Hall");
@@ -547,13 +548,13 @@ mod tests {
 
     #[test]
     fn the_timeout_is_bounded() {
-        for value in ["0", "121", "not-a-number"] {
+        for value in ["0", "1", "4", "121", "not-a-number"] {
             assert!(
                 parse(&["--timeout", value]).is_err(),
                 "{value:?} must be rejected"
             );
         }
-        assert!(parse(&["--timeout", "1"]).is_ok());
+        assert!(parse(&["--timeout", "5"]).is_ok());
         assert!(parse(&["--timeout", "120"]).is_ok());
     }
 
