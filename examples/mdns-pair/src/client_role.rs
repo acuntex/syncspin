@@ -1,9 +1,11 @@
 //! The client half of the run: browse for this run's record, dial it, wait for the session.
 //!
-//! The browse blocks its worker for one second per attempt, which is why the run's runtime has a
-//! second worker for the server. `connect` only schedules the attempt; the outcome arrives on the
-//! event stream, and this module turns the first `Connected` into the handle the run drives.
+//! The browse is a synchronous call that takes up to the backend's one-second window, so it runs on
+//! the blocking pool instead of an async worker. `connect` only schedules the attempt; the outcome
+//! arrives on the event stream, and this module turns the first `Connected` into the handle the
+//! run drives.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -31,14 +33,20 @@ const RETRY_PAUSE: Duration = Duration::from_millis(200);
 pub async fn discover(run_name: &str, budget: Duration) -> Result<String> {
     // This is the client's own daemon, a separate mDNS stack from the server's: the run exists to
     // exercise the advertisement and the browse as two peers see them.
-    let discovery = ClientMdns::new().context("failed to start the mDNS daemon")?;
+    let discovery = Arc::new(ClientMdns::new().context("failed to start the mDNS daemon")?);
     let deadline = Instant::now() + budget;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        // One browse blocks for the backend's one-second window; the outer deadline cannot cancel
-        // it, which is why this loop checks the deadline itself between attempts.
-        let servers = discover_servers(&discovery)?;
+        // One browse blocks for the backend's one-second window. It runs on the blocking pool so
+        // the server keeps serving; the outer deadline cannot cancel it, which is why this loop
+        // also checks the deadline itself between attempts.
+        let servers = tokio::task::spawn_blocking({
+            let discovery = Arc::clone(&discovery);
+            move || discover_servers(discovery.as_ref())
+        })
+        .await
+        .context("the discovery task ended")??;
         for server in matching_servers(&servers, run_name) {
             if let Some(endpoint) = reachable_endpoint(server).await {
                 println!("discovered {endpoint} on browse {attempt}");

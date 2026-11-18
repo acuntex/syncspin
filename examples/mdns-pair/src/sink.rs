@@ -9,17 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::bail;
-use syncspin_client::{AudioFormat, AudioFrame, Codec, Sink};
+use syncspin_client::{AudioFormat, AudioFrame, Sink};
 use tokio::sync::Notify;
-
-/// Sample rate this sink plays, in hertz.
-const SAMPLE_RATE: u32 = 48_000;
-
-/// Channel count this sink plays.
-const CHANNELS: u8 = 2;
-
-/// Bits per sample this sink plays.
-const BIT_DEPTH: u8 = 16;
 
 /// What the sink counted, shared with whoever waits for the stream to arrive.
 ///
@@ -69,15 +60,17 @@ impl Counters {
 pub struct CountingSink {
     /// Frame number that wakes the waiter.
     threshold: usize,
+    /// The only format this run accepts, so the numbers live in one place.
+    expected: AudioFormat,
     /// The shared counts, one clone of which is handed to the caller of [`Self::new`].
     counters: Counters,
 }
 
 impl CountingSink {
-    /// Creates a sink and the counters that observe it.
+    /// Creates a sink for `expected` and the counters that observe it.
     ///
     /// The waiter is woken once, when the sink writes the `threshold`-th frame.
-    pub fn new(threshold: usize) -> (CountingSink, Counters) {
+    pub fn new(threshold: usize, expected: AudioFormat) -> (CountingSink, Counters) {
         assert!(
             threshold > 0,
             "the threshold must be at least one frame, or the waiter is never woken"
@@ -91,6 +84,7 @@ impl CountingSink {
         (
             CountingSink {
                 threshold,
+                expected,
                 counters: counters.clone(),
             },
             counters,
@@ -100,14 +94,14 @@ impl CountingSink {
 
 impl Sink for CountingSink {
     fn open(&mut self, format: AudioFormat) -> anyhow::Result<()> {
-        if format.codec != Codec::Pcm
-            || format.sample_rate != SAMPLE_RATE
-            || format.channels != CHANNELS
-            || format.bit_depth != BIT_DEPTH
-        {
+        if format != self.expected {
             bail!(
-                "this sink plays {SAMPLE_RATE} Hz, {CHANNELS} channels, {BIT_DEPTH}-bit `pcm`, \
-                 but the stream announced {} Hz, {} channels, {}-bit `{}`",
+                "this run expects {} Hz, {} channels, {}-bit `{}`, but the stream announced \
+                 {} Hz, {} channels, {}-bit `{}`",
+                self.expected.sample_rate,
+                self.expected.channels,
+                self.expected.bit_depth,
+                self.expected.codec,
                 format.sample_rate,
                 format.channels,
                 format.bit_depth,
@@ -159,7 +153,7 @@ mod tests {
 
     #[test]
     fn a_foreign_format_is_refused() {
-        let (mut sink, _counters) = CountingSink::new(20);
+        let (mut sink, _counters) = CountingSink::new(20, format(48_000, 2, 16));
         assert!(sink.open(format(44_100, 2, 16)).is_err());
         let mut with_header = format(48_000, 2, 16);
         with_header.codec_header = Some(b"fLaC".to_vec());
@@ -173,12 +167,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "the threshold must be at least one frame")]
     fn a_zero_threshold_is_refused() {
-        CountingSink::new(0);
+        CountingSink::new(0, format(48_000, 2, 16));
     }
 
     #[test]
     fn writes_are_counted_and_the_format_is_remembered() {
-        let (mut sink, counters) = CountingSink::new(20);
+        let (mut sink, counters) = CountingSink::new(20, format(48_000, 2, 16));
         sink.open(format(48_000, 2, 16)).expect("the format opens");
         let chunk = vec![0u8; 3_840];
         for _ in 0..20 {
@@ -195,7 +189,7 @@ mod tests {
 
     #[test]
     fn encoded_frames_count_their_payload() {
-        let (mut sink, counters) = CountingSink::new(20);
+        let (mut sink, counters) = CountingSink::new(20, format(48_000, 2, 16));
         sink.open(format(48_000, 2, 16)).expect("the format opens");
         sink.write(
             AudioFrame::Encoded {
@@ -211,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_threshold_wakes_the_waiter() {
-        let (mut sink, counters) = CountingSink::new(20);
+        let (mut sink, counters) = CountingSink::new(20, format(48_000, 2, 16));
         sink.open(format(48_000, 2, 16)).expect("the format opens");
         let chunk = vec![0u8; 3_840];
         for _ in 0..20 {

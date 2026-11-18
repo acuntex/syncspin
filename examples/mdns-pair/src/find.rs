@@ -73,13 +73,33 @@ pub(crate) async fn reachable_endpoint(server: &DiscoveredServer) -> Option<Stri
 /// The stage the flow had reached when the deadline ended it.
 ///
 /// The flow records the stage in a shared counter while it runs and reads it back in the timeout's
-/// error arm, so the declaration order is the mapping: `Discovery` is 0, `Connection` is 1,
-/// `Stream` is 2.
+/// error arm. [`Stage::as_u8`] and [`Stage::from_u8`] are the only place the encoding lives, so a
+/// reordered variant cannot silently mislabel a timeout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stage {
     Discovery,
     Connection,
     Stream,
+}
+
+impl Stage {
+    /// Encodes the stage for the shared counter.
+    pub(crate) const fn as_u8(self) -> u8 {
+        match self {
+            Stage::Discovery => 0,
+            Stage::Connection => 1,
+            Stage::Stream => 2,
+        }
+    }
+
+    /// Decodes a stage the flow recorded; an unknown code reads as the last stage.
+    pub(crate) const fn from_u8(code: u8) -> Stage {
+        match code {
+            0 => Stage::Discovery,
+            1 => Stage::Connection,
+            _ => Stage::Stream,
+        }
+    }
 }
 
 /// The diagnostic for a browse that never saw this run's record.
@@ -95,8 +115,13 @@ pub(crate) fn no_service_message(run_name: &str, budget: Duration) -> String {
     )
 }
 
-/// The diagnostic for a flow that timed out in `stage`.
-pub(crate) fn timeout_message(stage: Stage, run_name: &str, budget: Duration) -> String {
+/// The diagnostic for a flow that timed out in `stage`; `frames` is the gate the run waits for.
+pub(crate) fn timeout_message(
+    stage: Stage,
+    run_name: &str,
+    budget: Duration,
+    frames: usize,
+) -> String {
     match stage {
         Stage::Discovery => no_service_message(run_name, budget),
         Stage::Connection => format!(
@@ -104,7 +129,7 @@ pub(crate) fn timeout_message(stage: Stage, run_name: &str, budget: Duration) ->
             budget.as_secs()
         ),
         Stage::Stream => format!(
-            "connected, but 20 audio frames did not arrive within {} s",
+            "connected, but {frames} audio frames did not arrive within {} s",
             budget.as_secs()
         ),
     }
@@ -162,13 +187,30 @@ mod tests {
              interface are required"
         );
 
-        let connection = timeout_message(Stage::Connection, "mdns-pair-7", Duration::from_secs(10));
+        let connection = timeout_message(
+            Stage::Connection,
+            "mdns-pair-7",
+            Duration::from_secs(10),
+            20,
+        );
         assert!(connection.contains("no connection"));
-        let stream = timeout_message(Stage::Stream, "mdns-pair-7", Duration::from_secs(10));
+        let stream = timeout_message(Stage::Stream, "mdns-pair-7", Duration::from_secs(10), 20);
         assert!(stream.contains("20 audio frames"));
         assert_eq!(
-            timeout_message(Stage::Discovery, "mdns-pair-7", Duration::from_secs(10)),
+            timeout_message(Stage::Discovery, "mdns-pair-7", Duration::from_secs(10), 20),
             discovery
+        );
+    }
+
+    #[test]
+    fn the_stage_encoding_round_trips() {
+        for stage in [Stage::Discovery, Stage::Connection, Stage::Stream] {
+            assert_eq!(Stage::from_u8(stage.as_u8()), stage);
+        }
+        assert_eq!(
+            Stage::from_u8(9),
+            Stage::Stream,
+            "an unknown code is the last stage"
         );
     }
 }

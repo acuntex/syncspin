@@ -255,9 +255,9 @@ go to standard output.
 
 /// Runs the command line and turns the run's outcome into the process's exit code.
 ///
-/// The runtime has two worker threads on purpose: a browse blocks its worker for one second per
-/// attempt, and the server has to keep serving on the other one even on a host with one vCPU.
-#[tokio::main(worker_threads = 2)]
+/// A browse is a synchronous call; [`client_role::discover`] runs it on the blocking pool, so the
+/// server keeps serving on the async workers even on a host with one vCPU.
+#[tokio::main]
 async fn main() -> ExitCode {
     let options = match parse_args(std::env::args().skip(1)) {
         Ok(Parse::Help) => {
@@ -320,7 +320,8 @@ async fn run(options: Options) -> Result<RunOutcome> {
     let client_id = identity.public_base64();
     // The record is published through the real backend and the server's browsing half is the
     // wrapper: the server must not dial unrelated clients that advertise on the network.
-    let (sink, counters) = CountingSink::new(GATE_FRAMES);
+    let expected = AudioFormat::pcm(SAMPLE_RATE, CHANNELS, BIT_DEPTH);
+    let (sink, counters) = CountingSink::new(GATE_FRAMES, expected.clone());
     let mut config = ServerConfig::new(run_name.clone(), Identity::generate());
     // Port 0: the operating system picks the port, so two runs on one host do not fight over a
     // fixed one, and the record names the port that was actually bound.
@@ -343,18 +344,18 @@ async fn run(options: Options) -> Result<RunOutcome> {
 
     // One deadline covers the browse, the connection and the frames; the stage the flow reached is
     // shared through an atomic so the timeout can name where it stopped.
-    let stage = Arc::new(AtomicU8::new(0));
+    let stage = Arc::new(AtomicU8::new(Stage::Discovery.as_u8()));
     let report = counters.clone();
     let flow = {
         let stage = Arc::clone(&stage);
         let run_name = run_name.clone();
         async move {
             let endpoint = client_role::discover(&run_name, options.timeout).await?;
-            stage.store(1, Ordering::SeqCst);
+            stage.store(Stage::Connection.as_u8(), Ordering::SeqCst);
             let (handle, events) =
                 client_role::await_connected(&run_name, &endpoint, identity, Box::new(sink))
                     .await?;
-            stage.store(2, Ordering::SeqCst);
+            stage.store(Stage::Stream.as_u8(), Ordering::SeqCst);
             counters.wait().await;
             Ok::<_, anyhow::Error>((handle, events))
         }
@@ -367,9 +368,10 @@ async fn run(options: Options) -> Result<RunOutcome> {
         result = timeout(options.timeout, flow) => match result {
             Ok(result) => result.map(|(handle, events)| Flow::Gate(handle, events)),
             Err(_) => Err(anyhow!(timeout_message(
-                stage_of(&stage),
+                Stage::from_u8(stage.load(Ordering::SeqCst)),
                 &run_name,
-                options.timeout
+                options.timeout,
+                GATE_FRAMES
             ))),
         },
     };
@@ -384,7 +386,7 @@ async fn run(options: Options) -> Result<RunOutcome> {
     let mut interrupted = false;
     let verdict = match outcome {
         Ok(Flow::Gate(mut handle, events)) => {
-            let verdict = verify_gate(&report);
+            let verdict = verify_gate(&report, &expected);
             handle.close(GoodbyeReason::Shutdown);
             said_goodbye = true;
             let _ = timeout(TEARDOWN, handle.finished()).await;
@@ -462,27 +464,14 @@ async fn server_start_error(
     }
 }
 
-/// Reads back the stage the flow had reached, for the timeout's diagnostic.
-///
-/// The flow stores 0, 1 and 2 in order before each awaited stage, so the mapping from the counter
-/// to [`Stage`] is fixed here and nowhere else.
-fn stage_of(stage: &AtomicU8) -> Stage {
-    match stage.load(Ordering::SeqCst) {
-        0 => Stage::Discovery,
-        1 => Stage::Connection,
-        _ => Stage::Stream,
-    }
-}
-
 /// Checks the two properties that make this run a success: the format and the byte count.
 ///
 /// This is an assertion, not a log line. A run that only printed the numbers would pass on a
 /// stream that delivered one chunk or announced another format, and the approval it demonstrates
 /// would be unproven.
-fn verify_gate(report: &Counters) -> Result<()> {
-    let expected = AudioFormat::pcm(SAMPLE_RATE, CHANNELS, BIT_DEPTH);
+fn verify_gate(report: &Counters, expected: &AudioFormat) -> Result<()> {
     match report.format() {
-        Some(format) if format == expected => {}
+        Some(format) if &format == expected => {}
         Some(format) => bail!(
             "the stream announced {} Hz, {} channels, {}-bit `{}`, but this run expects \
              {SAMPLE_RATE} Hz, {CHANNELS} channels, {BIT_DEPTH}-bit `pcm`",
@@ -628,13 +617,19 @@ mod tests {
     }
 
     #[test]
-    fn the_stage_counter_maps_onto_the_three_stages() {
-        let stage = AtomicU8::new(0);
-        assert_eq!(stage_of(&stage), Stage::Discovery);
-        stage.store(1, Ordering::SeqCst);
-        assert_eq!(stage_of(&stage), Stage::Connection);
-        stage.store(2, Ordering::SeqCst);
-        assert_eq!(stage_of(&stage), Stage::Stream);
+    fn the_stage_counter_carries_the_typed_stage() {
+        let stage = AtomicU8::new(Stage::Discovery.as_u8());
+        assert_eq!(
+            Stage::from_u8(stage.load(Ordering::SeqCst)),
+            Stage::Discovery
+        );
+        stage.store(Stage::Connection.as_u8(), Ordering::SeqCst);
+        assert_eq!(
+            Stage::from_u8(stage.load(Ordering::SeqCst)),
+            Stage::Connection
+        );
+        stage.store(Stage::Stream.as_u8(), Ordering::SeqCst);
+        assert_eq!(Stage::from_u8(stage.load(Ordering::SeqCst)), Stage::Stream);
     }
 
     #[test]
@@ -651,27 +646,28 @@ mod tests {
             }
         }
 
-        let (mut sink, counters) = CountingSink::new(GATE_FRAMES);
-        sink.open(AudioFormat::pcm(SAMPLE_RATE, CHANNELS, BIT_DEPTH))
+        let expected = AudioFormat::pcm(SAMPLE_RATE, CHANNELS, BIT_DEPTH);
+        let (mut sink, counters) = CountingSink::new(GATE_FRAMES, expected.clone());
+        sink.open(expected.clone())
             .expect("the stream format opens");
         feed(&mut sink, GATE_FRAMES);
         assert!(
-            verify_gate(&counters).is_ok(),
+            verify_gate(&counters, &expected).is_ok(),
             "the full gate passes and prints its count"
         );
 
-        let (mut sink, counters) = CountingSink::new(GATE_FRAMES);
-        sink.open(AudioFormat::pcm(SAMPLE_RATE, CHANNELS, BIT_DEPTH))
+        let (mut sink, counters) = CountingSink::new(GATE_FRAMES, expected.clone());
+        sink.open(expected.clone())
             .expect("the stream format opens");
         feed(&mut sink, GATE_FRAMES - 1);
         assert!(
-            verify_gate(&counters).is_err(),
+            verify_gate(&counters, &expected).is_err(),
             "one chunk short fails the byte count"
         );
 
-        let (_sink, counters) = CountingSink::new(GATE_FRAMES);
+        let (_sink, counters) = CountingSink::new(GATE_FRAMES, expected.clone());
         assert!(
-            verify_gate(&counters).is_err(),
+            verify_gate(&counters, &expected).is_err(),
             "a sink that never opened a stream fails the format check"
         );
     }
