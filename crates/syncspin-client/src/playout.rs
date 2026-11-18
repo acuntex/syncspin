@@ -226,6 +226,10 @@ impl PlayoutQueue {
     }
 
     /// Bytes in use, each frame costing its 13-byte chunk header plus its payload.
+    ///
+    /// The accounting seam is asserted by this module's rows; the session bounds the queue
+    /// through [`Self::push`] and never needs the running total.
+    #[cfg(test)]
     pub(crate) fn len_bytes(&self) -> u64 {
         self.len_bytes
     }
@@ -254,6 +258,9 @@ impl PlayoutQueue {
     }
 
     /// Whether the queue holds no frame.
+    ///
+    /// The session asks [`Self::next_due`] instead, so only the rows read this.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }

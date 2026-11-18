@@ -96,10 +96,6 @@ mod client;
 mod config;
 mod discovery;
 mod pairing;
-// The session's playout scheduler consumes this queue in the next change of the plan; until it
-// lands only the unit tests reach the module, so the library build would call every item dead.
-// The attribute goes with that change.
-#[cfg_attr(not(test), allow(dead_code))]
 mod playout;
 mod session;
 mod sink;
