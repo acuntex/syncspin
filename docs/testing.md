@@ -421,8 +421,9 @@ both with the `mdns` backend. It needs multicast and one non-loopback IPv4 inter
 published record, the discovered endpoint, the connection and the frame count, and exits 0; without
 multicast it prints a diagnostic naming the stage and exits 1. A bad command line, such as an
 unknown flag or a timeout outside the accepted range, exits 2. A build without the `mdns` feature
-also exits 2, printing `the mDNS flow needs the mdns feature: rebuild with --features mdns`. Ctrl-C
-before the frame gate prints `interrupted; the frame gate was not checked` and exits 130. It covers
+also exits 2, printing `the mDNS flow needs the mdns feature: rebuild with --features mdns`. An
+interrupt exits 130; when it arrives before the frame gate has passed it also prints
+`interrupted; the frame gate was not checked`. It covers
 the advertisement, the browse, the dial, the approval, the activation and one short stream on one
 host. It does not cover two hosts or the server-initiated direction.
 
