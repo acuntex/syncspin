@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 
+mod find;
+
 /// Base name the run announces unless `--name` says otherwise.
 const DEFAULT_NAME: &str = "mdns-pair";
 
