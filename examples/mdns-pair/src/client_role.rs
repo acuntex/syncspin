@@ -18,6 +18,7 @@ use syncspin_client::{
 use syncspin_client::MdnsDiscovery as ClientMdns;
 
 use crate::find::{matching_servers, no_service_message, reachable_endpoint};
+use crate::sink::Counters;
 
 /// How long the loop waits between two browse attempts.
 ///
@@ -57,6 +58,30 @@ pub async fn discover(run_name: &str, budget: Duration) -> Result<String> {
         tokio::time::sleep(RETRY_PAUSE).await;
         if Instant::now() >= deadline {
             return Err(anyhow!(no_service_message(run_name, budget)));
+        }
+    }
+}
+
+/// Waits for the frame gate while still watching the session.
+///
+/// The session reports a disconnect or a server error on the same stream the gate runs beside; a
+/// gate that only waited for the counter would let either become a misleading stream timeout. The
+/// outer deadline bounds this call, so no branch needs a timer of its own.
+pub async fn wait_for_gate(events: &mut EventStream, counters: &Counters) -> Result<()> {
+    loop {
+        tokio::select! {
+            biased;
+            _ = counters.wait() => return Ok(()),
+            event = events.next() => match event {
+                Some(Event::Disconnected { reason, .. }) => {
+                    bail!("the connection ended before the frame gate: {reason}")
+                }
+                Some(Event::ServerError { reason }) => {
+                    bail!("the server refused the session before the frame gate: {reason}")
+                }
+                Some(_) => {}
+                None => bail!("the event stream ended before the frame gate"),
+            },
         }
     }
 }

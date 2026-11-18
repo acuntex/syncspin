@@ -40,7 +40,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use syncspin_client::AudioFormat;
 #[cfg(feature = "mdns")]
-use syncspin_client::{ClientHandle, EventStream, GoodbyeReason, Identity};
+use syncspin_client::{GoodbyeReason, Identity};
 // Both crates export an `MdnsDiscovery`; each role runs its own daemon, so each import names the
 // role. The client's alias lives in `client_role`.
 #[cfg(feature = "mdns")]
@@ -257,8 +257,8 @@ go to standard output.
 
 /// Runs the command line and turns the run's outcome into the process's exit code.
 ///
-/// A browse is a synchronous call; [`client_role::discover`] runs it on the blocking pool, so the
-/// server keeps serving on the async workers even on a host with one vCPU.
+/// A browse is a synchronous call; `client_role::discover` runs it on the blocking pool, so the
+/// server keeps serving on the async worker even on a host with one vCPU.
 #[tokio::main]
 async fn main() -> ExitCode {
     let options = match parse_args(std::env::args().skip(1)) {
@@ -291,15 +291,6 @@ async fn main() -> ExitCode {
         eprintln!("error: the mDNS flow needs the mdns feature: rebuild with --features mdns");
         ExitCode::from(2)
     }
-}
-
-/// What the flow produced before teardown began.
-#[cfg(feature = "mdns")]
-enum Flow {
-    /// The gate was reached; the session is handed to the teardown.
-    Gate(ClientHandle, EventStream),
-    /// Ctrl-C arrived before the gate, so nothing was checked.
-    Interrupted,
 }
 
 /// The process outcome of a run that reached its teardown.
@@ -344,38 +335,34 @@ async fn run(options: Options) -> Result<RunOutcome> {
         return Err(server_start_error(&mut server_task).await);
     }
 
-    // One deadline covers the browse, the connection and the frames; the stage the flow reached is
-    // shared through an atomic so the timeout can name where it stopped.
+    // One deadline covers the browse, the connection and the frames. The phases are awaited
+    // separately so the handle exists by the time the run has to say why it leaves; the stage is
+    // shared so a timeout names where it stopped.
+    let deadline = tokio::time::Instant::now() + options.timeout;
     let stage = Arc::new(AtomicU8::new(Stage::Discovery.as_u8()));
     let report = counters.clone();
-    let flow = {
-        let stage = Arc::clone(&stage);
-        let run_name = run_name.clone();
-        async move {
+    let mut interrupted = false;
+
+    let connected = tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            interrupted = true;
+            None
+        }
+        result = tokio::time::timeout_at(deadline, async {
             let endpoint = client_role::discover(&run_name, options.timeout).await?;
             stage.store(Stage::Connection.as_u8(), Ordering::SeqCst);
-            let (handle, events) =
-                client_role::await_connected(&run_name, &endpoint, identity, Box::new(sink))
-                    .await?;
-            stage.store(Stage::Stream.as_u8(), Ordering::SeqCst);
-            counters.wait().await;
-            Ok::<_, anyhow::Error>((handle, events))
-        }
+            client_role::await_connected(&run_name, &endpoint, identity, Box::new(sink)).await
+        }) => Some(result),
     };
-    let outcome: Result<Flow> = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            println!("interrupted; the frame gate was not checked");
-            Ok(Flow::Interrupted)
-        }
-        result = timeout(options.timeout, flow) => match result {
-            Ok(result) => result.map(|(handle, events)| Flow::Gate(handle, events)),
-            Err(_) => Err(anyhow!(timeout_message(
-                Stage::from_u8(stage.load(Ordering::SeqCst)),
-                &run_name,
-                options.timeout,
-                GATE_FRAMES
-            ))),
-        },
+    let connected = match connected {
+        None => None,
+        Some(Ok(result)) => Some(result),
+        Some(Err(_)) => Some(Err(anyhow!(timeout_message(
+            Stage::from_u8(stage.load(Ordering::SeqCst)),
+            &run_name,
+            options.timeout,
+            GATE_FRAMES
+        )))),
     };
 
     // The client side of the teardown: the goodbye first, while the close signal still reaches a
@@ -385,21 +372,44 @@ async fn run(options: Options) -> Result<RunOutcome> {
     // `TEARDOWN` is dropped, and a dropped handle detaches the task instead of aborting it;
     // process exit is the real bound the design accepts.
     let mut said_goodbye = false;
-    let mut interrupted = false;
-    let verdict = match outcome {
-        Ok(Flow::Gate(mut handle, events)) => {
-            let verdict = verify_gate(&report, &expected);
+    let verdict = match connected {
+        // An interrupt before a session existed has no connection to say goodbye on.
+        None => Ok(()),
+        Some(Err(error)) => Err(error),
+        Some(Ok((mut handle, mut events))) => {
+            stage.store(Stage::Stream.as_u8(), Ordering::SeqCst);
+            let gate = tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    interrupted = true;
+                    Ok(())
+                }
+                result = tokio::time::timeout_at(
+                    deadline,
+                    client_role::wait_for_gate(&mut events, &counters),
+                ) => match result {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow!(timeout_message(
+                        Stage::from_u8(stage.load(Ordering::SeqCst)),
+                        &run_name,
+                        options.timeout,
+                        GATE_FRAMES
+                    ))),
+                },
+            };
+            // The session exists from here on, so it says why it leaves on every path, including
+            // an interrupt and a gate that failed.
             handle.close(GoodbyeReason::Shutdown);
             said_goodbye = true;
             let _ = timeout(TEARDOWN, handle.finished()).await;
             drop(events);
-            verdict
+            gate.and_then(|()| {
+                if interrupted {
+                    Ok(())
+                } else {
+                    verify_gate(&report, &expected)
+                }
+            })
         }
-        Ok(Flow::Interrupted) => {
-            interrupted = true;
-            Ok(())
-        }
-        Err(error) => Err(error),
     };
 
     // The server loop ends only on the stop signal: `ClientLeft` carries no client id, so any LAN
@@ -430,6 +440,7 @@ async fn run(options: Options) -> Result<RunOutcome> {
         eprintln!("error: {error:#}");
     }
     if interrupted {
+        println!("interrupted; the frame gate was not checked");
         return Ok(RunOutcome::Interrupted);
     }
     verdict?;

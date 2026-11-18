@@ -113,5 +113,10 @@ pub async fn serve(
         }
     }
 
+    // A stream that stops sending without a `stream/end` leaves any remaining player waiting for
+    // audio that never comes; end it before the listener goes away.
+    if let Some(mut writer) = stream.take() {
+        writer.end();
+    }
     server.shutdown().await
 }
