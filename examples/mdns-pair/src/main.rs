@@ -249,8 +249,9 @@ Options:
 
 The run appends its PID to the name unless --name is given, publishes
 _sendspin-server._tcp under it, discovers that same name and approves only the
-client that carries it. Silent frames go to a counting sink, which exits once
-the stream has delivered enough of them. Status lines go to standard output.
+client whose static key this run generated. Silent frames go to a counting
+sink, which exits once the stream has delivered enough of them. Status lines
+go to standard output.
 "
     )
 }
@@ -312,8 +313,14 @@ enum RunOutcome {
 }
 
 /// Runs one discovery, approval and stream pass, then tears both roles down.
-async fn run(options: Options) -> Result<()> {
+#[cfg(feature = "mdns")]
+async fn run(options: Options) -> Result<RunOutcome> {
     let run_name = run_name(&options, std::process::id())?;
+    // The client identity is generated once and its public half is the `client_id` the server
+    // sees. The mDNS TXT record is readable by anyone on the LAN, so the key the handshake proves
+    // - not the published name - is what decides who is approved.
+    let identity = Identity::generate();
+    let client_id = URL_SAFE_NO_PAD.encode(identity.public);
     // The record is published through the real backend and the server's browsing half is the
     // wrapper: the server must not dial unrelated clients that advertise on the network.
     let (sink, counters) = CountingSink::new(GATE_FRAMES);
@@ -346,7 +353,8 @@ async fn run(options: Options) -> Result<()> {
             let endpoint = client_role::discover(&run_name, options.timeout).await?;
             stage.store(1, Ordering::SeqCst);
             let (handle, events) =
-                client_role::await_connected(&run_name, &endpoint, Box::new(sink)).await?;
+                client_role::await_connected(&run_name, &endpoint, identity, Box::new(sink))
+                    .await?;
             stage.store(2, Ordering::SeqCst);
             counters.wait().await;
             Ok::<_, anyhow::Error>((handle, events))

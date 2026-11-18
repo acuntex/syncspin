@@ -2,9 +2,9 @@
 //!
 //! [`Server::start`] advertises before it returns, so the record exists by the time the bound
 //! address is handed to the run. This module is the host loop around the handle: it approves only
-//! the client that carries the run name, opens one stream once the player role is active, and
-//! writes 20 ms silent chunks until the run stops it. It ends by withdrawing the record in
-//! [`ServerHandle::shutdown`](syncspin_server::ServerHandle::shutdown).
+//! the client whose static public key the run generated, opens one stream once the player role is
+//! active, and writes 20 ms silent chunks until the run stops it. It ends by withdrawing the record
+//! in [`ServerHandle::shutdown`](syncspin_server::ServerHandle::shutdown).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -29,8 +29,10 @@ pub async fn serve(
     config: ServerConfig,
     ready: oneshot::Sender<SocketAddr>,
     mut stop: oneshot::Receiver<()>,
-    run_name: String,
+    departure: oneshot::Sender<()>,
+    expected_client_id: String,
 ) -> Result<()> {
+    let run_name = config.name.clone();
     let mut server = Server::start(config).await?;
     let address = server.local_addr();
     // The wildcard address carries the port the record names; the daemon resolves the record to
@@ -59,18 +61,14 @@ pub async fn serve(
                     name,
                     approved,
                 }) => {
-                    // The port is advertised to the whole network, so a stray client can reach it.
-                    // The TXT `name` is the only thing that decides who joins: this run approves
-                    // its own name and nobody else, and a foreign client stays unapproved.
-                    if name == run_name {
+                    // The TXT `name` is on the LAN and anyone can claim it; the static public key
+                    // is what the handshake proves, so only that decides who joins. A foreign
+                    // connection is printed and stays unapproved.
+                    if client_id == expected_client_id {
                         match server.approve(&client_id).await {
-                            Ok(()) => {
-                                println!(
-                                    "approved {name} as {client_id} (approved on arrival: \
-                                     {approved})"
-                                );
-                                approved_ours = true;
-                            }
+                            Ok(()) => println!(
+                                "approved {name} as {client_id} (approved on arrival: {approved})"
+                            ),
                             Err(error) => println!("could not approve {name}: {error:#}"),
                         }
                     } else {

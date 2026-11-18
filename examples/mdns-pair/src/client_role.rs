@@ -55,17 +55,19 @@ pub async fn discover(run_name: &str, budget: Duration) -> Result<String> {
 
 /// Connects to `endpoint` and waits for the session to report [`Event::Connected`].
 ///
-/// The identity is generated per run: nothing is stored, so the server sees a client it has never
-/// approved and the approval gate is part of what the run demonstrates. A disconnect and a server
-/// error are fatal here - the endpoint is pinned and this run has no second attempt to offer.
+/// The identity is generated once by the run and handed here, so the session presents the key whose
+/// public half the server approves; nothing is stored, and the server sees a client it has never
+/// approved, which is the approval gate the run demonstrates. A disconnect and a server error are
+/// fatal here - the endpoint is pinned and this run has no second attempt to offer.
 pub async fn await_connected(
     run_name: &str,
     endpoint: &str,
+    identity: Identity,
     sink: Box<dyn Sink>,
 ) -> Result<(ClientHandle, EventStream)> {
-    // The run name is also the player name: the server approves the `client/hello` name, and the
-    // two must be equal for the connection to be the one the server publishes for.
-    let config = ClientConfig::new(endpoint, run_name, Identity::generate());
+    // The run name is the player name the server reports; the identity is the key the server
+    // decides on.
+    let config = ClientConfig::new(endpoint, run_name, identity);
     let (handle, mut events) = connect(config, sink).await?;
     loop {
         match events.next().await {
