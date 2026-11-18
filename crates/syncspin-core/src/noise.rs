@@ -351,9 +351,16 @@ impl Responder {
 
     /// Reads one Noise handshake message and returns its decrypted payload.
     ///
-    /// The payload is returned verbatim. Message 1 carries the PSK metadata
-    /// (`psk_id`, `psk_category`) for the session layer to validate; the handshake itself starts
-    /// with the Sentinel PSK, which [`Responder::set_psk`] can replace.
+    /// The payload is returned verbatim, and this method validates nothing. Message 1 carries the
+    /// PSK metadata (`psk_id`, `psk_category`) for the session layer to validate; the handshake
+    /// itself starts with the Sentinel PSK, which [`Responder::set_psk`] can replace.
+    ///
+    /// A caller that drives `Responder` directly has to do what the session does with that payload:
+    /// reject an unknown category and a non-canonical id, match the announced category and id
+    /// against the PSKs it holds, check that a stored record names the `server_id` from
+    /// `server/init`, and fall back to the Sentinel PSK only on the initial handshake. A caller
+    /// that ignores the payload completes a handshake against any announced `psk_id` /
+    /// `psk_category` pair.
     pub fn read_message(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
         read_handshake_payload(&mut self.handshake, msg)
     }
