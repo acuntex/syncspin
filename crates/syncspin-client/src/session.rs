@@ -190,7 +190,7 @@ const OUTPUT_DELAY_COMMAND: &str = "set_output_delay";
 /// The player commands this configuration advertises.
 ///
 /// `set_output_delay` is present only when [`ClientConfig::output_delay_control`] is set: a host
-/// that cannot apply it must not claim it, and an unadvertised command stays ignored.
+/// that cannot apply it must not claim it, and [`Session::handle_command`] ignores it otherwise.
 fn supported_player_commands(config: &ClientConfig) -> Vec<String> {
     let mut commands: Vec<String> = PLAYER_COMMANDS
         .iter()
@@ -2754,30 +2754,24 @@ impl Session<'_> {
                 });
                 self.report_state().await?;
             }
-            command
-                if command == OUTPUT_DELAY_COMMAND
-                    && supported_player_commands(self.config)
-                        .iter()
-                        .any(|advertised| advertised == command) =>
-            {
+            // Advertised exactly when `output_delay_control` is set, see
+            // `supported_player_commands`; otherwise it falls through to the ignored arm.
+            OUTPUT_DELAY_COMMAND if self.config.output_delay_control => {
                 // The field is required for this command; a missing one is ignored like any other
-                // incomplete player command. A value above 5000 is outside the fixed range and a
-                // protocol error: `messaging.md` has the receiver close the connection. A negative
-                // or non-integer value never gets here: the `u32` field fails to decode and the
-                // whole message is ignored as malformed (deviation 15).
-                let Some(delay_ms) = player.output_delay_ms else {
+                // incomplete player command, with a line on stderr. A negative or non-integer
+                // value never gets here: the `u32` field fails to decode and the whole message is
+                // ignored as malformed (deviation 15).
+                let Some(requested) = player.output_delay_ms else {
+                    eprintln!("syncspin: set_output_delay without output_delay_ms ignored");
                     return Ok(());
                 };
-                if delay_ms > MAX_OUTPUT_DELAY_MS {
-                    bail!(
-                        "set_output_delay carries output_delay_ms {delay_ms}, outside \
-                         0-{MAX_OUTPUT_DELAY_MS}"
-                    );
-                }
-                self.emit(Event::OutputDelay { delay_ms });
-                // The host applies it and calls `ControlHandle::output_delay_applied`, which
-                // reads the sink and reports it; the session never reports a value it has not
-                // seen the sink adopt.
+                // A value above the fixed range is capped, not fatal (deviation 21), as for volume.
+                let applied = requested.min(MAX_OUTPUT_DELAY_MS);
+                self.emit(Event::OutputDelay { requested, applied });
+                // The host applies `applied` to its sink and persists it. The session reports
+                // the value the sink returns at its next poll, or at once when the host calls
+                // `ControlHandle::output_delay_applied`; it never reports a value it has not seen
+                // the sink adopt.
             }
             // A command this client does not advertise.
             _ => {}

@@ -4448,36 +4448,40 @@ async fn output_delay_is_advertised_only_when_the_host_opts_in() {
 }
 
 #[tokio::test]
-async fn the_output_delay_command_reaches_the_host_inside_the_range() {
+async fn the_output_delay_command_reports_the_clamped_value() {
     let server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let (_recordings, sink) = recording_sink();
     let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
     expect_connected(&mut events, &server).await;
 
-    for requested in [0, 200, 5_000] {
+    for (requested, expected) in [(0, 0), (200, 200), (5_000, 5_000), (5_001, 5_000)] {
         send_player_command(&server, "set_output_delay", Some(requested));
         match next_event(&mut events).await {
-            Event::OutputDelay { delay_ms } => assert_eq!(delay_ms, requested),
+            Event::OutputDelay {
+                requested: sent,
+                applied,
+            } => {
+                assert_eq!(sent, requested);
+                assert_eq!(applied, expected, "the applied delay for {requested} ms");
+            }
             other => panic!("expected OutputDelay for {requested} ms, got {other:?}"),
         }
     }
 }
 
 #[tokio::test]
-async fn an_out_of_range_output_delay_ends_the_connection() {
+async fn an_unadvertised_output_delay_command_is_ignored() {
     let server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let (_recordings, sink) = recording_sink();
-    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
-    // `messaging.md`: a value outside a fixed range is a protocol error and the receiver closes.
-    send_player_command(&server, "set_output_delay", Some(5_001));
-    loop {
-        match next_event(&mut events).await {
-            Event::Disconnected { .. } => break,
-            Event::OutputDelay { .. } => panic!("an out-of-range delay must not reach the host"),
-            _ => {}
-        }
+    send_player_command(&server, "set_output_delay", Some(200));
+    server.metadata("Still here", "An artist");
+    match next_event(&mut events).await {
+        Event::Track { title, .. } => assert_eq!(title, "Still here"),
+        other => panic!("an unadvertised command must be ignored, got {other:?}"),
     }
 }
 
@@ -4528,7 +4532,7 @@ async fn the_applied_output_delay_is_reported_at_once() {
 
     send_player_command(&server, "set_output_delay", Some(200));
     match next_event(&mut events).await {
-        Event::OutputDelay { delay_ms } => assert_eq!(delay_ms, 200),
+        Event::OutputDelay { applied, .. } => assert_eq!(applied, 200),
         other => panic!("expected OutputDelay, got {other:?}"),
     }
 

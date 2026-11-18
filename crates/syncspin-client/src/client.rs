@@ -452,15 +452,17 @@ pub enum Event {
     },
     /// The server asked this player to change its output delay.
     ///
-    /// Sent only while [`ClientConfig::output_delay_control`] is set, and only for a value inside
-    /// the protocol's 0-5000 ms; a value above 5000 is a protocol error that ends the connection, and a
-    /// negative one is dropped with the malformed message it arrives in. The host applies `delay_ms`
-    /// to its sink, persists it as `roles/player/v1.md` requires, and then calls
-    /// [`ControlHandle::output_delay_applied`], which reads the sink and reports the value to the
-    /// server in a `client/state`.
+    /// Sent only while [`ClientConfig::output_delay_control`] is set. A value above the protocol's
+    /// 0-5000 ms is capped to 5000 (deviation 21); a negative one is dropped with the malformed
+    /// message it arrives in. The host applies `applied` to its sink and persists it as
+    /// `roles/player/v1.md` requires. The session then reports what the sink returns in a
+    /// `client/state`: at its next timing poll (after a clock burst), or at once when the host calls
+    /// [`ControlHandle::output_delay_applied`].
     OutputDelay {
-        /// Delay the host should apply, in milliseconds.
-        delay_ms: u32,
+        /// Delay the server asked for, as it arrived on the wire.
+        requested: u32,
+        /// Delay the host should apply, always in the range 0-5000 ms.
+        applied: u32,
     },
     /// A pairing completed and the record is stored.
     ///
@@ -626,9 +628,10 @@ impl fmt::Debug for Event {
                 .field("applied", applied)
                 .field("muted", muted)
                 .finish(),
-            Self::OutputDelay { delay_ms } => formatter
+            Self::OutputDelay { requested, applied } => formatter
                 .debug_struct("OutputDelay")
-                .field("delay_ms", delay_ms)
+                .field("requested", requested)
+                .field("applied", applied)
                 .finish(),
             Self::Paired { server_id } => formatter
                 .debug_struct("Paired")
@@ -877,8 +880,9 @@ impl ControlHandle {
     /// The host calls this after it applied the delay from [`Event::OutputDelay`] to its sink and
     /// persisted it. The session reads [`Sink::output_delay`], re-maps the queued deadlines and
     /// sends a `client/state` at once, so the server recomputes its send-ahead from the value in
-    /// force instead of waiting for the next periodic check. A host that changes the delay on its
-    /// own, without a server command, calls it the same way.
+    /// force. Without the call the same report follows at the session's next timing poll, after
+    /// the next clock burst, so the call shortens the delay but is not needed for correctness. A
+    /// host that changes the delay on its own, without a server command, calls it the same way.
     ///
     /// # Errors
     /// Returns an error for a connection that has ended, and when the server did not activate
