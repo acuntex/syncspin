@@ -119,6 +119,22 @@ pub struct AudioFormat {
     pub codec_header: Option<Vec<u8>>,
 }
 
+impl AudioFormat {
+    /// Builds a PCM format.
+    ///
+    /// Samples are interleaved by channel and encoded as signed little-endian integers of
+    /// `bit_depth` bits, which is what the specification's PCM convention describes.
+    pub fn pcm(sample_rate: u32, channels: u8, bit_depth: u8) -> AudioFormat {
+        AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate,
+            channels,
+            bit_depth,
+            codec_header: None,
+        }
+    }
+}
+
 /// Audio output owned by the host application.
 ///
 /// A sink is moved into the connection and reused across reconnects, so its output device may stay
@@ -295,5 +311,15 @@ mod tests {
             assert_eq!(codec.to_string(), name);
             assert_eq!(Codec::from(name.to_owned()), codec);
         }
+    }
+
+    #[test]
+    fn a_pcm_format_carries_its_parameters() {
+        let format = AudioFormat::pcm(48_000, 2, 16);
+        assert_eq!(format.codec, Codec::Pcm);
+        assert_eq!(format.sample_rate, 48_000);
+        assert_eq!(format.channels, 2);
+        assert_eq!(format.bit_depth, 16);
+        assert!(format.codec_header.is_none(), "PCM carries no codec header");
     }
 }
