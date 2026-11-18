@@ -28,6 +28,7 @@ that shows it, and what an attacker gains. A working test is worth more than a d
   and the store they read, group and stream handling, and discovery.
 - `examples/player-pipe`: identity handling and file permissions.
 - `examples/server-demo`: the approval gate it demonstrates and the connection it admits.
+- `examples/mdns-pair`: the discovery smoke test and the approval it demonstrates.
 
 ## What is out of scope
 

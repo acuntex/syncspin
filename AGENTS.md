@@ -15,11 +15,13 @@ This file is for agents and contributors working in this repository.
 | `crates/syncspin-server/` | Listener, one group, roles, streams, pairing and discovery (`0.2`).             |
 | `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr.               |
 | `examples/server-demo/`   | Runnable reference server: approves one client and streams a tone.              |
+| `examples/mdns-pair/`     | One-command mDNS smoke test: advertises, discovers, approves, streams, exits.   |
 | `docs/`                   | Design, spec deviations and the testing handbook.                               |
 
 `player-pipe` is the reference `Sink`: it shows the event loop, the identity file and the reconnect
 policy without device code. `server-demo` is the reference host: it shows the approval gate, the
-event loop and the push data plane, and holds no files.
+event loop and the push data plane, and holds no files. `mdns-pair` is the smoke test: both roles in
+one process, two mDNS daemons, and a format-and-byte gate that decides the exit code.
 
 **Layering rule:** `syncspin-core` never imports `syncspin-client` or `syncspin-server`, and it
 never knows a transport. A dependency pointing from core towards a crate is a bug, not a shortcut.
