@@ -450,6 +450,19 @@ pub enum Event {
         /// Mute state that was requested, absent for a volume command.
         muted: Option<bool>,
     },
+    /// The server asked this player to change its output delay.
+    ///
+    /// Sent only while [`ClientConfig::output_delay_control`] is set. The host applies `applied`
+    /// to its sink and persists it, as `roles/player/v1.md` requires of the client; the session
+    /// reports the sink's value in the next `client/state` and re-maps queued deadlines when it
+    /// next reads the sink. `requested` is the value as it arrived, `applied` is clamped to the
+    /// protocol's 0-5000 ms.
+    OutputDelay {
+        /// Delay the server asked for, as it arrived on the wire.
+        requested: u32,
+        /// Delay the host should apply, clamped to 0-5000 ms.
+        applied: u32,
+    },
     /// A pairing completed and the record is stored.
     ///
     /// Reported after `server/pair-finalize`, once [`Storage`](crate::storage::Storage) accepted
@@ -613,6 +626,11 @@ impl fmt::Debug for Event {
                 .field("requested", requested)
                 .field("applied", applied)
                 .field("muted", muted)
+                .finish(),
+            Self::OutputDelay { requested, applied } => formatter
+                .debug_struct("OutputDelay")
+                .field("requested", requested)
+                .field("applied", applied)
                 .finish(),
             Self::Paired { server_id } => formatter
                 .debug_struct("Paired")
@@ -1646,6 +1664,7 @@ mod tests {
                 volume_policy: VolumePolicy::default(),
                 max_backoff: Duration::from_secs(30),
                 strict_group_id: false,
+                output_delay_control: false,
                 unpaired_access: true,
                 required_lead_time_ms: 250,
                 min_buffer_ms: None,

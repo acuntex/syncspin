@@ -283,6 +283,19 @@ pub struct ClientConfig {
     ///
     /// Reported in the first `client/state`; a host without a stored state passes `false`.
     pub muted: bool,
+    /// Whether the server may set this player's output delay with `set_output_delay`.
+    ///
+    /// Off by default. A host that can change the delay after its audio port (external speakers,
+    /// an amplifier, a soundbar) opts in: the client then advertises the command, reports
+    /// [`Event::OutputDelay`](crate::Event::OutputDelay) for a command it accepts, and the host
+    /// applies the value to its sink and persists it. A host that cannot apply the command must
+    /// leave this off, because `roles/player/v1.md` lets a client advertise only what it applies.
+    ///
+    /// The command is an instruction to the host, not a value the session applies itself: the sink
+    /// remains the authority for `output_delay_ms`, and the next `client/state` reports the value
+    /// the sink returns. The host applies the delay in between; the session re-maps queued
+    /// deadlines when it next reads the sink, after a state report or a clock burst.
+    pub output_delay_control: bool,
     /// Minimum start-up lead the server must give this player, in milliseconds.
     ///
     /// This is the host's own start-up cost: launching the output (`gst-launch`, `pacat`), the
@@ -492,6 +505,8 @@ impl ClientConfig {
             // The documented tolerance is the default: a foreign group id does not close the
             // connection unless the host asks for the spec's strictness.
             strict_group_id: false,
+            // The command is advertised only by a host that opts in.
+            output_delay_control: false,
             // Earlier releases admitted every session, so the setting starts where they left off.
             unpaired_access: true,
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
@@ -643,6 +658,7 @@ mod tests {
             volume_policy: VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             strict_group_id: false,
+            output_delay_control: false,
             unpaired_access: true,
             pairing_timeout: crate::DEFAULT_PAIRING_TIMEOUT,
             #[cfg(feature = "discovery")]

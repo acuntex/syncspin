@@ -184,6 +184,24 @@ const ROUND_LIMIT: u32 = 20;
 /// Player commands this client accepts from the server.
 const PLAYER_COMMANDS: [&str; 2] = ["volume", "mute"];
 
+/// Command a host that can change its output delay opts in to advertising.
+const OUTPUT_DELAY_COMMAND: &str = "set_output_delay";
+
+/// The player commands this configuration advertises.
+///
+/// `set_output_delay` is present only when [`ClientConfig::output_delay_control`] is set: a host
+/// that cannot apply it must not claim it, and an unadvertised command stays ignored.
+fn supported_player_commands(config: &ClientConfig) -> Vec<String> {
+    let mut commands: Vec<String> = PLAYER_COMMANDS
+        .iter()
+        .map(|command| (*command).to_owned())
+        .collect();
+    if config.output_delay_control {
+        commands.push(OUTPUT_DELAY_COMMAND.to_owned());
+    }
+    commands
+}
+
 /// Control message types that belong to pairing, whose malformed form is a protocol error.
 ///
 /// `pairing.md` treats a malformed or missing pairing field as a protocol error: the connection
@@ -2169,10 +2187,7 @@ impl Session<'_> {
                 output_delay_ms,
                 required_lead_time_ms,
                 min_buffer_ms: self.min_buffer_ms,
-                supported_commands: PLAYER_COMMANDS
-                    .iter()
-                    .map(|command| (*command).to_owned())
-                    .collect(),
+                supported_commands: supported_player_commands(self.config),
                 format: None,
             }),
         });
@@ -2739,7 +2754,21 @@ impl Session<'_> {
                 });
                 self.report_state().await?;
             }
-            // A command this client does not advertise, such as `set_output_delay`.
+            "set_output_delay" if self.config.output_delay_control => {
+                let Some(requested) = player.output_delay_ms else {
+                    // The command is advertised, but the field is required for it; a server that
+                    // omits it is ignored like any other incomplete command.
+                    eprintln!("ignoring set_output_delay without output_delay_ms");
+                    return Ok(());
+                };
+                self.emit(Event::OutputDelay {
+                    requested,
+                    applied: requested.min(MAX_OUTPUT_DELAY_MS),
+                });
+                // The host applies it to its sink; the next state or clock burst reads the sink
+                // again and re-maps queued deadlines from the value it reports.
+            }
+            // A command this client does not advertise.
             _ => {}
         }
         Ok(())
@@ -4079,6 +4108,7 @@ mod tests {
             volume_policy: crate::config::VolumePolicy::default(),
             max_backoff: Duration::from_secs(1),
             strict_group_id: false,
+            output_delay_control: false,
             unpaired_access: true,
             required_lead_time_ms: 250,
             min_buffer_ms: None,

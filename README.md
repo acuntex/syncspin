@@ -280,7 +280,12 @@ the client calls it one `pre_port_delay` before the frame's port deadline - the 
 does not schedule again - `discard_from` for a seek with a timestamp, `flush` at each boundary the
 crate announces, `pre_port_delay` for the buffers between `write` and the audio port, which the
 client compensates, and optionally `output_delay` for the delay the output adds beyond the audio
-port, which the client reports to the server, and `underruns` for diagnostics. The buffer the
+port, which the client reports to the server, and `underruns` for diagnostics. A host that can
+change that delay on request - a TV driving a soundbar, for example - sets
+`ClientConfig::output_delay_control`: the client then advertises `set_output_delay`, reports
+`Event::OutputDelay` with the clamped value, and the host applies it to its output and persists it.
+The next `client/state` reports the value the sink returns and the queued deadlines are re-mapped
+from it. The buffer the
 session asks for comes from its configuration or from arriving audio, so it needs no sink hook. The
 crate owns the connection, the clock, the playout schedule and the reconnect loop; the host owns the
 output device, the identity file and everything below the pipe.
