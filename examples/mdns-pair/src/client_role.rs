@@ -105,9 +105,9 @@ pub async fn connect_session(
     identity: Identity,
     sink: Box<dyn Sink>,
 ) -> Result<(ClientHandle, EventStream)> {
-    // The run name is the player name the server reports; the identity is the key the server
-    // decides on.
-    let config = ClientConfig::new(endpoint, run_name, identity);
+    // The player gets its own name, so the server's log lines tell the two roles apart; the
+    // identity is the key the server decides on.
+    let config = ClientConfig::new(endpoint, format!("{run_name}-player"), identity);
     connect(config, sink).await
 }
 

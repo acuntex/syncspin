@@ -100,8 +100,13 @@ const CHUNK_FRAMES: usize = SAMPLE_RATE as usize / 1000 * CHUNK_MS as usize;
 /// Payload bytes in one chunk.
 const CHUNK_BYTES: usize = CHUNK_FRAMES * BYTES_PER_FRAME;
 
-/// Chunks the server streams: 600 ms, enough for the gate and still a short run.
-const CHUNK_COUNT: usize = 30;
+/// Chunks the server streams: 2 s, far more than the gate needs.
+///
+/// The server opens the stream when the player role is granted, which can be before the player has
+/// reported its state; chunks written until then are not delivered to it. The surplus over
+/// [`GATE_FRAMES`] is what keeps a slow host from failing the gate. The run ends at the gate, so
+/// the extra chunks cost no time.
+const CHUNK_COUNT: usize = 100;
 
 /// Frames the sink must receive before the run counts as a success.
 const GATE_FRAMES: usize = 20;
@@ -318,6 +323,15 @@ async fn run(options: Options) -> Result<RunOutcome> {
     config.bind = SocketAddr::from(([0, 0, 0, 0], 0));
     config.discovery = Some(Arc::new(AdvertiseOnly::new(Arc::new(ServerMdns::new()?))));
 
+    // One task owns the signal for the whole run and latches it, so an interrupt that arrives
+    // between two phases is seen by the next one instead of being dropped.
+    let (interrupt_tx, mut interrupt) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = interrupt_tx.send(true);
+        }
+    });
+
     let (ready_tx, ready_rx) = oneshot::channel();
     let (stop_tx, stop_rx) = oneshot::channel();
     let (departure_tx, departure_rx) = oneshot::channel();
@@ -328,8 +342,18 @@ async fn run(options: Options) -> Result<RunOutcome> {
         departure_tx,
         client_id.clone(),
     ));
-    if ready_rx.await.is_err() {
-        return Err(server_start_error(&mut server_task).await);
+    tokio::select! {
+        ready = ready_rx => {
+            if ready.is_err() {
+                return Err(server_start_error(&mut server_task).await);
+            }
+        }
+        _ = interrupt.wait_for(|fired| *fired) => {
+            let _ = stop_tx.send(());
+            let _ = timeout(TEARDOWN, &mut server_task).await;
+            println!("interrupted; the frame gate was not checked");
+            return Ok(RunOutcome::Interrupted);
+        }
     }
 
     // One deadline covers the browse, the handshake and the frames. The phases are awaited on
@@ -342,7 +366,7 @@ async fn run(options: Options) -> Result<RunOutcome> {
 
     let verdict: Result<()> = async {
         let endpoint = tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = interrupt.wait_for(|fired| *fired) => {
                 interrupted = true;
                 return Ok(());
             }
@@ -359,7 +383,7 @@ async fn run(options: Options) -> Result<RunOutcome> {
             client_role::connect_session(&run_name, &endpoint, identity, Box::new(sink)).await?;
         let outcome: Result<()> = async {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                _ = interrupt.wait_for(|fired| *fired) => {
                     interrupted = true;
                     return Ok(());
                 }
@@ -376,7 +400,7 @@ async fn run(options: Options) -> Result<RunOutcome> {
                 },
             }
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                _ = interrupt.wait_for(|fired| *fired) => {
                     interrupted = true;
                     Ok(())
                 }

@@ -81,9 +81,13 @@ pub async fn serve(
                         );
                     }
                 }
-                Some(Event::ClientActivated { roles, .. }) => {
+                Some(Event::ClientActivated { client_id, roles }) => {
                     println!("activated with roles: {}", roles.join(", "));
-                    if stream.is_none() && roles.iter().any(|role| role == PLAYER_ROLE) {
+                    // Only this run's client opens the stream; another connection's activation
+                    // must not start one.
+                    if stream.is_none()
+                        && client_id == expected_client_id
+                        && roles.iter().any(|role| role == PLAYER_ROLE) {
                         stream = Some(server.open_stream(TrackInfo {
                             title: Some("mdns-pair smoke test".to_owned()),
                             ..TrackInfo::default()
