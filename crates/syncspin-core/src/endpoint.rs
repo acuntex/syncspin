@@ -21,24 +21,23 @@ pub fn is_path_absolute(path: &str) -> bool {
     if rest.starts_with('/') {
         return false;
     }
-    let bytes = rest.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
+    let mut bytes = rest.bytes();
+    while let Some(byte) = bytes.next() {
         match byte {
             b'/' | b':' | b'@' | b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'('
             | b')' | b'*' | b'+' | b',' | b';' | b'=' => {}
             b'%' => {
-                let hex = bytes.get(index + 1..index + 3);
-                if !hex.is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) {
+                // A percent-encoded octet is exactly two hex digits; the iterator consumes them.
+                let (Some(high), Some(low)) = (bytes.next(), bytes.next()) else {
+                    return false;
+                };
+                if !(high.is_ascii_hexdigit() && low.is_ascii_hexdigit()) {
                     return false;
                 }
-                index += 2;
             }
             byte if byte.is_ascii_alphanumeric() => {}
             _ => return false,
         }
-        index += 1;
     }
     true
 }
@@ -97,7 +96,7 @@ fn is_local_ip(ip: IpAddr) -> bool {
 /// The IPv4 address an IPv6 one embeds, for the mapped, compatible and NAT64 forms.
 fn embedded_ipv4(ip: Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     let [a, b, c, d, e, f, g, h] = ip.segments();
-    let inner = std::net::Ipv4Addr::from((u32::from(g) << 16) | u32::from(h));
+    let inner = std::net::Ipv4Addr::new((g >> 8) as u8, g as u8, (h >> 8) as u8, h as u8);
     let mapped = [a, b, c, d, e] == [0, 0, 0, 0, 0] && f == 0xffff;
     let compatible = [a, b, c, d, e, f] == [0; 6];
     let nat64 = [a, b, c, d, e, f] == [0x64, 0xff9b, 0, 0, 0, 0];
@@ -116,6 +115,9 @@ mod tests {
             "/sendspin",
             "/a/b",
             "/a%20b",
+            "/%41",
+            "/a%41",
+            "/ab%41",
             "/a:b@c",
             "/~x_y-z.w",
             "/a/",
@@ -124,10 +126,25 @@ mod tests {
             assert!(is_path_absolute(path), "{path:?}");
         }
         for path in [
-            "", "sendspin", "//a", "/a?b", "/a#b", "/a b", "/a%zz", "/a%", "/é",
+            "", "sendspin", "//a", "/a?b", "/a#b", "/a b", "/a%zz", "/a%2G", "/a%", "/é",
         ] {
             assert!(!is_path_absolute(path), "{path:?}");
         }
+    }
+
+    /// The embedded address is taken whole: a shift that keeps only the low byte would still
+    /// pass the local-address tests, because loopback depends on the first octet alone.
+    #[test]
+    fn an_embedded_ipv4_is_extracted_whole() {
+        let parse = |address: &str| address.parse::<Ipv6Addr>().expect("the address parses");
+        for address in ["::ffff:192.0.2.1", "::c000:201", "64:ff9b::c000:201"] {
+            assert_eq!(
+                embedded_ipv4(parse(address)),
+                Some(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+                "{address}"
+            );
+        }
+        assert_eq!(embedded_ipv4(parse("2001:db8::1")), None);
     }
 
     #[test]
@@ -168,6 +185,8 @@ mod tests {
             "host.0x:8927",
             "192.0.2.1:8927",
             "192.0.2.1",
+            "192.0.2.1:abc",
+            "[1:2:3:4:5:ffff:7f00:1]:8927",
             "[2001:db8::1]:8927",
             "[fe80::1%eth0]:8927",
             "[64:ff9b::c000:201]:8927",
