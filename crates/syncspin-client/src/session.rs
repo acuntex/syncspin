@@ -135,6 +135,13 @@ const SUPPORTED_ROLES: [&str; 3] = [PLAYER_ROLE, CONTROLLER_ROLE, METADATA_ROLE]
 /// Largest output delay reported to the server, in milliseconds.
 const MAX_OUTPUT_DELAY_MS: u32 = 5_000;
 
+/// How long after an accepted `set_output_delay` the session reads the sink on its own.
+///
+/// The host normally calls `ControlHandle::output_delay_applied` as soon as it applied the value.
+/// This bounded fallback keeps the server's view from going stale when it does not: the session
+/// reads the sink once, and reports only what the sink adopted by then.
+const OUTPUT_DELAY_FALLBACK: Duration = Duration::from_millis(500);
+
 /// How far past its pre-port write time a frame may be before it is dropped instead of written.
 ///
 /// `roles/player/v1.md` calls for late chunks to be dropped so they cannot break the sync they
@@ -536,6 +543,8 @@ enum Wakeup {
     Playout,
     /// The interval elapsed with drops still in the late-audio window.
     LateFlush,
+    /// The fallback read of the sink after a `set_output_delay` is due.
+    OutputDelayPoll,
     /// The clock deadline elapsed.
     Clock,
     /// The keepalive deadline elapsed: a ping is due, or the one on the wire timed out.
@@ -618,6 +627,9 @@ pub(crate) struct Session<'a> {
     output_delay: Option<Duration>,
     /// `required_lead_time_ms` as the last `client/state` reported it.
     reported_lead_ms: Option<u32>,
+    /// When the sink is read once after an accepted `set_output_delay`, in case the host never
+    /// calls `ControlHandle::output_delay_applied`. `None` while no command is pending.
+    output_delay_poll_at: Option<Instant>,
     /// Drops not yet reported through [`Event::LateAudio`].
     late_audio: LateAudioWindow,
     /// Remaining `client/time` messages of the current burst (0 = no burst running).
@@ -837,6 +849,7 @@ pub(crate) async fn attempt(
         pre_port_delay,
         output_delay,
         reported_lead_ms: None,
+        output_delay_poll_at: None,
         late_audio: LateAudioWindow::default(),
         sync_remaining: 0,
         burst_deadline: None,
@@ -978,6 +991,7 @@ impl Session<'_> {
             let control = &mut self.control;
             let next_playout = self.next_playout;
             let late_flush = self.late_audio.flush_at;
+            let output_delay_poll = self.output_delay_poll_at;
             let wakeup = tokio::select! {
                 biased;
                 request = async {
@@ -1005,6 +1019,12 @@ impl Session<'_> {
                         None => pending().await,
                     }
                 } => Wakeup::LateFlush,
+                () = async {
+                    match output_delay_poll {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => pending().await,
+                    }
+                } => Wakeup::OutputDelayPoll,
                 message = self.transport.read() => Wakeup::Socket(message),
                 () = async {
                     match deadline {
@@ -1041,6 +1061,10 @@ impl Session<'_> {
                 },
                 Wakeup::Playout => self.drain_playout()?,
                 Wakeup::LateFlush => self.flush_late_audio(),
+                Wakeup::OutputDelayPoll => {
+                    self.output_delay_poll_at = None;
+                    self.poll_timing().await?;
+                }
                 Wakeup::Clock => {
                     if self.rehandshake.is_some() {
                         // The server must send its activation under the new keys; staying silent
@@ -1220,7 +1244,7 @@ impl Session<'_> {
         if !self.state_sent && self.clock.sample_count() >= 1 && self.player_active() {
             self.send_client_state().await?;
         }
-        // A burst is one of the three poll points, whether or not it produced a report: the clock
+        // A burst is one of the poll points, whether or not it produced a report: the clock
         // moved and a changed timing has to re-map or re-arm from it.
         self.poll_timing().await
     }
@@ -2152,7 +2176,7 @@ impl Session<'_> {
     /// `supported_commands` list is what makes a conformant server send player commands at all.
     async fn send_client_state(&mut self) -> Result<()> {
         self.write_client_state().await?;
-        // The state report is one of the three poll points; after it, a changed timing sends the
+        // The state report is one of the poll points; after it, a changed timing sends the
         // state that reports the new value.
         self.poll_timing().await
     }
@@ -2239,7 +2263,7 @@ impl Session<'_> {
         self.flush_sink()?;
         self.open_sink(format.clone())?;
         self.stream = Some(format.clone());
-        // One of the three poll points the trait's rustdoc names: the host may have changed the
+        // One of the poll points the trait's rustdoc names: the host may have changed the
         // values since the previous stream.
         self.poll_timing().await?;
         self.emit(Event::StreamStart { format });
@@ -2588,8 +2612,9 @@ impl Session<'_> {
 
     /// Re-reads the delays the sink reports and reacts to a change.
     ///
-    /// The trait has no change notification, so the session polls at three named points: stream
-    /// open, after every `client/state` report and after every clock burst.
+    /// The trait has no change notification, so the session polls at named points: stream
+    /// open, after every `client/state` report, after every clock burst, once after an accepted
+    /// `set_output_delay` and on `ControlHandle::output_delay_applied`.
     ///
     /// [`Sink::pre_port_delay`] only moves the timer: the deadlines are a function of the server
     /// timestamp, the clock and the post-port delay. A change that moves `required_lead_time_ms` in
@@ -2757,21 +2782,24 @@ impl Session<'_> {
             // Advertised exactly when `output_delay_control` is set, see
             // `supported_player_commands`; otherwise it falls through to the ignored arm.
             OUTPUT_DELAY_COMMAND if self.config.output_delay_control => {
-                // The field is required for this command; a missing one is ignored like any other
-                // incomplete player command, with a line on stderr. A negative or non-integer
-                // value never gets here: the `u32` field fails to decode and the whole message is
-                // ignored as malformed (deviation 15).
+                // The field is required for this command; a missing one is ignored silently like
+                // the missing field of `volume` and `mute`. A negative or non-integer value never
+                // gets here: the `u32` field fails to decode and the whole message is ignored as
+                // malformed (deviation 15).
                 let Some(requested) = player.output_delay_ms else {
-                    eprintln!("syncspin: set_output_delay without output_delay_ms ignored");
                     return Ok(());
                 };
                 // A value above the fixed range is capped, not fatal (deviation 21), as for volume.
                 let applied = requested.min(MAX_OUTPUT_DELAY_MS);
+                // The event is emitted for every accepted command, also when `applied` equals the
+                // delay in force: the host persists the value, and a repeat is how it learns the
+                // server's choice again after a reconnect. Hosts must tolerate repeats.
                 self.emit(Event::OutputDelay { requested, applied });
                 // The host applies `applied` to its sink and persists it. The session reports
-                // the value the sink returns at its next poll, or at once when the host calls
-                // `ControlHandle::output_delay_applied`; it never reports a value it has not seen
-                // the sink adopt.
+                // the value the sink returns when the host calls
+                // `ControlHandle::output_delay_applied`, or from the fallback read below if the
+                // sink has adopted it by then; it never reports a value the sink did not adopt.
+                self.output_delay_poll_at = Some(Instant::now() + OUTPUT_DELAY_FALLBACK);
             }
             // A command this client does not advertise.
             _ => {}
@@ -2809,8 +2837,9 @@ impl Session<'_> {
             }
             ControlAction::Mute(muted) => self.apply_mute(muted).await.map(|()| self.volume),
             ControlAction::OutputDelayApplied => {
-                // `send_client_state` reads the sink once, re-maps the queue and reports it.
-                self.report_state().await.map(|()| self.volume)
+                // Reads the sink once and reports only when its timing differs from the cache.
+                self.output_delay_poll_at = None;
+                self.poll_timing().await.map(|()| self.volume)
             }
             ControlAction::SetUnpairedAccess(enabled) => self
                 .apply_unpaired_access(enabled)
@@ -4176,6 +4205,7 @@ mod tests {
             pre_port_delay: Duration::ZERO,
             output_delay: None,
             reported_lead_ms: None,
+            output_delay_poll_at: None,
             late_audio: LateAudioWindow::default(),
             sync_remaining: 0,
             burst_deadline: None,

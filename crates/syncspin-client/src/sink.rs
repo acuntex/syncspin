@@ -225,10 +225,11 @@ pub trait Sink: Send + 'static {
     /// it. A value that belongs on the post-port side raises the lead the server sends ahead
     /// instead of compensating it, because the server factors `output_delay` into that lead.
     ///
-    /// The client polls this when a stream opens, after every `client/state` report and after every
-    /// clock burst; a change moves the timer, and because the reported lead is at least the
-    /// pre-port delay, a change that moves that lead in either direction sends an updated
-    /// `required_lead_time_ms`. The default is zero.
+    /// The client polls this when a stream opens, after every `client/state` report, after every
+    /// clock burst, once about half a second after an accepted `set_output_delay`, and when the host
+    /// calls `ControlHandle::output_delay_applied`; a change moves the timer, and because the
+    /// reported lead is at least the pre-port delay, a change that moves that lead in either
+    /// direction sends an updated `required_lead_time_ms`. The default is zero.
     fn pre_port_delay(&self) -> Duration {
         Duration::ZERO
     }
@@ -241,7 +242,9 @@ pub trait Sink: Send + 'static {
     ///
     /// The host restores the same value across restarts and reconnections: the protocol requires
     /// `output_delay_ms` to persist, and this trait is the only place the client learns it. The
-    /// client polls it at the same points as [`Sink::pre_port_delay`]; a change re-maps the queued
+    /// client polls it at the same points as [`Sink::pre_port_delay`] (stream open, after every
+    /// `client/state` report, after every clock burst, the fallback read after `set_output_delay`
+    /// and `ControlHandle::output_delay_applied`); a change re-maps the queued
     /// deadlines and sends a new `client/state`, because `output_delay_ms` is a player field.
     ///
     /// `None` means the sink does not know, which the client treats as no additional delay.

@@ -456,8 +456,12 @@ pub enum Event {
     /// 0-5000 ms is capped to 5000 (deviation 21); a negative one is dropped with the malformed
     /// message it arrives in. The host applies `applied` to its sink and persists it as
     /// `roles/player/v1.md` requires. The session then reports what the sink returns in a
-    /// `client/state`: at its next timing poll (after a clock burst), or at once when the host calls
-    /// [`ControlHandle::output_delay_applied`].
+    /// `client/state`: at once when the host calls [`ControlHandle::output_delay_applied`], and
+    /// otherwise from a single fallback read of the sink half a second after the command (a value
+    /// the sink has not adopted by then waits for the next timing poll, after a clock burst).
+    ///
+    /// The event follows every accepted command, also when `applied` equals the delay already in
+    /// force, so a host must tolerate repeats.
     OutputDelay {
         /// Delay the server asked for, as it arrived on the wire.
         requested: u32,
@@ -879,10 +883,11 @@ impl ControlHandle {
     ///
     /// The host calls this after it applied the delay from [`Event::OutputDelay`] to its sink and
     /// persisted it. The session reads [`Sink::output_delay`], re-maps the queued deadlines and
-    /// sends a `client/state` at once, so the server recomputes its send-ahead from the value in
-    /// force. Without the call the same report follows at the session's next timing poll, after
-    /// the next clock burst, so the call shortens the delay but is not needed for correctness. A
-    /// host that changes the delay on its own, without a server command, calls it the same way.
+    /// sends a `client/state` at once when the sink's timing differs from what was last reported,
+    /// so the server recomputes its send-ahead from the value in force. Without the call the
+    /// session makes one fallback read of the sink half a second after a server command; a host
+    /// that applies the value later, or that changes the delay on its own without a server
+    /// command, must call this, or the report waits for the next timing poll after a clock burst.
     ///
     /// # Errors
     /// Returns an error for a connection that has ended, and when the server did not activate

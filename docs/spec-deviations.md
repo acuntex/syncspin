@@ -490,14 +490,16 @@ queue in `syncspin-client` is where the correction lands.
 **Spec:** `roles/player/v1.md`, `server/command` player object. `output_delay_ms` is an integer in
 the range 0-5000, required for `set_output_delay`, and `messaging.md` says a field value outside
 the fixed range its definition gives is a protocol error: the receiver MUST close the connection.
+This client does not close: that is a conscious deviation.
 
 **What we do:** a `server/command` carrying `set_output_delay` with an `output_delay_ms` of 5001 or
 more - the wire field is a `u32`, so such a value decodes - is reported as
 `Event::OutputDelay { requested, applied }` with `applied` capped to 5000. The host applies
 `applied`, so the client's own `client/state` stays inside the range a conformant server accepts,
 and the connection stays open. A negative or non-integer value fails to decode and is ignored with
-the whole message, as deviation 15 records. A missing `output_delay_ms` is ignored with a line on
-stderr. `the_output_delay_command_reports_the_clamped_value` pins 0, 200, 5000 and 5001.
+the whole message, as deviation 15 records. A missing `output_delay_ms` is ignored silently, like
+the missing field of `volume` and `mute`. `the_output_delay_command_reports_the_clamped_value`
+pins 0, 200, 5000 and 5001.
 
 **Why:** closing the connection would silence playback over a value the server got wrong, and the
 nearest legal delay is unambiguous. This is the same tolerance deviation 12 records for volume.

@@ -294,11 +294,15 @@ pub struct ClientConfig {
     /// The command is an instruction to the host, not a value the session applies itself: the sink
     /// remains the authority for `output_delay_ms`. Once the host applied the value it calls
     /// [`ControlHandle::output_delay_applied`](crate::ControlHandle::output_delay_applied), and the
-    /// session reads the sink, re-maps queued deadlines and reports it. Persisting the value, so it
+    /// session reads the sink, re-maps queued deadlines and reports it. A host that never calls it
+    /// is still reported: the session reads the sink once, half a second after the command, and
+    /// sends a `client/state` if the sink adopted a new value by then. A host that applies the
+    /// value later than that must call `output_delay_applied`. Persisting the value, so it
     /// survives restarts and reconnects, is the host's duty: the session never stores it.
     ///
-    /// Adding this field is a 0.x break for a full `ClientConfig { .. }` literal, as the changelog
-    /// records; [`ClientConfig::new`] and [`ClientConfig::with_output_delay_control`] keep working.
+    /// Adding this field is a 0.x break for a full `ClientConfig { .. }` literal (the changelog is
+    /// generated from the commit history at release time); [`ClientConfig::new`] and
+    /// [`ClientConfig::with_output_delay_control`] keep working.
     pub output_delay_control: bool,
     /// Minimum start-up lead the server must give this player, in milliseconds.
     ///

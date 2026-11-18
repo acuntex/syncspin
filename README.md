@@ -285,7 +285,8 @@ change that delay on request - a TV driving a soundbar, for example - sets
 `ClientConfig::output_delay_control`: the client then advertises `set_output_delay`, reports
 `Event::OutputDelay`, and the host applies it to its output, persists it and calls
 `ControlHandle::output_delay_applied`: the client then reads the sink, re-maps the queued deadlines
-and sends a `client/state` with the value in force. A value above 5000 ms is capped to 5000
+and sends a `client/state` with the value in force (without the call, one fallback read follows
+half a second after the command). A value above 5000 ms is capped to 5000
 instead of ending the connection (deviation 21). The buffer the
 session asks for comes from its configuration or from arriving audio, so it needs no sink hook. The
 crate owns the connection, the clock, the playout schedule and the reconnect loop; the host owns the

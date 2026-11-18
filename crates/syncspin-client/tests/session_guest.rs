@@ -1362,7 +1362,7 @@ async fn a_change_of_output_delay_remaps_and_reports_state() {
     );
 
     // The host raises the reported post-port delay; the volume command makes the session report
-    // its state, which is one of the three points where the timing is polled.
+    // its state, which is one of the points where the timing is polled.
     timing
         .lock()
         .expect("the timing lock is not poisoned")
@@ -4518,6 +4518,16 @@ async fn a_badly_typed_output_delay_command_is_ignored() {
         Event::Track { title, .. } => assert_eq!(title, "Still here"),
         other => panic!("a malformed command must be ignored, got {other:?}"),
     }
+
+    // A negative value does not decode into the `u32` field either: no event, no state change.
+    server.json(
+        r#"{"type":"server/command","payload":{"player":{"command":"set_output_delay","output_delay_ms":-5}}}"#,
+    );
+    server.metadata("Still here too", "An artist");
+    match next_event(&mut events).await {
+        Event::Track { title, .. } => assert_eq!(title, "Still here too"),
+        other => panic!("a negative delay must be ignored, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -4552,6 +4562,140 @@ async fn the_applied_output_delay_is_reported_at_once() {
     assert_eq!(
         player.output_delay_ms, 200,
         "the state carries the applied delay"
+    );
+}
+
+#[tokio::test]
+async fn an_applied_output_delay_is_reported_without_the_host_call() {
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let recordings = Recordings::default();
+    let timing = timing_handle(None, Duration::ZERO);
+    let sink = Box::new(RecordingSink::with_timing(recordings, timing.clone()));
+    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+    let _first = wait_for_client_state(&mut server).await;
+
+    send_player_command(&server, "set_output_delay", Some(200));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::OutputDelay { applied: 200, .. }
+    ));
+    // The host adopts the value but never calls `output_delay_applied`: the fallback read of the
+    // sink still reports it.
+    timing
+        .lock()
+        .expect("the timing lock is not poisoned")
+        .output_delay = Some(Duration::from_millis(200));
+
+    let player = wait_for_client_state(&mut server)
+        .await
+        .player
+        .expect("the player object is present");
+    assert_eq!(player.output_delay_ms, 200);
+}
+
+#[tokio::test]
+async fn an_output_delay_change_with_queued_audio_keeps_the_session_operational() {
+    let mut server = FakeServer::start(ServerOptions {
+        manual_time: true,
+        ..ServerOptions::default()
+    })
+    .await
+    .unwrap();
+    let recordings = Recordings::default();
+    let timing = timing_handle(Some(Duration::from_millis(500)), Duration::ZERO);
+    let sink = Box::new(RecordingSink::with_timing(
+        recordings.clone(),
+        timing.clone(),
+    ));
+    let (mut events, handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+    establish_clock(&mut server).await;
+
+    server.stream_start("pcm", 48_000, 2, 16);
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::StreamStart { .. }
+    ));
+    // Two frames far enough out to stay queued while the delay changes. The metadata message
+    // follows them on the same socket, so both are queued by the time its event arrives.
+    let started = Instant::now();
+    server.audio(now_us() + 2_000_000, 2_000_000, vec![0x11; 4]);
+    server.audio(now_us() + 2_100_000, 2_100_000, vec![0x22; 4]);
+    server.metadata("queued", "queued");
+    assert!(matches!(next_event(&mut events).await, Event::Track { .. }));
+    assert!(recordings.written().is_empty(), "both frames are queued");
+
+    // The server lowers the delay: the queued frames move later by 400 ms and nothing is lost.
+    send_player_command(&server, "set_output_delay", Some(100));
+    match next_event(&mut events).await {
+        Event::OutputDelay { applied, .. } => assert_eq!(applied, 100),
+        other => panic!("expected OutputDelay, got {other:?}"),
+    }
+    timing
+        .lock()
+        .expect("the timing lock is not poisoned")
+        .output_delay = Some(Duration::from_millis(100));
+    handle
+        .control()
+        .output_delay_applied()
+        .await
+        .expect("the player role is active");
+    loop {
+        let player = wait_for_client_state(&mut server)
+            .await
+            .player
+            .expect("the player state follows the role");
+        if player.output_delay_ms == 100 {
+            break;
+        }
+    }
+
+    // The server raises it again while the frames are still queued.
+    send_player_command(&server, "set_output_delay", Some(300));
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::OutputDelay { applied: 300, .. }
+    ));
+    timing
+        .lock()
+        .expect("the timing lock is not poisoned")
+        .output_delay = Some(Duration::from_millis(300));
+    handle
+        .control()
+        .output_delay_applied()
+        .await
+        .expect("the session is still operational");
+    loop {
+        let player = wait_for_client_state(&mut server)
+            .await
+            .player
+            .expect("the player state follows the role");
+        if player.output_delay_ms == 300 {
+            break;
+        }
+    }
+
+    // Both frames are still played, at the deadlines of the delay now in force (2.0 s - 300 ms).
+    let written = wait_for_writes(&recordings, 2).await;
+    assert_near(
+        written[0].due,
+        started + Duration::from_millis(1_700),
+        Duration::from_millis(150),
+        "the first frame follows the delay in force",
+    );
+    // The deadlines are computed, not measured: the second frame's follows the first by the
+    // 100 ms spacing of the timestamps, and both sit at the remapped (300 ms) position.
+    let spacing = written[1].due.duration_since(written[0].due);
+    assert!(
+        spacing >= Duration::from_millis(80) && spacing <= Duration::from_millis(120),
+        "the frames keep their 100 ms spacing, got {spacing:?}"
+    );
+    assert_near(
+        written[1].due,
+        started + Duration::from_millis(1_800),
+        Duration::from_millis(150),
+        "the second frame's deadline is remapped too",
     );
 }
 
