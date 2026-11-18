@@ -9,8 +9,14 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# The example's single mode: both roles need their mDNS backend. Off by default, so a plain
+# `cargo test --workspace` still exercises the crates without `mdns` through feature unification.
+mdns = ["syncspin-client/mdns", "syncspin-server/mdns"]
+
 [dependencies]
-syncspin-client = { version = "0.4.0", path = "../../crates/syncspin-client", features = ["mdns"] }
-syncspin-server = { version = "0.4.0", path = "../../crates/syncspin-server", features = ["mdns"] }
+syncspin-client = { version = "0.4.0", path = "../../crates/syncspin-client" }
+syncspin-server = { version = "0.4.0", path = "../../crates/syncspin-server" }
 anyhow.workspace = true
+base64.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

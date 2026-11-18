@@ -2,44 +2,67 @@
 //!
 //! The example runs both halves of the protocol in one binary: it publishes
 //! `_sendspin-server._tcp` under a name it derives for this run, discovers that same name from a
-//! separate mDNS query, approves only the client that carries the name, and streams silent frames
-//! into a counting sink until the stream arrives.
+//! separate mDNS query, approves only the client whose static public key it generated, and streams
+//! silent frames into a counting sink until the stream arrives.
 //!
-//! Both dependencies are built with their `mdns` backend unconditionally: there is no feature
-//! table, because an example without discovery has nothing to demonstrate.
+//! Both dependencies need their `mdns` backend, so the flow is behind this example's `mdns`
+//! feature. A build without it still parses the command line and exits 2 with the feature named.
 //!
 //! ```sh
-//! cargo run -p mdns-pair
+//! cargo run -p mdns-pair --features mdns
 //! ```
 //!
 //! The run name is `mdns-pair-<pid>` unless `--name` names it explicitly. The PID keeps two runs on
 //! one host apart, and it is also why an explicit name must fit the mDNS label with room to spare:
 //! a derived name grows by the suffix, an explicit one is published as given.
 
+// Without the flow, the helpers it drives are reachable only from the test module; the build still
+// parses the command line, so the dead-code analysis would otherwise name them.
+#![cfg_attr(not(feature = "mdns"), allow(dead_code))]
+
 mod advertise_only;
+#[cfg(feature = "mdns")]
 mod client_role;
 mod find;
+#[cfg(feature = "mdns")]
 mod server_role;
 mod sink;
 
+#[cfg(feature = "mdns")]
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU8, Ordering};
+#[cfg(feature = "mdns")]
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use syncspin_client::{AudioFormat, ClientHandle, EventStream, GoodbyeReason, Identity};
+use anyhow::{anyhow, bail, Result};
+#[cfg(feature = "mdns")]
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(feature = "mdns")]
+use base64::Engine as _;
+use syncspin_client::AudioFormat;
+#[cfg(feature = "mdns")]
+use syncspin_client::{ClientHandle, EventStream, GoodbyeReason, Identity};
 // Both crates export an `MdnsDiscovery`; each role runs its own daemon, so each import names the
 // role. The client's alias lives in `client_role`.
+#[cfg(feature = "mdns")]
 use syncspin_server::MdnsDiscovery as ServerMdns;
+#[cfg(feature = "mdns")]
 use syncspin_server::ServerConfig;
+#[cfg(feature = "mdns")]
 use tokio::sync::oneshot;
+#[cfg(feature = "mdns")]
 use tokio::time::timeout;
 
+#[cfg(feature = "mdns")]
 use crate::advertise_only::AdvertiseOnly;
-use crate::find::{timeout_message, Stage};
-use crate::sink::{Counters, CountingSink};
+#[cfg(feature = "mdns")]
+use crate::find::timeout_message;
+use crate::find::Stage;
+use crate::sink::Counters;
+#[cfg(any(feature = "mdns", test))]
+use crate::sink::CountingSink;
 
 /// Base name the run announces unless `--name` says otherwise.
 const DEFAULT_NAME: &str = "mdns-pair";
@@ -249,15 +272,43 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(options).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            // The cause chain stays on one line: a captured smoke-test log shows which stage
-            // failed and why without a stack of separate lines.
-            eprintln!("error: {error:#}");
-            ExitCode::FAILURE
+    #[cfg(feature = "mdns")]
+    {
+        match run(options).await {
+            Ok(RunOutcome::Completed) => ExitCode::SUCCESS,
+            Ok(RunOutcome::Interrupted) => ExitCode::from(130),
+            Err(error) => {
+                // The cause chain stays on one line: a captured smoke-test log shows which stage
+                // failed and why without a stack of separate lines.
+                eprintln!("error: {error:#}");
+                ExitCode::FAILURE
+            }
         }
     }
+    #[cfg(not(feature = "mdns"))]
+    {
+        let _ = options;
+        eprintln!("error: the mDNS flow needs the mdns feature: rebuild with --features mdns");
+        ExitCode::from(2)
+    }
+}
+
+/// What the flow produced before teardown began.
+#[cfg(feature = "mdns")]
+enum Flow {
+    /// The gate was reached; the session is handed to the teardown.
+    Gate(ClientHandle, EventStream),
+    /// Ctrl-C arrived before the gate, so nothing was checked.
+    Interrupted,
+}
+
+/// The process outcome of a run that reached its teardown.
+#[cfg(feature = "mdns")]
+enum RunOutcome {
+    /// The gate was reached and the count checked.
+    Completed,
+    /// Ctrl-C arrived before the gate.
+    Interrupted,
 }
 
 /// Runs one discovery, approval and stream pass, then tears both roles down.
