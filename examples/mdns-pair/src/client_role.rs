@@ -23,7 +23,7 @@ use syncspin_client::{connect, ClientConfig, ClientHandle, Event, EventStream, I
 use syncspin_client::MdnsDiscovery as ClientMdns;
 
 #[cfg(feature = "mdns")]
-use crate::find::{matching_servers, reachable_endpoint};
+use crate::find::{matching_servers, reachable};
 use crate::sink::Counters;
 use crate::PLAYER_SUFFIX;
 
@@ -57,7 +57,7 @@ pub async fn discover(run_name: &str) -> Result<String> {
         .await
         .context("the discovery task ended")??;
         for server in matching_servers(&servers, run_name) {
-            if let Some(endpoint) = reachable_endpoint(server).await {
+            if let Some(endpoint) = reachable(server).await {
                 // The path comes from a TXT record any LAN host can publish; `Debug` escapes it.
                 println!("discovered {endpoint:?} on browse {attempt}");
                 return Ok(endpoint);
@@ -141,7 +141,10 @@ pub async fn wait_for_connection(
                          {expected_server_id:?}"
                     );
                 }
-                println!("connected to {server_id:?} at {endpoint:?} (encrypted)");
+                println!(
+                    "connected to {} at {endpoint:?} (encrypted)",
+                    crate::server_role::short_id(&server_id)
+                );
                 return Ok(());
             }
             Some(Event::Disconnected { reason, .. }) => {

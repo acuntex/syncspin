@@ -442,13 +442,16 @@ async fn run(options: Options) -> Result<RunOutcome> {
             if interrupted {
                 Ok(())
             } else {
-                verify_gate(&report, &expected)
+                verify_gate(&report)
             }
         }
         .await;
         // The goodbye first, while the close signal still reaches a session that can send it, then
         // the task, then the event stream: dropping the stream first makes the session loop return
         // on `events.is_closed()` without a `client/goodbye`.
+        // `shutdown` is the truthful reason: this process is going away. The spec's advice that a
+        // server reconnect after it applies to server-initiated links; here the server is ours and
+        // stops right after.
         handle.close(GoodbyeReason::Shutdown);
         said_goodbye = true;
         let _ = timeout(TEARDOWN, handle.finished()).await;
@@ -528,18 +531,11 @@ async fn server_start_error(
 /// This is an assertion, not a log line. A run that only printed the numbers would pass on a
 /// stream that delivered one chunk or announced another format, and the approval it demonstrates
 /// would be unproven.
-fn verify_gate(report: &Counters, expected: &AudioFormat) -> Result<()> {
-    match report.format() {
-        Some(format) if &format == expected => {}
-        Some(format) => bail!(
-            "the stream announced {} Hz, {} channels, {}-bit `{}`, but this run expects \
-             {SAMPLE_RATE} Hz, {CHANNELS} channels, {BIT_DEPTH}-bit `pcm`",
-            format.sample_rate,
-            format.channels,
-            format.bit_depth,
-            format.codec
-        ),
-        None => bail!("the stream never announced a format"),
+fn verify_gate(report: &Counters) -> Result<()> {
+    // `CountingSink::open` refuses any format but the expected one, so a stored format is always
+    // the right one; only a stream that never opened is left to catch here.
+    if report.format().is_none() {
+        bail!("the stream never announced a format");
     }
     if report.bytes() < GATE_BYTES {
         bail!(
@@ -705,7 +701,7 @@ mod tests {
             .expect("the stream format opens");
         feed(&mut sink, GATE_FRAMES);
         assert!(
-            verify_gate(&counters, &expected).is_ok(),
+            verify_gate(&counters).is_ok(),
             "the full gate passes and prints its count"
         );
 
@@ -714,13 +710,13 @@ mod tests {
             .expect("the stream format opens");
         feed(&mut sink, GATE_FRAMES - 1);
         assert!(
-            verify_gate(&counters, &expected).is_err(),
+            verify_gate(&counters).is_err(),
             "one chunk short fails the byte count"
         );
 
         let (_sink, counters) = CountingSink::new(GATE_FRAMES, expected.clone());
         assert!(
-            verify_gate(&counters, &expected).is_err(),
+            verify_gate(&counters).is_err(),
             "a sink that never opened a stream fails the format check"
         );
     }

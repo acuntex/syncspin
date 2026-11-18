@@ -189,7 +189,7 @@ pub async fn discover_reachable_endpoint(discovery: &dyn Discovery) -> Result<St
     }
     let mut failures = Vec::new();
     for (address, endpoint) in candidates {
-        match probe(&address).await {
+        match probe(&address, PROBE_TIMEOUT).await {
             Ok(()) => return Ok(endpoint),
             Err(error) => failures.push(format!("{address}: {error:#}")),
         }
@@ -201,12 +201,36 @@ pub async fn discover_reachable_endpoint(discovery: &dyn Discovery) -> Result<St
 }
 
 /// Opens and immediately drops one TCP connection, to tell a reachable address from a dead one.
-async fn probe(address: &str) -> Result<()> {
+async fn probe(address: &str, timeout: Duration) -> Result<()> {
     // Dropping the stream closes the probe; it only decides reachability.
-    tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(address))
+    tokio::time::timeout(timeout, TcpStream::connect(address))
         .await
-        .with_context(|| format!("no answer within {} s", PROBE_TIMEOUT.as_secs()))??;
+        .with_context(|| format!("no answer within {} ms", timeout.as_millis()))??;
     Ok(())
+}
+
+/// Returns the first endpoint of one `server` record that accepts a TCP connection.
+///
+/// This is [`discover_reachable_endpoint`] for a host that has already chosen the record, for
+/// example by its `name`: the same IPv4-first walk and the same probe, with `timeout` as the budget
+/// for each address instead of the library's default.
+///
+/// # Errors
+/// Returns an error when the record names no dialable endpoint, and one naming every attempt when
+/// all addresses refused or timed out.
+pub async fn reachable_endpoint(server: &DiscoveredServer, timeout: Duration) -> Result<String> {
+    let addresses = server.ordered_addresses();
+    if addresses.is_empty() {
+        bail!("the record names no dialable endpoint");
+    }
+    let mut failures = Vec::new();
+    for address in addresses {
+        match probe(address, timeout).await {
+            Ok(()) => return Ok(format!("ws://{address}{}", server.path)),
+            Err(error) => failures.push(format!("{address}: {error:#}")),
+        }
+    }
+    bail!("no address accepted a connection ({})", failures.join("; "))
 }
 
 /// How a service is published and how remote ones are found.

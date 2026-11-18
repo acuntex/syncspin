@@ -724,7 +724,16 @@ impl Session<'_> {
     async fn run(mut self, noise: &mut TransportState) -> Result<()> {
         // The first activation: roles for a paired or approved client, and nothing for one that
         // still waits for the operator.
-        self.activate_roles(noise).await?;
+        // A failure here still ends a connection that `ClientConnected` announced, so the host
+        // sees the matching `ClientLeft` and its count of live connections stays right.
+        if let Err(error) = self.activate_roles(noise).await {
+            self.leave();
+            let _ = self.connection.close().await;
+            let _ = self.events.send(Event::ClientLeft {
+                reason: "activation failed".to_owned(),
+            });
+            return Err(error);
+        }
 
         let reason = loop {
             if let Some(reason) = self.ending.take() {

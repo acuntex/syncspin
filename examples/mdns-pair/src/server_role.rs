@@ -19,6 +19,11 @@ use crate::{CHUNK_BYTES, CHUNK_MS};
 /// Versioned role a connection needs before the run opens the stream.
 const PLAYER_ROLE: &str = "player@v1";
 
+/// The first characters of a key id: enough to tell two peers apart in a log, not the whole key.
+pub(crate) fn short_id(id: &str) -> String {
+    format!("{}…", id.chars().take(8).collect::<String>())
+}
+
 /// Starts the server, reports its address on `ready`, and serves until `stop` fires.
 ///
 /// The run waits for `ready` before it browses, so a listener that cannot start is an error here
@@ -47,14 +52,18 @@ pub async fn serve(
     let mut stream: Option<StreamWriter> = None;
     // One departure is all the run listens for, so the sender is taken once. `ClientLeft` names no
     // client, so the run counts live connections instead: the signal goes out when the count falls
-    // back to zero. With a foreign connection still open it stays silent, and the run's bounded
-    // wait covers it. The loop keeps serving whether or not anyone is waiting for it.
+    // back to zero. The server reports one `ClientLeft` for every `ClientConnected`, including a
+    // connection whose first activation failed. With a foreign connection still open the signal
+    // stays silent, and the run's bounded wait covers it. The loop keeps serving whether or not
+    // anyone is waiting for it.
     let mut departure = Some(departure);
     let mut live = 0usize;
     let silence = vec![0u8; CHUNK_BYTES];
     let mut pace = interval(Duration::from_millis(CHUNK_MS));
-    // A late wakeup writes one chunk, not a burst: the frames are meaningless once the run is over.
-    pace.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The writer stamps chunks by the audio written, not by the clock, so a late wakeup must catch
+    // up: skipping ticks would let the timeline fall behind real time, and the client drops chunks
+    // whose timestamp is already past. `Burst` keeps the timeline on the clock.
+    pace.set_missed_tick_behavior(MissedTickBehavior::Burst);
 
     loop {
         tokio::select! {
@@ -72,7 +81,8 @@ pub async fn serve(
                     if client_id == expected_client_id {
                         match server.approve(&client_id).await {
                             Ok(()) => println!(
-                                "approved {name:?} as {client_id} (approved on arrival: {approved})"
+                                "approved {name:?} as {} (approved on arrival: {approved})",
+                                short_id(&client_id)
                             ),
                             Err(error) => println!("could not approve {name:?}: {error:#}"),
                         }
@@ -80,8 +90,9 @@ pub async fn serve(
                         // A peer chooses its own name; `Debug` escapes control characters
                         // instead of letting them reach the terminal.
                         println!(
-                            "ignored {name:?} ({client_id}): this run approves only \
-                             {expected_client_id}"
+                            "ignored {name:?} ({}): this run approves only {}",
+                            short_id(&client_id),
+                            short_id(&expected_client_id)
                         );
                     }
                 }
@@ -92,6 +103,9 @@ pub async fn serve(
                     if stream.is_none()
                         && client_id == expected_client_id
                         && roles.iter().any(|role| role == PLAYER_ROLE) {
+                        // The interval has been idle until now; `Burst` would replay every tick
+                        // it missed and put the timeline far ahead of the clock.
+                        pace.reset();
                         stream = Some(server.open_stream(TrackInfo {
                             title: Some("mdns-pair smoke test".to_owned()),
                             ..TrackInfo::default()

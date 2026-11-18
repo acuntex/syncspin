@@ -122,7 +122,7 @@ pub use discovery::MdnsDiscovery;
 #[cfg(feature = "discovery")]
 pub use discovery::{advertise, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT};
 pub use discovery::{
-    discover_reachable_endpoint, discover_servers, DiscoveredServer, Discovery,
+    discover_reachable_endpoint, discover_servers, reachable_endpoint, DiscoveredServer, Discovery,
     ServiceAdvertisement, CLIENT_SERVICE_TYPE, DEFAULT_SENDSPIN_PATH, SERVER_SERVICE_TYPE,
 };
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};

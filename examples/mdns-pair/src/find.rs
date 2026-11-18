@@ -3,10 +3,10 @@
 //! A browse blocks, so it is not here. Everything that happens to a record after it arrives is, so
 //! the filter, the endpoint parse and the diagnostics are decided without a daemon.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use syncspin_client::DiscoveredServer;
-use tokio::net::TcpStream;
 
 /// How long one advertised address gets to accept before the next one is tried.
 ///
@@ -29,50 +29,40 @@ pub(crate) fn matching_servers<'a>(
         .collect()
 }
 
-/// Returns the `host:port` a `ws://` endpoint names, or `None` when it names none.
+/// Returns `server` without the addresses a client must not dial.
 ///
-/// [`DiscoveredServer::endpoints`] yields `ws://host:port/path`; the probe needs the authority half,
-/// so this strips the scheme and keeps what precedes the first `/`. A missing `ws://`, an empty
-/// authority (`ws:///sendspin`) and a scheme this example does not speak all yield `None` rather
-/// than a guess.
-fn probe_address(endpoint: &str) -> Option<&str> {
-    let rest = endpoint.strip_prefix("ws://")?;
-    let address = match rest.split_once('/') {
-        Some((address, _)) => address,
-        None => rest,
-    };
-    if address.is_empty() {
-        None
-    } else {
-        Some(address)
+/// `connection.md` says a client SHOULD only connect to an advertised address that is not a
+/// loopback or unspecified one. A record any LAN host can publish could otherwise point the probe,
+/// and then the session, at a port on this machine. An address that is not a literal socket
+/// address is kept: the library orders it with IPv6 and the probe decides.
+pub(crate) fn dialable(server: &DiscoveredServer) -> DiscoveredServer {
+    let addresses = server
+        .addresses
+        .iter()
+        .filter(|address| match address.parse::<SocketAddr>() {
+            Ok(address) => !address.ip().is_loopback() && !address.ip().is_unspecified(),
+            Err(_) => true,
+        })
+        .cloned()
+        .collect();
+    DiscoveredServer {
+        addresses,
+        path: server.path.clone(),
+        name: server.name.clone(),
     }
 }
 
-/// Returns the first endpoint of `server` that accepts a TCP connection, walking them in order.
+/// Returns the first dialable endpoint of `server` that accepts a TCP connection, or `None`.
 ///
-/// [`DiscoveredServer::endpoints`] already orders IPv4 first. What it cannot know is whether the
-/// first address is still served: a previous run's record, or a host that bound one family only,
-/// can leave a dead entry at the front. The probe is one TCP connect with a short timeout, and the
-/// returned endpoint is the one the session then dials, so the choice is not made twice.
-///
-/// The probe never reaches the server's event stream: the server reports a connection only after
-/// the WebSocket upgrade and the Noise handshake, so a probe that closes at once is neither a
-/// `ClientConnected` nor a `ClientLeft`. It repeats only while no address answers, and stops at
-/// the first one that does.
-pub(crate) async fn reachable_endpoint(server: &DiscoveredServer) -> Option<String> {
-    for endpoint in server.endpoints() {
-        let Some(address) = probe_address(&endpoint) else {
-            continue;
-        };
-        // Dropping the accepted stream closes the probe; it only decides reachability.
-        let accepted = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(address))
-            .await
-            .is_ok_and(|result| result.is_ok());
-        if accepted {
-            return Some(endpoint);
-        }
-    }
-    None
+/// The walk and the probe are the client library's ([`syncspin_client::reachable_endpoint`]); only
+/// the per-address budget is shorter, because a run has a few seconds in all. The returned endpoint
+/// is the one the session dials, so the choice is not made twice. The probe never reaches the
+/// server's event stream: the server reports a connection only after the WebSocket upgrade and the
+/// Noise handshake.
+pub(crate) async fn reachable(server: &DiscoveredServer) -> Option<String> {
+    syncspin_client::reachable_endpoint(&dialable(server), PROBE_TIMEOUT)
+        .await
+        .ok()
 }
 
 /// The stage a deadline ended in, named by the call that awaited it.
@@ -139,17 +129,23 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_address_comes_from_the_endpoint() {
-        assert_eq!(
-            probe_address("ws://192.0.2.10:8927/sendspin"),
-            Some("192.0.2.10:8927")
-        );
-        assert_eq!(
-            probe_address("ws://[2001:db8::1]:8927/sendspin"),
-            Some("[2001:db8::1]:8927")
-        );
-        assert_eq!(probe_address("http://192.0.2.10:8927/sendspin"), None);
-        assert_eq!(probe_address("ws:///sendspin"), None);
+    fn loopback_and_unspecified_addresses_are_not_dialable() {
+        let server = DiscoveredServer {
+            addresses: vec![
+                "127.0.0.1:8927".to_owned(),
+                "0.0.0.0:8927".to_owned(),
+                "[::1]:8927".to_owned(),
+                "[::]:8927".to_owned(),
+                "192.0.2.10:8927".to_owned(),
+                "[2001:db8::1]:8927".to_owned(),
+            ],
+            path: "/sendspin".to_owned(),
+            name: Some("mdns-pair-1".to_owned()),
+        };
+        let kept = dialable(&server);
+        assert_eq!(kept.addresses, ["192.0.2.10:8927", "[2001:db8::1]:8927"]);
+        assert_eq!(kept.path, "/sendspin");
+        assert_eq!(kept.name.as_deref(), Some("mdns-pair-1"));
     }
 
     #[test]

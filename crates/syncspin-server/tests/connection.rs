@@ -831,8 +831,8 @@ async fn the_start_lead_ignores_the_reported_timing() -> Result<()> {
     writer.write(&[0u8; 480 * 4]);
     let (header, _payload) = client.read_audio().await?;
     assert!(
-        header.send_ahead <= 200_000,
-        "the first chunk is sent at most the fixed 200 ms ahead, not the reported 3500 ms, got {} us",
+        (100_000..=200_000).contains(&header.send_ahead),
+        "the first chunk is sent about the fixed 200 ms ahead, not the reported 3500 ms, got {} us",
         header.send_ahead
     );
 
