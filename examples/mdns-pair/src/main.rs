@@ -56,7 +56,8 @@ const MAX_TIMEOUT_SECS: u64 = 120;
 /// Longest mDNS label, in bytes. The service name is one DNS label, so this is its ceiling.
 const MAX_MDNS_LABEL_LEN: usize = 63;
 
-/// Sample rate of the run's stream, the rate every player must support.
+/// Sample rate of the run's stream: the PCM format the spec requires every server to support,
+/// and the format this run's client advertises.
 const SAMPLE_RATE: u32 = 48_000;
 
 /// Channel count of the run's stream.
@@ -272,7 +273,7 @@ async fn run(options: Options) -> Result<()> {
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let (stop_tx, stop_rx) = oneshot::channel();
-    let server_task = tokio::spawn(server_role::serve(
+    let mut server_task = tokio::spawn(server_role::serve(
         config,
         ready_tx,
         stop_rx,
@@ -314,26 +315,36 @@ async fn run(options: Options) -> Result<()> {
         },
     };
 
-    // The client side of the teardown, in the order the session expects: the event stream goes
-    // first, then the goodbye, then the task. A `finished()` that outlives `TEARDOWN` is dropped,
-    // and a dropped handle detaches the task instead of aborting it; process exit is the real
-    // bound the design accepts.
+    // The client side of the teardown: the goodbye first, while the close signal still reaches a
+    // session that can send it, then the task, then the event stream. Dropping the stream first
+    // makes the session loop return on `events.is_closed()` without a `client/goodbye`, so this
+    // order is what deterministically takes the shutdown arm. A `finished()` that outlives
+    // `TEARDOWN` is dropped, and a dropped handle detaches the task instead of aborting it;
+    // process exit is the real bound the design accepts.
+    let mut said_goodbye = false;
     let verdict = match outcome {
         Ok(Some((mut handle, events))) => {
             let verdict = verify_gate(&report);
-            drop(events);
             handle.close(GoodbyeReason::Shutdown);
+            said_goodbye = true;
             let _ = timeout(TEARDOWN, handle.finished()).await;
+            drop(events);
             verdict
         }
         Ok(None) => Ok(()),
         Err(error) => Err(error),
     };
 
-    // The record goes even when the flow failed: the run is a smoke test, not a service, and a
-    // withdrawn advertisement is what keeps the next run from finding this one.
-    let _ = stop_tx.send(());
-    let _ = timeout(TEARDOWN, server_task).await;
+    // The server ends its loop on the `ClientLeft` the goodbye produces, so a clean close waits
+    // for that departure before the stop signal, which would otherwise win the race and hide the
+    // reason. A goodbye the server never reports falls through to the stop after `TEARDOWN`.
+    let departed = said_goodbye && timeout(TEARDOWN, &mut server_task).await.is_ok();
+    if !departed {
+        // The record goes even when the flow failed: the run is a smoke test, not a service, and a
+        // withdrawn advertisement is what keeps the next run from finding this one.
+        let _ = stop_tx.send(());
+        let _ = timeout(TEARDOWN, server_task).await;
+    }
     verdict
 }
 

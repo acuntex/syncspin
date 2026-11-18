@@ -156,9 +156,11 @@ mod tests {
     #[test]
     fn the_messages_name_the_stage_and_the_budget() {
         let discovery = no_service_message("mdns-pair-7", Duration::from_secs(10));
-        assert!(discovery.contains("mdns-pair-7"));
-        assert!(discovery.contains("10"));
-        assert!(discovery.contains("non-loopback IPv4"));
+        assert_eq!(
+            discovery,
+            "no service named mdns-pair-7 found within 10 s; multicast and one non-loopback IPv4 \
+             interface are required"
+        );
 
         let connection = timeout_message(Stage::Connection, "mdns-pair-7", Duration::from_secs(10));
         assert!(connection.contains("no connection"));

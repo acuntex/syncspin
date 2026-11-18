@@ -424,7 +424,8 @@ from this server, not a partial discard.
 `cargo run -p mdns-pair` starts a real server and a real client in one process, both with the
 `mdns` backend. It needs multicast and one non-loopback IPv4 interface. It prints the published
 record, the discovered endpoint, the connection and the frame count, and exits 0; without
-multicast it prints a diagnostic naming the stage and exits 1. It covers the advertisement, the
+multicast it prints a diagnostic naming the stage and exits 1. A bad command line, such as an
+unknown flag or a timeout outside the accepted range, exits 2. It covers the advertisement, the
 browse, the dial, the approval, the activation and one short stream on one host. It does not
 cover two hosts or the server-initiated direction.
 

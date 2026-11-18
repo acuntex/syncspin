@@ -78,6 +78,10 @@ impl CountingSink {
     ///
     /// The waiter is woken once, when the sink writes the `threshold`-th frame.
     pub fn new(threshold: usize) -> (CountingSink, Counters) {
+        assert!(
+            threshold > 0,
+            "the threshold must be at least one frame, or the waiter is never woken"
+        );
         let counters = Counters {
             frames: Arc::new(AtomicUsize::new(0)),
             bytes: Arc::new(AtomicUsize::new(0)),
@@ -109,6 +113,9 @@ impl Sink for CountingSink {
                 format.bit_depth,
                 format.codec,
             );
+        }
+        if format.codec_header.is_some() {
+            bail!("the stream announced `pcm` with a codec header, but PCM carries none");
         }
         *self
             .counters
@@ -154,7 +161,19 @@ mod tests {
     fn a_foreign_format_is_refused() {
         let (mut sink, _counters) = CountingSink::new(20);
         assert!(sink.open(format(44_100, 2, 16)).is_err());
+        let mut with_header = format(48_000, 2, 16);
+        with_header.codec_header = Some(b"fLaC".to_vec());
+        assert!(
+            sink.open(with_header).is_err(),
+            "a PCM format carrying a codec header is refused"
+        );
         assert!(sink.open(format(48_000, 2, 16)).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "the threshold must be at least one frame")]
+    fn a_zero_threshold_is_refused() {
+        CountingSink::new(0);
     }
 
     #[test]

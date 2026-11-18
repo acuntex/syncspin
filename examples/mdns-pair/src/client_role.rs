@@ -76,10 +76,6 @@ pub async fn await_connected(
                 println!("connected to {server_id} at {endpoint} (encrypted: {encrypted})");
                 return Ok((handle, events));
             }
-            Some(Event::StreamStart { format }) => println!(
-                "stream: {} {} Hz, {} channels, {}-bit",
-                format.codec, format.sample_rate, format.channels, format.bit_depth
-            ),
             Some(Event::Disconnected { reason, .. }) => {
                 bail!("the connection ended before the stream arrived: {reason}")
             }
