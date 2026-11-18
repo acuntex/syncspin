@@ -14,7 +14,7 @@ use syncspin_server::{Event, Server, ServerConfig, StreamWriter, TrackInfo};
 use tokio::sync::oneshot;
 use tokio::time::{interval, MissedTickBehavior};
 
-use crate::{CHUNK_BYTES, CHUNK_COUNT, CHUNK_MS};
+use crate::{CHUNK_BYTES, CHUNK_MS};
 
 /// Versioned role a connection needs before the run opens the stream.
 const PLAYER_ROLE: &str = "player@v1";
@@ -45,7 +45,6 @@ pub async fn serve(
 
     let mut events = server.events();
     let mut stream: Option<StreamWriter> = None;
-    let mut written = 0;
     // One departure is all the run listens for, so the sender is taken once. `ClientLeft` names no
     // client, so the run counts live connections instead: the signal goes out when the count falls
     // back to zero. With a foreign connection still open it stays silent, and the run's bounded
@@ -97,13 +96,12 @@ pub async fn serve(
                             title: Some("mdns-pair smoke test".to_owned()),
                             ..TrackInfo::default()
                         }));
-                        written = 0;
                         // The writer stamps each chunk with the group's fixed start lead, so a
                         // chunk is on the wire well before the instant it must play; the pacing
                         // here only keeps the host from sending the whole stream at once.
                         println!(
-                            "streaming {CHUNK_COUNT} silent chunks of {CHUNK_BYTES} bytes, one \
-                             every {CHUNK_MS} ms"
+                            "streaming silent chunks of {CHUNK_BYTES} bytes, one every {CHUNK_MS} ms \
+                             until the run stops"
                         );
                     }
                 }
@@ -125,11 +123,11 @@ pub async fn serve(
                 None => break,
             },
             _ = pace.tick(), if stream.is_some() => {
-                if written < CHUNK_COUNT {
-                    if let Some(writer) = stream.as_mut() {
-                        writer.write(&silence);
-                        written += 1;
-                    }
+                // The stream is one running timeline, as for any host: a player that reports its
+                // state late joins it at the playhead and hears what follows, so the host keeps
+                // writing in real time until the run stops it.
+                if let Some(writer) = stream.as_mut() {
+                    writer.write(&silence);
                 }
             }
         }
@@ -224,7 +222,7 @@ mod tests {
         .await
         .expect("the foreign session starts");
         // The handshake completing proves the server processed this connection. The stream is
-        // still running (100 chunks at 20 ms outlast the window below), so a client the server had
+        // still running (the host writes until it is stopped), so a client the server had
         // approved would receive frames now: the approved client's count must keep growing while
         // the foreign one's stays at zero, which a slow server cannot fake into a pass.
         wait_for_connection(&mut other_events, &endpoint, &server_id)

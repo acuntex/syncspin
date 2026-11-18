@@ -108,14 +108,6 @@ const CHUNK_FRAMES: usize = SAMPLE_RATE as usize / 1000 * CHUNK_MS as usize;
 /// Payload bytes in one chunk.
 const CHUNK_BYTES: usize = CHUNK_FRAMES * BYTES_PER_FRAME;
 
-/// Chunks the server streams: 2 s, far more than the gate needs.
-///
-/// The server opens the stream when the player role is granted, which can be before the player has
-/// reported its state; chunks written until then are not delivered to it. The surplus over
-/// [`GATE_FRAMES`] is what keeps a slow host from failing the gate. The run ends at the gate, so
-/// the extra chunks cost no time.
-const CHUNK_COUNT: usize = 100;
-
 /// Frames the sink must receive before the run counts as a success.
 const GATE_FRAMES: usize = 20;
 
