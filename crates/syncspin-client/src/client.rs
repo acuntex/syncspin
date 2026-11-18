@@ -370,7 +370,7 @@ pub enum Event {
         /// Server timestamp the audio should resume from, when the server named one.
         from_timestamp: Option<i64>,
     },
-    /// Audio arrived too late to play in sync and was dropped.
+    /// Audio was dropped as late or because the playout queue was full.
     ///
     /// `roles/player/v1.md` lets a client drop a chunk whose deadline already passed instead of
     /// playing it late, and this client does. `late_by` is the worst lateness in the reporting

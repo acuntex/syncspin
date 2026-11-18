@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use crate::sink::{AudioFrame, Codec};
 
-/// Bytes the server advertises as its buffer capacity, and the bound this queue holds itself to.
+/// Bytes the client advertises as its buffer capacity in `client/hello`, and the bound this queue
+/// holds itself to.
 pub(crate) const BUFFER_CAPACITY: u64 = 131_072;
 
 /// Bytes every chunk costs before its payload: the fixed header of a player audio chunk, one

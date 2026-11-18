@@ -205,7 +205,8 @@ pub trait Sink: Send + 'static {
     /// instead of compensating it, because the server factors `output_delay` into that lead.
     ///
     /// The client polls this when a stream opens, after every `client/state` report and after every
-    /// clock burst; a change moves the timer, and a raised value also reports an updated
+    /// clock burst; a change moves the timer, and because the reported lead is at least the
+    /// pre-port delay, a change that moves that lead in either direction sends an updated
     /// `required_lead_time_ms`. The default is zero.
     fn pre_port_delay(&self) -> Duration {
         Duration::ZERO

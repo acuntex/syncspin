@@ -132,14 +132,18 @@ pub enum AudioFrame<'a> {
 
 pub trait Sink: Send + 'static {
     fn open(&mut self, format: AudioFormat) -> Result<()>;
-    /// `due` is the playout deadline the crate computed from the server timestamp and the time
-    /// filter; the sink applies its own post-port delay.
+    /// `due` is the local instant the first sample should reach the audio port. The client calls
+    /// this at the frame's pre-port write time; the sink writes now and does not schedule again.
     fn write(&mut self, frame: AudioFrame<'_>, due: Instant) -> Result<()>;
     fn flush(&mut self) -> Result<()>;
-    /// Drops the audio due at or after `due`; the default flushes everything.
+    /// Drops the audio due at or after `due`; the default flushes everything. The client has
+    /// already cut its own queued frames at the server timestamp.
     fn discard_from(&mut self, due: Instant) -> Result<()> { self.flush() }
-    /// The delay the output adds after the audio port (external speakers, amplifiers).
-    /// Pipeline, decoder and DAC latency belong in the host's own scheduling.
+    /// Delay between `write` and the audio port: decoder, pipeline and device buffers the client
+    /// compensates by writing that much before `due`.
+    fn pre_port_delay(&self) -> Duration { Duration::ZERO }
+    /// The delay the output adds after the audio port (external speakers, amplifiers), reported
+    /// to the server and subtracted from every deadline.
     fn output_delay(&self) -> Option<Duration> { None }
     fn underruns(&self) -> u64 { 0 }
 }
@@ -150,6 +154,7 @@ pub enum Event {
     StreamStart { format: AudioFormat },
     StreamEnd { reason: StreamEndReason },     // End | RoleRemoved, before the sink flush
     StreamClear { from_timestamp: Option<i64> }, // seek, before the sink discards or flushes
+    LateAudio { late_by: Duration, dropped: u64 }, // late or overrun drops, at most once a second
     Track { title: String, artist: String, album: Option<String>, duration: Option<Duration>,
             playback_speed: u32 },                            // per-mille, 1000 = normal
     State(PlaybackState),
@@ -170,13 +175,21 @@ impl Client {
 ```
 
 Decisions: events as an async stream (no callback trait), reconnect/backoff and volume reporting
-inside the crate, `Sink` receives audio frames (decoded or pass-through) with a playout deadline,
-pushback via blocking `write` on its own task. The crate owns the time filter and therefore the
-deadline; the sink owns the real rendering latency, and the part beyond the audio port reaches
-`output_delay_ms` through `output_delay()`, while `underruns()` waits for a correction loop the
-session does not use yet. `min_buffer_ms` belongs to the crate: a
-host may pin it in `ClientConfig`, and otherwise the session derives it from the arrival delay of
-audio chunks and reports each sustained change in a `client/state`.
+inside the crate, `Sink` receives audio frames (decoded or pass-through) when their write time
+arrives and writes them on call, pushback via blocking `write` on its own task. The crate owns the
+time filter, the playout queue and therefore the schedule: each frame's server timestamp becomes a
+local deadline, the queue keeps the frames in deadline order, and the session calls `write` one
+`pre_port_delay` before that deadline. A frame more than 10 ms past its write time is dropped, never
+advanced, and `Event::LateAudio` reports the worst lateness and the count at most once per second,
+together with capacity evictions. The queue holds at most the `buffer_capacity` the client
+advertises (128 KiB), counted in write-time bytes - the 13-byte chunk header plus payload, released
+when the frame is written - which is deliberately tighter than the spec's completion-time
+accounting. The sink owns the real rendering latency: the part before the port is
+`pre_port_delay()`, the part beyond the audio port reaches `output_delay_ms` through
+`output_delay()`, while `underruns()` waits for a correction loop the session does not use yet.
+`min_buffer_ms` belongs to the crate: a host may pin it in `ClientConfig`, and otherwise the session
+derives it from the arrival delay of audio chunks and reports each sustained change in a
+`client/state`.
 
 ## Pairing
 
@@ -357,16 +370,19 @@ not stage 3:
 
 ## Decisions taken after the builder check
 
-- **Playout timing:** the crate owns the time filter and emits each frame with a playout deadline; the
-  sink honours it and reports its post-port output delay back through `output_delay()`, while
-  `underruns()` waits for a correction loop the session does not use yet. Audio that arrives before
-  the filter has an estimate - it is ready after three accepted samples - is delivered with
-  `Instant::now()`. Sync accuracy is therefore a contract between crate and sink: it depends on the
-  sink writing each frame at its playout deadline and compensating its own pre-port latency, while
-  `output_delay()` only tells the server what to add beyond the port. `min_buffer_ms` is derived from
-  arrival delay unless the host pins it, and `required_lead_time_ms` is the host's start-up cost: the
-  client reports both, but the server's stream start still uses one fixed lead until
-  `docs/spec-deviations.md` #17 closes.
+- **Playout timing:** the crate owns the time filter and the playout queue; it schedules each frame
+  from its server timestamp and calls `Sink::write` at the frame's pre-port write time, so the sink
+  writes on call instead of scheduling again. A sink whose output buffers before the port reports
+  that delay through `pre_port_delay()`, and the client moves the write time back by it; the part
+  beyond the audio port goes back to the server through `output_delay()`, which is also subtracted
+  from every deadline. A frame more than 10 ms past its write time is dropped, never advanced, and
+  `Event::LateAudio` reports the worst lateness and the count at most once per second. Audio that
+  arrives before the filter has an estimate - it is ready after three accepted samples - is written
+  with `Instant::now()`. `underruns()` still waits for a correction loop the session does not use,
+  and with no drift correction the client does not claim the spec's ±1 ms steady-state window
+  (`docs/spec-deviations.md` #20). `min_buffer_ms` is derived from arrival delay unless the host pins
+  it, and `required_lead_time_ms` is at least the sink's pre-port delay: the client reports both, but
+  the server's stream start still uses one fixed lead until `docs/spec-deviations.md` #17 closes.
 - **0.1 measures against the spec, not MA:** the five spec mandates found in the check are part of
   stage 1, not a later stage. Where MA disagrees with the spec, the spec wins and MA compatibility is
   verified by test.

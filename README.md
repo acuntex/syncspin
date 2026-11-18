@@ -137,6 +137,13 @@ audio, so a host can mute, stop or restart its output first; a reconnect flush p
 event. `Event::Track` carries the now-playing metadata with the position, the duration and the
 playback speed in per-mille, where `1000` is normal speed.
 
+Playout is scheduled in the client. Each audio frame is mapped from its server timestamp through the
+clock estimate, queued in deadline order and written one `pre_port_delay` before its port deadline,
+so a sink writes on call and must not schedule the frame again. A frame more than 10 ms past its
+write time is dropped instead of played late, and `Event::LateAudio` reports the worst lateness and
+the number dropped at most once per second; a full queue evicts its oldest frames the same way. The
+client does not correct clock drift yet - see [docs/spec-deviations.md](docs/spec-deviations.md) #20.
+
 ### The server
 
 `syncspin-server` listens on a configurable address and path, answers `client/init` with `server/init`
@@ -251,7 +258,12 @@ it found and passes one URL to `connect`, which the spec leaves implementation-d
   server it last admitted with `playback`, and the server keeps operator approval for its lifetime
   only. A restart asks the operator again.
 - **Playout lead.** Every member shares one timeline whose first sample is 200 ms after the stream
-  opens. The reported `required_lead_time_ms` and `min_buffer_ms` are received but do not move it.
+  opens. The client schedules each frame from that timeline, but the reported
+  `required_lead_time_ms` and `min_buffer_ms` do not move it.
+- **Drift correction.** Frames are written at their scheduled deadline and late ones are dropped,
+  but the client does not correct the clock drift that accumulates between them, so the
+  specification's ±1 ms steady-state window is not guaranteed; the queue is where correction will
+  land.
 - **TLS.** No TLS stack: a `wss://` address is rejected when the client is configured, and nothing
   is downgraded to `ws://`. A TLS backend is out of scope.
 
@@ -260,13 +272,15 @@ and the work that closes them in [docs/spec-deviations.md](docs/spec-deviations.
 
 ## Integrating a client
 
-A host supplies a [`Sink`](crates/syncspin-client/src/sink.rs): `open` for a new format, `write` for
-every chunk with the playout deadline the client computed, `discard_from` for a seek with a
-timestamp, `flush` at each boundary the crate announces, and optionally `output_delay` for the delay
-the output adds beyond the audio port, which the client reports to the server, and `underruns` for
-diagnostics. The buffer the session asks for comes from its configuration or from arriving audio,
-so it needs no sink hook. The crate owns the connection, the clock and the reconnect loop; the host
-owns the output device, the identity file and everything below the pipe.
+A host supplies a [`Sink`](crates/syncspin-client/src/sink.rs): `open` for a new format, `write` when
+the client calls it one `pre_port_delay` before the frame's port deadline - the sink writes now and
+does not schedule again - `discard_from` for a seek with a timestamp, `flush` at each boundary the
+crate announces, `pre_port_delay` for the buffers between `write` and the audio port, which the
+client compensates, and optionally `output_delay` for the delay the output adds beyond the audio
+port, which the client reports to the server, and `underruns` for diagnostics. The buffer the
+session asks for comes from its configuration or from arriving audio, so it needs no sink hook. The
+crate owns the connection, the clock, the playout schedule and the reconnect loop; the host owns the
+output device, the identity file and everything below the pipe.
 Pairing needs a [`Storage`](crates/syncspin-client/src/storage.rs) as well; without one the client
 offers no pairing method, and a host that already holds records can pass them to `connect_with_psks`
 instead.
