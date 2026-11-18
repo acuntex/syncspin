@@ -198,7 +198,14 @@ fn is_path_absolute(path: &str) -> bool {
 /// the host name `localhost`.
 fn is_local_address(address: &str) -> bool {
     match address.parse::<SocketAddr>() {
-        Ok(address) => address.ip().is_loopback() || address.ip().is_unspecified(),
+        Ok(address) => match address.ip() {
+            std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_unspecified(),
+            // An IPv4-mapped address is a loopback when the address it maps is one.
+            std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
+                || ip.is_loopback() || ip.is_unspecified(),
+                |mapped| mapped.is_loopback() || mapped.is_unspecified(),
+            ),
+        },
         Err(_) => address
             .rsplit_once(':')
             .map_or(address, |(host, _)| host)
@@ -898,6 +905,8 @@ mod tests {
             ("[::1]:8927", "/sendspin"),
             ("0.0.0.0:8927", "/sendspin"),
             ("[::]:8927", "/sendspin"),
+            ("[::ffff:127.0.0.1]:8927", "/sendspin"),
+            ("[::ffff:0.0.0.0]:8927", "/sendspin"),
             ("localhost:8927", "/sendspin"),
             ("192.0.2.1:8927", "sendspin"),
             ("192.0.2.1:8927", "//sendspin"),
