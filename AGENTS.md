@@ -31,6 +31,7 @@ never knows a transport. A dependency pointing from core towards a crate is a bu
 ```sh
 cargo test --workspace --locked
 cargo test --workspace --features pairing-code,storage-file --locked
+cargo test -p mdns-pair --features mdns --locked        # the flow behind mdns-pair's own feature
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 cargo package -p syncspin-core --locked                 # publishability, before a release

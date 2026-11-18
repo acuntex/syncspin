@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use syncspin_core::endpoint::{is_local_address, is_path_absolute};
 use tokio::net::TcpStream;
 
 /// Service type a client publishes when it waits for a server to connect.
@@ -133,8 +134,8 @@ impl DiscoveredServer {
     /// a record any LAN host can publish could otherwise point the client at a port on its own
     /// machine. The path rule is part of the address rule because an endpoint is only dialable when
     /// both hold; a record with a bad path yields no candidates at all. An address that is not a
-    /// literal socket address is kept, apart from the loopback host names `is_local_address`
-    /// lists, and the probe decides.
+    /// literal socket address is kept, apart from the loopback host names
+    /// [`is_local_address`] lists, and the probe decides.
     fn ordered_addresses(&self) -> Vec<&str> {
         if !is_path_absolute(&self.path) {
             return Vec::new();
@@ -160,73 +161,6 @@ impl DiscoveredServer {
             .into_iter()
             .map(|address| (address.to_owned(), format!("ws://{address}{}", self.path)))
             .collect()
-    }
-}
-
-/// Whether `path` matches the `path-absolute` rule of RFC 3986, section 3.3.
-///
-/// That is a `/`, then optionally a non-empty first segment and further `/`-separated segments,
-/// each made of unreserved characters, percent-encoded octets, sub-delimiters, `:` and `@`. A
-/// query, a fragment, a space or a control character is not part of it.
-fn is_path_absolute(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix('/') else {
-        return false;
-    };
-    if rest.starts_with('/') {
-        return false;
-    }
-    let bytes = rest.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        match byte {
-            b'/' | b':' | b'@' | b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'('
-            | b')' | b'*' | b'+' | b',' | b';' | b'=' => {}
-            b'%' => {
-                let hex = bytes.get(index + 1..index + 3);
-                if !hex.is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) {
-                    return false;
-                }
-                index += 2;
-            }
-            byte if byte.is_ascii_alphanumeric() => {}
-            _ => return false,
-        }
-        index += 1;
-    }
-    true
-}
-
-/// Whether `address` is one a client must not dial: a loopback or unspecified socket address, or a
-/// host name that is a loopback by rule.
-///
-/// A host name is local when it is `localhost`, `localhost.localdomain` or a name under
-/// `.localhost` (RFC 6761), or when it is numeric without being a socket address - the legacy
-/// IPv4 spellings such as `127.1` or `0x7f.1`, which a resolver turns into a loopback address. A
-/// real host name never ends in an all-digit label.
-fn is_local_address(address: &str) -> bool {
-    match address.parse::<SocketAddr>() {
-        Ok(address) => match address.ip() {
-            std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_unspecified(),
-            // An IPv4-mapped address is a loopback when the address it maps is one.
-            std::net::IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
-                || ip.is_loopback() || ip.is_unspecified(),
-                |mapped| mapped.is_loopback() || mapped.is_unspecified(),
-            ),
-        },
-        Err(_) => {
-            let host = address
-                .rsplit_once(':')
-                .map_or(address, |(host, _)| host)
-                .trim_end_matches('.')
-                .to_ascii_lowercase();
-            let last_label = host.rsplit('.').next().unwrap_or("");
-            host == "localhost"
-                || host == "localhost.localdomain"
-                || host.ends_with(".localhost")
-                || last_label.starts_with("0x")
-                || (!last_label.is_empty() && last_label.bytes().all(|byte| byte.is_ascii_digit()))
-        }
     }
 }
 
@@ -963,40 +897,6 @@ mod tests {
                 error.to_string().contains("no dialable endpoint"),
                 "{error}"
             );
-        }
-    }
-
-    /// A host name that merely looks like a loopback one is not refused.
-    #[test]
-    fn ordinary_host_names_are_kept() {
-        for address in [
-            "speaker.local:8927",
-            "my-host2:8927",
-            "a.localhosting.example:8927",
-        ] {
-            assert!(!is_local_address(address), "{address}");
-        }
-    }
-
-    /// The path rule accepts what RFC 3986 calls `path-absolute` and nothing else.
-    #[test]
-    fn a_path_must_be_path_absolute() {
-        for path in [
-            "/",
-            "/sendspin",
-            "/a/b",
-            "/a%20b",
-            "/a:b@c",
-            "/~x_y-z.w",
-            "/a/",
-            "/a;b=c",
-        ] {
-            assert!(is_path_absolute(path), "{path:?}");
-        }
-        for path in [
-            "", "sendspin", "//a", "/a?b", "/a#b", "/a b", "/a%zz", "/a%", "/é",
-        ] {
-            assert!(!is_path_absolute(path), "{path:?}");
         }
     }
 

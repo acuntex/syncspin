@@ -28,17 +28,19 @@ pub(crate) fn matching_servers<'a>(
         .collect()
 }
 
-/// Returns the first endpoint of `server` that accepts a TCP connection, or `None`.
+/// Returns the first endpoint of `server` that accepts a TCP connection.
 ///
 /// The walk and the probe are the client library's ([`syncspin_client::reachable_endpoint`]); only
 /// the per-address budget is shorter, because a run has a few seconds in all. The returned endpoint
 /// is the one the session dials, so the choice is not made twice. The probe never reaches the
 /// server's event stream: the server reports a connection only after the WebSocket upgrade and the
 /// Noise handshake.
-pub(crate) async fn reachable(server: &DiscoveredServer) -> Option<String> {
-    syncspin_client::reachable_endpoint(server, PROBE_TIMEOUT)
-        .await
-        .ok()
+///
+/// # Errors
+/// The library's error names every address that was tried and why it failed; it is returned as it
+/// is, so the run can say whether the record named nothing dialable or every address refused.
+pub(crate) async fn reachable(server: &DiscoveredServer) -> anyhow::Result<String> {
+    syncspin_client::reachable_endpoint(server, PROBE_TIMEOUT).await
 }
 
 /// The stage a deadline ended in, named by the call that awaited it.

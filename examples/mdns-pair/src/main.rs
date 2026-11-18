@@ -395,16 +395,14 @@ async fn run(options: Options) -> Result<RunOutcome> {
     let mut said_goodbye = false;
 
     let verdict: Result<Flow> = async {
-        // The browse owns the deadline: an in-flight browse cannot be cancelled, so the loop lets
-        // it finish and stops there, and the daemon is gone before the teardown starts.
-        let endpoint =
-            match until_interrupt(&mut interrupt, client_role::discover(&run_name, deadline)).await
-            {
-                None => return Ok(Flow::Interrupted),
-                Some(Ok(None)) => bail!(no_service_message(&run_name, options.timeout)),
-                Some(Ok(Some(endpoint))) => endpoint,
-                Some(Err(error)) => return Err(error),
-            };
+        // The browse owns the deadline and the interrupt: an in-flight browse cannot be cancelled,
+        // so it is never dropped. The loop lets it finish and stops there, and the daemon is gone
+        // before the teardown starts.
+        let endpoint = match client_role::discover(&run_name, deadline, &interrupt).await? {
+            Some(endpoint) => endpoint,
+            None if *interrupt.borrow() => return Ok(Flow::Interrupted),
+            None => bail!(no_service_message(&run_name, options.timeout)),
+        };
         // The session exists from this call on; an interrupt before it has no connection to say
         // goodbye on, and no handle to finish.
         let (mut handle, mut events) =
@@ -492,7 +490,7 @@ struct Wait {
 /// Runs `work` unless Ctrl-C arrives first, in which case it is dropped and `None` is returned.
 ///
 /// The interrupt is checked first, so one that is already latched wins over work that is ready.
-#[cfg(feature = "mdns")]
+#[cfg(any(feature = "mdns", test))]
 async fn until_interrupt<T>(
     interrupt: &mut tokio::sync::watch::Receiver<bool>,
     work: impl std::future::Future<Output = T>,
@@ -699,7 +697,6 @@ mod tests {
 
     /// A closed interrupt channel (no signal handler) must not read as Ctrl-C, and a latched
     /// `true` must.
-    #[cfg(feature = "mdns")]
     #[tokio::test]
     async fn a_closed_interrupt_channel_is_not_an_interrupt() {
         let (tx, mut rx) = tokio::sync::watch::channel(false);

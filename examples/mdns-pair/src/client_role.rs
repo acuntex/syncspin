@@ -40,17 +40,32 @@ const RETRY_PAUSE: Duration = Duration::from_millis(200);
 /// and a differently cased look-alike out. The endpoint that answered the probe is the one returned,
 /// so the session does not choose again between addresses.
 ///
-/// Returns `None` once `deadline` has passed without a match. A browse that is in flight cannot be
-/// cancelled, so it is awaited to its end; the loop then stops instead of starting another, and the
-/// daemon is dropped before this returns. The deadline is therefore overrun by at most one browse
-/// window.
+/// Returns `None` once `deadline` has passed without a match, or once `interrupt` has latched. A
+/// browse that is in flight cannot be cancelled, so it is awaited to its end; the loop then stops
+/// instead of starting another, and the daemon is dropped before this returns. The deadline and an
+/// interrupt are therefore both honoured at most one browse window late. The caller tells the two
+/// `None`s apart by reading `interrupt`.
+///
+/// # Errors
+/// A record that matched but whose addresses all refused or timed out is an error once the deadline
+/// passes, carrying the last attempt's per-address causes: discovery worked and the dial did not,
+/// which is a different failure from a record that never appeared.
 #[cfg(feature = "mdns")]
-pub async fn discover(run_name: &str, deadline: tokio::time::Instant) -> Result<Option<String>> {
+pub async fn discover(
+    run_name: &str,
+    deadline: tokio::time::Instant,
+    interrupt: &tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<String>> {
     // This is the client's own daemon, a separate mDNS stack from the server's: the run exists to
     // exercise the advertisement and the browse as two peers see them.
     let discovery = Arc::new(ClientMdns::new().context("failed to start the mDNS daemon")?);
     let mut attempt = 0u32;
+    // The newest probe failure for a record that matched; it replaces "never appeared" at the end.
+    let mut last_refusal: Option<String> = None;
     loop {
+        if *interrupt.borrow() {
+            return Ok(None);
+        }
         attempt += 1;
         // One browse blocks for the backend's one-second window. It runs on the blocking pool so
         // the server keeps serving, and it is always awaited: dropping the future would leave the
@@ -69,7 +84,7 @@ pub async fn discover(run_name: &str, deadline: tokio::time::Instant) -> Result<
             Err(error) => {
                 println!("browse {attempt} failed: {error:#}");
                 if tokio::time::Instant::now() >= deadline {
-                    return Ok(None);
+                    return end_without_match(last_refusal);
                 }
                 tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + RETRY_PAUSE))
                     .await;
@@ -77,17 +92,36 @@ pub async fn discover(run_name: &str, deadline: tokio::time::Instant) -> Result<
             }
         };
         for server in matching_servers(&servers, run_name) {
-            if let Some(endpoint) = reachable(server).await {
-                // The path comes from a TXT record any LAN host can publish; `Debug` escapes it.
-                println!("discovered {endpoint:?} on browse {attempt}");
-                return Ok(Some(endpoint));
+            match reachable(server).await {
+                Ok(endpoint) => {
+                    // The path comes from a TXT record any LAN host can publish; `Debug` escapes
+                    // it.
+                    println!("discovered {endpoint:?} on browse {attempt}");
+                    return Ok(Some(endpoint));
+                }
+                Err(error) => {
+                    // The causes name addresses from a record any LAN host can publish.
+                    let cause = format!("{error:#}");
+                    println!("browse {attempt}: {run_name} is not reachable: {cause:?}");
+                    last_refusal = Some(cause);
+                }
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
+            return end_without_match(last_refusal);
         }
         println!("browse {attempt}: no reachable service named {run_name} yet");
         tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + RETRY_PAUSE)).await;
+    }
+}
+
+/// The end of a discovery that found no endpoint: an error when a record matched and could not be
+/// dialled, `None` when none ever appeared.
+#[cfg(feature = "mdns")]
+fn end_without_match(last_refusal: Option<String>) -> Result<Option<String>> {
+    match last_refusal {
+        Some(cause) => bail!("found the service, but no address accepted a connection: {cause:?}"),
+        None => Ok(None),
     }
 }
 
