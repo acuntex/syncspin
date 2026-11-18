@@ -452,16 +452,14 @@ pub enum Event {
     },
     /// The server asked this player to change its output delay.
     ///
-    /// Sent only while [`ClientConfig::output_delay_control`] is set. The host applies `applied`
-    /// to its sink and persists it, as `roles/player/v1.md` requires of the client; the session
-    /// reports the sink's value in the next `client/state` and re-maps queued deadlines when it
-    /// next reads the sink. `requested` is the value as it arrived, `applied` is clamped to the
-    /// protocol's 0-5000 ms.
+    /// Sent only while [`ClientConfig::output_delay_control`] is set, and only for a value inside
+    /// the protocol's 0-5000 ms; an out-of-range request is a protocol error that ends the connection. The host applies `delay_ms`
+    /// to its sink, persists it as `roles/player/v1.md` requires, and then calls
+    /// [`ControlHandle::output_delay_applied`], which reads the sink and reports the value to the
+    /// server in a `client/state`.
     OutputDelay {
-        /// Delay the server asked for, as it arrived on the wire.
-        requested: u32,
-        /// Delay the host should apply, clamped to 0-5000 ms.
-        applied: u32,
+        /// Delay the host should apply, in milliseconds.
+        delay_ms: u32,
     },
     /// A pairing completed and the record is stored.
     ///
@@ -627,10 +625,9 @@ impl fmt::Debug for Event {
                 .field("applied", applied)
                 .field("muted", muted)
                 .finish(),
-            Self::OutputDelay { requested, applied } => formatter
+            Self::OutputDelay { delay_ms } => formatter
                 .debug_struct("OutputDelay")
-                .field("requested", requested)
-                .field("applied", applied)
+                .field("delay_ms", delay_ms)
                 .finish(),
             Self::Paired { server_id } => formatter
                 .debug_struct("Paired")
@@ -874,6 +871,23 @@ impl ControlHandle {
             .map(|_level| ())
     }
 
+    /// Tells the session that the host applied an output delay, so it reports the new value.
+    ///
+    /// The host calls this after it applied the delay from [`Event::OutputDelay`] to its sink and
+    /// persisted it. The session reads [`Sink::output_delay`], re-maps the queued deadlines and
+    /// sends a `client/state` at once, so the server recomputes its send-ahead from the value in
+    /// force instead of waiting for the next periodic check. A host that changes the delay on its
+    /// own, without a server command, calls it the same way.
+    ///
+    /// # Errors
+    /// Returns an error for a connection that has ended, and when the server did not activate
+    /// `player@v1`.
+    pub async fn output_delay_applied(&self) -> Result<()> {
+        self.send(ControlAction::OutputDelayApplied)
+            .await
+            .map(|_level| ())
+    }
+
     /// Sets the mute state without changing the level.
     ///
     /// The reported level therefore stays what it was, and the server sees the mute in the
@@ -1005,6 +1019,8 @@ pub(crate) enum ControlAction {
     ReportVolume(u8),
     /// Set the mute state, keeping the level.
     Mute(bool),
+    /// The host applied an output delay to its sink: read it and report it.
+    OutputDelayApplied,
     /// Whether the connection admits an unpaired session, applied to the shared value.
     SetUnpairedAccess(bool),
     /// Open a pairing window for this connection and start a waiting static-code attempt.

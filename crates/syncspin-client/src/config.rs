@@ -292,9 +292,13 @@ pub struct ClientConfig {
     /// leave this off, because `roles/player/v1.md` lets a client advertise only what it applies.
     ///
     /// The command is an instruction to the host, not a value the session applies itself: the sink
-    /// remains the authority for `output_delay_ms`, and the next `client/state` reports the value
-    /// the sink returns. The host applies the delay in between; the session re-maps queued
-    /// deadlines when it next reads the sink, after a state report or a clock burst.
+    /// remains the authority for `output_delay_ms`. Once the host applied the value it calls
+    /// [`ControlHandle::output_delay_applied`](crate::ControlHandle::output_delay_applied), and the
+    /// session reads the sink, re-maps queued deadlines and reports it. Persisting the value, so it
+    /// survives restarts and reconnects, is the host's duty: the session never stores it.
+    ///
+    /// Adding this field is a 0.x break for a full `ClientConfig { .. }` literal, as the changelog
+    /// records; [`ClientConfig::new`] and [`ClientConfig::with_output_delay_control`] keep working.
     pub output_delay_control: bool,
     /// Minimum start-up lead the server must give this player, in milliseconds.
     ///
@@ -470,6 +474,13 @@ impl fmt::Debug for ClientConfig {
 }
 
 impl ClientConfig {
+    /// Lets the server set this player's output delay; see [`ClientConfig::output_delay_control`].
+    #[must_use]
+    pub fn with_output_delay_control(mut self, enabled: bool) -> Self {
+        self.output_delay_control = enabled;
+        self
+    }
+
     /// Builds a configuration for `server` with the crate's defaults.
     ///
     /// Everything a host rarely changes starts at a documented value: no device description, no

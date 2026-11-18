@@ -4448,23 +4448,35 @@ async fn output_delay_is_advertised_only_when_the_host_opts_in() {
 }
 
 #[tokio::test]
-async fn the_output_delay_command_reports_the_clamped_value() {
+async fn the_output_delay_command_reaches_the_host_inside_the_range() {
     let server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let (_recordings, sink) = recording_sink();
     let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
     expect_connected(&mut events, &server).await;
 
-    for (requested, applied) in [(0, 0), (200, 200), (5_000, 5_000), (5_001, 5_000)] {
+    for requested in [0, 200, 5_000] {
         send_player_command(&server, "set_output_delay", Some(requested));
         match next_event(&mut events).await {
-            Event::OutputDelay {
-                requested: seen,
-                applied: got,
-            } => {
-                assert_eq!(seen, requested, "the requested value arrives unchanged");
-                assert_eq!(got, applied, "{requested} ms must apply as {applied} ms");
-            }
+            Event::OutputDelay { delay_ms } => assert_eq!(delay_ms, requested),
             other => panic!("expected OutputDelay for {requested} ms, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_out_of_range_output_delay_ends_the_connection() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // `messaging.md`: a value outside a fixed range is a protocol error and the receiver closes.
+    send_player_command(&server, "set_output_delay", Some(5_001));
+    loop {
+        match next_event(&mut events).await {
+            Event::Disconnected { .. } => break,
+            Event::OutputDelay { .. } => panic!("an out-of-range delay must not reach the host"),
+            _ => {}
         }
     }
 }
@@ -4505,35 +4517,57 @@ async fn a_badly_typed_output_delay_command_is_ignored() {
 }
 
 #[tokio::test]
-async fn the_applied_output_delay_reaches_the_next_client_state() {
+async fn the_applied_output_delay_is_reported_at_once() {
     let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
     let recordings = Recordings::default();
     let timing = timing_handle(None, Duration::ZERO);
     let sink = Box::new(RecordingSink::with_timing(recordings, timing.clone()));
-    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    let (mut events, handle) = connect_with_output_delay_control(&server, sink).await;
     expect_connected(&mut events, &server).await;
     let _first = wait_for_client_state(&mut server).await;
 
     send_player_command(&server, "set_output_delay", Some(200));
     match next_event(&mut events).await {
-        Event::OutputDelay { applied, .. } => assert_eq!(applied, 200),
+        Event::OutputDelay { delay_ms } => assert_eq!(delay_ms, 200),
         other => panic!("expected OutputDelay, got {other:?}"),
     }
 
-    // The host applies it to its output; the sink now reports it.
+    // The host applies it to its output, then tells the session; nothing else triggers a report.
     timing
         .lock()
         .expect("the timing lock is not poisoned")
         .output_delay = Some(Duration::from_millis(200));
+    handle
+        .control()
+        .output_delay_applied()
+        .await
+        .expect("the player role is active");
 
-    // The next state report reads the sink and carries the applied value.
-    send_player_command(&server, "volume", None);
     let state = wait_for_client_state(&mut server).await;
     let player = state.player.expect("the player object is present");
     assert_eq!(
         player.output_delay_ms, 200,
         "the state carries the applied delay"
     );
+}
+
+#[tokio::test]
+async fn a_persisted_output_delay_is_reported_in_the_first_state() {
+    // The host restores the delay in its sink; the session reports what the sink returns, so a
+    // reconnect or restart keeps the value without the session storing anything.
+    let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let recordings = Recordings::default();
+    let timing = timing_handle(None, Duration::ZERO);
+    timing
+        .lock()
+        .expect("the timing lock is not poisoned")
+        .output_delay = Some(Duration::from_millis(350));
+    let sink = Box::new(RecordingSink::with_timing(recordings, timing));
+    let (mut events, _handle) = connect_with_output_delay_control(&server, sink).await;
+    expect_connected(&mut events, &server).await;
+    let state = wait_for_client_state(&mut server).await;
+    let player = state.player.expect("the player object is present");
+    assert_eq!(player.output_delay_ms, 350);
 }
 
 #[tokio::test]

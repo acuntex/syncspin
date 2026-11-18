@@ -2754,19 +2754,28 @@ impl Session<'_> {
                 });
                 self.report_state().await?;
             }
-            "set_output_delay" if self.config.output_delay_control => {
-                let Some(requested) = player.output_delay_ms else {
-                    // The command is advertised, but the field is required for it; a server that
-                    // omits it is ignored like any other incomplete command.
-                    eprintln!("ignoring set_output_delay without output_delay_ms");
+            command
+                if command == OUTPUT_DELAY_COMMAND
+                    && supported_player_commands(self.config)
+                        .iter()
+                        .any(|advertised| advertised == command) =>
+            {
+                // The field is required for this command; a missing one is ignored like any other
+                // incomplete player command. A value outside the fixed 0-5000 range is a protocol
+                // error: `messaging.md` has the receiver close the connection.
+                let Some(delay_ms) = player.output_delay_ms else {
                     return Ok(());
                 };
-                self.emit(Event::OutputDelay {
-                    requested,
-                    applied: requested.min(MAX_OUTPUT_DELAY_MS),
-                });
-                // The host applies it to its sink; the next state or clock burst reads the sink
-                // again and re-maps queued deadlines from the value it reports.
+                if delay_ms > MAX_OUTPUT_DELAY_MS {
+                    bail!(
+                        "set_output_delay carries output_delay_ms {delay_ms}, outside \
+                         0-{MAX_OUTPUT_DELAY_MS}"
+                    );
+                }
+                self.emit(Event::OutputDelay { delay_ms });
+                // The host applies it and calls `ControlHandle::output_delay_applied`, which
+                // reads the sink and reports it; the session never reports a value it has not
+                // seen the sink adopt.
             }
             // A command this client does not advertise.
             _ => {}
@@ -2803,6 +2812,10 @@ impl Session<'_> {
                 self.apply_report_volume(level).await.map(|()| self.volume)
             }
             ControlAction::Mute(muted) => self.apply_mute(muted).await.map(|()| self.volume),
+            ControlAction::OutputDelayApplied => {
+                // `send_client_state` reads the sink once, re-maps the queue and reports it.
+                self.report_state().await.map(|()| self.volume)
+            }
             ControlAction::SetUnpairedAccess(enabled) => self
                 .apply_unpaired_access(enabled)
                 .await
@@ -2857,7 +2870,9 @@ impl Session<'_> {
                 Ok(())
             }
             ControlAction::SeekRelative(_) => self.check_controller_command("seek_relative"),
-            ControlAction::Volume(_) | ControlAction::Mute(_) => {
+            ControlAction::Volume(_)
+            | ControlAction::Mute(_)
+            | ControlAction::OutputDelayApplied => {
                 if !self.player_active() {
                     bail!("the server did not activate {PLAYER_ROLE}");
                 }

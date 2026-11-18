@@ -26,7 +26,6 @@ harmless.
 | 16  | A server keeps an unavailable client in the group                      | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                                                                                                           | Open, one group                    |
 | 17  | The server's send-ahead ignores the reported timing                    | [`roles/player/v1.md` — Server Audio Send Constraints](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server-audio-send-constraints)                                                                                                                    | Open, shared timeline              |
 | 19  | A foreign `group_id` is accepted unless strict mode is set             | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                                                                                                                  | Accepted, `strict_group_id`        |
-| 21  | An out-of-range `set_output_delay` is capped, not rejected             | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                                                                                                      | Accepted, `output_delay_control`   |
 | 20  | No drift correction: the ±1 ms steady-state window is not guaranteed   | [`roles/player/v1.md` — Sync Accuracy](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#sync-accuracy)                                                                                                                                                    | Open, no correction loop           |
 
 ## 1. Server-initiated connections: the last-playback server is not persisted
@@ -484,26 +483,6 @@ possible, is the half the queue can do on its own.
 frame) and let the queue apply the spec's sample deletion and insertion, or an asynchronous sample
 rate converter, before the write; then pin the ±1 ms window and the ±0.5% speed cap with tests. The
 queue in `syncspin-client` is where the correction lands.
-
-## 21. An out-of-range `set_output_delay` is capped, not rejected
-
-**Spec:** `roles/player/v1.md`, `server/command` player object. `output_delay_ms` is an integer in
-the range 0-5000, and `messaging.md` says a field value outside the fixed range its definition gives
-is a protocol error: the receiver MUST close the connection.
-
-**What we do:** a `set_output_delay` carrying an `output_delay_ms` above 5000 - the wire field is a
-`u32`, so such a value decodes - is reported to the host as 5000 in
-`Event::OutputDelay` and the connection stays open. The host applies
-the capped value to its sink. `the_output_delay_command_reports_the_clamped_value` pins the boundary
-for 0, 200, 5000 and 5001.
-
-**Why:** the same reason as the volume cap (#12): a server that got a range wrong should not
-silence playback, and the audible outcome - the longest delay the protocol allows - is unambiguous.
-A missing field is ignored, like the other incomplete player commands.
-
-**Removing it:** give `handle_command` the typed rejection path the spec's range errors would use
-and close the connection with a protocol-error reason, or reject the value at the parser; test the
-closed connection instead of the capped value.
 
 ## How to update this file
 
