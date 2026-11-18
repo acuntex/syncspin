@@ -147,6 +147,10 @@ done
 # manifest before the gates run under --locked.
 run cargo update --workspace --offline --quiet
 
+# Every example must name the version the manifests above now carry; a manifest the
+# rewrite above missed would otherwise keep pointing at the previous release.
+run scripts/check-example-versions.sh
+
 # Prepend the section produced above, or print it in a dry run.
 if $dry_run; then
   printf '+ prepend this to CHANGELOG.md:\n%s\n' "$section"

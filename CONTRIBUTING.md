@@ -66,7 +66,7 @@ are configured in [`.pre-commit-config.yaml`](.pre-commit-config.yaml); install 
 
 | Check     | What it proves                                                                                                                                                |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lint`    | `cargo fmt --check` and clippy without warnings.                                                                                                              |
+| `lint`    | `cargo fmt --check`, clippy without warnings, and the example manifests naming the workspace version.                                                         |
 | `test`    | The hermetic suite on x86_64: the workspace, the pairing features, and the library crates with their own defaults.                                            |
 | `msrv`    | The suite still builds and passes on 1.85.                                                                                                                    |
 | `arm`     | The crates still compile for ARMv7. The glibc 2.24 baseline itself needs the `zigbuild` run in [`docs/testing.md`](docs/testing.md); CI does not link it yet. |
@@ -152,7 +152,9 @@ It bumps the workspace version, the internal path-dependency requirements and th
 tripwires, refreshes `Cargo.lock`, prepends the changelog section rendered from the commits since the
 last tag, and refuses to continue
 if the previous version is still named anywhere outside `CHANGELOG.md` and the lock file — that check
-exists because a published README once advertised the release before it. Then it runs the format and
+exists because a published README once advertised the release before it. It also runs
+`scripts/check-example-versions.sh`, so an example whose Sendspin dependency does not name the new
+version stops the release instead of drifting from the published crates. Then it runs the format and
 test gates and commits `chore(release): <version>`.
 
 `--section <file>` prepends that file instead of a rendered section, for a release whose only content
