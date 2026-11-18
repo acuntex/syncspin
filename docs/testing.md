@@ -106,7 +106,7 @@ What the suites do not cover:
 - a second machine. The server suites use loopback; the two-device LAN check below has not been
   performed.
 - external review. The CPace layer has draft vectors and hermetic tests, not a review
-  ([`spec-deviations.md`](spec-deviations.md), "Code pairing is a feature and the CPace layer is unaudited").
+  ([`SECURITY.md`](../SECURITY.md), "The pairing PAKE").
 
 ## MSRV
 

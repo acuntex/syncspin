@@ -41,10 +41,13 @@ that shows it, and what an attacker gains. A working test is worth more than a d
 
 ## The pairing PAKE
 
-The CPace layer behind the pairing code flows is written here rather than taken from a crate, is
-pinned to the draft's vectors, and has not been reviewed externally. A review is wanted: the
-[review package](docs/cpace-review.md) records what it implements, what pins it and which
-questions are open. A finding there is a security report like any other.
+The CPace and wrapping layer behind the pairing code flows is written here rather than taken from a
+crate, is pinned to the draft's vectors, and has not had an external review. It sits behind the
+`pairing-code` feature and is off in the default build. A review is wanted: the
+[review package](docs/cpace-review.md) records what it implements, what pins it and which questions
+are open. A finding there is a security report like any other: use the
+[private advisory form](https://github.com/acuntex/syncspin/security/advisories/new), not a public
+issue.
 
 ## What must never be in a report
 

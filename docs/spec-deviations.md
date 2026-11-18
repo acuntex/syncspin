@@ -13,12 +13,10 @@ harmless.
 | #   | Area                                                                             | Spec section                                                                                                                                                                      | Status                             |
 | --- | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
 | 1   | Server-initiated connections: last-playback server not persisted                 | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                 | Open, no last-playback record      |
-| 3   | `psk_id` validation deferred to the session layer                                | [`connection.md` — Pre-Shared Key](https://github.com/Sendspin/spec/blob/main/connection.md#pre-shared-key)                                                                       | Accepted, `select_psk`             |
-| 4   | Code pairing behind a feature; CPace layer unaudited                             | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
+| 4   | Code pairing is behind a feature (server MUST)                                   | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                 | Accepted, `pairing-code`           |
 | 6   | Approval is not persisted across restarts                                        | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                           | Open, server lifetime              |
 | 7   | Scheduled metadata applied immediately                                           | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                             | Stage 1b                           |
 | 8   | In-place format change flushes buffered audio                                    | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                             | Stage 1b                           |
-| 9   | `Sink::underruns()` reported but never used                                      | — (library contract, no wire field)                                                                                                                                               | Stage 1b                           |
 | 10  | A stream-clear timestamp is honoured only by sinks that implement `discard_from` | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                             | Accepted, `Sink::discard_from`     |
 | 11  | Playout deadlines begin after three clock bursts                                 | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                           | Documented                         |
 | 12  | A player volume above 100 is capped, not rejected                                | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                 | Accepted, `clamp_volume_with`      |
@@ -74,49 +72,14 @@ decide, so the ranking and displacement rules reduce to always rejecting the sec
 admitted connection whose `activities` include `playback` is activated, and consult it in the
 both-empty tie-break once the cap rises above one. Then delete this entry.
 
-## 3. `psk_id` validation deferred to the session layer
+## 4. Code pairing is behind a feature (server MUST)
 
-**Spec:** `connection.md`, _Encryption_ → _Pre-Shared Key_ and _Sentinel Fallback_. The client
-decrypts the first handshake message, compares the announced `psk_id` against the hash of every
-candidate PSK of the announced `psk_category`, mixes in the match, fails on a stored-pubkey
-mismatch and falls back to the Sentinel PSK on a plain lookup miss.
-
-**What we do:** `syncspin_core::noise` is a byte-level responder. It starts every handshake with the
-Sentinel PSK and hands the decrypted message-1 payload back verbatim; the caller may replace the PSK
-with `Responder::set_psk` between reading message 1 and writing message 2. The selecting and
-validating is the session layer's job: `PskMetadata::parse` rejects an unknown category and a
-non-canonical id, and `select_psk` applies the matching key and falls back to the Sentinel key only
-on the initial handshake. The candidates come from `pairing::Candidates::load`: the records
-`ClientConfig::storage` holds, the records `connect_with_psks` passes (the store wins for a
-`server_id` it already knows), and the client's own pairing PSK. That pairing PSK is drawn once,
-persisted through `Storage::store_pairing_psk` and offered on every connection; it is a client-wide
-credential, so `select_psk` matches it for the announced `pr` id without a `server_id` check, which
-is what lets one token pair any number of servers. A stored record still has to match category and
-id and then name the `server_id` from `server/init`. A pairing that completes is persisted on
-`server/pair-finalize` as a `LongTerm` record, so the next handshake reads it as a stored record.
-`connect` passes no explicit records; a store on the config still supplies records and the pairing
-PSK, and a host that has neither reaches the guest path. `core` itself enforces none of that.
-
-**Why:** the Noise module owns no storage and no policy, so it cannot enumerate candidate PSKs or
-decide what a category mismatch means. Splitting it this way keeps `core` free of file I/O and lets
-a host with its own identity store drive selection.
-
-**Consequence while it stands:** a caller that drives `Responder` directly and ignores the payload
-completes a handshake against any announced `psk_id`/`psk_category` pair, with no fallback decision
-made for it. The client path is covered: the session validates the metadata, checks the category,
-id and server id of a stored record, checks the pairing PSK against the announced id alone, and
-falls back to the Sentinel key on the initial handshake only.
-
-**Removing it:** give `core` a PSK resolver (a trait the session implements over its storage, passed
-into the responder) so the handshake cannot finish without a matched category and id, and enforce
-the record's `server_id` check and the fallback-on-miss rule there. Then narrow `set_psk` or delete
-it.
-
-## 4. Code pairing is a feature and the CPace layer is unaudited
-
-**Spec:** `pairing.md`, _PAKE_, _Dynamic Pairing Code Flow_ and _Static Pairing Code Flow_ — a
-SHOULD, not a MUST. `CPACE-X25519-SHA512` per `draft-irtf-cfrg-cpace-21`, with the server as `A`,
-the client as `B` and the `MCF` generator, plus the wrapped-PSK exchange.
+**Spec:** `pairing.md`, _PAKE_, _Dynamic Pairing Code Flow_ and _Static Pairing Code Flow_. Servers
+MUST implement all three methods - Pairing PSK, the static code flow and the dynamic code flow.
+Clients MUST implement Pairing PSK and MAY implement additional methods; a client with an
+out-channel SHOULD prefer the dynamic flow over the static one. The code flows are
+`CPACE-X25519-SHA512` per `draft-irtf-cfrg-cpace-21`, with the server as `A`, the client as `B` and
+the `MCF` generator, plus the wrapped-PSK exchange.
 
 **What we do:** both flows are implemented in `syncspin-client` behind the `pairing-code` feature
 and offered only when a `Storage` can persist the record they produce - and, for the dynamic flow,
@@ -135,17 +98,15 @@ from `syncspin-core` only until a client opts into it. The specification publish
 for the dynamic code derivation: the tests pin a vector computed from the spec's formula and run the
 flow end to end against the fake server only.
 
-**The CPace and wrapping layer has not had an external review.** That is the reason this entry still
-exists after both flows shipped.
+**Why:** the server's default build departs from the MUST by offering only the Pairing PSK flow: a
+default `syncspin-server` refuses the two code methods (`ServerHandle::start_pairing`). A feature
+gate keeps a build that does not carry the PAKE from advertising the method. The client is free to
+gate the optional code methods, which is within the MAY, and the feature restores the server's MUST
+when enabled.
 
-**Why:** a default build must not advertise a method whose PAKE it does not carry, and unaudited
-crypto stays out of the default surface. A host that does not enable the feature gets the mandatory
-Pairing PSK flow only; one that enables it accepts that the layer is new code with draft vectors but
-no review.
-
-**Removing it:** get the layer reviewed externally. Then decide whether the feature becomes default:
-while it is not, a default build departs from the SHOULD by offering only the mandatory method. Add
-spec vectors for the dynamic derivation when they are published.
+**Removing it:** enable the code flows in the server by default (and then the client's optional
+methods) once the external review in `SECURITY.md` is done; add spec vectors for the dynamic
+derivation when they are published.
 
 ## 6. Approval is not persisted across restarts
 
@@ -205,27 +166,6 @@ offers, and the current consumer's format does not change mid-stream.
 **Removing it:** extend the sink contract with a drain-and-switch path (or a second output), wait
 for the old buffer to drain at the switch timestamp, and test a mid-stream change against a sink
 that records the boundary.
-
-## 9. `Sink::underruns()` is not used
-
-**Spec:** none; this is the design's sink contract (`docs/design/syncspin-design.md`, _Playout
-timing_), which expects underrun counts to feed buffer corrections.
-
-**What we do:** `Sink::underruns` has a default of zero and the session never calls it. A host can
-implement it for its own diagnostics, but the crate makes no decision from it. The `min_buffer_ms`
-the session reports is derived from the arrival delay of audio chunks instead, which needs no sink
-hook at all.
-
-**Why:** underruns say that the buffer was too small, but growing it from the count needs a re-sync
-and state-reporting loop per sink plus knowledge of the sink's internal buffer, which the crate does
-not have. The arrival delay the server's own send-ahead produces is the measurement the spec names
-for the value, and it is available to the session alone. Wiring a second, unverified input into a
-derived value would risk the two controls fighting each other.
-
-**Removing it:** read `underruns()` at each `client/state` report and after a clock burst, and raise
-the derived `min_buffer_ms` (bounded) when the count rises, leaving the arrival-delay estimate in
-place while the count is flat. Test the reported value against a fake sink that returns a fixed
-count.
 
 ## 10. A stream-clear timestamp is honoured only by sinks that implement `discard_from`
 

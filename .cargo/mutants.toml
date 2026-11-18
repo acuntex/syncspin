@@ -70,7 +70,7 @@ exclude_re = [
   # The base64 decoder rejects non-canonical trailing bits itself, so by the time the re-encode
   # comparison runs, the value is either already rejected or canonical. `||` and `&&` agree on
   # every input that reaches it.
-  '^crates/syncspin-core/src/noise\.rs:878:26: replace \|\| with && in ',
+  '^crates/syncspin-core/src/noise\.rs:885:26: replace \|\| with && in ',
 
   # The Kalman weights below are the filter's internals, not its contract. The contract is the
   # error bound the estimate promises: after convergence it holds, and every assertion in
