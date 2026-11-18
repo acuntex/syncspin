@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Sections are generated from Conventional Commits with [git-cliff](cliff.toml).
 
+## [0.5.0] - 2026-11-18
+
+### Added
+
+- **client:** the client owns playout scheduling: a bounded queue keyed by server timestamp (the advertised `buffer_capacity`, counted in write-time bytes), `Event::LateAudio`, and a lead that covers the sink's pre-port delay.
+- **client:** `Sink::pre_port_delay`, which separates the delay before the audio port from `Sink::output_delay`; the reported `required_lead_time_ms` is at least that value.
+- **client:** `ClientConfig::output_delay_control` and `Event::OutputDelay`: with the switch set, the client advertises `set_output_delay`, and `ControlHandle::output_delay_applied` re-reads the sink and reports the applied value at once.
+- **client:** `AudioFormat::pcm` and `DiscoveredServer::reachable_endpoint`.
+- **core:** an `endpoint` module with the `path-absolute` and loopback rules `connection.md` puts on an advertised endpoint, shared by both roles.
+- **examples:** `mdns-pair`, a one-command mDNS smoke test that advertises, browses, approves, streams and tears down on one host.
+
+### Changed
+
+- **Breaking:** `Sink::write` means "write this frame now". The client calls it at the frame's pre-port write time and drops a frame more than 10 ms late (reported as `LateAudio`) instead of advancing it. A sink that scheduled internally must write on call; the signature is unchanged.
+- **Breaking:** `ClientConfig` gains `output_delay_control`; a full `ClientConfig { .. }` literal needs the field, while `ClientConfig::new` and `with_output_delay_control` keep working.
+- Discovered records now exclude loopback and unspecified addresses and require an RFC 3986 `path-absolute` path, as `connection.md` asks. A consumer that used a loopback record to exercise discovery therefore gets no endpoint.
+- The server reports `ClientLeft` when a connection's first activation fails, so a host's count of live connections stays right.
+- A `set_output_delay` above 5000 ms is capped to 5000 instead of closing the connection, the same tolerance deviation 12 records for volume.
+
+### Fixed
+
+- `docs/spec-deviations.md` #8, #10 and #17 now describe what the code does; #20 records the missing drift correction; #21 records the output-delay cap; the 10 ms late tolerance is named as this crate's choice.
+
+### Notes
+
+- The multicast path of `mdns-pair` is not run in CI; its unit tests, including a loopback test of the approval by static key, are.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added

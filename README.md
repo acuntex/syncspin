@@ -12,7 +12,7 @@ host supplies the server's frames; it does not turn into a music server.
 
 ## Status
 
-**0.4.0, both halves.** The client is covered by a hermetic test suite, including pairing: the Pairing
+**0.5.0, both halves.** The client is covered by a hermetic test suite, including pairing: the Pairing
 PSK flow, the records it writes, the in-band re-handshake and `server/unpair`, plus the static and
 dynamic code flows behind the `pairing-code` feature. The server accepts clients, owns one group and
 its stream, serves the three roles, pairs with all three methods and discovers peers in both
@@ -46,8 +46,8 @@ decision lives in one place.
 
 ```toml
 [dependencies]
-syncspin-client = "0.4.0"
-syncspin-server = "0.4.0"
+syncspin-client = "0.5.0"
+syncspin-server = "0.5.0"
 ```
 
 Every release is tagged, and the tag carries the source it was published from. `syncspin-core` is
