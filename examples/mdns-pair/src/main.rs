@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use syncspin_client::AudioFormat;
+use syncspin_client::{AudioFormat, MAX_PLAYER_NAME_LEN};
 #[cfg(feature = "mdns")]
 use syncspin_client::{GoodbyeReason, Identity};
 // Both crates export an `MdnsDiscovery`; each role runs its own daemon, so each import names the
@@ -72,8 +72,12 @@ const MIN_TIMEOUT_SECS: u64 = 5;
 /// Longest accepted budget; a smoke test that waits longer has hung, not failed slowly.
 const MAX_TIMEOUT_SECS: u64 = 120;
 
-/// Longest mDNS label, in bytes. The service name is one DNS label, so this is its ceiling.
-const MAX_MDNS_LABEL_LEN: usize = 63;
+/// Suffix the player appends to the run name, so the server's log lines tell the roles apart.
+pub(crate) const PLAYER_SUFFIX: &str = "-player";
+
+/// Longest run name, in bytes: it is one mDNS label (63) and also becomes the player name, which
+/// the protocol caps at [`MAX_PLAYER_NAME_LEN`] including [`PLAYER_SUFFIX`].
+const MAX_RUN_NAME_LEN: usize = MAX_PLAYER_NAME_LEN - PLAYER_SUFFIX.len();
 
 /// Sample rate of the run's stream: the PCM format the spec requires every server to support,
 /// and the format this run's client advertises.
@@ -173,9 +177,10 @@ where
     // The run name is a single mDNS label; checking it here reports a bad name before an identity
     // is generated and a socket is opened. `run_name` checks the derived name again, because the
     // PID suffix can push a valid base over the limit.
-    if name.len() > MAX_MDNS_LABEL_LEN {
+    if name.len() > MAX_RUN_NAME_LEN {
         bail!(
-            "--name is {} bytes, but an mDNS label allows at most {MAX_MDNS_LABEL_LEN}",
+            "--name is {} bytes, but the run name allows at most {MAX_RUN_NAME_LEN}: it is one \
+             mDNS label and the player name is derived from it with `{PLAYER_SUFFIX}`",
             name.len()
         );
     }
@@ -190,17 +195,18 @@ where
 /// The name this run publishes and looks for.
 ///
 /// A derived name carries the PID so two runs on one host do not answer for each other; an
-/// explicit name is used as given and never grown. Either way the result must fit one mDNS label.
+/// explicit name is used as given and never grown. Either way the result must fit one mDNS label
+/// and leave room for [`PLAYER_SUFFIX`] in the player name.
 fn run_name(options: &Options, pid: u32) -> Result<String> {
     let name = if options.explicit_name {
         options.name.clone()
     } else {
         format!("{}-{pid}", options.name)
     };
-    if name.len() > MAX_MDNS_LABEL_LEN {
+    if name.len() > MAX_RUN_NAME_LEN {
         bail!(
-            "the run name {name:?} is {} bytes, but an mDNS label allows at most \
-             {MAX_MDNS_LABEL_LEN}",
+            "the run name {name:?} is {} bytes, but it allows at most {MAX_RUN_NAME_LEN}: it is \
+             one mDNS label and the player name is derived from it with `{PLAYER_SUFFIX}`",
             name.len()
         );
     }
@@ -597,10 +603,10 @@ mod tests {
     }
 
     #[test]
-    fn the_run_name_is_bounded_by_the_mdns_label() {
-        let name = "a".repeat(63);
+    fn the_run_name_leaves_room_for_the_player_suffix() {
+        let name = "a".repeat(MAX_RUN_NAME_LEN);
         assert!(parse(&["--name", &name]).is_ok());
-        let too_long = "a".repeat(64);
+        let too_long = "a".repeat(MAX_RUN_NAME_LEN + 1);
         assert!(parse(&["--name", &too_long]).is_err());
 
         let options = options(&["--name", &name]);
@@ -627,7 +633,7 @@ mod tests {
         };
         assert!(
             run_name(&named, 4242).is_err(),
-            "the PID suffix pushes 60 bytes over the label limit"
+            "the PID suffix pushes 60 bytes over the run-name limit"
         );
     }
 

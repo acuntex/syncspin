@@ -25,6 +25,7 @@ use syncspin_client::MdnsDiscovery as ClientMdns;
 #[cfg(feature = "mdns")]
 use crate::find::{matching_servers, reachable_endpoint};
 use crate::sink::Counters;
+use crate::PLAYER_SUFFIX;
 
 /// How long the loop waits between two browse attempts.
 ///
@@ -107,7 +108,7 @@ pub async fn connect_session(
 ) -> Result<(ClientHandle, EventStream)> {
     // The player gets its own name, so the server's log lines tell the two roles apart; the
     // identity is the key the server decides on.
-    let config = ClientConfig::new(endpoint, format!("{run_name}-player"), identity);
+    let config = ClientConfig::new(endpoint, format!("{run_name}{PLAYER_SUFFIX}"), identity);
     connect(config, sink).await
 }
 
