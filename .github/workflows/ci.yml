@@ -51,6 +51,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: example manifests
+        run: scripts/check-example-versions.sh
 
   test:
     name: test
