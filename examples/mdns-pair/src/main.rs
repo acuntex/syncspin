@@ -114,8 +114,12 @@ const GATE_FRAMES: usize = 20;
 /// Payload bytes those frames carry: 76,800, the number the gate asserts rather than prints.
 const GATE_BYTES: usize = GATE_FRAMES * CHUNK_BYTES;
 
-/// Upper bound on each of the three teardown waits — the client's goodbye, the server seeing it,
-/// and the server task — so a stuck peer cannot hold the command open.
+/// How long the run waits for the server to report the client's departure, only to keep the log in
+/// order. The client's session has already ended by then, so a normal departure arrives at once.
+const DEPARTURE_GRACE: Duration = Duration::from_millis(250);
+
+/// Upper bound on each of the two teardown waits - the client's goodbye and the server task - so a
+/// stuck peer cannot hold the command open.
 const TEARDOWN: Duration = Duration::from_secs(2);
 
 /// What the command line asked for.
@@ -383,68 +387,34 @@ async fn run(options: Options) -> Result<RunOutcome> {
     // their own so a timeout names the stage, and the handle is owned from `connect_session` on,
     // so every path after that says why the session leaves.
     let deadline = tokio::time::Instant::now() + options.timeout;
-    let report = counters.clone();
-    let mut interrupted = false;
     let mut said_goodbye = false;
 
-    let verdict: Result<()> = async {
-        let endpoint = tokio::select! {
-            _ = interrupt.wait_for(|fired| *fired) => {
-                interrupted = true;
-                return Ok(());
-            }
-            result = tokio::time::timeout_at(deadline, client_role::discover(&run_name)) => {
-                match result {
-                    Ok(result) => result?,
-                    Err(_) => bail!(no_service_message(&run_name, options.timeout)),
-                }
-            }
+    let verdict: Result<Flow> = async {
+        let endpoint = match until_interrupt(
+            &mut interrupt,
+            tokio::time::timeout_at(deadline, client_role::discover(&run_name)),
+        )
+        .await
+        {
+            None => return Ok(Flow::Interrupted),
+            Some(Err(_)) => bail!(no_service_message(&run_name, options.timeout)),
+            Some(Ok(result)) => result?,
         };
         // The session exists from this call on; an interrupt before it has no connection to say
         // goodbye on, and no handle to finish.
         let (mut handle, mut events) =
             client_role::connect_session(&run_name, &endpoint, identity, Box::new(sink)).await?;
-        let outcome: Result<()> = async {
-            tokio::select! {
-                _ = interrupt.wait_for(|fired| *fired) => {
-                    interrupted = true;
-                    return Ok(());
-                }
-                result = tokio::time::timeout_at(
-                    deadline,
-                    client_role::wait_for_connection(&mut events, &endpoint, &server_id),
-                ) => match result {
-                    Ok(result) => result?,
-                    Err(_) => bail!(timeout_message(
-                        Stage::Connection,
-                        options.timeout,
-                        GATE_FRAMES
-                    )),
-                },
-            }
-            tokio::select! {
-                _ = interrupt.wait_for(|fired| *fired) => {
-                    interrupted = true;
-                    Ok(())
-                }
-                result = tokio::time::timeout_at(
-                    deadline,
-                    client_role::wait_for_gate(&mut events, &counters),
-                ) => match result {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow!(timeout_message(
-                        Stage::Stream,
-                        options.timeout,
-                        GATE_FRAMES
-                    ))),
-                },
-            }?;
-            if interrupted {
-                Ok(())
-            } else {
-                verify_gate(&report)
-            }
-        }
+        let outcome = await_gate(
+            &mut interrupt,
+            Wait {
+                deadline,
+                budget: options.timeout,
+            },
+            &mut events,
+            &endpoint,
+            &server_id,
+            &counters,
+        )
         .await;
         // The goodbye first, while the close signal still reaches a session that can send it, then
         // the task, then the event stream: dropping the stream first makes the session loop return
@@ -462,10 +432,10 @@ async fn run(options: Options) -> Result<RunOutcome> {
 
     // The server loop ends only on the stop signal: `ClientLeft` carries no client id, so any LAN
     // client leaving after this run's approval would otherwise end the server. The departure is
-    // awaited only so the goodbye's log line appears before the stop, and only for `TEARDOWN`; it
-    // never gates the run.
+    // awaited only so the goodbye's log line appears before the stop, and only for a short grace
+    // that does not grow with other clients on the LAN; it never gates the run.
     if said_goodbye {
-        let _ = timeout(TEARDOWN, departure_rx).await;
+        let _ = timeout(DEPARTURE_GRACE, departure_rx).await;
     }
     // The record goes even when the flow failed once the server has started: the run is a smoke
     // test, not a service, and a withdrawn advertisement is what keeps the next run from finding
@@ -483,17 +453,87 @@ async fn run(options: Options) -> Result<RunOutcome> {
     if let Some(error) = server_error {
         // A failed flow keeps its own error; the server's is reported beside it rather than
         // replacing the failure that explains the run.
-        if verdict.is_ok() && !interrupted {
+        if matches!(verdict, Ok(Flow::Done)) {
             return Err(error);
         }
         eprintln!("error: {error:#}");
     }
-    if interrupted {
-        println!("interrupted; the frame gate was not checked");
-        return Ok(RunOutcome::Interrupted);
+    match verdict? {
+        Flow::Interrupted => {
+            println!("interrupted; the frame gate was not checked");
+            Ok(RunOutcome::Interrupted)
+        }
+        Flow::Done => Ok(RunOutcome::Completed),
     }
-    verdict?;
-    Ok(RunOutcome::Completed)
+}
+
+/// How a phase of the run ended when it did not fail.
+#[cfg(feature = "mdns")]
+enum Flow {
+    /// The phase finished and, for the last one, the gate was checked.
+    Done,
+    /// Ctrl-C arrived first; nothing after it ran.
+    Interrupted,
+}
+
+/// What a waiting phase is bounded by: the run's one deadline and the budget it was derived from,
+/// which the stage messages name.
+#[cfg(feature = "mdns")]
+struct Wait {
+    deadline: tokio::time::Instant,
+    budget: Duration,
+}
+
+/// Runs `work` unless Ctrl-C arrives first, in which case it is dropped and `None` is returned.
+///
+/// The interrupt is checked first, so one that is already latched wins over work that is ready.
+#[cfg(feature = "mdns")]
+async fn until_interrupt<T>(
+    interrupt: &mut tokio::sync::watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = interrupt.wait_for(|fired| *fired) => None,
+        value = work => Some(value),
+    }
+}
+
+/// Waits for `Connected` from this run's server, then for the frame gate, and checks the gate.
+#[cfg(feature = "mdns")]
+async fn await_gate(
+    interrupt: &mut tokio::sync::watch::Receiver<bool>,
+    wait: Wait,
+    events: &mut syncspin_client::EventStream,
+    endpoint: &str,
+    server_id: &str,
+    counters: &Counters,
+) -> Result<Flow> {
+    match until_interrupt(
+        interrupt,
+        tokio::time::timeout_at(
+            wait.deadline,
+            client_role::wait_for_connection(events, endpoint, server_id),
+        ),
+    )
+    .await
+    {
+        None => return Ok(Flow::Interrupted),
+        Some(Err(_)) => bail!(timeout_message(Stage::Connection, wait.budget, GATE_FRAMES)),
+        Some(Ok(result)) => result?,
+    }
+    match until_interrupt(
+        interrupt,
+        tokio::time::timeout_at(wait.deadline, client_role::wait_for_gate(events, counters)),
+    )
+    .await
+    {
+        None => return Ok(Flow::Interrupted),
+        Some(Err(_)) => bail!(timeout_message(Stage::Stream, wait.budget, GATE_FRAMES)),
+        Some(Ok(result)) => result?,
+    }
+    verify_gate(counters)?;
+    Ok(Flow::Done)
 }
 
 /// Turns a closed ready channel into the cause the server task left behind.

@@ -50,12 +50,23 @@ pub async fn discover(run_name: &str) -> Result<String> {
         // One browse blocks for the backend's one-second window. It runs on the blocking pool so
         // the server keeps serving. The caller's deadline drops this future between awaits; the
         // browse already in flight finishes on its own, so this loop keeps no clock.
-        let servers = tokio::task::spawn_blocking({
+        let browsed = tokio::task::spawn_blocking({
             let discovery = Arc::clone(&discovery);
             move || discover_servers(discovery.as_ref())
         })
         .await
-        .context("the discovery task ended")??;
+        .context("the discovery task ended")?;
+        // A browse that fails is retried like one that finds nothing: the daemon can report an
+        // error on its first window while the record is not yet on the wire, and the caller's
+        // deadline bounds the loop either way.
+        let servers = match browsed {
+            Ok(servers) => servers,
+            Err(error) => {
+                println!("browse {attempt} failed: {error:#}");
+                tokio::time::sleep(RETRY_PAUSE).await;
+                continue;
+            }
+        };
         for server in matching_servers(&servers, run_name) {
             if let Some(endpoint) = reachable(server).await {
                 // The path comes from a TXT record any LAN host can publish; `Debug` escapes it.

@@ -508,7 +508,7 @@ async fn a_dropped_event_stream_ends_the_listener() {
 fn browsing_asks_for_servers_and_reads_a_plain_ws_endpoint() {
     let discovery = RecordingDiscovery {
         servers: Mutex::new(vec![DiscoveredServer {
-            addresses: vec!["127.0.0.1:8927".to_owned()],
+            addresses: vec!["192.0.2.1:8927".to_owned()],
             path: "/sendspin".to_owned(),
             name: Some("A server".to_owned()),
         }]),
@@ -523,7 +523,7 @@ fn browsing_asks_for_servers_and_reads_a_plain_ws_endpoint() {
     );
     assert_eq!(
         servers.first().and_then(DiscoveredServer::endpoint),
-        Some("ws://127.0.0.1:8927/sendspin".to_owned()),
+        Some("ws://192.0.2.1:8927/sendspin".to_owned()),
         "a discovered record names a plain ws:// endpoint"
     );
 }

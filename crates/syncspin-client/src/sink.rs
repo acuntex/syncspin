@@ -123,7 +123,12 @@ impl AudioFormat {
     /// Builds a PCM format.
     ///
     /// Samples are interleaved by channel and encoded as signed little-endian integers of
-    /// `bit_depth` bits, which is what the specification's PCM convention describes.
+    /// `bit_depth` bits, which is what the specification's PCM convention describes; 24-bit samples
+    /// are packed as three bytes.
+    ///
+    /// The values are not validated. A server must support PCM at 16 bit, one or two channels and
+    /// 44.1 or 48 kHz, and may support others, so a format outside that is for the host to judge: a
+    /// zero channel count or a bit depth that is not a whole number of bytes describes no stream.
     pub fn pcm(sample_rate: u32, channels: u8, bit_depth: u8) -> AudioFormat {
         AudioFormat {
             codec: Codec::Pcm,
