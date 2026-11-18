@@ -332,15 +332,17 @@ async fn run(options: Options) -> Result<RunOutcome> {
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let (stop_tx, stop_rx) = oneshot::channel();
+    let (departure_tx, departure_rx) = oneshot::channel();
     let mut server_task = tokio::spawn(server_role::serve(
         config,
         ready_tx,
         stop_rx,
-        run_name.clone(),
+        departure_tx,
+        client_id.clone(),
     ));
-    ready_rx
-        .await
-        .context("the server role ended before it published its record")?;
+    if ready_rx.await.is_err() {
+        return Err(server_start_error(&mut server_task).await);
+    }
 
     // One deadline covers the browse, the connection and the frames; the stage the flow reached is
     // shared through an atomic so the timeout can name where it stopped.
@@ -360,13 +362,13 @@ async fn run(options: Options) -> Result<RunOutcome> {
             Ok::<_, anyhow::Error>((handle, events))
         }
     };
-    let outcome: Result<Option<(ClientHandle, EventStream)>> = tokio::select! {
+    let outcome: Result<Flow> = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            println!("interrupted");
-            Ok(None)
+            println!("interrupted; the frame gate was not checked");
+            Ok(Flow::Interrupted)
         }
         result = timeout(options.timeout, flow) => match result {
-            Ok(result) => result.map(Some),
+            Ok(result) => result.map(|(handle, events)| Flow::Gate(handle, events)),
             Err(_) => Err(anyhow!(timeout_message(
                 stage_of(&stage),
                 &run_name,
@@ -382,8 +384,9 @@ async fn run(options: Options) -> Result<RunOutcome> {
     // `TEARDOWN` is dropped, and a dropped handle detaches the task instead of aborting it;
     // process exit is the real bound the design accepts.
     let mut said_goodbye = false;
+    let mut interrupted = false;
     let verdict = match outcome {
-        Ok(Some((mut handle, events))) => {
+        Ok(Flow::Gate(mut handle, events)) => {
             let verdict = verify_gate(&report);
             handle.close(GoodbyeReason::Shutdown);
             said_goodbye = true;
@@ -391,22 +394,75 @@ async fn run(options: Options) -> Result<RunOutcome> {
             drop(events);
             verdict
         }
-        Ok(None) => Ok(()),
+        Ok(Flow::Interrupted) => {
+            interrupted = true;
+            Ok(())
+        }
         Err(error) => Err(error),
     };
 
-    // The server ends its loop on the `ClientLeft` the goodbye produces, so a clean close waits
-    // for the server task — the departure, or the server ending on its own — before the stop
-    // signal, which would otherwise win the race and hide the reason. A goodbye the server never
-    // reports falls through to the stop after `TEARDOWN`.
-    let departed = said_goodbye && timeout(TEARDOWN, &mut server_task).await.is_ok();
-    if !departed {
-        // The record goes even when the flow failed: the run is a smoke test, not a service, and a
-        // withdrawn advertisement is what keeps the next run from finding this one.
-        let _ = stop_tx.send(());
-        let _ = timeout(TEARDOWN, server_task).await;
+    // The server loop ends only on the stop signal: `ClientLeft` carries no client id, so any LAN
+    // client leaving after this run's approval would otherwise end the server. The departure is
+    // awaited only so the goodbye's log line appears before the stop, and only for `TEARDOWN`; it
+    // never gates the run.
+    if said_goodbye {
+        let _ = timeout(TEARDOWN, departure_rx).await;
     }
-    verdict
+    // The record goes even when the flow failed: the run is a smoke test, not a service, and a
+    // withdrawn advertisement is what keeps the next run from finding this one.
+    let _ = stop_tx.send(());
+    let server_error = match timeout(TEARDOWN, &mut server_task).await {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(error))) => Some(error.context("the server role failed during shutdown")),
+        Ok(Err(join_error)) => Some(anyhow!("the server role task failed: {join_error}")),
+        Err(_) => Some(anyhow!(
+            "the server role did not stop within {} s",
+            TEARDOWN.as_secs()
+        )),
+    };
+    if let Some(error) = server_error {
+        // A failed flow keeps its own error; the server's is reported beside it rather than
+        // replacing the failure that explains the run.
+        if verdict.is_ok() && !interrupted {
+            return Err(error);
+        }
+        eprintln!("error: {error:#}");
+    }
+    if interrupted {
+        return Ok(RunOutcome::Interrupted);
+    }
+    verdict?;
+    Ok(RunOutcome::Completed)
+}
+
+/// Turns a closed ready channel into the cause the server task left behind.
+///
+/// The task is awaited under [`TEARDOWN`] so a start failure is reported with its own error chain
+/// instead of the generic message; a task that ended without an error, panicked, or did not end in
+/// time each gets its own sentence. The borrow keeps the handle usable by the normal path, which
+/// only runs when the ready channel delivered.
+#[cfg(feature = "mdns")]
+async fn server_start_error(
+    server_task: &mut tokio::task::JoinHandle<Result<()>>,
+) -> anyhow::Error {
+    match timeout(TEARDOWN, &mut *server_task).await {
+        Ok(Ok(Ok(()))) => {
+            anyhow!("the server role ended before it published its record, without an error")
+        }
+        Ok(Ok(Err(error))) => {
+            anyhow!("the server role failed before it published its record: {error:#}")
+        }
+        Ok(Err(join_error)) if join_error.is_panic() => {
+            anyhow!("the server role panicked before it published its record: {join_error}")
+        }
+        Ok(Err(join_error)) => {
+            anyhow!("the server role was cancelled before it published its record: {join_error}")
+        }
+        Err(_) => anyhow!(
+            "the server role did not end within {} s after its ready channel closed",
+            TEARDOWN.as_secs()
+        ),
+    }
 }
 
 /// Reads back the stage the flow had reached, for the timeout's diagnostic.

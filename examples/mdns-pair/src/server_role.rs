@@ -22,9 +22,10 @@ const PLAYER_ROLE: &str = "player@v1";
 /// Starts the server, reports its address on `ready`, and serves until `stop` fires.
 ///
 /// The run waits for `ready` before it browses, so a listener that cannot start is an error here
-/// rather than a discovery timeout there. The loop ends on the stop signal, on the event stream
-/// ending, or when the client this run approved has left; the handle's shutdown then withdraws the
-/// advertised record.
+/// rather than a discovery timeout there. The loop ends only on the stop signal or when the event
+/// stream ends: `ClientLeft` carries no client id, so it cannot tell this run's departure from any
+/// other LAN client's, and a foreign departure must not end the server. A departure is printed and
+/// reported on `departure` (best effort) after the goodbye that produced it.
 pub async fn serve(
     config: ServerConfig,
     ready: oneshot::Sender<SocketAddr>,
@@ -44,9 +45,9 @@ pub async fn serve(
     let mut events = server.events();
     let mut stream: Option<StreamWriter> = None;
     let mut written = 0;
-    // Set once the run's own client was approved. `ClientLeft` carries no `client_id`, so this is
-    // what tells the loop that the departure it just saw is the end of the run.
-    let mut approved_ours = false;
+    // One departure is all the run listens for, so the sender is taken on the first `ClientLeft`.
+    // The loop keeps serving whether or not anyone is waiting for it.
+    let mut departure = Some(departure);
     let silence = vec![0u8; CHUNK_BYTES];
     let mut pace = interval(Duration::from_millis(CHUNK_MS));
     // A late wakeup writes one chunk, not a burst: the frames are meaningless once the run is over.
@@ -72,7 +73,10 @@ pub async fn serve(
                             Err(error) => println!("could not approve {name}: {error:#}"),
                         }
                     } else {
-                        println!("refused {name:?}: this run approves only {run_name:?}");
+                        println!(
+                            "ignored {name} ({client_id}): this run approves only \
+                             {expected_client_id}"
+                        );
                     }
                 }
                 Some(Event::ClientActivated { roles, .. }) => {
@@ -91,8 +95,8 @@ pub async fn serve(
                 }
                 Some(Event::ClientLeft { reason }) => {
                     println!("client left: {reason}");
-                    if approved_ours {
-                        break;
+                    if let Some(departure) = departure.take() {
+                        let _ = departure.send(());
                     }
                 }
                 Some(other) => println!("server event: {other:?}"),
