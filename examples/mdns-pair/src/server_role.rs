@@ -73,8 +73,10 @@ pub async fn serve(
                             Err(error) => println!("could not approve {name}: {error:#}"),
                         }
                     } else {
+                        // A peer chooses its own name; `Debug` escapes control characters
+                        // instead of letting them reach the terminal.
                         println!(
-                            "ignored {name} ({client_id}): this run approves only \
+                            "ignored {name:?} ({client_id}): this run approves only \
                              {expected_client_id}"
                         );
                     }
@@ -119,4 +121,109 @@ pub async fn serve(
         writer.end();
     }
     server.shutdown().await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use syncspin_client::{AudioFormat, GoodbyeReason, Identity as ClientIdentity};
+    use syncspin_server::{DiscoveredClient, Discovery, ServiceAdvertisement};
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::client_role::{connect_session, wait_for_connection, wait_for_gate};
+    use crate::sink::CountingSink;
+    use crate::{GATE_FRAMES, TEARDOWN};
+
+    /// A backend that publishes nothing and browses nothing, so the test opens no multicast socket.
+    struct NoDiscovery;
+
+    impl Discovery for NoDiscovery {
+        fn advertise(&self, _service: ServiceAdvertisement) -> Result<()> {
+            Ok(())
+        }
+
+        fn withdraw(&self, _service_type: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn browse(&self, _service_type: &str) -> Result<Vec<DiscoveredClient>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The run's core promise: only the client whose static key this run generated is approved, and
+    /// only that client receives a stream. Loopback only; no daemon, no multicast.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_the_expected_key_is_approved() {
+        let identity = ClientIdentity::generate();
+        let expected = identity.public_base64();
+        let mut config = ServerConfig::new(
+            "mdns-pair-test".to_owned(),
+            syncspin_server::Identity::generate(),
+        );
+        config.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        config.discovery = Some(Arc::new(NoDiscovery));
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let (departure_tx, _departure_rx) = oneshot::channel();
+        let server = tokio::spawn(serve(config, ready_tx, stop_rx, departure_tx, expected));
+        let address = ready_rx.await.expect("the server published its address");
+        let endpoint = format!("ws://{address}/sendspin");
+        let format = AudioFormat::pcm(48_000, 2, 16);
+
+        // The approved client: the key the server compares against.
+        let (sink, counters) = CountingSink::new(GATE_FRAMES, format.clone());
+        let (mut handle, mut events) =
+            connect_session("approved", &endpoint, identity, Box::new(sink))
+                .await
+                .expect("the approved session starts");
+        wait_for_connection(&mut events, &endpoint)
+            .await
+            .expect("the approved handshake completes");
+        timeout(
+            Duration::from_secs(5),
+            wait_for_gate(&mut events, &counters),
+        )
+        .await
+        .expect("the gate arrives")
+        .expect("the gate passes");
+
+        // Another key is admitted to the connection but never to the stream.
+        let (sink, counters) = CountingSink::new(1, format);
+        let (_other, mut other_events) = connect_session(
+            "foreign",
+            &endpoint,
+            ClientIdentity::generate(),
+            Box::new(sink),
+        )
+        .await
+        .expect("the foreign session starts");
+        wait_for_connection(&mut other_events, &endpoint)
+            .await
+            .expect("the foreign handshake completes");
+        assert!(
+            timeout(
+                Duration::from_millis(500),
+                wait_for_gate(&mut other_events, &counters)
+            )
+            .await
+            .is_err(),
+            "a foreign key must not be approved"
+        );
+
+        handle.close(GoodbyeReason::Shutdown);
+        let _ = timeout(TEARDOWN, handle.finished()).await;
+        let _ = stop_tx.send(());
+        timeout(TEARDOWN, server)
+            .await
+            .expect("the server stops")
+            .expect("the server task does not panic")
+            .expect("the shutdown is clean");
+    }
 }

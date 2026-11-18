@@ -70,37 +70,11 @@ pub(crate) async fn reachable_endpoint(server: &DiscoveredServer) -> Option<Stri
     None
 }
 
-/// The stage the flow had reached when the deadline ended it.
-///
-/// The flow records the stage in a shared counter while it runs and reads it back in the timeout's
-/// error arm. [`Stage::as_u8`] and [`Stage::from_u8`] are the only place the encoding lives, so a
-/// reordered variant cannot silently mislabel a timeout.
+/// The stage a deadline ended in, named by the call that awaited it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stage {
-    Discovery,
     Connection,
     Stream,
-}
-
-impl Stage {
-    /// Encodes the stage for the shared counter.
-    pub(crate) const fn as_u8(self) -> u8 {
-        match self {
-            Stage::Discovery => 0,
-            Stage::Connection => 1,
-            Stage::Stream => 2,
-        }
-    }
-
-    /// Decodes a stage the flow recorded; an unknown code reads as the start state, so a
-    /// corrupted counter cannot claim the flow got further than it did.
-    pub(crate) const fn from_u8(code: u8) -> Stage {
-        match code {
-            1 => Stage::Connection,
-            2 => Stage::Stream,
-            _ => Stage::Discovery,
-        }
-    }
 }
 
 /// The diagnostic for a browse that never saw this run's record.
@@ -117,14 +91,8 @@ pub(crate) fn no_service_message(run_name: &str, budget: Duration) -> String {
 }
 
 /// The diagnostic for a flow that timed out in `stage`; `frames` is the gate the run waits for.
-pub(crate) fn timeout_message(
-    stage: Stage,
-    run_name: &str,
-    budget: Duration,
-    frames: usize,
-) -> String {
+pub(crate) fn timeout_message(stage: Stage, budget: Duration, frames: usize) -> String {
     match stage {
-        Stage::Discovery => no_service_message(run_name, budget),
         Stage::Connection => format!(
             "discovered the service, but no connection was established within {} s",
             budget.as_secs()
@@ -190,38 +158,11 @@ mod tests {
 
         let connection = timeout_message(
             Stage::Connection,
-            "mdns-pair-7",
             Duration::from_secs(10),
             crate::GATE_FRAMES,
         );
         assert!(connection.contains("no connection"));
-        let stream = timeout_message(
-            Stage::Stream,
-            "mdns-pair-7",
-            Duration::from_secs(10),
-            crate::GATE_FRAMES,
-        );
+        let stream = timeout_message(Stage::Stream, Duration::from_secs(10), crate::GATE_FRAMES);
         assert!(stream.contains("20 audio frames"));
-        assert_eq!(
-            timeout_message(
-                Stage::Discovery,
-                "mdns-pair-7",
-                Duration::from_secs(10),
-                crate::GATE_FRAMES
-            ),
-            discovery
-        );
-    }
-
-    #[test]
-    fn the_stage_encoding_round_trips() {
-        for stage in [Stage::Discovery, Stage::Connection, Stage::Stream] {
-            assert_eq!(Stage::from_u8(stage.as_u8()), stage);
-        }
-        assert_eq!(
-            Stage::from_u8(9),
-            Stage::Discovery,
-            "an unknown code must not claim progress"
-        );
     }
 }

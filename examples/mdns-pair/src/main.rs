@@ -16,23 +16,20 @@
 //! one host apart, and it is also why an explicit name must fit the mDNS label with room to spare:
 //! a derived name grows by the suffix, an explicit one is published as given.
 
-// Without the flow, the helpers it drives are reachable only from the test module; the build still
-// parses the command line, so the dead-code analysis would otherwise name them.
+// Without the mDNS feature the flow is not built, so its helpers are reachable only from the test
+// module, while the feature-less build still parses the command line and exits 2. The allow is
+// scoped to that build: with `mdns` on, dead code is still reported.
 #![cfg_attr(not(feature = "mdns"), allow(dead_code))]
 
 mod advertise_only;
-#[cfg(feature = "mdns")]
 mod client_role;
 mod find;
-#[cfg(feature = "mdns")]
 mod server_role;
 mod sink;
 
 #[cfg(feature = "mdns")]
 use std::net::SocketAddr;
 use std::process::ExitCode;
-#[cfg(any(feature = "mdns", test))]
-use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(feature = "mdns")]
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,9 +52,9 @@ use tokio::time::timeout;
 #[cfg(feature = "mdns")]
 use crate::advertise_only::AdvertiseOnly;
 #[cfg(feature = "mdns")]
-use crate::find::timeout_message;
-#[cfg(any(feature = "mdns", test))]
 use crate::find::Stage;
+#[cfg(feature = "mdns")]
+use crate::find::{no_service_message, timeout_message};
 use crate::sink::Counters;
 #[cfg(any(feature = "mdns", test))]
 use crate::sink::CountingSink;
@@ -93,8 +90,8 @@ const BYTES_PER_FRAME: usize = CHANNELS as usize * BIT_DEPTH as usize / 8;
 
 /// Duration of one streamed chunk, in milliseconds.
 ///
-/// The specification forbids a chunk shorter than 15 ms and longer than 150 ms, so 20 ms sits in
-/// the middle of the range, and it is also the pace the server writes at.
+/// The specification says a chunk should not be shorter than 15 ms and must not exceed 150 ms, so
+/// 20 ms sits in the middle of the range, and it is also the pace the server writes at.
 const CHUNK_MS: u64 = 20;
 
 /// Frames in one chunk at [`SAMPLE_RATE`].
@@ -335,50 +332,50 @@ async fn run(options: Options) -> Result<RunOutcome> {
         return Err(server_start_error(&mut server_task).await);
     }
 
-    // One deadline covers the browse, the connection and the frames. The phases are awaited
-    // separately so the handle exists by the time the run has to say why it leaves; the stage is
-    // shared so a timeout names where it stopped.
+    // One deadline covers the browse, the handshake and the frames. The phases are awaited on
+    // their own so a timeout names the stage, and the handle is owned from `connect_session` on,
+    // so every path after that says why the session leaves.
     let deadline = tokio::time::Instant::now() + options.timeout;
-    let stage = Arc::new(AtomicU8::new(Stage::Discovery.as_u8()));
     let report = counters.clone();
     let mut interrupted = false;
-
-    let connected = tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            interrupted = true;
-            None
-        }
-        result = tokio::time::timeout_at(deadline, async {
-            let endpoint = client_role::discover(&run_name, options.timeout).await?;
-            stage.store(Stage::Connection.as_u8(), Ordering::SeqCst);
-            client_role::await_connected(&run_name, &endpoint, identity, Box::new(sink)).await
-        }) => Some(result),
-    };
-    let connected = match connected {
-        None => None,
-        Some(Ok(result)) => Some(result),
-        Some(Err(_)) => Some(Err(anyhow!(timeout_message(
-            Stage::from_u8(stage.load(Ordering::SeqCst)),
-            &run_name,
-            options.timeout,
-            GATE_FRAMES
-        )))),
-    };
-
-    // The client side of the teardown: the goodbye first, while the close signal still reaches a
-    // session that can send it, then the task, then the event stream. Dropping the stream first
-    // makes the session loop return on `events.is_closed()` without a `client/goodbye`, so this
-    // order is what deterministically takes the shutdown arm. A `finished()` that outlives
-    // `TEARDOWN` is dropped, and a dropped handle detaches the task instead of aborting it;
-    // process exit is the real bound the design accepts.
     let mut said_goodbye = false;
-    let verdict = match connected {
-        // An interrupt before a session existed has no connection to say goodbye on.
-        None => Ok(()),
-        Some(Err(error)) => Err(error),
-        Some(Ok((mut handle, mut events))) => {
-            stage.store(Stage::Stream.as_u8(), Ordering::SeqCst);
-            let gate = tokio::select! {
+
+    let verdict: Result<()> = async {
+        let endpoint = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                interrupted = true;
+                return Ok(());
+            }
+            result = tokio::time::timeout_at(deadline, client_role::discover(&run_name)) => {
+                match result {
+                    Ok(result) => result?,
+                    Err(_) => bail!(no_service_message(&run_name, options.timeout)),
+                }
+            }
+        };
+        // The session exists from this call on; an interrupt before it has no connection to say
+        // goodbye on, and no handle to finish.
+        let (mut handle, mut events) =
+            client_role::connect_session(&run_name, &endpoint, identity, Box::new(sink)).await?;
+        let outcome: Result<()> = async {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    interrupted = true;
+                    return Ok(());
+                }
+                result = tokio::time::timeout_at(
+                    deadline,
+                    client_role::wait_for_connection(&mut events, &endpoint),
+                ) => match result {
+                    Ok(result) => result?,
+                    Err(_) => bail!(timeout_message(
+                        Stage::Connection,
+                        options.timeout,
+                        GATE_FRAMES
+                    )),
+                },
+            }
+            tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     interrupted = true;
                     Ok(())
@@ -389,28 +386,29 @@ async fn run(options: Options) -> Result<RunOutcome> {
                 ) => match result {
                     Ok(result) => result,
                     Err(_) => Err(anyhow!(timeout_message(
-                        Stage::from_u8(stage.load(Ordering::SeqCst)),
-                        &run_name,
+                        Stage::Stream,
                         options.timeout,
                         GATE_FRAMES
                     ))),
                 },
-            };
-            // The session exists from here on, so it says why it leaves on every path, including
-            // an interrupt and a gate that failed.
-            handle.close(GoodbyeReason::Shutdown);
-            said_goodbye = true;
-            let _ = timeout(TEARDOWN, handle.finished()).await;
-            drop(events);
-            gate.and_then(|()| {
-                if interrupted {
-                    Ok(())
-                } else {
-                    verify_gate(&report, &expected)
-                }
-            })
+            }?;
+            if interrupted {
+                Ok(())
+            } else {
+                verify_gate(&report, &expected)
+            }
         }
-    };
+        .await;
+        // The goodbye first, while the close signal still reaches a session that can send it, then
+        // the task, then the event stream: dropping the stream first makes the session loop return
+        // on `events.is_closed()` without a `client/goodbye`.
+        handle.close(GoodbyeReason::Shutdown);
+        said_goodbye = true;
+        let _ = timeout(TEARDOWN, handle.finished()).await;
+        drop(events);
+        outcome
+    }
+    .await;
 
     // The server loop ends only on the stop signal: `ClientLeft` carries no client id, so any LAN
     // client leaving after this run's approval would otherwise end the server. The departure is
@@ -627,22 +625,6 @@ mod tests {
         assert_eq!(BYTES_PER_FRAME, 4);
         assert_eq!((CHUNK_BYTES, GATE_BYTES), (3_840, 76_800));
         assert_eq!(GATE_BYTES, GATE_FRAMES * CHUNK_BYTES);
-    }
-
-    #[test]
-    fn the_stage_counter_carries_the_typed_stage() {
-        let stage = AtomicU8::new(Stage::Discovery.as_u8());
-        assert_eq!(
-            Stage::from_u8(stage.load(Ordering::SeqCst)),
-            Stage::Discovery
-        );
-        stage.store(Stage::Connection.as_u8(), Ordering::SeqCst);
-        assert_eq!(
-            Stage::from_u8(stage.load(Ordering::SeqCst)),
-            Stage::Connection
-        );
-        stage.store(Stage::Stream.as_u8(), Ordering::SeqCst);
-        assert_eq!(Stage::from_u8(stage.load(Ordering::SeqCst)), Stage::Stream);
     }
 
     #[test]

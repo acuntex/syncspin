@@ -5,37 +5,44 @@
 //! arrives on the event stream, and this module turns the first `Connected` into the handle the
 //! run drives.
 
+#[cfg(feature = "mdns")]
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(feature = "mdns")]
+use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
-use syncspin_client::{
-    connect, discover_servers, ClientConfig, ClientHandle, Event, EventStream, Identity, Sink,
-};
+#[cfg(feature = "mdns")]
+use anyhow::Context;
+use anyhow::{bail, Result};
+#[cfg(feature = "mdns")]
+use syncspin_client::discover_servers;
+use syncspin_client::{connect, ClientConfig, ClientHandle, Event, EventStream, Identity, Sink};
 
 // The client crate and the server crate both export an `MdnsDiscovery`; each side of the run
 // starts its own daemon, so the alias says which role this one plays.
+#[cfg(feature = "mdns")]
 use syncspin_client::MdnsDiscovery as ClientMdns;
 
-use crate::find::{matching_servers, no_service_message, reachable_endpoint};
+#[cfg(feature = "mdns")]
+use crate::find::{matching_servers, reachable_endpoint};
 use crate::sink::Counters;
 
 /// How long the loop waits between two browse attempts.
 ///
 /// A browse already blocks for one second, so this is only the pause that keeps the loop from
 /// spinning when the backend answers at once.
+#[cfg(feature = "mdns")]
 const RETRY_PAUSE: Duration = Duration::from_millis(200);
 
-/// Browses until a record named `run_name` answers on one of its endpoints, or `budget` is spent.
+/// Browses until a record named `run_name` answers on one of its endpoints.
 ///
 /// Only the record this run published is dialled: the exact TXT `name` filter keeps a stale record
 /// and a differently cased look-alike out. The endpoint that answered the probe is the one returned,
 /// so the session does not choose again between addresses.
-pub async fn discover(run_name: &str, budget: Duration) -> Result<String> {
+#[cfg(feature = "mdns")]
+pub async fn discover(run_name: &str) -> Result<String> {
     // This is the client's own daemon, a separate mDNS stack from the server's: the run exists to
     // exercise the advertisement and the browse as two peers see them.
     let discovery = Arc::new(ClientMdns::new().context("failed to start the mDNS daemon")?);
-    let deadline = Instant::now() + budget;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -56,9 +63,8 @@ pub async fn discover(run_name: &str, budget: Duration) -> Result<String> {
         }
         println!("browse {attempt}: no reachable service named {run_name} yet");
         tokio::time::sleep(RETRY_PAUSE).await;
-        if Instant::now() >= deadline {
-            return Err(anyhow!(no_service_message(run_name, budget)));
-        }
+        // The caller's deadline bounds this loop; one browse is not cancellable, so the loop owns
+        // no clock of its own.
     }
 }
 
@@ -86,13 +92,14 @@ pub async fn wait_for_gate(events: &mut EventStream, counters: &Counters) -> Res
     }
 }
 
-/// Connects to `endpoint` and waits for the session to report [`Event::Connected`].
+/// Starts the session against `endpoint` and hands the handle back at once.
 ///
 /// The identity is generated once by the run and handed here, so the session presents the key whose
 /// public half the server approves; nothing is stored, and the server sees a client it has never
-/// approved, which is the approval gate the run demonstrates. A disconnect and a server error are
-/// fatal here - the endpoint is pinned and this run has no second attempt to offer.
-pub async fn await_connected(
+/// approved, which is the approval gate the run demonstrates. Handing the handle back before the
+/// handshake completes is what lets the run say goodbye when the wait for `Connected` is cut short:
+/// the session exists from this call on.
+pub async fn connect_session(
     run_name: &str,
     endpoint: &str,
     identity: Identity,
@@ -101,7 +108,14 @@ pub async fn await_connected(
     // The run name is the player name the server reports; the identity is the key the server
     // decides on.
     let config = ClientConfig::new(endpoint, run_name, identity);
-    let (handle, mut events) = connect(config, sink).await?;
+    connect(config, sink).await
+}
+
+/// Waits for the session to report [`Event::Connected`].
+///
+/// A disconnect and a server error are fatal here - the endpoint is pinned and this run has no
+/// second attempt to offer.
+pub async fn wait_for_connection(events: &mut EventStream, endpoint: &str) -> Result<()> {
     loop {
         match events.next().await {
             Some(Event::Connected {
@@ -109,10 +123,10 @@ pub async fn await_connected(
                 encrypted,
             }) => {
                 println!("connected to {server_id} at {endpoint} (encrypted: {encrypted})");
-                return Ok((handle, events));
+                return Ok(());
             }
             Some(Event::Disconnected { reason, .. }) => {
-                bail!("the connection ended before the stream arrived: {reason}")
+                bail!("the connection ended before it was established: {reason}")
             }
             Some(Event::ServerError { reason }) => {
                 bail!("the server refused the session: {reason}")
