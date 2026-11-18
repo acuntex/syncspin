@@ -24,7 +24,7 @@ harmless.
 | 14  | A reconnect keeps the last known `active_roles` while playback-capable | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                                                                                                            | Accepted, `handshake`              |
 | 15  | A malformed control message is ignored, not fatal                      | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                                                                                                                | Accepted, `handle_control_message` |
 | 16  | A server keeps an unavailable client in the group                      | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                                                                                                           | Open, one group                    |
-| 17  | The server's stream start lead is one fixed value                      | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart)                                                                                                                                                  | Open, shared timeline              |
+| 17  | The server's stream start lead is one fixed value                      | [`roles/player/v1.md` — Server Audio Send Constraints](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server-audio-send-constraints)                                                                                                                    | Open, shared timeline              |
 | 19  | A foreign `group_id` is accepted unless strict mode is set             | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                                                                                                                  | Accepted, `strict_group_id`        |
 | 20  | No drift correction: the ±1 ms steady-state window is not guaranteed   | [`roles/player/v1.md` — Sync Accuracy](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#sync-accuracy)                                                                                                                                                    | Open, no correction loop           |
 
@@ -382,26 +382,32 @@ the first test so an unavailable member ends in a stopped solo group.
 
 ## 17. The server's stream start lead is one fixed value
 
-**Spec:** `messaging.md`, _`stream/start`_. After a role that defines a `client/state` object is
-added to `active_roles`, the server MUST wait for that update before starting the role's stream, and
-each role's stream configuration is derived from what the client reports - for the player, its
-`required_lead_time_ms` and `min_buffer_ms`.
+**Spec:** `roles/player/v1.md`, _Server Audio Send Constraints_. After a `stream/start` that begins
+buffering from empty, the server MUST schedule the first audio timestamp at least `min_buffer_ms` +
+`output_delay_ms` ahead for each player, and for grouped playback uses the maximum of those
+send-aheads across the group, recomputed when players join, leave or update their timing. The
+`required_lead_time_ms` is a hint: the server SHOULD extend the lead toward it only when that adds
+no latency (buffered sources, not live streams). Separately, `messaging.md` (`stream/start`) has the
+server wait for a role's `client/state` object before starting that role's stream.
 
 **What we do:** the stream waits for the update (the group announces nothing to a member without its
 `player` object) but schedules the first sample at `START_LEAD`, 200 ms after the stream opens, for
-every member. The reported lead and buffer are received but not used, and `output_delay_ms` is
-ignored as well. The group fans one timeline out to every member, so all of them share the
-timestamps; the tests `two_players_receive_the_same_frames` and
+every member. The reported `min_buffer_ms`, `required_lead_time_ms` and `output_delay_ms` are
+received but not used, and the lead is not recomputed when a member joins or updates its timing.
+A player that reports `min_buffer_ms` + `output_delay_ms` above 200 ms is therefore started with
+less lead than the spec's MUST requires. The group fans one timeline out to every member, so all of
+them share the timestamps; the tests `two_players_receive_the_same_frames` and
 `a_player_hears_nothing_before_it_reports_its_state` pin that.
 
 **Why:** a stream is one timeline: starting it at each member's own reported lead would give the
 members different timestamps for the same audio, which the server fan-out and the group design do
-not allow. The honest fixes are a lead derived from the slowest ready player, or a per-member
-announcement ahead of the shared first sample.
+not allow. The spec's own answer is a common send-ahead equal to the group maximum, which is what
+removing this deviation implements.
 
-**Removing it:** schedule a new stream at the largest `required_lead_time_ms` among the players that
-are ready when it opens, wait for a late member's report before announcing to it, and test a stream
-with two members whose reported leads differ.
+**Removing it:** schedule a new stream at the largest `min_buffer_ms` + `output_delay_ms` among the
+players that are ready when it opens (extending toward `required_lead_time_ms` only for buffered
+sources), recompute it when a member joins or updates its timing, wait for a late member's report
+before announcing to it, and test a stream with two members whose reported values differ.
 
 ## 19. A foreign `group_id` is accepted unless strict mode is set
 
@@ -449,6 +455,8 @@ within 10 seconds. Corrections in steady state MUST NOT be audible.
 that write time is dropped and reported through `Event::LateAudio`, never advanced; nothing inserts
 or deletes samples, resamples, or adjusts the output rate. Scheduling accuracy is therefore bounded
 by the clock estimate, the sink's own jitter and the 10 ms late tolerance, not by a correction loop.
+The 10 ms is this crate's own choice: the spec only says a player SHOULD drop chunks whose
+timestamp is already in the past and names no tolerance.
 The client makes no ±1 ms steady-state claim and does not implement soft correction or the ±0.5%
 speed limit, because it never changes playback speed.
 
