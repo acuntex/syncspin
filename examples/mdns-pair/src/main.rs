@@ -90,7 +90,8 @@ const GATE_FRAMES: usize = 20;
 /// Payload bytes those frames carry: 76,800, the number the gate asserts rather than prints.
 const GATE_BYTES: usize = GATE_FRAMES * CHUNK_BYTES;
 
-/// Upper bound on each half of the teardown, so a stuck peer cannot hold the command open.
+/// Upper bound on each of the three teardown waits — the client's goodbye, the server seeing it,
+/// and the server task — so a stuck peer cannot hold the command open.
 const TEARDOWN: Duration = Duration::from_secs(2);
 
 /// What the command line asked for.
@@ -336,8 +337,9 @@ async fn run(options: Options) -> Result<()> {
     };
 
     // The server ends its loop on the `ClientLeft` the goodbye produces, so a clean close waits
-    // for that departure before the stop signal, which would otherwise win the race and hide the
-    // reason. A goodbye the server never reports falls through to the stop after `TEARDOWN`.
+    // for the server task — the departure, or the server ending on its own — before the stop
+    // signal, which would otherwise win the race and hide the reason. A goodbye the server never
+    // reports falls through to the stop after `TEARDOWN`.
     let departed = said_goodbye && timeout(TEARDOWN, &mut server_task).await.is_ok();
     if !departed {
         // The record goes even when the flow failed: the run is a smoke test, not a service, and a
