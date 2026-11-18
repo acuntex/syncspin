@@ -24,7 +24,7 @@ harmless.
 | 14  | A reconnect keeps the last known `active_roles` while playback-capable | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                                                                                                            | Accepted, `handshake`              |
 | 15  | A malformed control message is ignored, not fatal                      | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                                                                                                                | Accepted, `handle_control_message` |
 | 16  | A server keeps an unavailable client in the group                      | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                                                                                                           | Open, one group                    |
-| 17  | The server's stream start lead is one fixed value                      | [`roles/player/v1.md` — Server Audio Send Constraints](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server-audio-send-constraints)                                                                                                                    | Open, shared timeline              |
+| 17  | The server's send-ahead ignores the reported timing                    | [`roles/player/v1.md` — Server Audio Send Constraints](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server-audio-send-constraints)                                                                                                                    | Open, shared timeline              |
 | 19  | A foreign `group_id` is accepted unless strict mode is set             | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                                                                                                                  | Accepted, `strict_group_id`        |
 | 20  | No drift correction: the ±1 ms steady-state window is not guaranteed   | [`roles/player/v1.md` — Sync Accuracy](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#sync-accuracy)                                                                                                                                                    | Open, no correction loop           |
 
@@ -380,7 +380,7 @@ not play it - is kept, and the rest of the rule cannot be followed without the g
 `stream/end` the spec requires in that order, and serve the controller's `switch` command; then flip
 the first test so an unavailable member ends in a stopped solo group.
 
-## 17. The server's stream start lead is one fixed value
+## 17. The server's send-ahead ignores the reported timing
 
 **Spec:** `roles/player/v1.md`, _Server Audio Send Constraints_. After a `stream/start` that begins
 buffering from empty, the server MUST schedule the first audio timestamp at least `min_buffer_ms` +

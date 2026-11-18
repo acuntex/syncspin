@@ -382,7 +382,7 @@ not stage 3:
   and with no drift correction the client does not claim the spec's ±1 ms steady-state window
   (`docs/spec-deviations.md` #20). `min_buffer_ms` is derived from arrival delay unless the host pins
   it, and `required_lead_time_ms` is at least the sink's pre-port delay: the client reports both, but
-  the server's stream start still uses one fixed lead until `docs/spec-deviations.md` #17 closes.
+  the server's send-ahead still ignores the reported timing - at a stream start, on a seek and against `min_buffer_ms` - until `docs/spec-deviations.md` #17 closes.
 - **0.1 measures against the spec, not MA:** the five spec mandates found in the check are part of
   stage 1, not a later stage. Where MA disagrees with the spec, the spec wins and MA compatibility is
   verified by test.
