@@ -87,7 +87,7 @@ The examples are meant to be read. `player-pipe/src/main.rs` holds the event loo
 handling and the pairing token, and `player-pipe/src/pipe_sink.rs` the `Sink` implementation.
 `server-demo/src/main.rs` holds the approval gate, the event loop and the push data plane.
 `mdns-pair/src/main.rs` runs a whole discovery, approval and stream pass in one process, and exits
-on the format and the byte count.
+on the format and the byte count; run it with `cargo run -p mdns-pair --features mdns`.
 
 ## What works today
 

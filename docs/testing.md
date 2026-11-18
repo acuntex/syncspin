@@ -66,11 +66,6 @@ is wrong by construction.
 
 A fake server, not a live Music Assistant, is the reference peer for anything that needs a peer.
 
-Feature unification reaches the examples: `mdns-pair` enables `mdns` on both crates by default, so
-the default `test` and `msrv` jobs compile `mdns-sd` and run the two backends' record tests without
-asking for discovery. The example is not run there, and the multicast path it needs stays manual
-(below).
-
 ### Pairing
 
 The pairing suites are split by flow. Feature unification decides what a run covers: `storage-file`
@@ -421,13 +416,15 @@ from this server, not a partial discard.
 
 ## One-host discovery smoke check (not run in CI)
 
-`cargo run -p mdns-pair` starts a real server and a real client in one process, both with the
-`mdns` backend. It needs multicast and one non-loopback IPv4 interface. It prints the published
-record, the discovered endpoint, the connection and the frame count, and exits 0; without
+`cargo run -p mdns-pair --features mdns` starts a real server and a real client in one process,
+both with the `mdns` backend. It needs multicast and one non-loopback IPv4 interface. It prints the
+published record, the discovered endpoint, the connection and the frame count, and exits 0; without
 multicast it prints a diagnostic naming the stage and exits 1. A bad command line, such as an
-unknown flag or a timeout outside the accepted range, exits 2. It covers the advertisement, the
-browse, the dial, the approval, the activation and one short stream on one host. It does not
-cover two hosts or the server-initiated direction.
+unknown flag or a timeout outside the accepted range, exits 2. A build without the `mdns` feature
+also exits 2, printing `the mDNS flow needs the mdns feature: rebuild with --features mdns`. Ctrl-C
+before the frame gate prints `interrupted; the frame gate was not checked` and exits 130. It covers
+the advertisement, the browse, the dial, the approval, the activation and one short stream on one
+host. It does not cover two hosts or the server-initiated direction.
 
 ## Manual two-device LAN check (not yet performed)
 
