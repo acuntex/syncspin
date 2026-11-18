@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 
+mod advertise_only;
 mod find;
 mod sink;
 
