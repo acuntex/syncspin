@@ -791,6 +791,57 @@ mod tests {
         );
     }
 
+    /// The chosen-record probe walks the addresses in order and returns the first that answers.
+    #[tokio::test]
+    async fn reachable_endpoint_walks_past_a_dead_address() {
+        // An owned loopback listener, so the probe has something that accepts and closes.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a loopback listener");
+        let address = listener.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+
+        let live = DiscoveredServer {
+            addresses: vec!["127.0.0.1:1".to_owned(), address.to_string()],
+            path: DEFAULT_SENDSPIN_PATH.to_owned(),
+            name: None,
+        };
+        assert_eq!(
+            reachable_endpoint(&live, Duration::from_millis(200))
+                .await
+                .expect("the second address accepts"),
+            format!("ws://{address}{DEFAULT_SENDSPIN_PATH}")
+        );
+
+        let dead = DiscoveredServer {
+            addresses: vec!["127.0.0.1:1".to_owned()],
+            path: DEFAULT_SENDSPIN_PATH.to_owned(),
+            name: None,
+        };
+        assert!(
+            reachable_endpoint(&dead, Duration::from_millis(100))
+                .await
+                .is_err(),
+            "an address that refuses is not a candidate"
+        );
+
+        let relative = DiscoveredServer {
+            addresses: vec![address.to_string()],
+            path: "sendspin".to_owned(),
+            name: None,
+        };
+        assert!(
+            reachable_endpoint(&relative, Duration::from_millis(100))
+                .await
+                .is_err(),
+            "a record with a relative path has no dialable endpoint"
+        );
+    }
+
     /// A discovered record becomes a plain `ws://` endpoint, and nothing else.
     #[test]
     fn a_discovered_server_builds_a_plain_ws_endpoint() {
