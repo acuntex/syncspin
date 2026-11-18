@@ -89,6 +89,9 @@ pub async fn serve(
                             ..TrackInfo::default()
                         }));
                         written = 0;
+                        // The writer stamps each chunk with the group's fixed start lead, so a
+                        // chunk is on the wire well before the instant it must play; the pacing
+                        // here only keeps the host from sending the whole stream at once.
                         println!(
                             "streaming {CHUNK_COUNT} silent chunks of {CHUNK_BYTES} bytes, one \
                              every {CHUNK_MS} ms"
@@ -101,7 +104,8 @@ pub async fn serve(
                         let _ = departure.send(());
                     }
                 }
-                Some(other) => println!("server event: {other:?}"),
+                // Never print an event's payload: a later event may carry pairing material.
+                Some(_) => println!("server event"),
                 None => break,
             },
             _ = pace.tick(), if stream.is_some() => {
@@ -204,6 +208,8 @@ mod tests {
         )
         .await
         .expect("the foreign session starts");
+        // The handshake completing proves the server processed this connection; the gate it never
+        // reaches is what would prove approval.
         wait_for_connection(&mut other_events, &endpoint)
             .await
             .expect("the foreign handshake completes");

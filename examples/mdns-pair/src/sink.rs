@@ -94,13 +94,12 @@ impl CountingSink {
 
 impl Sink for CountingSink {
     fn open(&mut self, format: AudioFormat) -> anyhow::Result<()> {
-        // Fields first, then the header, so a header-bearing stream gets the diagnostic that names
-        // it instead of the generic format mismatch it would also be.
-        if format.codec != self.expected.codec
-            || format.sample_rate != self.expected.sample_rate
-            || format.channels != self.expected.channels
-            || format.bit_depth != self.expected.bit_depth
-        {
+        // The header first, so a header-bearing stream gets the diagnostic that names it; the
+        // expected format never carries one, so the equality below would also reject it.
+        if format.codec_header.is_some() {
+            bail!("the stream announced `pcm` with a codec header, but PCM carries none");
+        }
+        if format != self.expected {
             bail!(
                 "this run expects {} Hz, {} channels, {}-bit `{}`, but the stream announced \
                  {} Hz, {} channels, {}-bit `{}`",
@@ -113,9 +112,6 @@ impl Sink for CountingSink {
                 format.bit_depth,
                 format.codec,
             );
-        }
-        if format.codec_header.is_some() {
-            bail!("the stream announced `pcm` with a codec header, but PCM carries none");
         }
         *self
             .counters

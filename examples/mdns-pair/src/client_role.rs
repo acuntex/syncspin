@@ -122,7 +122,12 @@ pub async fn wait_for_connection(events: &mut EventStream, endpoint: &str) -> Re
                 server_id,
                 encrypted,
             }) => {
-                println!("connected to {server_id} at {endpoint} (encrypted: {encrypted})");
+                // The library has no unencrypted path; asserting it here keeps a future downgrade
+                // from turning this smoke test green.
+                if !encrypted {
+                    bail!("the connection to {server_id} is not encrypted");
+                }
+                println!("connected to {server_id} at {endpoint} (encrypted)");
                 return Ok(());
             }
             Some(Event::Disconnected { reason, .. }) => {
