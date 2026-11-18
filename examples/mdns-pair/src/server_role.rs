@@ -182,10 +182,9 @@ mod tests {
     async fn only_the_expected_key_is_approved() {
         let identity = ClientIdentity::generate();
         let expected = identity.public_base64();
-        let mut config = ServerConfig::new(
-            "mdns-pair-test".to_owned(),
-            syncspin_server::Identity::generate(),
-        );
+        let server_identity = syncspin_server::Identity::generate();
+        let server_id = server_identity.public_base64();
+        let mut config = ServerConfig::new("mdns-pair-test".to_owned(), server_identity);
         config.bind = SocketAddr::from(([127, 0, 0, 1], 0));
         config.discovery = Some(Arc::new(NoDiscovery));
 
@@ -203,7 +202,7 @@ mod tests {
             connect_session("approved", &endpoint, identity, Box::new(sink))
                 .await
                 .expect("the approved session starts");
-        wait_for_connection(&mut events, &endpoint)
+        wait_for_connection(&mut events, &endpoint, &server_id)
             .await
             .expect("the approved handshake completes");
         timeout(
@@ -228,7 +227,7 @@ mod tests {
         // still running (100 chunks at 20 ms outlast the window below), so a client the server had
         // approved would receive frames now: the approved client's count must keep growing while
         // the foreign one's stays at zero, which a slow server cannot fake into a pass.
-        wait_for_connection(&mut other_events, &endpoint)
+        wait_for_connection(&mut other_events, &endpoint, &server_id)
             .await
             .expect("the foreign handshake completes");
         let before = approved_counters.frames();

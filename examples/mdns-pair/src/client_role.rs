@@ -113,11 +113,16 @@ pub async fn connect_session(
     connect(config, sink).await
 }
 
-/// Waits for the session to report [`Event::Connected`].
+/// Waits for the session to report [`Event::Connected`] from the server whose key is
+/// `expected_server_id`.
 ///
 /// A disconnect and a server error are fatal here - the endpoint is pinned and this run has no
 /// second attempt to offer.
-pub async fn wait_for_connection(events: &mut EventStream, endpoint: &str) -> Result<()> {
+pub async fn wait_for_connection(
+    events: &mut EventStream,
+    endpoint: &str,
+    expected_server_id: &str,
+) -> Result<()> {
     loop {
         match events.next().await {
             Some(Event::Connected {
@@ -128,6 +133,15 @@ pub async fn wait_for_connection(events: &mut EventStream, endpoint: &str) -> Re
                 // from turning this smoke test green.
                 if !encrypted {
                     bail!("the connection to {server_id:?} is not encrypted");
+                }
+                // The TXT `name` is only a discovery hint that any LAN host can copy; the server's
+                // static key is what the handshake proves. A different key means the record led to
+                // another host, and a green run would not have exercised this run's server.
+                if server_id != expected_server_id {
+                    bail!(
+                        "the server at {endpoint:?} is {server_id:?}, not this run's server \
+                         {expected_server_id:?}"
+                    );
                 }
                 println!("connected to {server_id:?} at {endpoint:?} (encrypted)");
                 return Ok(());

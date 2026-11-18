@@ -95,7 +95,7 @@ const BYTES_PER_FRAME: usize = CHANNELS as usize * BIT_DEPTH as usize / 8;
 /// Duration of one streamed chunk, in milliseconds.
 ///
 /// The specification says a chunk should not be shorter than 15 ms and must not exceed 150 ms, so
-/// 20 ms sits in the middle of the range, and it is also the pace the server writes at.
+/// 20 ms is just above the floor, and it is also the pace the server writes at.
 const CHUNK_MS: u64 = 20;
 
 // The bound is the specification's (`roles/player/v1.md`, Server Audio Send Constraints), so a
@@ -328,7 +328,9 @@ async fn run(options: Options) -> Result<RunOutcome> {
     // wrapper: the server must not dial unrelated clients that advertise on the network.
     let expected = AudioFormat::pcm(SAMPLE_RATE, CHANNELS, BIT_DEPTH);
     let (sink, counters) = CountingSink::new(GATE_FRAMES, expected.clone());
-    let mut config = ServerConfig::new(run_name.clone(), Identity::generate());
+    let server_identity = Identity::generate();
+    let server_id = server_identity.public_base64();
+    let mut config = ServerConfig::new(run_name.clone(), server_identity);
     // Port 0: the operating system picks the port, so two runs on one host do not fight over a
     // fixed one, and the record names the port that was actually bound. The wildcard address is
     // deliberate: the record resolves to this host's non-loopback interfaces, and a loopback-only
@@ -413,7 +415,7 @@ async fn run(options: Options) -> Result<RunOutcome> {
                 }
                 result = tokio::time::timeout_at(
                     deadline,
-                    client_role::wait_for_connection(&mut events, &endpoint),
+                    client_role::wait_for_connection(&mut events, &endpoint, &server_id),
                 ) => match result {
                     Ok(result) => result?,
                     Err(_) => bail!(timeout_message(
@@ -465,8 +467,9 @@ async fn run(options: Options) -> Result<RunOutcome> {
     if said_goodbye {
         let _ = timeout(TEARDOWN, departure_rx).await;
     }
-    // The record goes even when the flow failed: the run is a smoke test, not a service, and a
-    // withdrawn advertisement is what keeps the next run from finding this one.
+    // The record goes even when the flow failed once the server has started: the run is a smoke
+    // test, not a service, and a withdrawn advertisement is what keeps the next run from finding
+    // this one. A start that never returned is aborted, so it has nothing to withdraw.
     let _ = stop_tx.send(());
     let server_error = match timeout(TEARDOWN, &mut server_task).await {
         Ok(Ok(Ok(()))) => None,
