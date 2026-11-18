@@ -1,0 +1,16 @@
+[package]
+name = "mdns-pair"
+description = "Example: one process discovers its own server over mDNS and streams to a counting sink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+syncspin-client = { version = "0.4.0", path = "../../crates/syncspin-client", features = ["mdns"] }
+syncspin-server = { version = "0.4.0", path = "../../crates/syncspin-server", features = ["mdns"] }
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
