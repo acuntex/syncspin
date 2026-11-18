@@ -343,6 +343,11 @@ async fn run(options: Options) -> Result<RunOutcome> {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             let _ = interrupt_tx.send(true);
+        } else {
+            // No handler could be installed, so no interrupt can ever arrive. The sender stays
+            // alive: a dropped one would make every waiter see a closed channel at once.
+            let _keep = interrupt_tx;
+            std::future::pending::<()>().await;
         }
     });
 
@@ -375,7 +380,7 @@ async fn run(options: Options) -> Result<RunOutcome> {
                 );
             }
         },
-        _ = interrupt.wait_for(|fired| *fired) => {
+        Ok(_) = interrupt.wait_for(|fired| *fired) => {
             let _ = stop_tx.send(());
             let _ = timeout(TEARDOWN, &mut server_task).await;
             println!("interrupted; the frame gate was not checked");
@@ -390,16 +395,16 @@ async fn run(options: Options) -> Result<RunOutcome> {
     let mut said_goodbye = false;
 
     let verdict: Result<Flow> = async {
-        let endpoint = match until_interrupt(
-            &mut interrupt,
-            tokio::time::timeout_at(deadline, client_role::discover(&run_name)),
-        )
-        .await
-        {
-            None => return Ok(Flow::Interrupted),
-            Some(Err(_)) => bail!(no_service_message(&run_name, options.timeout)),
-            Some(Ok(result)) => result?,
-        };
+        // The browse owns the deadline: an in-flight browse cannot be cancelled, so the loop lets
+        // it finish and stops there, and the daemon is gone before the teardown starts.
+        let endpoint =
+            match until_interrupt(&mut interrupt, client_role::discover(&run_name, deadline)).await
+            {
+                None => return Ok(Flow::Interrupted),
+                Some(Ok(None)) => bail!(no_service_message(&run_name, options.timeout)),
+                Some(Ok(Some(endpoint))) => endpoint,
+                Some(Err(error)) => return Err(error),
+            };
         // The session exists from this call on; an interrupt before it has no connection to say
         // goodbye on, and no handle to finish.
         let (mut handle, mut events) =
@@ -494,7 +499,8 @@ async fn until_interrupt<T>(
 ) -> Option<T> {
     tokio::select! {
         biased;
-        _ = interrupt.wait_for(|fired| *fired) => None,
+        // A closed channel is not an interrupt: only a latched `true` is.
+        Ok(_) = interrupt.wait_for(|fired| *fired) => None,
         value = work => Some(value),
     }
 }
@@ -689,6 +695,23 @@ mod tests {
             run_name(&named, 4242).is_err(),
             "the PID suffix pushes 60 bytes over the run-name limit"
         );
+    }
+
+    /// A closed interrupt channel (no signal handler) must not read as Ctrl-C, and a latched
+    /// `true` must.
+    #[cfg(feature = "mdns")]
+    #[tokio::test]
+    async fn a_closed_interrupt_channel_is_not_an_interrupt() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        let ran = until_interrupt(&mut rx, async { 7 }).await;
+        assert_eq!(ran, Some(7), "the work runs when no interrupt can arrive");
+
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).expect("a receiver exists");
+        drop(tx);
+        let ran = until_interrupt(&mut rx, async { 7 }).await;
+        assert_eq!(ran, None, "a latched interrupt wins over ready work");
     }
 
     #[test]

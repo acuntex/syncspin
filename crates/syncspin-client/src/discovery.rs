@@ -109,7 +109,9 @@ impl DiscoveredServer {
     /// provided by the Noise layer inside the payloads. An address that carries a scheme already,
     /// a missing address, a path that is not `path-absolute` (RFC 3986) and a loopback or
     /// unspecified address all yield nothing: the first three would mean guessing what the
-    /// advertiser meant, and `connection.md` says a client SHOULD NOT dial the last.
+    /// advertiser meant, and `connection.md` says a client SHOULD NOT dial the last. The rule has no
+    /// opt-out: a test that needs a record to resolve uses a non-loopback address, such as one from
+    /// the documentation range `192.0.2.0/24`.
     ///
     /// An mDNS record commonly resolves to several addresses for one service - a dual-stack host
     /// publishes both. The IPv4 addresses come first so a server that listens on a single IPv4
@@ -131,7 +133,8 @@ impl DiscoveredServer {
     /// a record any LAN host can publish could otherwise point the client at a port on its own
     /// machine. The path rule is part of the address rule because an endpoint is only dialable when
     /// both hold; a record with a bad path yields no candidates at all. An address that is not a
-    /// literal socket address is kept, apart from `localhost`, and the probe decides.
+    /// literal socket address is kept, apart from the loopback host names `is_local_address`
+    /// lists, and the probe decides.
     fn ordered_addresses(&self) -> Vec<&str> {
         if !is_path_absolute(&self.path) {
             return Vec::new();
@@ -194,8 +197,13 @@ fn is_path_absolute(path: &str) -> bool {
     true
 }
 
-/// Whether `address` is one a client must not dial: a loopback or unspecified socket address, or
-/// the host name `localhost`.
+/// Whether `address` is one a client must not dial: a loopback or unspecified socket address, or a
+/// host name that is a loopback by rule.
+///
+/// A host name is local when it is `localhost`, `localhost.localdomain` or a name under
+/// `.localhost` (RFC 6761), or when it is numeric without being a socket address - the legacy
+/// IPv4 spellings such as `127.1` or `0x7f.1`, which a resolver turns into a loopback address. A
+/// real host name never ends in an all-digit label.
 fn is_local_address(address: &str) -> bool {
     match address.parse::<SocketAddr>() {
         Ok(address) => match address.ip() {
@@ -206,11 +214,19 @@ fn is_local_address(address: &str) -> bool {
                 |mapped| mapped.is_loopback() || mapped.is_unspecified(),
             ),
         },
-        Err(_) => address
-            .rsplit_once(':')
-            .map_or(address, |(host, _)| host)
-            .trim_end_matches('.')
-            .eq_ignore_ascii_case("localhost"),
+        Err(_) => {
+            let host = address
+                .rsplit_once(':')
+                .map_or(address, |(host, _)| host)
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let last_label = host.rsplit('.').next().unwrap_or("");
+            host == "localhost"
+                || host == "localhost.localdomain"
+                || host.ends_with(".localhost")
+                || last_label.starts_with("0x")
+                || (!last_label.is_empty() && last_label.bytes().all(|byte| byte.is_ascii_digit()))
+        }
     }
 }
 
@@ -242,19 +258,16 @@ pub async fn discover_reachable_endpoint(discovery: &dyn Discovery) -> Result<St
         .iter()
         .flat_map(DiscoveredServer::candidates)
         .collect();
-    if candidates.is_empty() {
-        bail!(
+    walk(
+        candidates,
+        PROBE_TIMEOUT,
+        &format!(
             "no server advertised {SERVER_SERVICE_TYPE} with a dialable address; start one with \
              `server-demo --mdns` or pass --server"
-        );
-    }
-    match first_accepting(candidates, PROBE_TIMEOUT).await {
-        Ok(endpoint) => Ok(endpoint),
-        Err(failures) => bail!(
-            "none of the discovered servers accepted a connection ({})",
-            failures.join("; ")
         ),
-    }
+        "none of the discovered servers accepted a connection",
+    )
+    .await
 }
 
 /// Probes `candidates` in order and returns the endpoint of the first address that accepts.
@@ -293,14 +306,31 @@ async fn probe(address: &str, timeout: Duration) -> Result<()> {
 /// Returns an error when the record names no dialable endpoint, and one naming every attempt when
 /// all addresses refused or timed out.
 pub async fn reachable_endpoint(server: &DiscoveredServer, timeout: Duration) -> Result<String> {
-    let candidates = server.candidates();
+    walk(
+        server.candidates(),
+        timeout,
+        "the record names no dialable endpoint",
+        "no address accepted a connection",
+    )
+    .await
+}
+
+/// Probes `candidates`; `empty` is the error for no candidates at all, and `failed` prefixes the
+/// list of attempts when none accepts.
+///
+/// Both entry points share this, so the walk and the shape of the error stay in one place.
+async fn walk(
+    candidates: Vec<(String, String)>,
+    timeout: Duration,
+    empty: &str,
+    failed: &str,
+) -> Result<String> {
     if candidates.is_empty() {
-        bail!("the record names no dialable endpoint");
+        bail!("{empty}");
     }
-    match first_accepting(candidates, timeout).await {
-        Ok(endpoint) => Ok(endpoint),
-        Err(failures) => bail!("no address accepted a connection ({})", failures.join("; ")),
-    }
+    first_accepting(candidates, timeout)
+        .await
+        .map_err(|failures| anyhow::anyhow!("{failed} ({})", failures.join("; ")))
 }
 
 /// How a service is published and how remote ones are found.
@@ -908,6 +938,11 @@ mod tests {
             ("[::ffff:127.0.0.1]:8927", "/sendspin"),
             ("[::ffff:0.0.0.0]:8927", "/sendspin"),
             ("localhost:8927", "/sendspin"),
+            ("kitchen.localhost:8927", "/sendspin"),
+            ("localhost.localdomain:8927", "/sendspin"),
+            ("127.1:8927", "/sendspin"),
+            ("0x7f.1:8927", "/sendspin"),
+            ("2130706433:8927", "/sendspin"),
             ("192.0.2.1:8927", "sendspin"),
             ("192.0.2.1:8927", "//sendspin"),
             ("192.0.2.1:8927", "/sendspin?x=1"),
@@ -928,6 +963,18 @@ mod tests {
                 error.to_string().contains("no dialable endpoint"),
                 "{error}"
             );
+        }
+    }
+
+    /// A host name that merely looks like a loopback one is not refused.
+    #[test]
+    fn ordinary_host_names_are_kept() {
+        for address in [
+            "speaker.local:8927",
+            "my-host2:8927",
+            "a.localhosting.example:8927",
+        ] {
+            assert!(!is_local_address(address), "{address}");
         }
     }
 

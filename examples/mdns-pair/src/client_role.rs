@@ -39,8 +39,13 @@ const RETRY_PAUSE: Duration = Duration::from_millis(200);
 /// Only the record this run published is dialled: the exact TXT `name` filter keeps a stale record
 /// and a differently cased look-alike out. The endpoint that answered the probe is the one returned,
 /// so the session does not choose again between addresses.
+///
+/// Returns `None` once `deadline` has passed without a match. A browse that is in flight cannot be
+/// cancelled, so it is awaited to its end; the loop then stops instead of starting another, and the
+/// daemon is dropped before this returns. The deadline is therefore overrun by at most one browse
+/// window.
 #[cfg(feature = "mdns")]
-pub async fn discover(run_name: &str) -> Result<String> {
+pub async fn discover(run_name: &str, deadline: tokio::time::Instant) -> Result<Option<String>> {
     // This is the client's own daemon, a separate mDNS stack from the server's: the run exists to
     // exercise the advertisement and the browse as two peers see them.
     let discovery = Arc::new(ClientMdns::new().context("failed to start the mDNS daemon")?);
@@ -48,8 +53,8 @@ pub async fn discover(run_name: &str) -> Result<String> {
     loop {
         attempt += 1;
         // One browse blocks for the backend's one-second window. It runs on the blocking pool so
-        // the server keeps serving. The caller's deadline drops this future between awaits; the
-        // browse already in flight finishes on its own, so this loop keeps no clock.
+        // the server keeps serving, and it is always awaited: dropping the future would leave the
+        // browse and its daemon running behind the caller's teardown.
         let browsed = tokio::task::spawn_blocking({
             let discovery = Arc::clone(&discovery);
             move || discover_servers(discovery.as_ref())
@@ -63,7 +68,11 @@ pub async fn discover(run_name: &str) -> Result<String> {
             Ok(servers) => servers,
             Err(error) => {
                 println!("browse {attempt} failed: {error:#}");
-                tokio::time::sleep(RETRY_PAUSE).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + RETRY_PAUSE))
+                    .await;
                 continue;
             }
         };
@@ -71,11 +80,14 @@ pub async fn discover(run_name: &str) -> Result<String> {
             if let Some(endpoint) = reachable(server).await {
                 // The path comes from a TXT record any LAN host can publish; `Debug` escapes it.
                 println!("discovered {endpoint:?} on browse {attempt}");
-                return Ok(endpoint);
+                return Ok(Some(endpoint));
             }
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
         println!("browse {attempt}: no reachable service named {run_name} yet");
-        tokio::time::sleep(RETRY_PAUSE).await;
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + RETRY_PAUSE)).await;
     }
 }
 

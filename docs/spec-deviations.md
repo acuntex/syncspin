@@ -405,7 +405,11 @@ Two neighbouring rules of the same section are not met either. A seek is a `stre
 `from_timestamp`, and the spec requires the first timestamp after it to satisfy each player's
 send-ahead; the group uses `START_LEAD` there too. And the server MUST keep each player's queued
 duration at or above its `min_buffer_ms` during live playback; the group does not track queued
-duration at all, it only paces chunks on the shared timeline.
+duration at all, it only paces chunks on the shared timeline. A third rule is met only because the
+group never uses it: a `stream/clear` that carries `from_timestamp` MUST set it at least the larger
+of `min_buffer_ms` and `required_lead_time_ms`, plus `output_delay_ms`, after `server_transmitted`.
+The server sends `from_timestamp: None` everywhere; the first change that sends one has to derive it
+from the reported timing.
 
 **Why:** a stream is one timeline: starting it at each member's own reported lead would give the
 members different timestamps for the same audio, which the server fan-out and the group design do

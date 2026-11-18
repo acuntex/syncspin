@@ -242,6 +242,37 @@ async fn a_closed_socket_is_reported_as_a_leave() -> Result<()> {
     Ok(())
 }
 
+/// A client that vanishes right after the handshake may break the first activation. Whichever way
+/// the connection ends, the host that saw `ClientConnected` gets exactly one `ClientLeft`.
+#[tokio::test]
+async fn a_client_that_vanishes_before_activation_still_leaves_once() -> Result<()> {
+    let (server, port, mut events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.handshake(Suite::ChaChaPoly).await?;
+    // The hello makes the server announce the connection; the socket goes before the activation
+    // is read, so the server's first write may already fail.
+    client.send_json(&client_hello()).await?;
+    client.close().await?;
+
+    assert!(matches!(
+        next_event(&mut events).await,
+        Event::ClientConnected { .. }
+    ));
+    loop {
+        match next_event(&mut events).await {
+            Event::ClientLeft { .. } => break,
+            Event::ClientActivated { .. } => {}
+            other => panic!("expected ClientLeft, got {other:?}"),
+        }
+    }
+    server.shutdown().await?;
+    assert!(
+        events.next().await.is_none(),
+        "no second ClientLeft follows the first"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn shutdown_closes_the_connection_and_ends_the_event_stream() -> Result<()> {
     let (server, port, mut events) = start().await?;
