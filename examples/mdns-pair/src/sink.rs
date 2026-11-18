@@ -94,7 +94,13 @@ impl CountingSink {
 
 impl Sink for CountingSink {
     fn open(&mut self, format: AudioFormat) -> anyhow::Result<()> {
-        if format != self.expected {
+        // Fields first, then the header, so a header-bearing stream gets the diagnostic that names
+        // it instead of the generic format mismatch it would also be.
+        if format.codec != self.expected.codec
+            || format.sample_rate != self.expected.sample_rate
+            || format.channels != self.expected.channels
+            || format.bit_depth != self.expected.bit_depth
+        {
             bail!(
                 "this run expects {} Hz, {} channels, {}-bit `{}`, but the stream announced \
                  {} Hz, {} channels, {}-bit `{}`",
@@ -154,13 +160,16 @@ mod tests {
     #[test]
     fn a_foreign_format_is_refused() {
         let (mut sink, _counters) = CountingSink::new(20, format(48_000, 2, 16));
-        assert!(sink.open(format(44_100, 2, 16)).is_err());
+        let error = sink
+            .open(format(44_100, 2, 16))
+            .expect_err("a foreign sample rate is refused");
+        assert!(error.to_string().contains("44100 Hz"), "got: {error}");
         let mut with_header = format(48_000, 2, 16);
         with_header.codec_header = Some(b"fLaC".to_vec());
-        assert!(
-            sink.open(with_header).is_err(),
-            "a PCM format carrying a codec header is refused"
-        );
+        let error = sink
+            .open(with_header)
+            .expect_err("a PCM format carrying a codec header is refused");
+        assert!(error.to_string().contains("codec header"), "got: {error}");
         assert!(sink.open(format(48_000, 2, 16)).is_ok());
     }
 

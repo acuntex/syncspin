@@ -92,12 +92,13 @@ impl Stage {
         }
     }
 
-    /// Decodes a stage the flow recorded; an unknown code reads as the last stage.
+    /// Decodes a stage the flow recorded; an unknown code reads as the start state, so a
+    /// corrupted counter cannot claim the flow got further than it did.
     pub(crate) const fn from_u8(code: u8) -> Stage {
         match code {
-            0 => Stage::Discovery,
             1 => Stage::Connection,
-            _ => Stage::Stream,
+            2 => Stage::Stream,
+            _ => Stage::Discovery,
         }
     }
 }
@@ -191,13 +192,23 @@ mod tests {
             Stage::Connection,
             "mdns-pair-7",
             Duration::from_secs(10),
-            20,
+            crate::GATE_FRAMES,
         );
         assert!(connection.contains("no connection"));
-        let stream = timeout_message(Stage::Stream, "mdns-pair-7", Duration::from_secs(10), 20);
+        let stream = timeout_message(
+            Stage::Stream,
+            "mdns-pair-7",
+            Duration::from_secs(10),
+            crate::GATE_FRAMES,
+        );
         assert!(stream.contains("20 audio frames"));
         assert_eq!(
-            timeout_message(Stage::Discovery, "mdns-pair-7", Duration::from_secs(10), 20),
+            timeout_message(
+                Stage::Discovery,
+                "mdns-pair-7",
+                Duration::from_secs(10),
+                crate::GATE_FRAMES
+            ),
             discovery
         );
     }
@@ -209,8 +220,8 @@ mod tests {
         }
         assert_eq!(
             Stage::from_u8(9),
-            Stage::Stream,
-            "an unknown code is the last stage"
+            Stage::Discovery,
+            "an unknown code must not claim progress"
         );
     }
 }
