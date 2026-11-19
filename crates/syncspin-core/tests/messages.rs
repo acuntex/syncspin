@@ -1731,3 +1731,40 @@ fn an_empty_frame_is_rejected() {
         "the error leaves the reassembler usable"
     );
 }
+
+#[test]
+fn a_body_without_its_id_parses_like_the_whole_chunk() {
+    let audio = [0xf8, 0xff, 0x00, 0x11, 0x22];
+    for header in [
+        AudioChunkHeader {
+            timestamp_us: 1_760_000_123_456,
+            send_ahead: 250_000,
+        },
+        AudioChunkHeader {
+            timestamp_us: -42,
+            send_ahead: u32::MAX,
+        },
+    ] {
+        let chunk = header.encode(&audio);
+        let whole = AudioChunkHeader::parse(&chunk).unwrap();
+        let body = AudioChunkHeader::parse_body(&chunk[1..]).unwrap();
+        assert_eq!(whole, body);
+        assert_eq!(body.0, header);
+        assert_eq!(body.1, &audio);
+    }
+}
+
+#[test]
+fn a_body_shorter_than_the_header_is_truncated_and_names_the_message_length() {
+    // The length reported is the whole message's, id byte included, so it agrees with `parse`.
+    for len in 0..AudioChunkHeader::LEN - 1 {
+        let body = vec![0u8; len];
+        let error = AudioChunkHeader::parse_body(&body)
+            .expect_err("a body shorter than the fixed header must be rejected");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("truncated") && message.contains(&format!("{} bytes", len + 1)),
+            "unexpected error for body length {len}: {message}"
+        );
+    }
+}

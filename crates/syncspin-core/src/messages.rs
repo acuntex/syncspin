@@ -827,11 +827,23 @@ impl AudioChunkHeader {
         if id != AUDIO_CHUNK_ID {
             bail!("binary message id {id} is not an audio chunk");
         }
+        Self::parse_body(body)
+    }
+
+    /// Parses an audio chunk whose message-id byte has already been removed.
+    ///
+    /// A reassembler hands the body over without the id, so a receiver that has classified the
+    /// message by id can parse it in place instead of prefixing the id again. The result is the
+    /// same as [`Self::parse`] on the id followed by `body`.
+    ///
+    /// # Errors
+    /// Returns an error for a body shorter than [`Self::LEN`] minus the id byte.
+    pub fn parse_body(body: &[u8]) -> Result<(Self, &[u8])> {
         let Some((timestamp, body)) = body.split_at_checked(8) else {
-            bail!("audio chunk truncated: {} bytes", message.len());
+            bail!("audio chunk truncated: {} bytes", body.len() + 1);
         };
         let Some((send_ahead, audio)) = body.split_at_checked(4) else {
-            bail!("audio chunk truncated: {} bytes", message.len());
+            bail!("audio chunk truncated: {} bytes", body.len() + 9);
         };
         let mut timestamp_us = [0u8; 8];
         timestamp_us.copy_from_slice(timestamp);
