@@ -144,7 +144,13 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
             writer.seek(Duration::ZERO);
             last_seed = Instant::now();
         }
-        assert_eq!(writer.write(&chunk), WriteOutcome::Written);
+        assert!(
+            matches!(
+                writer.write(&chunk),
+                WriteOutcome::Written | WriteOutcome::Held
+            ),
+            "a chunk is scheduled, or held until the restart trigger has been sent"
+        );
         tokio::time::sleep(CHUNK).await;
         while let Ok((arrival, due, length)) = received.try_recv() {
             assert_eq!(
