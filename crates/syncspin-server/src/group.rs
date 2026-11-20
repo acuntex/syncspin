@@ -22,7 +22,7 @@
 //! player's reported buffer and lead time (see `docs/spec-deviations.md`).
 
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -102,15 +102,20 @@ pub(crate) enum Outbound {
         reset: bool,
     },
     /// One audio chunk, already framed with its message id and header.
-    Audio(Vec<u8>),
+    Audio {
+        /// The framed chunk.
+        chunk: Vec<u8>,
+        /// Set by the connection task once the socket write finished.
+        transmitted: Arc<AtomicBool>,
+    },
 }
 
 /// One chunk this member was sent, kept until its transmission and its playtime have passed.
 ///
-/// The per-member capacity accounting that reads these fields lands with its own change; the shape
-/// is fixed here so the member model is complete.
+/// The per-member capacity accounting reads these fields on every send: a chunk counts while its
+/// transmission is unfinished or its completion is in the future, and it is kept until its raw
+/// playtime has passed, because a changed output delay can make it count again.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct SentChunk {
     /// Server clock time of the chunk's first sample, in microseconds.
     timestamp_us: i64,
@@ -152,9 +157,6 @@ struct Member {
     /// The output delay the member reported, in milliseconds.
     output_delay_ms: u32,
     /// The largest outstanding audio size the member announced in `client/hello`, in bytes.
-    ///
-    /// The per-member capacity accounting that reads it lands with its own change.
-    #[allow(dead_code)]
     capacity: u64,
     /// Server clock time before which this member must not receive audio, in microseconds.
     ///
@@ -187,6 +189,38 @@ impl Member {
     fn member_lead_us(&self) -> i64 {
         let millis = u64::from(self.min_buffer_ms).saturating_add(u64::from(self.output_delay_ms));
         i64::try_from(millis.saturating_mul(1_000)).unwrap_or(i64::MAX)
+    }
+
+    /// The framed bytes this member's sent chunks still occupy at `now_us`.
+    ///
+    /// A chunk counts until its transmission report arrives and its completion - the raw end less
+    /// the member's current output delay - has passed. The delay is re-read here, so a report
+    /// that changes it re-computes the count from the list.
+    fn counted_bytes(&self, now_us: i64) -> u64 {
+        let delay_us = i64::from(self.output_delay_ms).saturating_mul(1_000);
+        self.sent.iter().fold(0u64, |total, sent| {
+            let completion = sent
+                .timestamp_us
+                .saturating_add(micros_i64(sent.duration))
+                .saturating_sub(delay_us);
+            if sent.transmitted.load(Ordering::Relaxed) && completion <= now_us {
+                total
+            } else {
+                total.saturating_add(u64::try_from(sent.bytes).unwrap_or(u64::MAX))
+            }
+        })
+    }
+
+    /// Drops the sent chunks whose transmission is confirmed and whose raw playtime has passed.
+    ///
+    /// The raw end ignores the output delay on purpose: a chunk whose completion moved into the
+    /// past only because the delay rose must stay while its raw end is still future, so a later
+    /// delay decrease can count it again.
+    fn prune_sent(&mut self, now_us: i64) {
+        self.sent.retain(|sent| {
+            let raw_end = sent.timestamp_us.saturating_add(micros_i64(sent.duration));
+            raw_end > now_us || !sent.transmitted.load(Ordering::Relaxed)
+        });
     }
 }
 
@@ -1029,8 +1063,11 @@ impl Inner {
     /// and sets no gate. A member that went unavailable between the clear and this send gets no
     /// start; it is unannounced and receives the new stream's start when it returns.
     fn start_in_place(&mut self, index: usize, now_us: i64) {
+        if !self.playing {
+            return;
+        }
         self.declare_playback(index);
-        if !self.playing || self.members[index].stream_announced || !self.members[index].plays() {
+        if self.members[index].stream_announced || !self.members[index].plays() {
             return;
         }
         let start = self.stream_start(now_us);
@@ -1179,10 +1216,35 @@ impl Inner {
     /// Sends one framed audio chunk to every player with an announced stream.
     ///
     /// The chunk is the same for every member: one timeline, one set of timestamps. Each client
-    /// translates them with its own clock estimate.
-    fn send_audio(&self, chunk: &[u8]) {
-        for member in self.members.iter().filter(|member| member.streams()) {
-            let _ = member.sender.send(Outbound::Audio(chunk.to_vec()));
+    /// translates them with its own clock estimate. Whether a member gets it is per member: a
+    /// gated one or one whose own start is still ahead is skipped, and so is one whose capacity
+    /// is used up by chunks it has not finished playing. The count is rebuilt from the sent list
+    /// on every chunk, so an ack, a passing playtime or a reported output delay all take effect
+    /// without a separate pass. A skipped member hears a hole while the group timeline moves on;
+    /// the wire has no per-member skip signal.
+    fn send_audio(&mut self, chunk: &[u8], timestamp_us: i64, duration: Duration, now_us: i64) {
+        let framed = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        for member in self.members.iter_mut().filter(|member| member.streams()) {
+            if member.start_gate || member.start_at > timestamp_us {
+                continue;
+            }
+            member.prune_sent(now_us);
+            let count = member.counted_bytes(now_us);
+            if framed > member.capacity.saturating_sub(count) {
+                continue;
+            }
+            let transmitted = Arc::new(AtomicBool::new(false));
+            let _ = member.sender.send(Outbound::Audio {
+                chunk: chunk.to_vec(),
+                transmitted: Arc::clone(&transmitted),
+            });
+            member.sent.push(SentChunk {
+                timestamp_us,
+                duration,
+                bytes: chunk.len(),
+                transmitted,
+            });
+            member.start_at = 0;
         }
     }
 
@@ -1409,7 +1471,7 @@ impl Inner {
 
     /// Assigns the next timestamp to one payload, advances the timeline and sends it.
     fn assign_and_send(&mut self, payload: &[u8], duration: Duration, now_us: i64) -> WriteOutcome {
-        let chunk = {
+        let (chunk, timestamp_us) = {
             let Some(stream) = self.stream.as_mut() else {
                 return WriteOutcome::Dropped(WriteError::Ended);
             };
@@ -1420,13 +1482,14 @@ impl Inner {
             stream.next_us = timestamp_us.saturating_add(micros_i64(duration));
             stream.position = stream.position.saturating_add(duration);
             stream.wrote_any = true;
-            AudioChunkHeader {
+            let chunk = AudioChunkHeader {
                 timestamp_us,
                 send_ahead: send_ahead(timestamp_us, now_us),
             }
-            .encode(payload)
+            .encode(payload);
+            (chunk, timestamp_us)
         };
-        self.send_audio(&chunk);
+        self.send_audio(&chunk, timestamp_us, duration, now_us);
         WriteOutcome::Written
     }
 }
@@ -1502,14 +1565,33 @@ mod tests {
         Group::new("g".into(), AudioFormat::pcm(48_000, 2, 16), events).expect("a group builds")
     }
 
+    /// The capacity of a test member that should receive every chunk it is offered.
+    const ROOMY: u64 = 1 << 20;
+
     /// Joins a ready player with `min_buffer_ms` and `output_delay_ms` and returns its queue.
     fn add_player(
         group: &Group,
         min_buffer_ms: u32,
         output_delay_ms: u32,
     ) -> (u64, mpsc::UnboundedReceiver<Outbound>) {
+        add_player_with_capacity(group, min_buffer_ms, output_delay_ms, ROOMY)
+    }
+
+    /// Joins a ready player with a chosen buffer capacity and returns its queue.
+    fn add_player_with_capacity(
+        group: &Group,
+        min_buffer_ms: u32,
+        output_delay_ms: u32,
+        capacity: u64,
+    ) -> (u64, mpsc::UnboundedReceiver<Outbound>) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let id = group.join(vec![PLAYER_ROLE.to_owned()], sender, 0);
+        let id = group.join(vec![PLAYER_ROLE.to_owned()], sender, capacity);
+        report_timing(group, id, min_buffer_ms, output_delay_ms);
+        (id, receiver)
+    }
+
+    /// Reports one ready player's timing again.
+    fn report_timing(group: &Group, id: u64, min_buffer_ms: u32, output_delay_ms: u32) {
         group.report_client_state(
             id,
             &ClientState {
@@ -1525,7 +1607,18 @@ mod tests {
                 }),
             },
         );
-        (id, receiver)
+    }
+
+    /// Opens a stream, reports the ready member's start trigger and returns the epoch.
+    fn open_stream_reported(
+        group: &Group,
+        id: u64,
+        receiver: &mut mpsc::UnboundedReceiver<Outbound>,
+    ) -> u64 {
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(receiver);
+        group.trigger_sent(id, epoch, anchor, reset, Some(group.now_us() + 1_000_000));
+        epoch
     }
 
     /// Takes the next trigger from a member's queue, skipping the other messages it receives.
@@ -1540,9 +1633,45 @@ mod tests {
                     anchor,
                     reset,
                 } => return (*message, epoch, anchor, reset),
-                Outbound::Message(_) | Outbound::Audio(_) => {}
+                Outbound::Message(_) | Outbound::Audio { .. } => {}
             }
         }
+    }
+
+    /// Takes the next audio chunk from a member's queue.
+    fn next_audio(receiver: &mut mpsc::UnboundedReceiver<Outbound>) -> (Vec<u8>, Arc<AtomicBool>) {
+        loop {
+            if let Outbound::Audio { chunk, transmitted } =
+                receiver.try_recv().expect("audio is queued")
+            {
+                return (chunk, transmitted);
+            }
+        }
+    }
+
+    /// Returns every audio chunk queued for a member.
+    fn drain_audio(
+        receiver: &mut mpsc::UnboundedReceiver<Outbound>,
+    ) -> Vec<(Vec<u8>, Arc<AtomicBool>)> {
+        let mut chunks = Vec::new();
+        while let Ok(outbound) = receiver.try_recv() {
+            if let Outbound::Audio { chunk, transmitted } = outbound {
+                chunks.push((chunk, transmitted));
+            }
+        }
+        chunks
+    }
+
+    /// Returns the number of chunks one member still accounts for.
+    fn sent_len(group: &Group, id: u64) -> usize {
+        group
+            .lock()
+            .members
+            .iter()
+            .find(|member| member.id == id)
+            .expect("the member")
+            .sent
+            .len()
     }
 
     #[test]
@@ -1911,7 +2040,7 @@ mod tests {
                         starts += 1;
                     }
                 }
-                Outbound::Audio(_) => {}
+                Outbound::Audio { .. } => {}
             }
         }
         assert_eq!(
@@ -2206,6 +2335,418 @@ mod tests {
         assert!(
             !group.apply_controller_command(&next),
             "a queue command belongs to the host, not to the group"
+        );
+    }
+
+    #[test]
+    fn a_member_with_capacity_one_is_skipped_for_every_chunk() {
+        let group = test_group();
+        let (id, mut receiver) = add_player_with_capacity(&group, 0, 0, 1);
+        open_stream_reported(&group, id, &mut receiver);
+
+        for _ in 0..2 {
+            assert_eq!(
+                group.write_audio(&[0u8; 480 * 4], None),
+                WriteOutcome::Written,
+                "the group still schedules the chunk"
+            );
+        }
+        assert!(
+            drain_audio(&mut receiver).is_empty(),
+            "not even one framed chunk fits into a one-byte capacity"
+        );
+        assert_eq!(sent_len(&group, id), 0, "a skipped chunk is not recorded");
+    }
+
+    #[test]
+    fn a_member_with_room_receives_the_chunk_and_records_its_framed_length() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 0, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        let timestamp_us = group.lock().stream.as_ref().expect("a stream").next_us;
+
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        let (chunk, transmitted) = next_audio(&mut receiver);
+        assert_eq!(
+            chunk.len(),
+            AudioChunkHeader::LEN + 480 * 4,
+            "the accounted length is the framed one"
+        );
+        assert!(
+            !transmitted.load(Ordering::Relaxed),
+            "the connection task sets the ack after the socket write"
+        );
+
+        let inner = group.lock();
+        let member = inner
+            .members
+            .iter()
+            .find(|member| member.id == id)
+            .expect("the member");
+        assert_eq!(member.sent.len(), 1);
+        assert_eq!(member.sent[0].timestamp_us, timestamp_us);
+        assert_eq!(member.sent[0].duration, Duration::from_millis(10));
+        assert_eq!(member.sent[0].bytes, chunk.len());
+        assert!(
+            Arc::ptr_eq(&member.sent[0].transmitted, &transmitted),
+            "the member holds the same ack handle the connection task sets"
+        );
+    }
+
+    #[test]
+    fn a_chunk_that_exceeds_the_remaining_capacity_is_skipped_and_the_timeline_advances() {
+        let group = test_group();
+        let framed = AudioChunkHeader::LEN + 480 * 4;
+        let (id, mut receiver) = add_player_with_capacity(&group, 0, 0, 2_000);
+        open_stream_reported(&group, id, &mut receiver);
+        let first = group.lock().stream.as_ref().expect("a stream").next_us;
+
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        let (chunk, transmitted) = next_audio(&mut receiver);
+        assert_eq!(chunk.len(), framed);
+        let second = group.lock().stream.as_ref().expect("a stream").next_us;
+        assert_eq!(second - first, 10_000);
+
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written,
+            "the host's write is accepted even though a member is skipped"
+        );
+        let third = group.lock().stream.as_ref().expect("a stream").next_us;
+        assert_eq!(
+            third - second,
+            10_000,
+            "the timeline advances for the whole group, not per member"
+        );
+        assert!(
+            drain_audio(&mut receiver).is_empty(),
+            "the second chunk does not fit behind the unacked first"
+        );
+        assert_eq!(sent_len(&group, id), 1);
+
+        transmitted.store(true, Ordering::Relaxed);
+        let retry = vec![0u8; framed];
+        group.lock().send_audio(
+            &retry,
+            first + 20_000,
+            Duration::from_millis(10),
+            first + 20_000,
+        );
+        assert_eq!(
+            sent_len(&group, id),
+            1,
+            "the acked past chunk is pruned before the count"
+        );
+        let (retried, _) = next_audio(&mut receiver);
+        assert_eq!(
+            retried.len(),
+            framed,
+            "a later chunk is tried again once the old one no longer counts"
+        );
+    }
+
+    #[test]
+    fn a_past_acked_chunk_is_pruned_and_a_future_one_stays() {
+        let group = test_group();
+        let framed = AudioChunkHeader::LEN + 480 * 4;
+        let chunk = vec![0u8; framed];
+        let (id, mut receiver) = add_player(&group, 0, 0);
+        open_stream_reported(&group, id, &mut receiver);
+
+        {
+            let mut inner = group.lock();
+            inner.send_audio(&chunk, 1_000_000, Duration::from_millis(10), 1_000_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(member.sent.len(), 1);
+            member.sent[0].transmitted.store(true, Ordering::Relaxed);
+            // The raw end is 1_010_000, exactly now and therefore not in the future.
+            inner.send_audio(&chunk, 2_000_000, Duration::from_millis(10), 1_010_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(
+                member.sent.len(),
+                1,
+                "the acked chunk whose playtime passed is pruned"
+            );
+            assert_eq!(member.sent[0].timestamp_us, 2_000_000);
+        }
+
+        {
+            let mut inner = group.lock();
+            // A 100 ms chunk whose raw end is still future at 3_050_000.
+            inner.send_audio(&chunk, 3_000_000, Duration::from_millis(100), 3_000_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            for sent in &member.sent {
+                sent.transmitted.store(true, Ordering::Relaxed);
+            }
+            inner.send_audio(&chunk, 3_050_000, Duration::from_millis(10), 3_050_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(
+                member.sent.len(),
+                2,
+                "the past chunk is pruned and the future one stays"
+            );
+            assert!(
+                member
+                    .sent
+                    .iter()
+                    .any(|sent| sent.timestamp_us == 3_000_000),
+                "a chunk whose raw end is future stays for a possible delay change"
+            );
+        }
+    }
+
+    #[test]
+    fn a_delay_decrease_re_counts_a_chunk_whose_raw_end_is_future() {
+        let group = test_group();
+        let framed = AudioChunkHeader::LEN + 480 * 4;
+        let chunk = vec![0u8; framed];
+        let (id, mut receiver) = add_player_with_capacity(&group, 0, 0, framed as u64 + 100);
+        open_stream_reported(&group, id, &mut receiver);
+
+        {
+            let mut inner = group.lock();
+            inner.send_audio(&chunk, 1_000_000, Duration::from_millis(100), 1_000_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            member.sent[0].transmitted.store(true, Ordering::Relaxed);
+        }
+        // With a 90 ms output delay the completion (1_010_000) is past at 1_050_000, so the
+        // acked chunk does not count - but its raw end (1_100_000) is still future.
+        report_timing(&group, id, 0, 90);
+        {
+            let mut inner = group.lock();
+            inner.send_audio(&chunk, 1_050_000, Duration::from_millis(100), 1_050_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(
+                member.sent.len(),
+                2,
+                "a chunk that could count again is kept until its raw end passes"
+            );
+            member.sent[1].transmitted.store(true, Ordering::Relaxed);
+        }
+
+        // Dropping the delay back to zero makes both completions future again: together they
+        // exceed the capacity, so the next chunk is skipped.
+        report_timing(&group, id, 0, 0);
+        {
+            let mut inner = group.lock();
+            inner.send_audio(&chunk, 1_100_000, Duration::from_millis(100), 1_050_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(
+                member.sent.len(),
+                2,
+                "the delay decrease re-counts the retained chunk and leaves no room"
+            );
+        }
+    }
+
+    #[test]
+    fn the_count_uses_the_members_current_output_delay() {
+        let group = test_group();
+        let framed = AudioChunkHeader::LEN + 480 * 4;
+        let chunk = vec![0u8; framed];
+        let (id, mut receiver) = add_player_with_capacity(&group, 0, 0, framed as u64);
+        open_stream_reported(&group, id, &mut receiver);
+
+        {
+            let mut inner = group.lock();
+            inner.send_audio(&chunk, 1_000_000, Duration::from_millis(100), 1_000_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            member.sent[0].transmitted.store(true, Ordering::Relaxed);
+            // Completion 1_100_000 > 1_050_000: the chunk still counts and fills the capacity.
+            inner.send_audio(&chunk, 1_050_000, Duration::from_millis(100), 1_050_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(member.sent.len(), 1, "the counted chunk leaves no room");
+        }
+
+        // A 90 ms delay moves the completion to 1_010_000, past at 1_050_000, so the same chunk
+        // no longer counts and the next one fits.
+        report_timing(&group, id, 0, 90);
+        {
+            let mut inner = group.lock();
+            inner.send_audio(&chunk, 1_050_000, Duration::from_millis(100), 1_050_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(
+                member.sent.len(),
+                2,
+                "the count follows the member's current output delay"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reset_report_clears_the_sent_list_and_an_in_place_start_does_not() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 0, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        assert_eq!(sent_len(&group, id), 1);
+
+        group.open_stream(TrackInfo {
+            title: Some("the next track".to_owned()),
+            ..TrackInfo::default()
+        });
+        let (clear, epoch, anchor, reset) = next_trigger(&mut receiver);
+        assert!(matches!(clear, Incoming::StreamClear(_)));
+        assert!(anchor && reset);
+        assert_eq!(
+            sent_len(&group, id),
+            1,
+            "neither the clear's send nor the in-place start resets the list"
+        );
+        group.trigger_sent(id, epoch, anchor, reset, Some(group.now_us() + 1_000_000));
+        assert_eq!(sent_len(&group, id), 0, "the clear's report is the reset");
+
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        assert_eq!(sent_len(&group, id), 1);
+        group.end_stream();
+        let (end, epoch, anchor, reset) = next_trigger(&mut receiver);
+        assert!(matches!(end, Incoming::StreamEnd(_)));
+        assert!(!anchor && reset);
+        assert_eq!(sent_len(&group, id), 1, "the end's send does not reset yet");
+        group.trigger_sent(id, epoch, anchor, reset, None);
+        assert_eq!(sent_len(&group, id), 0, "the end's report is a reset");
+    }
+
+    #[test]
+    fn a_gated_or_not_yet_started_member_is_skipped_until_its_start_passes() {
+        let group = test_group();
+        let framed = AudioChunkHeader::LEN + 480 * 4;
+        let chunk = vec![0u8; framed];
+        let (id, mut receiver) = add_player(&group, 0, 0);
+        open_stream_reported(&group, id, &mut receiver);
+
+        {
+            let mut inner = group.lock();
+            let member = inner
+                .members
+                .iter_mut()
+                .find(|member| member.id == id)
+                .expect("the member");
+            member.start_gate = true;
+            inner.send_audio(&chunk, 1_000_000, Duration::from_millis(10), 1_000_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(member.sent.len(), 0, "a gated member receives nothing");
+
+            let member = inner
+                .members
+                .iter_mut()
+                .find(|member| member.id == id)
+                .expect("the member");
+            member.start_gate = false;
+            member.start_at = 2_000_000;
+            inner.send_audio(&chunk, 1_999_999, Duration::from_millis(10), 2_000_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(
+                member.sent.len(),
+                0,
+                "a chunk before the member's own start is skipped"
+            );
+
+            inner.send_audio(&chunk, 2_000_000, Duration::from_millis(10), 2_000_000);
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert_eq!(
+                member.sent.len(),
+                1,
+                "the chunk at the member's start is delivered"
+            );
+            assert_eq!(
+                member.start_at, 0,
+                "the first delivered chunk clears the floor"
+            );
+        }
+        let (received, _) = next_audio(&mut receiver);
+        assert_eq!(received.len(), framed);
+    }
+
+    #[test]
+    fn an_unavailable_member_receives_nothing_and_adds_nothing() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 0, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        group.report_client_state(
+            id,
+            &ClientState {
+                available: false,
+                player: None,
+            },
+        );
+
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        assert!(
+            drain_audio(&mut receiver).is_empty(),
+            "an announced but unavailable member receives no audio"
+        );
+        assert_eq!(
+            sent_len(&group, id),
+            0,
+            "nothing is added to a member that receives nothing"
         );
     }
 

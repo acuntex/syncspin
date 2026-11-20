@@ -18,6 +18,7 @@
 //! A failure decided from `client/init` alone is answered with `server/error` and a close; every
 //! later failure is silent, which is why the handshake paths here close without a message.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -791,10 +792,13 @@ impl Session<'_> {
                             self.group.trigger_sent(member, epoch, anchor, reset, t);
                         }
                     }
-                    Some(Outbound::Audio(chunk)) => {
+                    Some(Outbound::Audio { chunk, transmitted }) => {
                         if self.connection.send_plaintext(noise, chunk).await.is_err() {
                             break "connection lost".to_owned();
                         }
+                        // The group counts a chunk until this report arrives; a failed write ends
+                        // the connection instead of leaving the member's queue outstanding.
+                        transmitted.store(true, Ordering::Relaxed);
                     }
                     // The group is dropped only when the server is, so this is the shutdown path.
                     None => {
