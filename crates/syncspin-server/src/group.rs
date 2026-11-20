@@ -1982,6 +1982,11 @@ mod tests {
         assert_eq!(stream.start_position, Duration::from_millis(10));
         assert_eq!(stream.next_us, stream.start_us + 10_000);
         assert!(stream.anchor_us >= before && stream.anchor_us <= after);
+        assert_eq!(
+            stream.start_us,
+            stream.anchor_us.saturating_add(1),
+            "a zero lead still starts one microsecond in the future"
+        );
     }
 
     #[test]
@@ -2617,11 +2622,12 @@ mod tests {
         let stream = inner.stream.as_ref().expect("a stream");
         assert!(inner.members.is_empty());
         assert!(stream.anchor.is_none(), "the empty pending set flushes");
-        assert!(
-            stream.next_us > before && stream.next_us <= after + 1,
-            "with no ready member left the fallback is max(now + lead, now + 1)"
-        );
         assert!(stream.anchor_us >= before && stream.anchor_us <= after);
+        assert_eq!(
+            stream.next_us,
+            stream.anchor_us.saturating_add(1),
+            "a zero lead still starts one microsecond in the future"
+        );
     }
 
     #[test]
@@ -2824,7 +2830,13 @@ mod tests {
         assert!(
             !drain_outbound(&mut late_rx)
                 .iter()
-                .any(|outbound| matches!(outbound, Outbound::Trigger { .. })),
+                .any(|outbound| match outbound {
+                    Outbound::Trigger { message, .. } => {
+                        matches!(**message, Incoming::StreamStart(_))
+                    }
+                    Outbound::Message(message) => matches!(**message, Incoming::StreamStart(_)),
+                    Outbound::Audio { .. } => false,
+                }),
             "an announced returning member gets no second start"
         );
         let inner = group.lock();
