@@ -752,9 +752,10 @@ impl Session<'_> {
             let keepalive = self.keepalive_deadline();
             // `biased` polls the branches in declaration order and takes the first that is ready.
             // `outgoing` comes first so inbound traffic cannot starve the audio it carries; the
-            // read and the keepalive branches are polled in every gap between chunks. Only a host
-            // that feeds faster than the socket drains - the unbounded-queue case the group already
-            // documents - can hold them off, which is a pre-existing limit of the queue, not of this
+            // read and the keepalive branches are polled in every gap between chunks. The queue
+            // behind this loop is the group's: audio is capped at the member's `buffer_capacity`,
+            // while control messages are unbounded, so a slow socket with a large control queue
+            // can still hold these branches off. That is a property of the queue, not of this
             // ordering. `frame` (the read) comes before the keepalive branch so a frame already
             // waiting on the wire is consumed and counted before the pong window is judged: a frame
             // that arrives at the deadline keeps the connection, instead of the deadline branch

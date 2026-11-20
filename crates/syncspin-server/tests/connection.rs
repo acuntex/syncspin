@@ -1793,35 +1793,39 @@ async fn ending_a_track_sends_an_end_and_the_next_start_opens_a_new_stream() -> 
         ..TrackInfo::default()
     });
 
-    // The order is the one the host API produces: `stream/end`, then the new `stream/start`.
-    let mut seen = Vec::new();
-    while seen.len() < 2 {
-        match client.next_received().await? {
-            Received::Json(message) => match *message {
-                Incoming::StreamEnd(end) => {
-                    assert_eq!(end.roles, Some(vec!["player".to_owned()]));
-                    seen.push("end");
-                }
-                Incoming::StreamStart(start) => {
-                    assert_eq!(
-                        start
-                            .player
-                            .expect("the new stream carries its format")
-                            .codec,
-                        "pcm"
-                    );
-                    seen.push("start");
-                }
-                _ => {}
-            },
-            Received::Audio(..) => {}
+    // The order is the one the host API produces: `stream/end`, then the new `stream/start`. A
+    // `stream/clear` between them would be the track-jump path and would fail this row.
+    let mut stream_messages = Vec::new();
+    while stream_messages.len() < 2 {
+        if let Received::Json(message) = client.next_received().await? {
+            if matches!(
+                message.as_ref(),
+                Incoming::StreamEnd(_) | Incoming::StreamStart(_) | Incoming::StreamClear(_)
+            ) {
+                stream_messages.push(*message);
+            }
         }
     }
-    assert_eq!(
-        seen,
-        ["end", "start"],
-        "ending a track and opening the next one sends the end before the new start"
-    );
+    match &stream_messages[0] {
+        Incoming::StreamEnd(end) => assert_eq!(
+            end.roles,
+            Some(vec!["player".to_owned()]),
+            "the first stream message is the end of the old track"
+        ),
+        other => panic!("expected stream/end first, got {other:?}"),
+    }
+    match &stream_messages[1] {
+        Incoming::StreamStart(start) => assert_eq!(
+            start
+                .player
+                .as_ref()
+                .expect("the new stream carries its format")
+                .codec,
+            "pcm",
+            "the second stream message is the new track's start"
+        ),
+        other => panic!("expected stream/start second, got {other:?}"),
+    }
 
     second.end();
     client.goodbye("shutdown").await?;

@@ -155,10 +155,13 @@ accept is answered with `server/error` and a close; a handshake that does not au
 without a further message. Each connection is reported to the host as it connects, is activated and
 leaves.
 
-One group holds every client. All members receive the same frames with the same playout timestamps,
-the server answers each client's `client/time` burst, and a member that stops reading does not hold
-up the others. The host pushes audio into a `StreamWriter` from `ServerHandle::open_stream`; the server
-stamps every chunk from the configured format and fans it out without decoding. A client is given
+One group holds every client and every member reads from one shared timeline, so the chunks that
+reach a member carry the same playout timestamps as the others'. A gated start, a full
+`buffer_capacity` or a late join can skip chunks for it, and it hears a hole rather than a delayed
+chunk. The server answers each client's `client/time` burst, and a member that stops reading does
+not hold up the others. The host pushes audio into a `StreamWriter` from
+`ServerHandle::open_stream`; the server stamps every chunk from the configured format and fans it
+out without decoding. A client is given
 `player@v1` only when its `player@v1_support` lists that exact format, so nobody is sent a stream it
 cannot play. Volume, mute and play/pause/stop belong to the group. The active roles are the three v1
 roles a player needs: `player@v1`, `controller@v1` and `metadata@v1`.
@@ -266,7 +269,7 @@ it found and passes one URL to `connect`, which the spec leaves implementation-d
   when the common one does not cover it. The live queue and the `required_lead_time_ms` hint of the
   same section are still open: the server does not keep a player's queued duration at its
   `min_buffer_ms`, and it does not extend the lead toward the hint (deviation 17). The 15 ms lower
-  bound belongs to the host's chunk size.
+  bound belongs to the host's chunk size and remains open in #17.
 - **Drift correction.** Frames are written at their scheduled deadline and late ones are dropped,
   but the client does not correct the clock drift that accumulates between them, so the
   specification's ±1 ms steady-state window is not guaranteed; the queue is where correction will

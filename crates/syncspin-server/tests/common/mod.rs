@@ -581,10 +581,11 @@ impl FakeClient {
     /// Waits until the group has handled every message this connection sent before the call.
     ///
     /// The server answers a `client/time` request after the frames that arrived before it on the
-    /// same connection: a `client/state` report is in the group, and a `stream/start` has reported
-    /// its send. `marker` is echoed by the reply, so a reply to another request cannot pass for
-    /// this barrier. Audio and other control messages that arrive first are skipped, so a test that
-    /// expects one of them must read it before the barrier.
+    /// same connection: a `client/state` report is in the group, and a trigger `stream/start` has
+    /// reported its send (an in-place start is a plain message and reports nothing). `marker` is
+    /// echoed by the reply, so a reply to another request cannot pass for this barrier. Audio and
+    /// other control messages that arrive first are skipped, so a test that expects one of them
+    /// must read it before the barrier.
     pub async fn barrier(&mut self, marker: i64) -> Result<()> {
         let reply = self.round_trip_time(marker).await?;
         assert_eq!(

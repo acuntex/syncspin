@@ -1738,6 +1738,24 @@ mod tests {
         outbound
     }
 
+    /// Returns the queued stream lifecycle messages, in order, triggers and plain messages alike.
+    fn stream_messages(receiver: &mut mpsc::UnboundedReceiver<Outbound>) -> Vec<Incoming> {
+        drain_outbound(receiver)
+            .into_iter()
+            .filter_map(|outbound| match outbound {
+                Outbound::Message(message) => Some(*message),
+                Outbound::Trigger { message, .. } => Some(*message),
+                Outbound::Audio { .. } => None,
+            })
+            .filter(|message| {
+                matches!(
+                    message,
+                    Incoming::StreamStart(_) | Incoming::StreamClear(_) | Incoming::StreamEnd(_)
+                )
+            })
+            .collect()
+    }
+
     /// Returns the metadata states a member was sent, in order.
     fn drain_metadata(receiver: &mut mpsc::UnboundedReceiver<Outbound>) -> Vec<Metadata> {
         drain_outbound(receiver)
@@ -3477,6 +3495,61 @@ mod tests {
             sent_len(&group, id),
             0,
             "nothing is added to a member that receives nothing"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_member_misses_a_jumps_start_and_the_next_pause_end() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 100, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        group.report_client_state(
+            id,
+            &ClientState {
+                available: false,
+                player: None,
+            },
+        );
+
+        // A track jump still reaches the announced member with the clear, because it must discard
+        // its buffers, but the unavailable member gets no start for the new stream.
+        group.open_stream(TrackInfo {
+            title: Some("the next track".to_owned()),
+            ..TrackInfo::default()
+        });
+        let jump = stream_messages(&mut receiver);
+        assert_eq!(
+            jump.len(),
+            1,
+            "a jump sends one stream message to the member"
+        );
+        assert!(
+            matches!(jump[0], Incoming::StreamClear(_)),
+            "the announced member is cleared"
+        );
+
+        // The pause ends only the streams the group has announced, and this member lost its
+        // announcement at the jump, so it hears no end for the stream it does not have.
+        group.pause();
+        assert!(
+            stream_messages(&mut receiver).is_empty(),
+            "an unavailable member that lost the announced stream hears no pause end"
+        );
+
+        // The play restart also skips it while it stays unavailable.
+        group.play();
+        assert!(
+            stream_messages(&mut receiver).is_empty(),
+            "the unavailable member gets no start from the play restart"
+        );
+
+        // Its return is what gets the new stream's start.
+        report_timing(&group, id, 100, 0);
+        let returned = stream_messages(&mut receiver);
+        assert_eq!(returned.len(), 1, "the returning member is announced once");
+        assert!(
+            matches!(returned[0], Incoming::StreamStart(_)),
+            "the return gets the new stream's start, not the old track's"
         );
     }
 

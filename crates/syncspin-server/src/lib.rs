@@ -9,9 +9,11 @@
 //! three pairing methods and the approval gate. A client connects, `client/init` is answered with
 //! `server/init` and Noise message 1, the handshake completes, and the server sends `server/hello`,
 //! `server/activate` with the roles that connection may use, `server/state` and `group/update`.
-//! Every member of the group receives the same stream frames with the same playout timestamps, and
-//! each one measures its own offset by sending `client/time`, which the server answers with the
-//! receive and transmit stamps of the request. The host pushes audio into a [`StreamWriter`]; the
+//! Every member of the group reads one shared timeline, so the chunks it receives carry the same
+//! playout timestamps as the other members'. A gated start, a full `buffer_capacity` or a late join
+//! can skip chunks for it, and it hears a hole instead of a delayed chunk. Each member measures its
+//! own offset by sending `client/time`, which the server answers with the receive and transmit
+//! stamps of the request. The host pushes audio into a [`StreamWriter`]; the
 //! server stamps every chunk with the server-clock playout timestamp and fans it out. Volume, mute
 //! and playback belong to the group, and a member's `client/state` is a report rather than a
 //! command: the group takes from it whether the member is available, the `player` object its

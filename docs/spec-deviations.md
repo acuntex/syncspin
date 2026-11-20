@@ -379,8 +379,9 @@ announces a new stream to it, or, if it stays unavailable through that too, it i
 returns.
 `a_member_that_reports_itself_unavailable_receives_no_audio` pins the withheld audio,
 `a_returning_member_keeps_its_larger_old_start_at_and_gets_no_second_start` pins the returning
-member, and `group_state_applies_to_every_member_and_a_report_is_not_a_command` pins that a report
-never becomes a command.
+member, `an_unavailable_member_misses_a_jumps_start_and_the_next_pause_end` pins the missed jump
+start and pause end, and `group_state_applies_to_every_member_and_a_report_is_not_a_command` pins
+that a report never becomes a command.
 
 **Why:** a solo group and the `switch` command cycle need several groups per server, which this
 milestone does not have; the one thing that must not happen - audio to a client that says it will
@@ -404,16 +405,18 @@ longer than 150 ms and SHOULD NOT send one shorter than 15 ms. Separately, `mess
 (`stream/start`) has the server wait for a role's `client/state` object before starting that role's
 stream.
 
-**What we do:** the lead rules are kept. `Group::group_lead_us` takes the largest `min_buffer_ms` +
-`output_delay_ms` over the members that `plays()`, and every restart from empty - a new stream, a
-`play` restart and a seek's `stream/clear` - anchors the shared timeline on the transmit time of its
-trigger plus that lead; a report that arrives after the instant re-leads from `now` instead of using
-a past timestamp. A late joiner gets a future timestamp only: it joins the group timeline when the
-common lead covers it and gets its own lead, with a hole, when it does not. Each member's
-outstanding audio is capped at the `buffer_capacity` its `client/hello` announced: a chunk that
-would overrun it is not started, and a queued or sent chunk counts until its transmission is
-finished and `timestamp + duration - output_delay_ms` has passed. The `client/state` wait is kept
-too: the group announces no stream to a member without its `player` object.
+**What we do:** the lead rules are kept wherever a restart has a ready member.
+`Group::group_lead_us` takes the largest `min_buffer_ms` + `output_delay_ms` over the members that
+`plays()`, and a restart from empty that has one - a new stream, a `play` restart or a seek's
+`stream/clear` - anchors the shared timeline on the transmit time of its trigger plus that lead; a
+report that arrives after the instant re-leads from `now` instead of using a past timestamp. With
+no ready member no anchor is armed and the provisional timeline stands; the first member to report
+joins it as a late joiner, with its own lead when the common one does not cover it. A late joiner
+never moves the timeline and never gets a past timestamp. Each member's outstanding audio is capped
+at the `buffer_capacity` its `client/hello` announced: a chunk that would overrun it is not
+started, and a queued or sent chunk counts until its transmission is finished and
+`timestamp + duration - output_delay_ms` has passed. The `client/state` wait is kept too: the group
+announces no stream to a member without its `player` object.
 
 What remains is the live queue: the group does not keep a player's queued duration at
 `min_buffer_ms` during playback, and does not restore it after a join or an increase of the reported

@@ -377,10 +377,12 @@ impl StreamWriter {
 
     /// Moves the stream to `position` and drops everything the clients have buffered for it.
     ///
-    /// The next chunk is scheduled the largest reported `min_buffer_ms` + `output_delay_ms` after
-    /// the `stream/clear` was transmitted, so a player that is already running can refill; a report
-    /// that arrives after that instant re-leads from the current time. A position beyond the
-    /// track's known duration is clamped to the end; an unknown duration is not clamped at all.
+    /// An active group clears the players, and the next chunk is scheduled the largest reported
+    /// `min_buffer_ms` + `output_delay_ms` after that `stream/clear` was transmitted, so a player
+    /// that is already running can refill; a report that arrives after that instant re-leads from
+    /// the current time. A seek while the group is paused sends no clear: the next `play` restarts
+    /// the stream a lead ahead from the new position. A position beyond the track's known duration
+    /// is clamped to the end; an unknown duration is not clamped at all.
     pub fn seek(&mut self, position: Duration) {
         self.group.seek(position);
     }

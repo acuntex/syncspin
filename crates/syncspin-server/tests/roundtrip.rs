@@ -38,9 +38,10 @@ const CHUNK: Duration = Duration::from_millis(10);
 ///
 /// The client schedules only after three clock bursts, and before that it writes each frame on
 /// arrival. A seek re-seeds the server timeline one reported lead ahead - 250 ms in the first
-/// `client/state`, before the client has arrival samples - so re-seeding at that interval keeps a
-/// slow burst from pushing every later stamp into the past. Once the estimate is ready, the first
-/// queued frame is written well inside this window, one pre-port delay before its deadline.
+/// `client/state`, before the client has arrival samples - so re-seeding at the same interval
+/// keeps a slow burst from pushing every later stamp into the past. The window and the lead are
+/// equal, so the margin is the pre-port delay alone: once the estimate is ready, a queued frame is
+/// written `PRE_PORT` (100 ms) before its deadline, 150 ms after the seek that queued it.
 const RESEED: Duration = Duration::from_millis(250);
 
 /// A sink that reports every frame to the test and plays nothing.
