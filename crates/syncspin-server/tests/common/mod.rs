@@ -601,7 +601,12 @@ impl FakeClient {
     /// taken shortly before it lies a little earlier. A test that compares a stamp with it allows
     /// for that transit instead of assuming two clocks.
     pub async fn server_time(&mut self) -> Result<i64> {
-        Ok(self.round_trip_time(0).await?.server_transmitted)
+        let reply = self.round_trip_time(0).await?;
+        assert_eq!(
+            reply.client_transmitted, 0,
+            "the clock reading's reply echoes its own request"
+        );
+        Ok(reply.server_transmitted)
     }
 
     /// Waits for the server's keepalive ping and returns its payload, with the automatic pong

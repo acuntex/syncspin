@@ -412,11 +412,11 @@ stream.
 report that arrives after the instant re-leads from `now` instead of using a past timestamp. With
 no ready member no anchor is armed and the provisional timeline stands; the first member to report
 joins it as a late joiner, with its own lead when the common one does not cover it. A late joiner
-never moves the timeline and never gets a past timestamp. Each member's outstanding audio is capped
-at the `buffer_capacity` its `client/hello` announced: a chunk that would overrun it is not
-started, and a queued or sent chunk counts until its transmission is finished and
-`timestamp + duration - output_delay_ms` has passed. The `client/state` wait is kept too: the group
-announces no stream to a member without its `player` object.
+after the anchor never moves the timeline and never gets a past timestamp. Each member's
+outstanding audio is capped at the `buffer_capacity` its `client/hello` announced: a chunk that
+would overrun it is not started, and a queued or sent chunk counts until its transmission is
+finished and `timestamp + duration - output_delay_ms` has passed. The `client/state` wait is kept
+too: the group announces no stream to a member without its `player` object.
 
 What remains is the live queue: the group does not keep a player's queued duration at
 `min_buffer_ms` during playback, and does not restore it after a join or an increase of the reported

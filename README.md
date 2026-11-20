@@ -263,13 +263,13 @@ it found and passes one URL to `connect`, which the spec leaves implementation-d
 - **Discovery persistence.** Both crates browse and advertise, but the client does not persist the
   server it last admitted with `playback`, and the server keeps operator approval for its lifetime
   only. A restart asks the operator again.
-- **Playout lead.** The members of a group share one timeline, and its first sample is the largest
-  `min_buffer_ms` + `output_delay_ms` the ready members report, counted from the transmit time of
-  the `stream/start`; a late joiner gets a future timestamp on the same timeline, with its own lead
-  when the common one does not cover it. The live queue and the `required_lead_time_ms` hint of the
-  same section are still open: the server does not keep a player's queued duration at its
-  `min_buffer_ms`, and it does not extend the lead toward the hint (deviation 17). The 15 ms lower
-  bound belongs to the host's chunk size and remains open in #17.
+- **Playout lead.** The members of a group share one timeline; a restart with a ready member starts
+  its first sample at the largest `min_buffer_ms` + `output_delay_ms` those members report after
+  the restart trigger (`stream/start` or `stream/clear`), and a late joiner gets a future timestamp
+  on the same timeline, with its own lead when the common one does not cover it. The live queue and
+  the `required_lead_time_ms` hint of the same section are still open: the server does not keep a
+  player's queued duration at its `min_buffer_ms`, and it does not extend the lead toward the hint
+  (deviation 17). The 15 ms lower bound belongs to the host's chunk size and remains open in #17.
 - **Drift correction.** Frames are written at their scheduled deadline and late ones are dropped,
   but the client does not correct the clock drift that accumulates between them, so the
   specification's ±1 ms steady-state window is not guaranteed; the queue is where correction will

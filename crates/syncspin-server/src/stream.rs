@@ -328,6 +328,10 @@ impl std::error::Error for WriteError {}
 ///
 /// Dropping the writer without [`StreamWriter::end`] ends the stream, so a host that returns early
 /// does not leave a stream running that it can no longer feed.
+///
+/// The writer must not outlive the Tokio runtime that started the server either: a restart that
+/// anchors a ready member arms a deadline timer on that runtime, and spawning it after the runtime
+/// has shut down panics.
 #[derive(Debug)]
 pub struct StreamWriter {
     group: Arc<Group>,

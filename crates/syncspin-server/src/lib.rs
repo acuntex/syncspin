@@ -545,6 +545,10 @@ pub(crate) enum Command {
 /// hands the stream out once; the group operations are what a host calls while it plays, and the
 /// pairing and approval methods reach the connections by `client_id`. [`ServerHandle::shutdown`]
 /// ends the server, and dropping the handle does the same without waiting for it.
+///
+/// The handle must not outlive the Tokio runtime [`Server::start`] ran on: a restart with a ready
+/// member arms a deadline timer on that runtime, and spawning it after the runtime has shut down
+/// panics.
 pub struct ServerHandle {
     task: Option<JoinHandle<Result<()>>>,
     /// The discovery loop, when the host supplied a backend.
@@ -596,11 +600,12 @@ impl ServerHandle {
     /// The group is told before the host writes anything: every player receives `stream/start` with
     /// the configured format, the metadata role receives the track, and the writer's first chunk is
     /// scheduled at the largest `min_buffer_ms` + `output_delay_ms` the ready players report,
-    /// counted from the transmit time of that start. A stream that is still running is cleared
-    /// first, so opening a track while another plays is a track jump rather than an in-place format
-    /// change. A host that ends a track with [`StreamWriter::end`] before opening the next one sends
-    /// `stream/end` in between: the group has no queue and cannot tell a natural transition from a
-    /// stopped stream (deviation 22 in `docs/spec-deviations.md`).
+    /// counted from the transmit time of the restart trigger (a start, or a clear for a track
+    /// jump). A stream that is still running is cleared first, so opening a track while another
+    /// plays is a track jump rather than an in-place format change. A host that ends a track with
+    /// [`StreamWriter::end`] before opening the next one sends `stream/end` in between: the group
+    /// has no queue and cannot tell a natural transition from a stopped stream (deviation 22 in
+    /// `docs/spec-deviations.md`).
     ///
     /// A group with no player still accepts the writer: a stream that nobody hears is the host's
     /// business, and its timestamps stay consistent for a player that joins later.
