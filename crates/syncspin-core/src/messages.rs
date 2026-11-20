@@ -817,6 +817,8 @@ impl AudioChunkHeader {
 
     /// Parses one audio chunk, returning its header and the encoded audio that follows.
     ///
+    /// After checking the id byte it delegates to [`Self::parse_body`].
+    ///
     /// # Errors
     /// Returns an error for an empty message, for a message whose id is not [`AUDIO_CHUNK_ID`],
     /// and for a chunk shorter than [`Self::LEN`].

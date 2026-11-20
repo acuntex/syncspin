@@ -1761,10 +1761,10 @@ fn a_body_shorter_than_the_header_is_truncated_and_names_the_message_length() {
         let body = vec![0u8; len];
         let error = AudioChunkHeader::parse_body(&body)
             .expect_err("a body shorter than the fixed header must be rejected");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("truncated") && message.contains(&format!("{} bytes", len + 1)),
-            "unexpected error for body length {len}: {message}"
+        assert_eq!(
+            format!("{error:#}"),
+            format!("audio chunk truncated: {} bytes", len + 1),
+            "unexpected error for body length {len}"
         );
     }
 }
