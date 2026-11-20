@@ -37,10 +37,11 @@ const CHUNK: Duration = Duration::from_millis(10);
 /// How often the test re-seeds the timeline while it waits for the clock estimate.
 ///
 /// The client schedules only after three clock bursts, and before that it writes each frame on
-/// arrival. A seek re-seeds the server timeline one start lead ahead, so re-seeding until a
-/// scheduled write appears keeps a slow burst from pushing every later stamp into the past. Once
-/// the estimate is ready, the first queued frame is written well inside this window.
-const RESEED: Duration = Duration::from_millis(200);
+/// arrival. A seek re-seeds the server timeline one reported lead ahead - 250 ms in the first
+/// `client/state`, before the client has arrival samples - so re-seeding at that interval keeps a
+/// slow burst from pushing every later stamp into the past. Once the estimate is ready, the first
+/// queued frame is written well inside this window, one pre-port delay before its deadline.
+const RESEED: Duration = Duration::from_millis(250);
 
 /// A sink that reports every frame to the test and plays nothing.
 ///
@@ -126,13 +127,13 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
         }
     }
 
-    // 480 stereo frames of 16-bit PCM are 10 ms at 48 kHz. The server seeds the stream timeline one
-    // start lead ahead of now and advances it by the chunk playtime, so a writer paced at the
-    // playtime keeps every frame ahead of the clock. The client schedules from its clock estimate
-    // only after three bursts; re-seeding the timeline until a scheduled write appears gives that
-    // estimate a fresh window without ever letting the writer outrun it. Each write is paced at the
-    // playtime of the chunk, because a writer that ran ahead would push the deadlines into the past
-    // and prove nothing.
+    // 480 stereo frames of 16-bit PCM are 10 ms at 48 kHz. The server schedules the first chunk one
+    // reported lead after the start - and after each seek's clear - and advances the timeline by
+    // the chunk playtime, so a writer paced at the playtime keeps every frame ahead of the clock.
+    // The client schedules from its clock estimate only after three bursts; re-seeding the timeline
+    // until a scheduled write appears gives that estimate a fresh window without ever letting the
+    // writer outrun it. Each write is paced at the playtime of the chunk, because a writer that ran
+    // ahead would push the deadlines into the past and prove nothing.
     let chunk = [9u8; 480 * 4];
     let mut last_seed = Instant::now() - RESEED;
     let give_up = Instant::now() + TIMEOUT;

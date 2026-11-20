@@ -8,8 +8,10 @@
 //!
 //! Everything here is synchronous and guarded by one mutex, which is never held across an await:
 //! the connection tasks read their messages from an unbounded channel, so a client that stopped
-//! reading cannot block the host that pushes audio. A queue that grows without bound is the price;
-//! bounding it, and deciding which chunks a slow client loses, is the next milestone's problem.
+//! reading cannot block the host that pushes audio. The channel can still grow with control
+//! messages, but the audio outstanding to one member is bounded by the `buffer_capacity` its
+//! `client/hello` announced: a chunk that would overrun it is not started, and the member hears a
+//! hole instead.
 //!
 //! Two rules the specification states govern when a member hears anything. A stream is announced
 //! only to a member whose `client/state` reports both the `player` object the activation requires
@@ -18,8 +20,11 @@
 //! `playback` activity on the connection, so the group declares it on every member while the group
 //! plays and drops it when playback stops.
 //!
-//! One rule this milestone does not keep: the start lead is one fixed value instead of each
-//! player's reported buffer and lead time (see `docs/spec-deviations.md`).
+//! The send-ahead rules of the specification are kept: a restart starts from the largest
+//! `min_buffer_ms` + `output_delay_ms` the ready members report, anchored on the transmit time of
+//! the trigger. What this milestone does not keep is the live queue duration, the optional
+//! `required_lead_time_ms` hint and the 15 ms lower bound of a chunk, which belongs to the host's
+//! chunking (see `docs/spec-deviations.md` #17).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -717,12 +722,16 @@ impl Group {
         let _ = self.events.send(Event::StreamStarted);
     }
 
-    /// Sends one chunk to every player and advances the timeline.
+    /// Sends one chunk to every player that can take it and advances the timeline.
     ///
     /// The chunk is checked before the timeline moves, so a refused chunk leaves no hole for the
     /// next one. `duration` is the host's playtime for a compressed format, and must be absent for
     /// PCM, whose playtime follows from its frame count. Bytes written to a paused or ended stream
     /// are dropped, because there is no timeline to place them on.
+    ///
+    /// A member gated by its start, or without room for the framed chunk inside the
+    /// `buffer_capacity` it announced, is skipped: the chunk keeps its place on the shared timeline,
+    /// so that member hears a hole instead of a delayed chunk.
     ///
     /// While a restart anchors the timeline, the payload is held instead of scheduled; the anchor
     /// flush assigns its timestamp from the trigger's real transmit time. A host that starves the
@@ -1043,6 +1052,10 @@ impl Inner {
     }
 
     /// Returns the `stream/start` message for the current format.
+    ///
+    /// The `server_transmitted` value is a placeholder: the connection task stamps the real
+    /// transmit time immediately before encryption, and that reading is the `T` the trigger reports
+    /// to the anchor.
     fn stream_start(&self, now_us: i64) -> Incoming {
         Incoming::StreamStart(StreamStart {
             server_transmitted: now_us,
@@ -1196,7 +1209,8 @@ impl Inner {
     /// The clear is a restart trigger: it anchors the new segment and resets the member's sent
     /// chunks on its report. An announced but unavailable member still gets it, because the client
     /// must discard its buffers; it is not part of the anchor's pending set because it does not
-    /// `plays()`.
+    /// `plays()`. The queued `server_transmitted` is a placeholder the connection overwrites at the
+    /// send, like the start's.
     fn send_stream_clear(&self, now_us: i64) {
         let message = Incoming::StreamClear(StreamClear {
             server_transmitted: now_us,

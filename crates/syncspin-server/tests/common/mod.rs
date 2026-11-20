@@ -185,15 +185,6 @@ pub fn player_state_with_timing(
     })
 }
 
-/// How long to wait past the 100 ms lead [`player_state`] reports.
-///
-/// A member that reports just before the host writes becomes a late joiner with its own start
-/// floor. A test that expects audio after reading the start waits this long, so the next write
-/// re-seeds the timeline a lead ahead and is no longer gated.
-pub async fn wait_out_player_lead() {
-    tokio::time::sleep(Duration::from_millis(150)).await;
-}
-
 /// One message the fake client received after the handshake.
 #[derive(Debug)]
 pub enum Received {
@@ -585,6 +576,22 @@ impl FakeClient {
             _ => None,
         })
         .await
+    }
+
+    /// Waits until the group has handled every message this connection sent before the call.
+    ///
+    /// The server answers a `client/time` request after the frames that arrived before it on the
+    /// same connection: a `client/state` report is in the group, and a `stream/start` has reported
+    /// its send. `marker` is echoed by the reply, so a reply to another request cannot pass for
+    /// this barrier. Audio and other control messages that arrive first are skipped, so a test that
+    /// expects one of them must read it before the barrier.
+    pub async fn barrier(&mut self, marker: i64) -> Result<()> {
+        let reply = self.round_trip_time(marker).await?;
+        assert_eq!(
+            reply.client_transmitted, marker,
+            "the barrier's reply echoes its own request"
+        );
+        Ok(())
     }
 
     /// Returns the server's clock at the transmission of a fresh `server/time` reply.
