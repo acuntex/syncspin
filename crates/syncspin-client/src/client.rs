@@ -884,7 +884,8 @@ impl ControlHandle {
     /// The host calls this after it applied the delay from [`Event::OutputDelay`] to its sink and
     /// persisted it. The session reads [`Sink::output_delay`], re-maps the queued deadlines and
     /// sends a `client/state` at once when the sink's timing differs from what was last reported,
-    /// so the server recomputes its send-ahead from the value in force. Without the call the
+    /// so the server's next stream start or seek derives its lead from the value in force; a
+    /// stream already under way keeps its timeline (deviation 17). Without the call the
     /// session makes one fallback read of the sink half a second after a server command; a host
     /// that applies the value later, or that changes the delay on its own without a server
     /// command, must call this, or the report waits for the next timing poll after a clock burst.

@@ -117,6 +117,19 @@ pub fn client_hello() -> Incoming {
 
 /// The `client/hello` of a client that plays `formats`.
 pub fn client_hello_with_formats(formats: Vec<SupportedFormat>) -> Incoming {
+    client_hello_with(formats, 1 << 20)
+}
+
+/// The `client/hello` of a player with a chosen `buffer_capacity`.
+///
+/// The capacity is the framed byte count a member may have outstanding: the 13-byte header plus
+/// the payload of every chunk the server has started but not seen played out.
+pub fn client_hello_with_capacity(buffer_capacity: u64) -> Incoming {
+    client_hello_with(vec![pcm_format()], buffer_capacity)
+}
+
+/// The `client/hello` of a client that plays `formats` and holds `buffer_capacity` bytes.
+fn client_hello_with(formats: Vec<SupportedFormat>, buffer_capacity: u64) -> Incoming {
     Incoming::ClientHello(ClientHello {
         name: CLIENT_NAME.to_owned(),
         device_info: Some(DeviceInfo {
@@ -132,7 +145,7 @@ pub fn client_hello_with_formats(formats: Vec<SupportedFormat>) -> Incoming {
         ],
         player_support: Some(PlayerSupport {
             supported_formats: formats,
-            buffer_capacity: 1 << 20,
+            buffer_capacity,
         }),
         supported_pair_methods: SupportedPairMethods::default(),
         unpaired_access: UnpairedAccess { enabled: true },
@@ -144,14 +157,28 @@ pub fn client_hello_with_formats(formats: Vec<SupportedFormat>) -> Incoming {
 /// The specification requires it after the player role becomes active and before the server may
 /// announce a stream, so every test that expects audio sends it.
 pub fn player_state(available: bool, volume: u8, muted: bool) -> Incoming {
+    player_state_with_timing(available, volume, muted, 100, 0)
+}
+
+/// The `client/state` a client reports for its player role with its own timing.
+///
+/// `min_buffer_ms` is the startup lead the server derives its group lead from, and
+/// `output_delay_ms` is the delay beyond the audio port the client compensates for.
+pub fn player_state_with_timing(
+    available: bool,
+    volume: u8,
+    muted: bool,
+    min_buffer_ms: u32,
+    output_delay_ms: u32,
+) -> Incoming {
     Incoming::ClientState(ClientState {
         available,
         player: Some(PlayerState {
             volume: Some(volume),
             muted: Some(muted),
-            output_delay_ms: 0,
+            output_delay_ms,
             required_lead_time_ms: 200,
-            min_buffer_ms: 100,
+            min_buffer_ms,
             supported_commands: vec!["volume".to_owned(), "mute".to_owned()],
             format: None,
         }),
@@ -400,8 +427,22 @@ impl FakeClient {
         server: &ServerHandle,
         suite: Suite,
     ) -> Result<ServerActivate> {
+        self.connect_and_activate_with(server, suite, client_hello())
+            .await
+    }
+
+    /// Connects and activates with a chosen `client/hello`, then reports the player state.
+    ///
+    /// The hello carries the player's formats and buffer capacity, so a test that needs a narrow
+    /// capacity or a role the server withholds uses this instead of [`Self::connect_and_activate`].
+    pub async fn connect_and_activate_with(
+        &mut self,
+        server: &ServerHandle,
+        suite: Suite,
+        hello: Incoming,
+    ) -> Result<ServerActivate> {
         self.handshake(suite).await?;
-        let first = self.activate().await?;
+        let first = self.activate_with(hello).await?;
         assert!(
             first.active_roles.unwrap_or_default().is_empty(),
             "an unapproved client must not be activated with roles"
@@ -535,6 +576,37 @@ impl FakeClient {
             _ => None,
         })
         .await
+    }
+
+    /// Waits until the group has handled every message this connection sent before the call.
+    ///
+    /// The server answers a `client/time` request after the frames that arrived before it on the
+    /// same connection: a `client/state` report is in the group, and a trigger `stream/start` has
+    /// reported its send (an in-place start is a plain message and reports nothing). `marker` is
+    /// echoed by the reply, so a reply to another request cannot pass for this barrier. Audio and
+    /// other control messages that arrive first are skipped, so a test that expects one of them
+    /// must read it before the barrier.
+    pub async fn barrier(&mut self, marker: i64) -> Result<()> {
+        let reply = self.round_trip_time(marker).await?;
+        assert_eq!(
+            reply.client_transmitted, marker,
+            "the barrier's reply echoes its own request"
+        );
+        Ok(())
+    }
+
+    /// Returns the server's clock at the transmission of a fresh `server/time` reply.
+    ///
+    /// The reply's `server_transmitted` is the instant the answer left the server, so a stamp
+    /// taken shortly before it lies a little earlier. A test that compares a stamp with it allows
+    /// for that transit instead of assuming two clocks.
+    pub async fn server_time(&mut self) -> Result<i64> {
+        let reply = self.round_trip_time(0).await?;
+        assert_eq!(
+            reply.client_transmitted, 0,
+            "the clock reading's reply echoes its own request"
+        );
+        Ok(reply.server_transmitted)
     }
 
     /// Waits for the server's keepalive ping and returns its payload, with the automatic pong

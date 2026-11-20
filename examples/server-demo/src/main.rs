@@ -299,7 +299,10 @@ async fn run(options: Options) -> Result<()> {
             },
             _ = pace.tick(), if stream.is_some() => {
                 if let Some((writer, offset)) = stream.as_mut() {
-                    writer.write(&tone[*offset..*offset + CHUNK_BYTES]);
+                    // A chunk the server cannot schedule - the group is paused, or the stream has
+                    // ended - is dropped; resending audio is worse than losing it, so the demo
+                    // moves on to the next one.
+                    let _ = writer.write(&tone[*offset..*offset + CHUNK_BYTES]);
                     *offset = (*offset + CHUNK_BYTES) % tone.len();
                 }
             }

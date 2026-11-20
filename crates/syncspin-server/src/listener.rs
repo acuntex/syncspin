@@ -18,6 +18,7 @@
 //! A failure decided from `client/init` alone is answered with `server/error` and a close; every
 //! later failure is silent, which is why the handshake paths here close without a message.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,7 @@ use syncspin_core::framing::{
 };
 use syncspin_core::messages::{
     ClientHello, ClientPairAuth, ClientPairConfirm, ClientPairFinalize, ClientPairInit,
-    ClientPairPending, ClientPairRetry, Incoming, NoiseHandshake, PairingActivation,
+    ClientPairPending, ClientPairRetry, DecodeError, Incoming, NoiseHandshake, PairingActivation,
     ServerActivate, ServerError, ServerHello, ServerInit, ServerTime, PROTOCOL_VERSION,
 };
 use syncspin_core::noise::{
@@ -751,9 +752,10 @@ impl Session<'_> {
             let keepalive = self.keepalive_deadline();
             // `biased` polls the branches in declaration order and takes the first that is ready.
             // `outgoing` comes first so inbound traffic cannot starve the audio it carries; the
-            // read and the keepalive branches are polled in every gap between chunks. Only a host
-            // that feeds faster than the socket drains - the unbounded-queue case the group already
-            // documents - can hold them off, which is a pre-existing limit of the queue, not of this
+            // read and the keepalive branches are polled in every gap between chunks. The queue
+            // behind this loop is the group's: audio is capped at the member's `buffer_capacity`,
+            // while control messages are unbounded, so a slow socket with a large control queue
+            // can still hold these branches off. That is a property of the queue, not of this
             // ordering. `frame` (the read) comes before the keepalive branch so a frame already
             // waiting on the wire is consumed and counted before the pong window is judged: a frame
             // that arrives at the deadline keeps the connection, instead of the deadline branch
@@ -767,14 +769,44 @@ impl Session<'_> {
                     }
                 } => match outgoing {
                     Some(Outbound::Message(message)) => {
+                        let mut message = message;
+                        // The stamp is taken at the send, never at enqueue: a queued message waits
+                        // behind audio, and its transmit time is what a receiver measures.
+                        stamp_transmitted(&mut message, self.group.now_us());
                         if self.connection.send_json(noise, &message).await.is_err() {
                             break "connection lost".to_owned();
                         }
                     }
-                    Some(Outbound::Audio(chunk)) => {
+                    Some(Outbound::Trigger {
+                        message,
+                        epoch,
+                        anchor,
+                        reset,
+                    }) => {
+                        // The group anchors a restart on the instant its trigger was sent, and
+                        // reports the same reading; a report for a superseded epoch changes
+                        // nothing.
+                        let now = self.group.now_us();
+                        let mut message = message;
+                        let transmitted = stamp_transmitted(&mut message, now);
+                        if self.connection.send_json(noise, &message).await.is_err() {
+                            break "connection lost".to_owned();
+                        }
+                        if let Some(member) = self.member {
+                            self.group
+                                .trigger_sent(member, epoch, anchor, reset, transmitted);
+                        }
+                    }
+                    Some(Outbound::Audio { mut chunk, transmitted }) => {
+                        // `send_ahead` is stamped immediately before encryption, from the same
+                        // clock the timestamp was placed on; the timestamp itself is untouched.
+                        stamp_send_ahead(&mut chunk, self.group.now_us());
                         if self.connection.send_plaintext(noise, chunk).await.is_err() {
                             break "connection lost".to_owned();
                         }
+                        // The group counts a chunk until this report arrives; a failed write ends
+                        // the connection instead of leaving the member's queue outstanding.
+                        transmitted.store(true, Ordering::Relaxed);
                     }
                     // The group is dropped only when the server is, so this is the shutdown path.
                     None => {
@@ -956,8 +988,13 @@ impl Session<'_> {
         if self.member.is_some() {
             return;
         }
+        let capacity = self
+            .hello
+            .player_support
+            .as_ref()
+            .map_or(0, |support| support.buffer_capacity);
         let (sender, receiver) = mpsc::unbounded_channel();
-        self.member = Some(self.group.join(roles, sender));
+        self.member = Some(self.group.join(roles, sender, capacity));
         self.outbound = Some(receiver);
     }
 
@@ -981,7 +1018,7 @@ impl Session<'_> {
         text: &str,
         arrived: Instant,
     ) -> Result<()> {
-        let message = match Incoming::parse(text) {
+        let message = match parse_report(text, &self.roles) {
             Ok(Some(message)) => message,
             // A type this revision does not have carries nothing to act on.
             Ok(None) => return Ok(()),
@@ -992,6 +1029,12 @@ impl Session<'_> {
                 return Ok(());
             }
         };
+        // The typed decode accepts the wire widths, not the protocol's ranges; an out-of-range
+        // value in an active role object is the same kind of failure as a wrong type.
+        if !report_values_in_range(&message) {
+            self.protocol_error();
+            return Ok(());
+        }
         match message {
             Incoming::ClientGoodbye(goodbye) => self.ending = Some(goodbye.reason),
             // Every request gets its own reply: one timeline is what a client measures its offset
@@ -1724,7 +1767,103 @@ impl Session<'_> {
     }
 }
 
-/// Why a `client/init` was refused, as the `reason` of `server/error`.
+/// Stamps the transmit time of a stream lifecycle message at the instant it is sent.
+///
+/// `server_transmitted` measures when the frame leaves, not when the group queued it. The same
+/// reading is the `T` a trigger reports, so the anchor measures the real transmit interval. A
+/// `stream/end` carries no timestamp, which is why the return value is optional.
+fn stamp_transmitted(message: &mut Incoming, now_us: i64) -> Option<i64> {
+    match message {
+        Incoming::StreamStart(start) => {
+            start.server_transmitted = now_us;
+            Some(now_us)
+        }
+        Incoming::StreamClear(clear) => {
+            clear.server_transmitted = now_us;
+            Some(now_us)
+        }
+        _ => None,
+    }
+}
+
+/// Writes the transmit interval into an owned player audio plaintext.
+///
+/// The 13-byte header is `[id][timestamp: 8][send_ahead: 4]`. The timestamp is read back
+/// untouched, because one timeline serves every member, and `send_ahead` becomes the interval
+/// between this send and that due instant: zero at or past it, saturated to `u32::MAX` above it.
+fn stamp_send_ahead(chunk: &mut [u8], now_us: i64) {
+    let Some(bytes) = chunk.get(1..9) else {
+        return;
+    };
+    let Ok(timestamp_bytes) = <[u8; 8]>::try_from(bytes) else {
+        return;
+    };
+    let timestamp_us = i64::from_be_bytes(timestamp_bytes);
+    let ahead = timestamp_us.saturating_sub(now_us);
+    let send_ahead = if ahead <= 0 {
+        0
+    } else {
+        u32::try_from(ahead).unwrap_or(u32::MAX)
+    };
+    if let Some(field) = chunk.get_mut(9..13) {
+        field.copy_from_slice(&send_ahead.to_be_bytes());
+    }
+}
+
+/// Parses one text frame, dropping role objects the connection has no active role for.
+///
+/// A role object belongs to the role named in its envelope: `player` to `player@v1` and
+/// `controller` to `controller@v1`. `messaging.md` leaves an inactive role's object unvalidated,
+/// so it is removed before the typed decode; a wrong-typed value there must not close the
+/// connection. An active object stays and is decoded and range-checked like any other message.
+fn parse_report(text: &str, roles: &[String]) -> Result<Option<Incoming>, DecodeError> {
+    let mut document: serde_json::Value =
+        serde_json::from_str(text).map_err(DecodeError::Malformed)?;
+    let (role, name) = match document.get("type").and_then(serde_json::Value::as_str) {
+        Some("client/state") => (PLAYER_ROLE, "player"),
+        Some("client/command") => (CONTROLLER_ROLE, "controller"),
+        // Every other message keeps the classification `Incoming::parse` gives it, including the
+        // unknown type a later revision may send and this one must ignore.
+        _ => return Incoming::parse(text),
+    };
+    if !roles.iter().any(|active| active == role) {
+        if let Some(payload) = document
+            .get_mut("payload")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            payload.remove(name);
+        }
+    }
+    serde_json::from_value(document)
+        .map(Some)
+        .map_err(DecodeError::Malformed)
+}
+
+/// Whether the bounded values of an active role object are inside the protocol's ranges.
+///
+/// The typed decode rejects a wrong type, but the wire widths are wider than the specification:
+/// `volume` is a `u8` and the timing fields are `u32`, so 101 and 6000 decode. An object that
+/// [`parse_report`] dropped belongs to an inactive role and is not checked. The player's
+/// `required_lead_time_ms` is a hint this server does not act on, so it has no range here.
+fn report_values_in_range(message: &Incoming) -> bool {
+    /// The specification's upper bound for a player timing field, in milliseconds.
+    const MAX_TIMING_MS: u32 = 5_000;
+
+    match message {
+        Incoming::ClientState(state) => state.player.as_ref().is_none_or(|player| {
+            player.min_buffer_ms <= MAX_TIMING_MS
+                && player.output_delay_ms <= MAX_TIMING_MS
+                && player.volume.is_none_or(|volume| volume <= 100)
+        }),
+        Incoming::ClientCommand(command) => command
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.volume)
+            .is_none_or(|volume| volume <= 100),
+        _ => true,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitFailure {
     /// The client speaks another core message format.
@@ -2010,5 +2149,102 @@ mod tests {
             reason.contains("pcm, 48000 Hz, 2 channel(s), 16 bit"),
             "the reason names the format the server would have sent: {reason}"
         );
+    }
+
+    #[test]
+    fn an_inactive_role_object_is_dropped_before_the_typed_decode() {
+        let roles = vec![CONTROLLER_ROLE.to_owned(), METADATA_ROLE.to_owned()];
+        let text = r#"{"type":"client/state","payload":{"available":true,
+            "player":{"volume":"loud","min_buffer_ms":"soon"}}}"#;
+        let message = parse_report(text, &roles)
+            .expect("an inactive object's wrong types must not fail the decode")
+            .expect("client/state is a known message");
+        match message {
+            Incoming::ClientState(state) => {
+                assert!(state.available);
+                assert!(
+                    state.player.is_none(),
+                    "the player object belongs to an inactive role"
+                );
+            }
+            other => panic!("expected client/state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_active_role_object_is_decoded_and_range_checked() {
+        let text = r#"{"type":"client/state","payload":{"available":true,
+            "player":{"volume":101,"muted":false,"output_delay_ms":0,
+                      "required_lead_time_ms":200,"min_buffer_ms":100}}}"#;
+        let message = parse_report(text, &[PLAYER_ROLE.to_owned()])
+            .expect("the active object decodes")
+            .expect("client/state is a known message");
+        assert!(
+            !report_values_in_range(&message),
+            "a volume above 100 closes even though it fits a u8"
+        );
+
+        let timing = r#"{"type":"client/state","payload":{"available":true,
+            "player":{"volume":100,"muted":false,"output_delay_ms":0,
+                      "required_lead_time_ms":200,"min_buffer_ms":6000}}}"#;
+        let message = parse_report(timing, &[PLAYER_ROLE.to_owned()])
+            .expect("the active object decodes")
+            .expect("client/state is a known message");
+        assert!(
+            !report_values_in_range(&message),
+            "a timing above 5000 ms closes"
+        );
+
+        let command = r#"{"type":"client/command","payload":{"controller":
+            {"command":"volume","volume":101}}}"#;
+        let message = parse_report(command, &[CONTROLLER_ROLE.to_owned()])
+            .expect("the active object decodes")
+            .expect("client/command is a known message");
+        assert!(
+            !report_values_in_range(&message),
+            "an active controller's volume above 100 closes"
+        );
+
+        let wrong_type = r#"{"type":"client/state","payload":{"available":true,
+            "player":{"volume":100,"muted":false,"output_delay_ms":0,
+                      "required_lead_time_ms":200,"min_buffer_ms":"soon"}}}"#;
+        assert!(
+            parse_report(wrong_type, &[PLAYER_ROLE.to_owned()]).is_err(),
+            "a wrong-typed value in an active object is a decode error"
+        );
+    }
+
+    #[test]
+    fn the_send_ahead_patch_keeps_the_timestamp_and_saturates() {
+        use syncspin_core::messages::AudioChunkHeader;
+
+        let mut chunk = AudioChunkHeader {
+            timestamp_us: 1_000,
+            send_ahead: 0,
+        }
+        .encode(b"audio");
+        stamp_send_ahead(&mut chunk, 500);
+        let (header, audio) = AudioChunkHeader::parse(&chunk).expect("the frame stays valid");
+        assert_eq!(header.timestamp_us, 1_000, "the timestamp is untouched");
+        assert_eq!(header.send_ahead, 500);
+        assert_eq!(audio, b"audio");
+
+        let mut late = AudioChunkHeader {
+            timestamp_us: 400,
+            send_ahead: 7,
+        }
+        .encode(b"audio");
+        stamp_send_ahead(&mut late, 500);
+        let (header, _) = AudioChunkHeader::parse(&late).expect("the frame stays valid");
+        assert_eq!(header.send_ahead, 0, "a late chunk reports no lead");
+
+        let mut far = AudioChunkHeader {
+            timestamp_us: i64::MAX,
+            send_ahead: 0,
+        }
+        .encode(b"audio");
+        stamp_send_ahead(&mut far, 0);
+        let (header, _) = AudioChunkHeader::parse(&far).expect("the frame stays valid");
+        assert_eq!(header.send_ahead, u32::MAX, "the interval saturates");
     }
 }
