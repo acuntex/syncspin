@@ -26,7 +26,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Bytes, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use syncspin_core::clock::{ClockFilter, TimeSample};
@@ -262,7 +262,7 @@ pub(crate) enum SocketMessage {
     /// A cleartext JSON text frame.
     Text(String),
     /// One Noise transport message.
-    Binary(Vec<u8>),
+    Binary(Bytes),
     /// The peer closed the connection.
     Closed,
 }
@@ -310,7 +310,7 @@ impl Transport {
                 Some(Message::Text(text)) => {
                     return Ok(SocketMessage::Text(text.as_str().to_owned()))
                 }
-                Some(Message::Binary(bytes)) => return Ok(SocketMessage::Binary(bytes.to_vec())),
+                Some(Message::Binary(bytes)) => return Ok(SocketMessage::Binary(bytes)),
                 Some(Message::Ping(payload)) => {
                     self.send(Message::Pong(payload)).await?;
                 }
@@ -2280,16 +2280,13 @@ impl Session<'_> {
     /// the message it was parsed from. The queue stores the raw server timestamp beside the local
     /// deadline, so a later `stream/clear` can cut by the stamp a clock update does not move.
     async fn handle_audio(&mut self, body: &[u8], arrival_us: i64) -> Result<()> {
-        // The reassembler removes the message id, which the chunk parser expects.
-        let mut message = Vec::with_capacity(1 + body.len());
-        message.push(AUDIO_CHUNK_ID);
-        message.extend_from_slice(body);
-        let (header, data) = AudioChunkHeader::parse(&message)?;
+        // The reassembler removed the message id, so the body parses in place.
+        let (header, data) = AudioChunkHeader::parse_body(body)?;
 
         if !self.player_active() {
             return Ok(());
         }
-        let Some(format) = self.stream.clone() else {
+        let Some(format) = self.stream.as_ref() else {
             // Audio cannot be classified before a stream announced its format.
             return Ok(());
         };

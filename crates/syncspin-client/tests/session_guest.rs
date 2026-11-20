@@ -2443,6 +2443,39 @@ async fn a_malformed_audio_header_is_a_protocol_error() {
 }
 
 #[tokio::test]
+async fn the_audio_header_boundary_is_twelve_bytes_after_the_id() {
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    // Id 4, a full 12-byte header and no audio, with no stream announced: well-formed, so it is
+    // ignored and the connection stays up.
+    let mut header_only = vec![4];
+    header_only.extend_from_slice(&[0; 12]);
+    server.binary(header_only);
+    server.metadata("Still here", "An artist");
+    match next_event(&mut events).await {
+        Event::Track { title, .. } => assert_eq!(title, "Still here"),
+        other => panic!("a complete header must not close the connection, got {other:?}"),
+    }
+
+    // One byte short of the header closes it, and the message names the length it saw.
+    let mut short = vec![4];
+    short.extend_from_slice(&[0; 11]);
+    server.binary(short);
+    match next_event(&mut events).await {
+        Event::Disconnected { reason, .. } => assert!(
+            reason.contains("truncated") && reason.contains("12 bytes"),
+            "unexpected reason: {reason}"
+        ),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    assert_still_reconnecting(handle).await;
+}
+
+#[tokio::test]
 async fn a_server_that_never_starts_the_handshake_is_refused() {
     let options = ServerOptions {
         start_handshake: false,
