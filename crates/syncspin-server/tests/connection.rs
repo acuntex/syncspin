@@ -11,7 +11,7 @@ use common::*;
 use syncspin_core::messages::{
     ClientCommand, ControllerCommand, Incoming, ServerError, ServerState, StreamEnd,
 };
-use syncspin_server::TrackInfo;
+use syncspin_server::{TrackInfo, WriteOutcome};
 #[tokio::test]
 async fn a_client_connects_and_is_activated() -> Result<()> {
     for suite in Suite::ALL {
@@ -405,8 +405,8 @@ async fn a_player_receives_the_stream_with_playout_timestamps() -> Result<()> {
 
     // 480 stereo frames of 16-bit PCM are 10 ms at 48 kHz.
     let chunk = [7u8; 480 * 4];
-    writer.write(&chunk);
-    writer.write(&chunk);
+    assert_eq!(writer.write(&chunk), WriteOutcome::Written);
+    assert_eq!(writer.write(&chunk), WriteOutcome::Written);
 
     let (first, payload) = client.read_audio().await?;
     assert_eq!(payload, chunk, "the server forwards the bytes unchanged");
@@ -525,7 +525,7 @@ async fn a_client_without_the_stream_format_gets_no_player_role_and_no_stream() 
     }
 
     let mut writer = server.open_stream(TrackInfo::default());
-    writer.write(&[0u8; 480 * 4]);
+    assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
     client.expect_no_stream(Duration::from_millis(300)).await?;
     writer.end();
 
@@ -701,7 +701,7 @@ async fn a_client_that_never_answers_does_not_stall_the_writer() -> Result<()> {
     let chunk = [0u8; 480 * 4];
     let started = Instant::now();
     for _ in 0..100 {
-        writer.write(&chunk);
+        assert_eq!(writer.write(&chunk), WriteOutcome::Written);
     }
     assert!(
         started.elapsed() < Duration::from_secs(1),
@@ -767,7 +767,7 @@ async fn pausing_ends_the_stream_and_playing_announces_it_again() -> Result<()> 
     assert_eq!(group.playback_state, "playing");
 
     // Audio written after the resume goes out again.
-    writer.write(&[0u8; 480 * 4]);
+    assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
     client.read_audio().await?;
 
     server.stop();
@@ -806,8 +806,8 @@ async fn two_players_receive_the_same_frames() -> Result<()> {
     second.read_stream_start().await?;
 
     let chunk = [5u8; 480 * 4];
-    writer.write(&chunk);
-    writer.write(&[6u8; 480 * 4]);
+    assert_eq!(writer.write(&chunk), WriteOutcome::Written);
+    assert_eq!(writer.write(&[6u8; 480 * 4]), WriteOutcome::Written);
 
     let (first_header, first_payload) = first.read_audio().await?;
     let (second_header, second_payload) = second.read_audio().await?;
@@ -859,7 +859,7 @@ async fn the_start_lead_ignores_the_reported_timing() -> Result<()> {
 
     let mut writer = server.open_stream(TrackInfo::default());
     client.read_stream_start().await?;
-    writer.write(&[0u8; 480 * 4]);
+    assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
     let (header, _payload) = client.read_audio().await?;
     assert!(
         (100_000..=200_000).contains(&header.send_ahead),
@@ -894,7 +894,7 @@ async fn a_stalled_member_does_not_hold_up_the_other() -> Result<()> {
     let chunk = [1u8; 480 * 4];
     let started = Instant::now();
     for _ in 0..50 {
-        writer.write(&chunk);
+        assert_eq!(writer.write(&chunk), WriteOutcome::Written);
     }
     let mut last = i64::MIN;
     for index in 0..50 {
@@ -961,7 +961,7 @@ async fn every_member_gets_its_own_clock_reply() -> Result<()> {
     first.read_stream_start().await?;
     second.read_stream_start().await?;
     for _ in 0..20 {
-        writer.write(&[0u8; 480 * 4]);
+        assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
     }
     let reply = first.round_trip_time(7_000_000).await?;
     assert_eq!(reply.client_transmitted, 7_000_000);
@@ -1077,7 +1077,7 @@ async fn a_player_hears_nothing_before_it_reports_its_state() -> Result<()> {
     );
 
     let mut writer = server.open_stream(TrackInfo::default());
-    writer.write(&[0u8; 480 * 4]);
+    assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
     client.expect_no_stream(Duration::from_millis(300)).await?;
 
     // The report is what lets the server announce the stream; what was written before it is gone.
@@ -1090,7 +1090,7 @@ async fn a_player_hears_nothing_before_it_reports_its_state() -> Result<()> {
             .codec,
         "pcm"
     );
-    writer.write(&[1u8; 480 * 4]);
+    assert_eq!(writer.write(&[1u8; 480 * 4]), WriteOutcome::Written);
     let (_, payload) = client.read_audio().await?;
     assert_eq!(payload, [1u8; 480 * 4]);
 
@@ -1118,7 +1118,7 @@ async fn a_member_that_reports_itself_unavailable_receives_no_audio() -> Result<
     // A time request travels the same connection and is read after the report, so its reply proves
     // the group has seen the report before the chunk below is written.
     assert_eq!(away.round_trip_time(1_000).await?.client_transmitted, 1_000);
-    writer.write(&[2u8; 480 * 4]);
+    assert_eq!(writer.write(&[2u8; 480 * 4]), WriteOutcome::Written);
     let (_, payload) = here.read_audio().await?;
     assert_eq!(payload, [2u8; 480 * 4]);
     away.expect_no_audio(Duration::from_millis(300)).await?;
@@ -1126,7 +1126,7 @@ async fn a_member_that_reports_itself_unavailable_receives_no_audio() -> Result<
     // A member that comes back hears the running stream again, without a new announcement.
     away.send_json(&player_state(true, 100, false)).await?;
     assert_eq!(away.round_trip_time(2_000).await?.client_transmitted, 2_000);
-    writer.write(&[3u8; 480 * 4]);
+    assert_eq!(writer.write(&[3u8; 480 * 4]), WriteOutcome::Written);
     let (_, payload) = away.read_audio().await?;
     assert_eq!(payload, [3u8; 480 * 4]);
 

@@ -317,7 +317,9 @@ back a handle and an event stream. The host writes frames into the `StreamWriter
 let mut server = Server::start(config).await?;
 let mut events = server.events();
 let mut stream = server.open_stream(track);
-stream.write(&pcm);
+if let WriteOutcome::Dropped(error) = stream.write(&pcm) {
+    eprintln!("the chunk was not scheduled: {error}");
+}
 while let Some(event) = events.next().await {
     // ClientConnected, ClientActivated, PairingRequested, Paired, ClientLeft, ...
 }

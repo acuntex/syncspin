@@ -32,7 +32,7 @@ use syncspin_core::messages::{
 };
 use tokio::sync::mpsc;
 
-use crate::stream::{AudioFormat, TrackInfo};
+use crate::stream::{AudioFormat, Codec, TrackInfo, WriteError, WriteOutcome};
 use crate::Event;
 
 /// The role a client outputs audio with.
@@ -62,6 +62,13 @@ const PLAYBACK_ACTIVITY: &str = "playback";
 /// the largest of those values among the ready players, which is the change
 /// `docs/spec-deviations.md` names.
 pub(crate) const START_LEAD: Duration = Duration::from_millis(200);
+
+/// The longest chunk the server may send, as the player role states it.
+///
+/// `roles/player/v1.md` forbids a chunk longer than 150 ms, because a player would have to buffer
+/// more than it promised. The server refuses a longer chunk before the timeline moves, so a
+/// rejected chunk leaves no hole.
+const MAX_CHUNK_DURATION: Duration = Duration::from_millis(150);
 
 /// The controller commands the group acts on itself.
 ///
@@ -445,24 +452,42 @@ impl Group {
 
     /// Sends one chunk to every player and advances the timeline.
     ///
-    /// Returns whether the chunk went out; bytes written to a paused or ended stream are dropped,
-    /// because there is no timeline to place them on.
-    pub(crate) fn write_audio(&self, bytes: &[u8]) -> bool {
-        if bytes.is_empty() {
-            return false;
+    /// The chunk is checked before the timeline moves, so a refused chunk leaves no hole for the
+    /// next one. `duration` is the host's playtime for a compressed format, and must be absent for
+    /// PCM, whose playtime follows from its frame count. Bytes written to a paused or ended stream
+    /// are dropped, because there is no timeline to place them on.
+    pub(crate) fn write_audio(&self, bytes: &[u8], duration: Option<Duration>) -> WriteOutcome {
+        if bytes.is_empty() || duration == Some(Duration::ZERO) {
+            return WriteOutcome::Dropped(WriteError::Empty);
         }
         let now = self.clock.now_us();
         let mut inner = self.lock();
         let format = inner.format.clone();
+        let duration = match (&format.codec, duration) {
+            (Codec::Pcm, None) => {
+                if bytes.len() % format.frame_bytes() != 0 {
+                    return WriteOutcome::Dropped(WriteError::Incomplete);
+                }
+                format.duration(bytes.len())
+            }
+            (Codec::Pcm, Some(_)) => return WriteOutcome::Dropped(WriteError::WrongMethod),
+            (_, None) => return WriteOutcome::Dropped(WriteError::WrongMethod),
+            (_, Some(duration)) => duration,
+        };
+        if duration.is_zero() {
+            return WriteOutcome::Dropped(WriteError::Empty);
+        }
+        if duration > MAX_CHUNK_DURATION {
+            return WriteOutcome::Dropped(WriteError::TooLong);
+        }
         let chunk = {
             let Some(stream) = inner.stream.as_mut() else {
-                return false;
+                return WriteOutcome::Dropped(WriteError::Ended);
             };
             if !stream.active {
-                return false;
+                return WriteOutcome::Dropped(WriteError::Paused);
             }
             let timestamp_us = stream.next_us;
-            let duration = format.duration(bytes.len());
             stream.next_us = timestamp_us.saturating_add(micros_i64(duration));
             stream.position = stream.position.saturating_add(duration);
             AudioChunkHeader {
@@ -472,7 +497,7 @@ impl Group {
             .encode(bytes)
         };
         inner.send_audio(&chunk);
-        true
+        WriteOutcome::Written
     }
 
     /// Moves the stream to `position` and drops what the players have buffered.
@@ -810,6 +835,48 @@ impl Clock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::StreamWriter;
+
+    #[test]
+    fn a_pcm_writer_requires_whole_frames_and_respects_the_150_ms_bound() {
+        let (events, _rx) = mpsc::unbounded_channel();
+        let group = Group::new("g".into(), AudioFormat::pcm(48_000, 2, 16), events).unwrap();
+        group.open_stream(TrackInfo::default());
+        let mut writer = StreamWriter::new(group.clone());
+        // 480 stereo frames = 10 ms = 480*4 bytes.
+        assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
+        assert_eq!(
+            writer.write(&[0u8; 480 * 4 + 1]),
+            WriteOutcome::Dropped(WriteError::Incomplete)
+        );
+        // 150 ms exactly is 7_200 frames = 7200*4 bytes.
+        assert_eq!(writer.write(&[0u8; 7200 * 4]), WriteOutcome::Written);
+        assert_eq!(
+            writer.write(&[0u8; 7200 * 4 + 4]),
+            WriteOutcome::Dropped(WriteError::TooLong)
+        );
+        assert_eq!(writer.write(&[]), WriteOutcome::Dropped(WriteError::Empty));
+    }
+
+    #[test]
+    fn an_encoded_format_refuses_plain_write_and_a_zero_duration() {
+        let (events, _rx) = mpsc::unbounded_channel();
+        let group = Group::new("g".into(), AudioFormat::opus(48_000, 2), events).unwrap();
+        group.open_stream(TrackInfo::default());
+        let mut writer = StreamWriter::new(group.clone());
+        assert_eq!(
+            writer.write(&[0u8; 10]),
+            WriteOutcome::Dropped(WriteError::WrongMethod)
+        );
+        assert_eq!(
+            writer.write_encoded(&[0u8; 10], Duration::ZERO),
+            WriteOutcome::Dropped(WriteError::Empty)
+        );
+        assert_eq!(
+            writer.write_encoded(&[0u8; 10], Duration::from_millis(10)),
+            WriteOutcome::Written
+        );
+    }
 
     #[test]
     fn the_start_lead_is_what_a_player_can_buffer() {
@@ -868,19 +935,22 @@ mod tests {
             events,
         )
         .expect("a group builds");
-        assert!(
-            !group.write_audio(&[]),
+        assert_eq!(
+            group.write_audio(&[], None),
+            WriteOutcome::Dropped(WriteError::Empty),
             "an empty chunk has no playtime to schedule"
         );
-        assert!(
-            !group.write_audio(&[0u8; 4]),
+        assert_eq!(
+            group.write_audio(&[0u8; 4], None),
+            WriteOutcome::Dropped(WriteError::Ended),
             "no stream is open, so there is no timeline to place bytes on"
         );
 
         group.open_stream(TrackInfo::default());
         group.pause();
-        assert!(
-            !group.write_audio(&[0u8; 4]),
+        assert_eq!(
+            group.write_audio(&[0u8; 4], None),
+            WriteOutcome::Dropped(WriteError::Paused),
             "bytes written while the group is paused are dropped"
         );
     }
@@ -939,8 +1009,9 @@ mod tests {
             },
         );
         group.open_stream(TrackInfo::default());
-        assert!(
-            group.write_audio(&[0u8; 4]),
+        assert_eq!(
+            group.write_audio(&[0u8; 4], None),
+            WriteOutcome::Written,
             "a stale report must not disturb the group's stream"
         );
     }

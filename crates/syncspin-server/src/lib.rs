@@ -83,7 +83,7 @@ pub use crate::discovery::{
 pub use crate::pairing::{
     CodeFormat, PairingMethod, PairingRecord, PairingStore, DEFAULT_PAIRING_TIMEOUT,
 };
-pub use crate::stream::{AudioFormat, Codec, StreamWriter, TrackInfo};
+pub use crate::stream::{AudioFormat, Codec, StreamWriter, TrackInfo, WriteError, WriteOutcome};
 
 /// The address the listener binds when the configuration does not narrow it.
 ///
