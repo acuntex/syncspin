@@ -401,10 +401,26 @@ impl Group {
             state.controller = Some(inner.controller());
         }
         if roles.iter().any(|role| role == METADATA_ROLE) {
-            state.metadata = Some(inner.metadata(now));
+            // The first state of a metadata role must be dated in the past or present. The check
+            // above has already moved the timeline an armed anchor would leave behind, so build
+            // it against that state; while the segment has not started, the scheduled update
+            // follows as a second state and corrects the joiner rather than letting it
+            // extrapolate across the lead.
+            state.metadata = Some(inner.metadata_at(now));
         }
         if state.controller.is_some() || state.metadata.is_some() {
             send_to(&sender, Incoming::ServerState(state));
+        }
+        if roles.iter().any(|role| role == METADATA_ROLE) {
+            if let Some(scheduled) = inner.scheduled_metadata(now) {
+                send_to(
+                    &sender,
+                    Incoming::ServerState(ServerState {
+                        controller: None,
+                        metadata: Some(scheduled),
+                    }),
+                );
+            }
         }
         send_to(&sender, Incoming::GroupUpdate(inner.group_update()));
 
@@ -950,30 +966,47 @@ impl Inner {
     /// audio starts instead of extrapolating across the lead. Once the segment is under way the
     /// state describes `now`, and an inactive stream reports the position its pause froze.
     fn metadata(&self, now_us: i64) -> Metadata {
-        let (timestamp, title, artist, album_artist, album, duration, position) = match &self.stream
-        {
-            Some(stream) => {
-                let track = &stream.track;
-                let (timestamp, position) = if stream.active {
-                    if now_us < stream.start_us {
-                        (stream.start_us, stream.start_position)
-                    } else {
-                        (now_us, stream.position_at(now_us))
-                    }
-                } else {
-                    (now_us, stream.position)
-                };
-                (
-                    timestamp,
-                    track.title.clone(),
-                    track.artist.clone(),
-                    track.album_artist.clone(),
-                    track.album.clone(),
-                    track.duration,
-                    Some(position),
-                )
+        self.scheduled_metadata(now_us)
+            .unwrap_or_else(|| self.metadata_at(now_us))
+    }
+
+    /// Returns the scheduled update for a segment that has not started, or `None` once it has.
+    fn scheduled_metadata(&self, now_us: i64) -> Option<Metadata> {
+        let stream = self.stream.as_ref()?;
+        if !stream.active || now_us >= stream.start_us {
+            return None;
+        }
+        Some(self.metadata_state(stream.start_us, Some(stream.start_position)))
+    }
+
+    /// Returns the state at `now_us` with a past or present timestamp.
+    ///
+    /// This is also the first state a joining metadata role gets: `messaging.md` requires a past
+    /// or present timestamp there. [`Self::scheduled_metadata`] follows it while the segment has
+    /// not started, so a joiner that arrives during the lead is corrected rather than left to
+    /// extrapolate the first state.
+    fn metadata_at(&self, now_us: i64) -> Metadata {
+        let position = self.stream.as_ref().map(|stream| {
+            if stream.active {
+                stream.position_at(now_us)
+            } else {
+                stream.position
             }
-            None => (now_us, None, None, None, None, None, None),
+        });
+        self.metadata_state(now_us, position)
+    }
+
+    /// Builds a `metadata` object for one timestamp and source position.
+    fn metadata_state(&self, timestamp: i64, position: Option<Duration>) -> Metadata {
+        let (title, artist, album_artist, album, duration) = match &self.stream {
+            Some(stream) => (
+                stream.track.title.clone(),
+                stream.track.artist.clone(),
+                stream.track.album_artist.clone(),
+                stream.track.album.clone(),
+                stream.track.duration,
+            ),
+            None => (None, None, None, None, None),
         };
         Metadata {
             timestamp: Some(timestamp),
@@ -1484,7 +1517,9 @@ impl Inner {
             stream.wrote_any = true;
             let chunk = AudioChunkHeader {
                 timestamp_us,
-                send_ahead: send_ahead(timestamp_us, now_us),
+                // The connection stamps the real interval immediately before encryption; the
+                // group has not sent anything yet and leaves the placeholder.
+                send_ahead: 0,
             }
             .encode(payload);
             (chunk, timestamp_us)
@@ -1509,14 +1544,6 @@ fn group_id() -> anyhow::Result<String> {
         anyhow::anyhow!("failed to draw the group identifier from the operating system CSPRNG")
     })?;
     Ok(URL_SAFE_NO_PAD.encode(id))
-}
-
-/// The lead from a chunk's timestamp back to its transmission, saturating as the wire requires.
-fn send_ahead(timestamp_us: i64, now_us: i64) -> u32 {
-    match timestamp_us.saturating_sub(now_us) {
-        lead if lead <= 0 => 0,
-        lead => u32::try_from(lead).unwrap_or(u32::MAX),
-    }
 }
 
 /// The whole microseconds of `duration`, saturating at the `i64` range.
@@ -2209,14 +2236,6 @@ mod tests {
             member.start_gate,
             "a member that never reported stays gated for its late report"
         );
-    }
-
-    #[test]
-    fn send_ahead_saturates_instead_of_wrapping() {
-        assert_eq!(send_ahead(1_000, 500), 500);
-        assert_eq!(send_ahead(500, 500), 0, "no lead measures as zero");
-        assert_eq!(send_ahead(400, 500), 0, "a late chunk reports no lead");
-        assert_eq!(send_ahead(i64::MAX, 0), u32::MAX);
     }
 
     #[test]
