@@ -29,7 +29,7 @@ futures-util.workspace = true
 getrandom.workspace = true
 # mDNS is a synchronous daemon on a thread of its own; the feature is off unless a host asks for
 # the backend. Default features off: the `async` and `logging` halves are not used here.
-mdns-sd = { version = "0.21", optional = true, default-features = false }
+mdns-sd = { version = "0.22", optional = true, default-features = false }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite.workspace = true
