@@ -311,7 +311,7 @@ while let Some(event) = events.next().await {
 }
 ```
 
-`handle.control()` returns the play/pause/skip, seek, volume and mute controls; dropping the handle
+`handle.control()` returns the play/pause/skip/stop, seek, repeat, shuffle, group switch, group volume and group mute controls and the player's own volume and mute; dropping the handle
 or the event stream ends the connection.
 
 A host with no audio output - a remote control, a display or a bridge - connects headless. The

@@ -110,6 +110,8 @@ mod sink;
 
 pub mod storage;
 
+#[cfg(feature = "controller")]
+pub use client::RepeatMode;
 #[cfg(feature = "metadata")]
 pub use client::TrackProgress;
 pub use client::{

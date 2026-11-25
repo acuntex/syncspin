@@ -767,6 +767,29 @@ impl TrackProgress {
     }
 }
 
+/// Repeat mode of the group, as the controller commands name it.
+#[cfg(feature = "controller")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatMode {
+    /// No repeat (`repeat_off`).
+    Off,
+    /// Repeat the current track (`repeat_one`).
+    One,
+    /// Repeat all tracks (`repeat_all`).
+    All,
+}
+
+#[cfg(feature = "controller")]
+impl RepeatMode {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Off => "repeat_off",
+            Self::One => "repeat_one",
+            Self::All => "repeat_all",
+        }
+    }
+}
+
 /// Playback state as the server describes it.
 ///
 /// The group fields come from `group/update`, which is the authoritative source: every message
@@ -789,6 +812,11 @@ pub struct PlaybackState {
     /// range, and in both cases `ControlHandle::seek` refuses rather than sending a target it
     /// cannot check. A `group/update` leaves it alone, because it belongs to the controller state.
     pub seek_max_ms: Option<u64>,
+    /// Repeat mode the server reports: `off`, `one` or `all`; `None` before the first controller
+    /// state. A value this revision does not name is carried verbatim.
+    pub repeat: Option<String>,
+    /// Whether shuffle is on, when the server reports it.
+    pub shuffle: Option<bool>,
     /// Playback state of the group, once a `group/update` arrived.
     ///
     /// `playing` and `stopped` are the values this revision defines; a paused group reports
@@ -918,6 +946,69 @@ impl ControlHandle {
     #[cfg(feature = "controller")]
     pub async fn previous(&self) -> Result<()> {
         self.transport("previous").await
+    }
+
+    /// Stops playback and resets the position to the beginning.
+    ///
+    /// # Errors
+    /// Like every controller command: when the connection has ended, the controller role is not
+    /// active, or the server's latest `supported_commands` does not list `stop`.
+    #[cfg(feature = "controller")]
+    pub async fn stop(&self) -> Result<()> {
+        self.transport("stop").await
+    }
+
+    /// Sets the repeat mode of the group.
+    ///
+    /// # Errors
+    /// As for [`ControlHandle::stop`], with the command the mode names (`repeat_off`,
+    /// `repeat_one` or `repeat_all`).
+    #[cfg(feature = "controller")]
+    pub async fn repeat(&self, mode: RepeatMode) -> Result<()> {
+        self.transport(mode.command()).await
+    }
+
+    /// Turns shuffle on (`shuffle`) or off (`unshuffle`).
+    ///
+    /// # Errors
+    /// As for [`ControlHandle::stop`].
+    #[cfg(feature = "controller")]
+    pub async fn shuffle(&self, enabled: bool) -> Result<()> {
+        self.transport(if enabled { "shuffle" } else { "unshuffle" })
+            .await
+    }
+
+    /// Moves this client to the next group in the server's predefined cycle.
+    ///
+    /// # Errors
+    /// As for [`ControlHandle::stop`].
+    #[cfg(feature = "controller")]
+    pub async fn switch(&self) -> Result<()> {
+        self.transport("switch").await
+    }
+
+    /// Sets the volume of the whole group, 0-100. This is the group's volume, not this player's:
+    /// see `ControlHandle::set_volume` for the player's own level when the `player` feature is on.
+    ///
+    /// # Errors
+    /// As for [`ControlHandle::stop`] with the command `volume`, and for a level above 100, which
+    /// the protocol cannot carry and which is refused before anything is sent.
+    #[cfg(feature = "controller")]
+    pub async fn set_group_volume(&self, level: u8) -> Result<()> {
+        self.send(ControlAction::GroupVolume(level))
+            .await
+            .map(|_level| ())
+    }
+
+    /// Mutes or unmutes the whole group.
+    ///
+    /// # Errors
+    /// As for [`ControlHandle::stop`] with the command `mute`.
+    #[cfg(feature = "controller")]
+    pub async fn set_group_mute(&self, muted: bool) -> Result<()> {
+        self.send(ControlAction::GroupMute(muted))
+            .await
+            .map(|_level| ())
     }
 
     /// Seeks to an absolute position in milliseconds.
@@ -1154,6 +1245,12 @@ pub(crate) enum ControlAction {
     /// Seek to an absolute position in milliseconds.
     #[cfg(feature = "controller")]
     Seek(u64),
+    /// Set the volume of the whole group.
+    #[cfg(feature = "controller")]
+    GroupVolume(u8),
+    /// Mute or unmute the whole group.
+    #[cfg(feature = "controller")]
+    GroupMute(bool),
     /// Seek by an offset in milliseconds; negative rewinds.
     #[cfg(feature = "controller")]
     SeekRelative(i64),

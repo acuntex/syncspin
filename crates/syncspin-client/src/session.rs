@@ -2917,6 +2917,8 @@ impl Session<'_> {
                 self.playback.volume = None;
                 self.playback.muted = None;
                 self.playback.seek_max_ms = None;
+                self.playback.repeat = None;
+                self.playback.shuffle = None;
                 self.emit(Event::State(self.playback.clone()));
             }
             #[cfg(feature = "metadata")]
@@ -3011,6 +3013,8 @@ impl Session<'_> {
                 self.playback.volume = controller.volume;
                 self.playback.muted = controller.muted;
                 self.playback.seek_max_ms = controller.seek_max_ms;
+                self.playback.repeat = controller.repeat;
+                self.playback.shuffle = controller.shuffle;
                 self.emit(Event::State(self.playback.clone()));
             }
         }
@@ -3148,6 +3152,24 @@ impl Session<'_> {
                 .await
                 .map(|()| self.volume),
             #[cfg(feature = "controller")]
+            ControlAction::GroupVolume(level) => self
+                .send_command(ControllerCommand {
+                    command: "volume".to_owned(),
+                    volume: Some(level),
+                    ..ControllerCommand::default()
+                })
+                .await
+                .map(|()| self.volume),
+            #[cfg(feature = "controller")]
+            ControlAction::GroupMute(muted) => self
+                .send_command(ControllerCommand {
+                    command: "mute".to_owned(),
+                    mute: Some(muted),
+                    ..ControllerCommand::default()
+                })
+                .await
+                .map(|()| self.volume),
+            #[cfg(feature = "controller")]
             ControlAction::SeekRelative(offset_ms) => self
                 .send_controller_command("seek_relative", None, Some(offset_ms))
                 .await
@@ -3223,6 +3245,17 @@ impl Session<'_> {
             }
             #[cfg(feature = "controller")]
             ControlAction::SeekRelative(_) => self.check_controller_command("seek_relative"),
+            #[cfg(feature = "controller")]
+            ControlAction::GroupVolume(level) => {
+                if *level > 100 {
+                    bail!(
+                        "the group volume {level} is outside the 0-100 range the protocol defines"
+                    );
+                }
+                self.check_controller_command("volume")
+            }
+            #[cfg(feature = "controller")]
+            ControlAction::GroupMute(_) => self.check_controller_command("mute"),
             #[cfg(feature = "player")]
             ControlAction::Volume(_)
             | ControlAction::Mute(_)
@@ -3288,13 +3321,20 @@ impl Session<'_> {
         position_ms: Option<u64>,
         offset_ms: Option<i64>,
     ) -> Result<()> {
+        self.send_command(ControllerCommand {
+            command: command.to_owned(),
+            position_ms,
+            offset_ms,
+            ..ControllerCommand::default()
+        })
+        .await
+    }
+
+    /// Sends one complete controller command; only the fields that belong to it are set.
+    #[cfg(feature = "controller")]
+    async fn send_command(&mut self, command: ControllerCommand) -> Result<()> {
         let message = Incoming::ClientCommand(ClientCommand {
-            controller: Some(ControllerCommand {
-                command: command.to_owned(),
-                position_ms,
-                offset_ms,
-                ..ControllerCommand::default()
-            }),
+            controller: Some(command),
         });
         self.send_json(&message).await
     }
