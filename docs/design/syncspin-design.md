@@ -381,8 +381,11 @@ not stage 3:
   with `Instant::now()`. `underruns()` still waits for a correction loop the session does not use,
   and with no drift correction the client does not claim the spec's ±1 ms steady-state window
   (`docs/spec-deviations.md` #20). `min_buffer_ms` is derived from arrival delay unless the host pins
-  it, and `required_lead_time_ms` is at least the sink's pre-port delay: the client reports both, but
-  the server's send-ahead still ignores the reported timing - at a stream start, on a seek and against `min_buffer_ms` - until `docs/spec-deviations.md` #17 closes.
+  it, and `required_lead_time_ms` is at least the sink's pre-port delay: the client reports both.
+  The server derives its start and seek lead from the largest reported `min_buffer_ms` +
+  `output_delay_ms` among the ready members, anchored on the trigger's transmit time; what remains
+  of `docs/spec-deviations.md` #17 is the live queue, the `required_lead_time_ms` hint and the
+  15 ms lower bound.
 - **0.1 measures against the spec, not MA:** the five spec mandates found in the check are part of
   stage 1, not a later stage. Where MA disagrees with the spec, the spec wins and MA compatibility is
   verified by test.

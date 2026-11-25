@@ -222,8 +222,9 @@ pub trait Sink: Send + 'static {
     /// The client calls [`Sink::write`] this much before the frame's playout deadline, so the frame
     /// reaches the port at `due`. A sink that forwards frames straight to its pipeline leaves this
     /// at zero; one whose output buffers internally reports the buffer here so the client can fill
-    /// it. A value that belongs on the post-port side raises the lead the server sends ahead
-    /// instead of compensating it, because the server factors `output_delay` into that lead.
+    /// it. A value that belongs on the post-port side raises the lead the server sends ahead at the
+    /// next start or seek instead of compensating it, because the server factors `output_delay` into
+    /// that lead; a stream already under way keeps its timeline (deviation 17).
     ///
     /// The client polls this when a stream opens, after every `client/state` report, after every
     /// clock burst, once about half a second after an accepted `set_output_delay`, and when the host
@@ -238,7 +239,8 @@ pub trait Sink: Send + 'static {
     /// chain after the DAC. Decoder, pipeline and device-internal buffer latency belong in the host's
     /// playout scheduling, not here. A conformant server factors this value into its send-ahead, so
     /// reporting a buffer here raises the lead instead of compensating it; the server in this
-    /// workspace ignores the reported timing until `docs/spec-deviations.md` #17 closes.
+    /// workspace does so at the next stream start or seek, not on a stream already under way, whose
+    /// live queue remains `docs/spec-deviations.md` #17.
     ///
     /// The host restores the same value across restarts and reconnections: the protocol requires
     /// `output_delay_ms` to persist, and this trait is the only place the client learns it. The

@@ -322,11 +322,16 @@ impl std::error::Error for WriteError {}
 /// timeline and the playout timestamps.
 ///
 /// Calls are synchronous and never wait for a client. A write only queues the chunk for the
-/// connection tasks, so a client that has stopped reading cannot hold the host up; the price is that
-/// its queue grows, which is the backpressure question the next milestone answers.
+/// connection tasks, so a client that has stopped reading cannot hold the host up; the audio
+/// outstanding to a member is bounded by the `buffer_capacity` it announced, and a chunk that
+/// would overrun it is skipped rather than queued.
 ///
 /// Dropping the writer without [`StreamWriter::end`] ends the stream, so a host that returns early
 /// does not leave a stream running that it can no longer feed.
+///
+/// The writer must not outlive the Tokio runtime that started the server either: a restart that
+/// anchors a ready member arms a deadline timer on that runtime, and spawning it after the runtime
+/// has shut down panics.
 #[derive(Debug)]
 pub struct StreamWriter {
     group: Arc<Group>,
@@ -376,9 +381,12 @@ impl StreamWriter {
 
     /// Moves the stream to `position` and drops everything the clients have buffered for it.
     ///
-    /// The next chunk plays `START_LEAD` after the seek, which is long enough for a player that is
-    /// already running to refill. A position beyond the track's known duration is clamped to the
-    /// end; an unknown duration is not clamped at all.
+    /// An active group clears the players, and the next chunk is scheduled the largest reported
+    /// `min_buffer_ms` + `output_delay_ms` after that `stream/clear` was transmitted, so a player
+    /// that is already running can refill; a report that arrives after that instant re-leads from
+    /// the current time. A seek while the group is paused sends no clear: the next `play` restarts
+    /// the stream a lead ahead from the new position. A position beyond the track's known duration
+    /// is clamped to the end; an unknown duration is not clamped at all.
     pub fn seek(&mut self, position: Duration) {
         self.group.seek(position);
     }

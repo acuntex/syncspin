@@ -8,8 +8,10 @@
 //!
 //! Everything here is synchronous and guarded by one mutex, which is never held across an await:
 //! the connection tasks read their messages from an unbounded channel, so a client that stopped
-//! reading cannot block the host that pushes audio. A queue that grows without bound is the price;
-//! bounding it, and deciding which chunks a slow client loses, is the next milestone's problem.
+//! reading cannot block the host that pushes audio. The channel can still grow with control
+//! messages, but the audio outstanding to one member is bounded by the `buffer_capacity` its
+//! `client/hello` announced: a chunk that would overrun it is not started, and the member hears a
+//! hole instead.
 //!
 //! Two rules the specification states govern when a member hears anything. A stream is announced
 //! only to a member whose `client/state` reports both the `player` object the activation requires
@@ -18,8 +20,11 @@
 //! `playback` activity on the connection, so the group declares it on every member while the group
 //! plays and drops it when playback stops.
 //!
-//! One rule this milestone does not keep: the start lead is one fixed value instead of each
-//! player's reported buffer and lead time (see `docs/spec-deviations.md`).
+//! The send-ahead rules of the specification are kept: a restart with a ready member starts from
+//! the reported lead, anchored on the transmit time of the trigger; with none, no anchor is armed
+//! and the provisional timeline stands. What this milestone does not keep is the live queue
+//! duration, the optional `required_lead_time_ms` hint and the 15 ms lower bound of a chunk, which
+//! belongs to the host's chunking (see `docs/spec-deviations.md` #17).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -717,12 +722,16 @@ impl Group {
         let _ = self.events.send(Event::StreamStarted);
     }
 
-    /// Sends one chunk to every player and advances the timeline.
+    /// Sends one chunk to every player that can take it and advances the timeline.
     ///
     /// The chunk is checked before the timeline moves, so a refused chunk leaves no hole for the
     /// next one. `duration` is the host's playtime for a compressed format, and must be absent for
     /// PCM, whose playtime follows from its frame count. Bytes written to a paused or ended stream
     /// are dropped, because there is no timeline to place them on.
+    ///
+    /// A member gated by its start, or without room for the framed chunk inside the
+    /// `buffer_capacity` it announced, is skipped: the chunk keeps its place on the shared timeline,
+    /// so that member hears a hole instead of a delayed chunk.
     ///
     /// While a restart anchors the timeline, the payload is held instead of scheduled; the anchor
     /// flush assigns its timestamp from the trigger's real transmit time. A host that starves the
@@ -1043,6 +1052,10 @@ impl Inner {
     }
 
     /// Returns the `stream/start` message for the current format.
+    ///
+    /// The `server_transmitted` value is a placeholder: the connection task stamps the real
+    /// transmit time immediately before encryption, and that reading is the `T` the trigger reports
+    /// to the anchor.
     fn stream_start(&self, now_us: i64) -> Incoming {
         Incoming::StreamStart(StreamStart {
             server_transmitted: now_us,
@@ -1196,7 +1209,8 @@ impl Inner {
     /// The clear is a restart trigger: it anchors the new segment and resets the member's sent
     /// chunks on its report. An announced but unavailable member still gets it, because the client
     /// must discard its buffers; it is not part of the anchor's pending set because it does not
-    /// `plays()`.
+    /// `plays()`. The queued `server_transmitted` is a placeholder the connection overwrites at the
+    /// send, like the start's.
     fn send_stream_clear(&self, now_us: i64) {
         let message = Incoming::StreamClear(StreamClear {
             server_transmitted: now_us,
@@ -1586,7 +1600,10 @@ mod tests {
     use crate::stream::StreamWriter;
     use syncspin_core::messages::PlayerState;
 
-    /// Builds the group the group tests drive, outside any runtime so no anchor timer is spawned.
+    /// Builds the group the group tests drive.
+    ///
+    /// Built outside a runtime, as every test but the anchor timer's is, it spawns no timer and the
+    /// test drives the deadline through `Inner::check_anchor_at`.
     fn test_group() -> Arc<Group> {
         let (events, _receiver) = mpsc::unbounded_channel();
         Group::new("g".into(), AudioFormat::pcm(48_000, 2, 16), events).expect("a group builds")
@@ -1613,6 +1630,29 @@ mod tests {
     ) -> (u64, mpsc::UnboundedReceiver<Outbound>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let id = group.join(vec![PLAYER_ROLE.to_owned()], sender, capacity);
+        report_timing(group, id, min_buffer_ms, output_delay_ms);
+        (id, receiver)
+    }
+
+    /// Joins a metadata-only member and returns its queue.
+    fn add_metadata(group: &Group) -> (u64, mpsc::UnboundedReceiver<Outbound>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let id = group.join(vec![METADATA_ROLE.to_owned()], sender, 0);
+        (id, receiver)
+    }
+
+    /// Joins a member that both plays and displays metadata and returns its queue.
+    fn add_player_and_metadata(
+        group: &Group,
+        min_buffer_ms: u32,
+        output_delay_ms: u32,
+    ) -> (u64, mpsc::UnboundedReceiver<Outbound>) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let id = group.join(
+            vec![PLAYER_ROLE.to_owned(), METADATA_ROLE.to_owned()],
+            sender,
+            ROOMY,
+        );
         report_timing(group, id, min_buffer_ms, output_delay_ms);
         (id, receiver)
     }
@@ -1689,6 +1729,58 @@ mod tests {
         chunks
     }
 
+    /// Returns every queued message, in order.
+    fn drain_outbound(receiver: &mut mpsc::UnboundedReceiver<Outbound>) -> Vec<Outbound> {
+        let mut outbound = Vec::new();
+        while let Ok(message) = receiver.try_recv() {
+            outbound.push(message);
+        }
+        outbound
+    }
+
+    /// Returns the queued stream lifecycle messages, in order, triggers and plain messages alike.
+    fn stream_messages(receiver: &mut mpsc::UnboundedReceiver<Outbound>) -> Vec<Incoming> {
+        drain_outbound(receiver)
+            .into_iter()
+            .filter_map(|outbound| match outbound {
+                Outbound::Message(message) => Some(*message),
+                Outbound::Trigger { message, .. } => Some(*message),
+                Outbound::Audio { .. } => None,
+            })
+            .filter(|message| {
+                matches!(
+                    message,
+                    Incoming::StreamStart(_) | Incoming::StreamClear(_) | Incoming::StreamEnd(_)
+                )
+            })
+            .collect()
+    }
+
+    /// Returns the metadata states a member was sent, in order.
+    fn drain_metadata(receiver: &mut mpsc::UnboundedReceiver<Outbound>) -> Vec<Metadata> {
+        drain_outbound(receiver)
+            .into_iter()
+            .filter_map(|outbound| match outbound {
+                Outbound::Message(message) => match *message {
+                    Incoming::ServerState(state) => state.metadata,
+                    _ => None,
+                },
+                Outbound::Trigger { .. } | Outbound::Audio { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Returns one member's start floor.
+    fn member_start_at(group: &Group, id: u64) -> i64 {
+        group
+            .lock()
+            .members
+            .iter()
+            .find(|member| member.id == id)
+            .expect("the member")
+            .start_at
+    }
+
     /// Returns the number of chunks one member still accounts for.
     fn sent_len(group: &Group, id: u64) -> usize {
         group
@@ -1720,6 +1812,11 @@ mod tests {
             WriteOutcome::Dropped(WriteError::TooLong)
         );
         assert_eq!(writer.write(&[]), WriteOutcome::Dropped(WriteError::Empty));
+        assert_eq!(
+            writer.write_encoded(&[0u8; 480 * 4], Duration::from_millis(10)),
+            WriteOutcome::Dropped(WriteError::WrongMethod),
+            "PCM audio uses write, not write_encoded"
+        );
     }
 
     #[test]
@@ -1739,6 +1836,57 @@ mod tests {
         assert_eq!(
             writer.write_encoded(&[0u8; 10], Duration::from_millis(10)),
             WriteOutcome::Written
+        );
+        assert_eq!(
+            writer.write_encoded(&[0u8; 10], Duration::from_millis(151)),
+            WriteOutcome::Dropped(WriteError::TooLong),
+            "a supplied playtime past 150 ms is refused too"
+        );
+    }
+
+    #[test]
+    fn a_one_frame_chunk_at_an_absurd_rate_has_no_playtime() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let group = Group::new(
+            "a group".to_owned(),
+            AudioFormat::pcm(u32::MAX, 2, 16),
+            events,
+        )
+        .expect("a group builds");
+        group.open_stream(TrackInfo::default());
+        let next_us = group.lock().stream.as_ref().expect("a stream").next_us;
+        let mut writer = StreamWriter::new(group.clone());
+        assert_eq!(
+            writer.write(&[0u8; 4]),
+            WriteOutcome::Dropped(WriteError::Empty),
+            "one frame at the highest rate truncates to a zero duration"
+        );
+        assert_eq!(
+            group.lock().stream.as_ref().expect("a stream").next_us,
+            next_us,
+            "a chunk without playtime leaves no hole"
+        );
+    }
+
+    #[test]
+    fn a_writer_that_ended_refuses_further_chunks() {
+        let group = test_group();
+        group.open_stream(TrackInfo::default());
+        let mut writer = StreamWriter::new(group.clone());
+        assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
+        writer.end();
+        assert_eq!(
+            writer.write(&[0u8; 480 * 4]),
+            WriteOutcome::Dropped(WriteError::Ended),
+            "the writer reports Ended after end, not Paused"
+        );
+        assert_eq!(
+            writer.write_encoded(&[0u8; 480 * 4], Duration::from_millis(10)),
+            WriteOutcome::Dropped(WriteError::Ended)
+        );
+        assert!(
+            !group.lock().stream.as_ref().expect("a stream").active,
+            "end() makes the stream inactive"
         );
     }
 
@@ -1790,6 +1938,86 @@ mod tests {
             third - second,
             10_000,
             "the accepted chunks stay one chunk apart"
+        );
+    }
+
+    #[test]
+    fn a_stalled_timeline_re_seeds_a_lead_ahead_and_states_it_before_the_audio() {
+        let group = test_group();
+        let (id, mut receiver) = add_player_and_metadata(&group, 0, 0);
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(&mut receiver);
+        group.trigger_sent(id, epoch, anchor, reset, Some(group.now_us() + 500_000));
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        let _ = drain_outbound(&mut receiver);
+
+        // Pretend the host starved the queue: the timeline now lies behind the clock.
+        let now = group.now_us();
+        group.lock().stream.as_mut().expect("a stream").next_us = now - 50_000;
+        let before = group.now_us();
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        let after = group.now_us();
+
+        let outbound = drain_outbound(&mut receiver);
+        let order = outbound
+            .iter()
+            .map(|message| match message {
+                Outbound::Message(message) if matches!(**message, Incoming::ServerState(_)) => {
+                    "state"
+                }
+                Outbound::Audio { .. } => "audio",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            ["state", "audio"],
+            "the state describing the new segment precedes its audio"
+        );
+        let metadata = match &outbound[0] {
+            Outbound::Message(message) => match &**message {
+                Incoming::ServerState(state) => state.metadata.clone().expect("a metadata state"),
+                _ => panic!("expected a server state"),
+            },
+            _ => panic!("expected a server state"),
+        };
+        let chunk = match &outbound[1] {
+            Outbound::Audio { chunk, .. } => chunk,
+            _ => panic!("expected audio"),
+        };
+        let (header, _) = AudioChunkHeader::parse(chunk).expect("a framed chunk");
+        let inner = group.lock();
+        let stream = inner.stream.as_ref().expect("a stream");
+        assert_eq!(header.timestamp_us, stream.start_us);
+        assert_eq!(metadata.timestamp, Some(stream.start_us));
+        assert_eq!(
+            metadata
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.track_progress),
+            Some(10),
+            "the re-seed keeps the position of the next sample"
+        );
+        assert_eq!(
+            metadata
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.playback_speed),
+            Some(1000)
+        );
+        assert_eq!(stream.start_position, Duration::from_millis(10));
+        assert_eq!(stream.next_us, stream.start_us + 10_000);
+        assert!(stream.anchor_us >= before && stream.anchor_us <= after);
+        assert_eq!(
+            stream.start_us,
+            stream.anchor_us.saturating_add(1),
+            "a zero lead still starts one microsecond in the future"
         );
     }
 
@@ -1962,21 +2190,100 @@ mod tests {
 
         let late = group.now_us() + 2_000_000;
         group.trigger_sent(second, epoch, true, true, Some(late));
+        {
+            let inner = group.lock();
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == second)
+                .expect("the second member");
+            assert!(!member.start_gate, "the late report clears the gate");
+            assert_eq!(
+                member.start_at,
+                late + 3_500_000,
+                "the late member keeps its own lead from the trigger's transmit"
+            );
+            assert!(
+                member.start_at > inner.stream.as_ref().expect("a stream").next_us,
+                "its own lead exceeds the shared timeline, at the price of a hole"
+            );
+        }
+
+        // A stale transmit time on a report that joins the running segment falls to the timeline
+        // floor, so the member is never given a past `start_at`.
+        let stale = group.now_us() - 10_000_000;
+        group.trigger_sent(first, epoch, true, true, Some(stale));
         let inner = group.lock();
         let member = inner
             .members
             .iter()
-            .find(|member| member.id == second)
-            .expect("the second member");
-        assert!(!member.start_gate, "the late report clears the gate");
+            .find(|member| member.id == first)
+            .expect("the first member");
+        let next_us = inner.stream.as_ref().expect("a stream").next_us;
         assert_eq!(
-            member.start_at,
-            late + 3_500_000,
-            "the late member keeps its own lead from the trigger's transmit"
+            member.start_at, next_us,
+            "a stale T falls back to the next sample's timestamp"
         );
         assert!(
-            member.start_at > inner.stream.as_ref().expect("a stream").next_us,
-            "its own lead exceeds the shared timeline, at the price of a hole"
+            stale + 100_000 < member.start_at,
+            "the member's own lead would be in the past and cannot be the floor"
+        );
+    }
+
+    #[test]
+    fn held_audio_flushes_at_the_anchor_and_the_bound_is_one_second() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 100, 0);
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(&mut receiver);
+
+        let hundred_ms = vec![0u8; 4800 * 4];
+        for _ in 0..10 {
+            assert_eq!(
+                group.write_audio(&hundred_ms, None),
+                WriteOutcome::Held,
+                "exactly one second fits in the held queue"
+            );
+        }
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Dropped(WriteError::Backpressure),
+            "the new chunk is dropped, not the beginning of the track"
+        );
+
+        let t = group.now_us() + 500_000;
+        group.trigger_sent(id, epoch, anchor, reset, Some(t));
+
+        let chunks = drain_audio(&mut receiver);
+        assert_eq!(chunks.len(), 10, "the refused chunk is not queued");
+        let (first, _) = AudioChunkHeader::parse(&chunks[0].0).expect("a framed chunk");
+        assert_eq!(
+            first.timestamp_us,
+            t + 100_000,
+            "the flush assigns the first timestamp from max(T) + lead"
+        );
+        for (index, (chunk, _)) in chunks.iter().enumerate() {
+            let (header, _) = AudioChunkHeader::parse(chunk).expect("a framed chunk");
+            assert_eq!(
+                header.timestamp_us,
+                first.timestamp_us + 100_000 * index as i64,
+                "the held chunks keep their order and playtime"
+            );
+        }
+        let inner = group.lock();
+        let member = inner
+            .members
+            .iter()
+            .find(|member| member.id == id)
+            .expect("the member");
+        assert_eq!(member.sent.len(), 10);
+        let stream = inner.stream.as_ref().expect("a stream");
+        assert!(stream.held.is_empty(), "the flush empties the held queue");
+        assert_eq!(stream.start_us, first.timestamp_us);
+        assert_eq!(
+            stream.next_us,
+            first.timestamp_us + 1_000_000,
+            "ten held chunks advance the timeline by their playtime"
         );
     }
 
@@ -2082,6 +2389,177 @@ mod tests {
     }
 
     #[test]
+    fn a_seek_clears_as_the_anchor_and_resets_the_count() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 100, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        assert_eq!(sent_len(&group, id), 1);
+        let old_epoch = group.lock().epoch;
+
+        group.seek(Duration::from_secs(30));
+        let (clear, epoch, anchor, reset) = next_trigger(&mut receiver);
+        assert!(matches!(clear, Incoming::StreamClear(_)));
+        assert!(
+            anchor && reset,
+            "a seek's clear restarts the timeline and resets the count"
+        );
+        assert_ne!(epoch, old_epoch, "a seek moves the epoch");
+        assert_eq!(sent_len(&group, id), 1, "the report resets, not the send");
+
+        let t = group.now_us() + 100_000;
+        group.trigger_sent(id, epoch, anchor, reset, Some(t));
+        let inner = group.lock();
+        let member = inner
+            .members
+            .iter()
+            .find(|member| member.id == id)
+            .expect("the member");
+        assert_eq!(member.sent.len(), 0, "the clear's report resets the count");
+        let stream = inner.stream.as_ref().expect("a stream");
+        assert_eq!(stream.start_position, Duration::from_secs(30));
+        assert_eq!(stream.position, Duration::from_secs(30));
+        assert_eq!(stream.next_us, t + 100_000);
+        assert_eq!(stream.start_us, stream.next_us);
+        assert_eq!(stream.anchor_us, t);
+    }
+
+    #[test]
+    fn a_seek_below_the_lead_is_a_scheduled_update_at_the_segment_start() {
+        let group = test_group();
+        let (id, mut receiver) = add_player_and_metadata(&group, 3000, 500);
+        open_stream_reported(&group, id, &mut receiver);
+        let _ = drain_metadata(&mut receiver);
+
+        group.seek(Duration::from_secs(1));
+        let now = group.now_us();
+        let states = drain_metadata(&mut receiver);
+        assert_eq!(states.len(), 1, "a seek reports the new segment once");
+        let (start_us, start_position) = {
+            let inner = group.lock();
+            let stream = inner.stream.as_ref().expect("a stream");
+            (stream.start_us, stream.start_position)
+        };
+        assert_eq!(start_position, Duration::from_secs(1));
+        assert!(
+            start_us > now,
+            "the seek's provisional start is a full lead ahead"
+        );
+        assert_eq!(states[0].timestamp, Some(start_us));
+        assert_eq!(
+            states[0]
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.track_progress),
+            Some(1_000),
+            "a seek below the lead is not clamped to zero"
+        );
+        assert_eq!(
+            states[0]
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.playback_speed),
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn the_first_state_of_a_join_is_past_or_present_and_the_scheduled_one_follows() {
+        let group = test_group();
+        let (first, mut first_rx) = add_player(&group, 100, 0);
+        let (second, mut second_rx) = add_player(&group, 100, 0);
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(&mut first_rx);
+        let _ = next_trigger(&mut second_rx);
+        let t = group.now_us() + 100_000;
+        group.trigger_sent(first, epoch, anchor, reset, Some(t));
+        group.trigger_sent(second, epoch, true, true, Some(t));
+
+        // A seek to 10 s arms a fresh anchor. One member reports a transmit 5 s ahead while the
+        // other stays pending, so the deadline check moves the timeline the join must build on.
+        group.seek(Duration::from_secs(10));
+        let (clear, clear_epoch, clear_anchor, clear_reset) = next_trigger(&mut first_rx);
+        assert!(matches!(clear, Incoming::StreamClear(_)));
+        let _ = next_trigger(&mut second_rx);
+        let future = group.now_us() + 5_000_000;
+        group.trigger_sent(first, clear_epoch, clear_anchor, clear_reset, Some(future));
+        {
+            let mut inner = group.lock();
+            let now = group.now_us();
+            inner
+                .stream
+                .as_mut()
+                .expect("a stream")
+                .anchor
+                .as_mut()
+                .expect("an anchor")
+                .deadline_us = now - 1;
+        }
+
+        let before = group.now_us();
+        let (_metadata, mut receiver) = add_metadata(&group);
+        let after = group.now_us();
+        let states = drain_metadata(&mut receiver);
+        assert_eq!(
+            states.len(),
+            2,
+            "a join sends its state and, during the lead, the scheduled one"
+        );
+        assert!(
+            states[0]
+                .timestamp
+                .is_some_and(|timestamp| (before..=after).contains(&timestamp)),
+            "the first state of a join is dated past or present"
+        );
+        let (start_us, position) = {
+            let inner = group.lock();
+            let stream = inner.stream.as_ref().expect("a stream");
+            assert!(stream.anchor.is_none(), "the due anchor was flushed");
+            (stream.start_us, stream.position)
+        };
+        assert!(start_us > after, "the segment starts a lead ahead");
+        assert_eq!(states[1].timestamp, Some(start_us));
+        assert_eq!(
+            states[1]
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.track_progress),
+            Some(10_000),
+            "the scheduled state carries the seek target"
+        );
+        let first_timestamp = states[0].timestamp.expect("the first state is dated");
+        let heard = position
+            .saturating_sub(Duration::from_micros(
+                u64::try_from(start_us - first_timestamp).unwrap_or_default(),
+            ))
+            .as_millis();
+        assert_eq!(
+            states[0]
+                .progress
+                .as_ref()
+                .and_then(|progress| progress.track_progress),
+            Some(u64::try_from(heard).unwrap_or(u64::MAX)),
+            "the first state is built against the flushed timeline, not the provisional one"
+        );
+        assert!(
+            heard < 9_000,
+            "the pending report moved the timeline well past the provisional start"
+        );
+        for state in &states {
+            assert_eq!(
+                state
+                    .progress
+                    .as_ref()
+                    .and_then(|progress| progress.playback_speed),
+                Some(1000)
+            );
+        }
+    }
+
+    #[test]
     fn a_seek_while_paused_sends_no_clear() {
         let group = test_group();
         let (id, mut receiver) = add_player(&group, 100, 0);
@@ -2149,6 +2627,173 @@ mod tests {
     }
 
     #[test]
+    fn an_anchor_that_loses_every_member_re_leads_from_now() {
+        let group = test_group();
+        let (first, mut first_rx) = add_player(&group, 3000, 500);
+        let (second, mut second_rx) = add_player(&group, 3000, 500);
+        group.open_stream(TrackInfo::default());
+        let _ = next_trigger(&mut first_rx);
+        let _ = next_trigger(&mut second_rx);
+
+        let before = group.now_us();
+        group.leave(first);
+        assert!(
+            group
+                .lock()
+                .stream
+                .as_ref()
+                .expect("a stream")
+                .anchor
+                .is_some(),
+            "one member still waits"
+        );
+        group.leave(second);
+
+        let after = group.now_us();
+        let inner = group.lock();
+        let stream = inner.stream.as_ref().expect("a stream");
+        assert!(inner.members.is_empty());
+        assert!(stream.anchor.is_none(), "the empty pending set flushes");
+        assert!(stream.anchor_us >= before && stream.anchor_us <= after);
+        assert_eq!(
+            stream.next_us,
+            stream.anchor_us.saturating_add(1),
+            "a zero lead still starts one microsecond in the future"
+        );
+    }
+
+    #[test]
+    fn a_report_from_a_non_ready_member_applies_only_its_reset() {
+        let group = test_group();
+        let (first, mut first_rx) = add_player(&group, 100, 0);
+        let (second, mut second_rx) = add_player(&group, 100, 0);
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(&mut first_rx);
+        let (_, second_epoch, second_anchor, second_reset) = next_trigger(&mut second_rx);
+        let t = group.now_us() + 100_000;
+        group.trigger_sent(first, epoch, anchor, reset, Some(t));
+        group.trigger_sent(second, second_epoch, second_anchor, second_reset, Some(t));
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        assert_eq!(sent_len(&group, second), 1);
+
+        group.open_stream(TrackInfo {
+            title: Some("the next track".to_owned()),
+            ..TrackInfo::default()
+        });
+        let jump_epoch = group.lock().epoch;
+        let (clear, clear_epoch, clear_anchor, clear_reset) = next_trigger(&mut first_rx);
+        assert!(matches!(clear, Incoming::StreamClear(_)));
+        assert_eq!(clear_epoch, jump_epoch);
+        assert!(clear_anchor && clear_reset);
+        let (second_clear, second_clear_epoch, ..) = next_trigger(&mut second_rx);
+        assert!(matches!(second_clear, Incoming::StreamClear(_)));
+        assert_eq!(second_clear_epoch, jump_epoch);
+
+        group.report_client_state(
+            second,
+            &ClientState {
+                available: false,
+                player: None,
+            },
+        );
+        let future = group.now_us() + 5_000_000;
+        group.trigger_sent(second, jump_epoch, true, true, Some(future));
+        {
+            let inner = group.lock();
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == second)
+                .expect("the second member");
+            assert_eq!(
+                member.sent.len(),
+                0,
+                "the reset is applied even though the member is not ready"
+            );
+            assert_eq!(member.start_at, 0, "a non-ready report sets no start floor");
+            let held = inner
+                .stream
+                .as_ref()
+                .expect("a stream")
+                .anchor
+                .as_ref()
+                .expect("the ready member still anchors");
+            assert_eq!(held.pending, vec![first]);
+            assert!(
+                held.reported.is_empty(),
+                "the unavailable member's transmit time is not used"
+            );
+        }
+
+        let first_t = group.now_us() + 200_000;
+        group.trigger_sent(first, jump_epoch, true, true, Some(first_t));
+        let inner = group.lock();
+        assert_eq!(
+            inner.stream.as_ref().expect("a stream").next_us,
+            first_t + 100_000,
+            "the anchor uses only the ready member's transmit time"
+        );
+    }
+
+    #[test]
+    fn a_superseded_anchors_old_reports_cannot_anchor_the_next_segment() {
+        let group = test_group();
+        let (first, mut first_rx) = add_player(&group, 100, 0);
+        let (second, mut second_rx) = add_player(&group, 100, 0);
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(&mut first_rx);
+        let _ = next_trigger(&mut second_rx);
+
+        let old_t = group.now_us() + 60_000_000;
+        group.trigger_sent(first, epoch, anchor, reset, Some(old_t));
+        assert!(
+            group
+                .lock()
+                .stream
+                .as_ref()
+                .expect("a stream")
+                .anchor
+                .is_some(),
+            "one report leaves the other member pending, so the old anchor is still armed"
+        );
+
+        group.seek(Duration::from_secs(5));
+        let (clear, seek_epoch, clear_anchor, clear_reset) = next_trigger(&mut first_rx);
+        assert!(matches!(clear, Incoming::StreamClear(_)));
+        let (_, second_epoch, second_anchor, second_reset) = next_trigger(&mut second_rx);
+        assert_eq!(second_epoch, seek_epoch);
+        assert!(clear_anchor && clear_reset && second_anchor && second_reset);
+
+        let now = group.now_us();
+        let first_t = now + 100_000;
+        let second_t = now + 200_000;
+        group.trigger_sent(first, seek_epoch, clear_anchor, clear_reset, Some(first_t));
+        group.trigger_sent(
+            second,
+            second_epoch,
+            second_anchor,
+            second_reset,
+            Some(second_t),
+        );
+
+        let inner = group.lock();
+        let stream = inner.stream.as_ref().expect("a stream");
+        assert_eq!(
+            stream.next_us,
+            second_t + 100_000,
+            "the new segment anchors only on the new reports"
+        );
+        assert_eq!(stream.anchor_us, second_t);
+        assert!(
+            stream.next_us < old_t,
+            "the superseded anchor's transmit time cannot appear in the new segment"
+        );
+    }
+
+    #[test]
     fn a_completed_anchor_makes_the_anchor_check_a_no_op() {
         let group = test_group();
         let (id, mut receiver) = add_player(&group, 100, 0);
@@ -2157,14 +2802,197 @@ mod tests {
         group.trigger_sent(id, epoch, anchor, reset, Some(group.now_us() + 1_000_000));
         let next_us = group.lock().stream.as_ref().expect("a stream").next_us;
 
+        let (_metadata, mut metadata_rx) = add_metadata(&group);
+        let _ = drain_metadata(&mut metadata_rx);
         group.lock().check_anchor_at(group.now_us() + 10_000_000);
-        let inner = group.lock();
-        let stream = inner.stream.as_ref().expect("a stream");
-        assert_eq!(
-            stream.next_us, next_us,
-            "a finished anchor is not re-flushed"
+        {
+            let inner = group.lock();
+            let stream = inner.stream.as_ref().expect("a stream");
+            assert_eq!(
+                stream.next_us, next_us,
+                "a finished anchor is not re-flushed"
+            );
+            assert!(stream.anchor.is_none());
+        }
+        assert!(
+            drain_metadata(&mut metadata_rx).is_empty(),
+            "a finished anchor is not re-flushed as a second state"
         );
-        assert!(stream.anchor.is_none());
+    }
+
+    #[test]
+    fn a_lead_raise_before_the_first_chunk_moves_the_segment_and_resends_one_state() {
+        let group = test_group();
+        let (first, mut first_rx) = add_player(&group, 100, 0);
+        let (second, mut second_rx) = add_player(&group, 100, 0);
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(&mut first_rx);
+        let _ = next_trigger(&mut second_rx);
+        let t = group.now_us() + 500_000;
+        group.trigger_sent(first, epoch, anchor, reset, Some(t));
+        group.trigger_sent(second, epoch, true, true, Some(t));
+        assert_eq!(
+            group.lock().stream.as_ref().expect("a stream").start_us,
+            t + 100_000
+        );
+
+        let (late, mut late_rx) = add_player(&group, 100, 0);
+        let (_, late_epoch, late_anchor, late_reset) = next_trigger(&mut late_rx);
+        assert_eq!(late_epoch, epoch);
+        assert!(
+            !late_anchor && !late_reset,
+            "a late joiner moves no timeline"
+        );
+        let (_metadata, mut metadata_rx) = add_metadata(&group);
+        let _ = drain_outbound(&mut metadata_rx);
+        assert!(!group.lock().stream.as_ref().expect("a stream").wrote_any);
+
+        report_timing(&group, first, 3000, 500);
+        let first_start = {
+            let inner = group.lock();
+            let stream = inner.stream.as_ref().expect("a stream");
+            assert_eq!(stream.anchor_us, t);
+            stream.start_us
+        };
+        assert_eq!(
+            first_start,
+            t + 3_500_000,
+            "the raise re-seeds from the anchor's transmit and the new lead"
+        );
+        let states = drain_metadata(&mut metadata_rx);
+        assert_eq!(
+            states.len(),
+            1,
+            "a raise resends exactly one scheduled state"
+        );
+        assert_eq!(states[0].timestamp, Some(first_start));
+        assert_eq!(member_start_at(&group, late), first_start);
+
+        report_timing(&group, second, 5000, 500);
+        let second_start = group.lock().stream.as_ref().expect("a stream").start_us;
+        assert_eq!(second_start, t + 5_500_000, "a second raise moves it again");
+        let states = drain_metadata(&mut metadata_rx);
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].timestamp, Some(second_start));
+        assert_eq!(member_start_at(&group, late), second_start);
+    }
+
+    #[test]
+    fn a_returning_member_keeps_its_larger_old_start_at_and_gets_no_second_start() {
+        let group = test_group();
+        let (base, mut base_rx) = add_player(&group, 3000, 500);
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(&mut base_rx);
+        let t = group.now_us() + 100_000;
+        group.trigger_sent(base, epoch, anchor, reset, Some(t));
+        let next_us = group.lock().stream.as_ref().expect("a stream").next_us;
+        assert_eq!(next_us, t + 3_500_000);
+
+        let (late, mut late_rx) = add_player_and_metadata(&group, 3000, 500);
+        let joined = drain_outbound(&mut late_rx);
+        assert!(
+            joined.iter().any(|outbound| matches!(
+                outbound,
+                Outbound::Message(message) if matches!(**message, Incoming::ServerState(_))
+            )),
+            "the metadata role's join queued its server/state"
+        );
+        let (late_epoch, late_anchor, late_reset) = joined
+            .iter()
+            .find_map(|outbound| match outbound {
+                Outbound::Trigger {
+                    message,
+                    epoch,
+                    anchor,
+                    reset,
+                } if matches!(**message, Incoming::StreamStart(_)) => {
+                    Some((*epoch, *anchor, *reset))
+                }
+                _ => None,
+            })
+            .expect("the late joiner's start is a trigger");
+        assert_eq!(late_epoch, epoch);
+        assert!(!late_anchor && !late_reset);
+        let late_t = group.now_us() + 1_000_000;
+        group.trigger_sent(late, late_epoch, late_anchor, late_reset, Some(late_t));
+        let own_floor = late_t + 3_500_000;
+        assert_eq!(member_start_at(&group, late), own_floor);
+        assert!(
+            own_floor > next_us,
+            "the late joiner's own lead leaves a hole"
+        );
+
+        group.report_client_state(
+            late,
+            &ClientState {
+                available: false,
+                player: None,
+            },
+        );
+        report_timing(&group, late, 3000, 500);
+        assert_eq!(
+            member_start_at(&group, late),
+            own_floor,
+            "a return never lowers the lead a late joiner already had"
+        );
+        let mut outbound = joined;
+        outbound.extend(drain_outbound(&mut late_rx));
+        let starts = outbound
+            .iter()
+            .filter(|outbound| match outbound {
+                Outbound::Trigger { message, .. } => {
+                    matches!(**message, Incoming::StreamStart(_))
+                }
+                Outbound::Message(message) => matches!(**message, Incoming::StreamStart(_)),
+                Outbound::Audio { .. } => false,
+            })
+            .count();
+        assert_eq!(
+            starts, 1,
+            "the late join was announced once and an announced returning member gets no second start"
+        );
+        let inner = group.lock();
+        let member = inner
+            .members
+            .iter()
+            .find(|member| member.id == late)
+            .expect("the late member");
+        assert!(
+            member.stream_announced,
+            "the announcement survives the absence"
+        );
+    }
+
+    #[test]
+    fn a_member_ready_after_stream_end_gets_no_trigger() {
+        let group = test_group();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let id = group.join(vec![PLAYER_ROLE.to_owned()], sender, ROOMY);
+        group.open_stream(TrackInfo::default());
+        group.end_stream();
+
+        report_timing(&group, id, 100, 0);
+        assert!(
+            stream_messages(&mut receiver).is_empty(),
+            "a member that becomes ready after stream/end waits for the next stream"
+        );
+        assert!(
+            !group
+                .lock()
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member")
+                .stream_announced,
+            "the ended stream was never announced to the member"
+        );
+
+        group.open_stream(TrackInfo::default());
+        let starts = stream_messages(&mut receiver);
+        assert!(
+            matches!(starts.as_slice(), [Incoming::StreamStart(_)]),
+            "the next stream starts the member: {starts:?}"
+        );
     }
 
     #[test]
@@ -2362,6 +3190,19 @@ mod tests {
         let group = test_group();
         let (id, mut receiver) = add_player_with_capacity(&group, 0, 0, 1);
         open_stream_reported(&group, id, &mut receiver);
+        {
+            let inner = group.lock();
+            let member = inner
+                .members
+                .iter()
+                .find(|member| member.id == id)
+                .expect("the member");
+            assert!(
+                !member.start_gate,
+                "the start was reported, so the gate is not why nothing arrives"
+            );
+            assert_eq!(member.start_at, 0, "nor is the member's own start floor");
+        }
 
         for _ in 0..2 {
             assert_eq!(
@@ -2766,6 +3607,61 @@ mod tests {
             sent_len(&group, id),
             0,
             "nothing is added to a member that receives nothing"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_member_misses_a_jumps_start_and_the_next_pause_end() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 100, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        group.report_client_state(
+            id,
+            &ClientState {
+                available: false,
+                player: None,
+            },
+        );
+
+        // A track jump still reaches the announced member with the clear, because it must discard
+        // its buffers, but the unavailable member gets no start for the new stream.
+        group.open_stream(TrackInfo {
+            title: Some("the next track".to_owned()),
+            ..TrackInfo::default()
+        });
+        let jump = stream_messages(&mut receiver);
+        assert_eq!(
+            jump.len(),
+            1,
+            "a jump sends one stream message to the member"
+        );
+        assert!(
+            matches!(jump[0], Incoming::StreamClear(_)),
+            "the announced member is cleared"
+        );
+
+        // The pause ends only the streams the group has announced, and this member lost its
+        // announcement at the jump, so it hears no end for the stream it does not have.
+        group.pause();
+        assert!(
+            stream_messages(&mut receiver).is_empty(),
+            "an unavailable member that lost the announced stream hears no pause end"
+        );
+
+        // The play restart also skips it while it stays unavailable.
+        group.play();
+        assert!(
+            stream_messages(&mut receiver).is_empty(),
+            "the unavailable member gets no start from the play restart"
+        );
+
+        // Its return is what gets the new stream's start.
+        report_timing(&group, id, 100, 0);
+        let returned = stream_messages(&mut receiver);
+        assert_eq!(returned.len(), 1, "the returning member is announced once");
+        assert!(
+            matches!(returned[0], Incoming::StreamStart(_)),
+            "the return gets the new stream's start, not the old track's"
         );
     }
 

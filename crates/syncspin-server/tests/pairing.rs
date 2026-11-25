@@ -607,15 +607,17 @@ async fn an_unapproved_client_gets_no_roles_and_no_audio() -> Result<()> {
             .contains(&"player@v1".to_owned()),
         "the approval activates the player role"
     );
-    client.send_json(&player_state(true, 100, false)).await?;
+    client
+        .send_json(&player_state_with_timing(true, 100, false, 0, 0))
+        .await?;
     let start = client.read_stream_start().await?;
     assert_eq!(
         start.player.expect("the stream carries its format").codec,
         "pcm"
     );
-    // The chunk written before the report was addressed to nobody; the next one reaches the
-    // approved member once its start lead has passed.
-    wait_out_player_lead().await;
+    // The chunk written before the report was addressed to nobody. A zero report lead keeps this
+    // row free of the lead, and the barrier proves the start was reported before the next write.
+    client.barrier(1).await?;
     assert_eq!(writer.write(&[4u8; 480 * 4]), WriteOutcome::Written);
     let (_, audio) = client.read_audio().await?;
     assert_eq!(audio, [4u8; 480 * 4], "the approved client hears the group");
@@ -644,9 +646,12 @@ async fn revoking_an_approval_takes_the_roles_and_the_audio_away() -> Result<()>
         .contains(&"player@v1".to_owned()));
 
     let mut writer = server.open_stream(TrackInfo::default());
-    client.send_json(&player_state(true, 100, false)).await?;
+    client
+        .send_json(&player_state_with_timing(true, 100, false, 0, 0))
+        .await?;
     client.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // A zero report lead and the start's send report leave the write ungated.
+    client.barrier(1).await?;
     assert_eq!(writer.write(&[5u8; 480 * 4]), WriteOutcome::Written);
     let (_, audio) = client.read_audio().await?;
     assert_eq!(

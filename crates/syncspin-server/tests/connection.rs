@@ -386,6 +386,9 @@ async fn a_player_receives_the_stream_with_playout_timestamps() -> Result<()> {
             .contains(&"player@v1".to_owned()),
         "a client that plays the configured format is a player"
     );
+    // The time reply travels after the state report on the same connection, so the member is
+    // ready before the stream opens and anchors the timeline.
+    client.barrier(1).await?;
 
     let mut writer = server.open_stream(TrackInfo {
         title: Some("A title".to_owned()),
@@ -393,7 +396,8 @@ async fn a_player_receives_the_stream_with_playout_timestamps() -> Result<()> {
         ..TrackInfo::default()
     });
     let start = client.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // The reply proves the start's send report, which completes the anchor and clears the gate.
+    client.barrier(2).await?;
     let player = start
         .player
         .expect("an active player stream carries its format");
@@ -693,11 +697,13 @@ async fn a_client_that_never_answers_does_not_stall_the_writer() -> Result<()> {
     client
         .connect_and_activate(&server, Suite::ChaChaPoly)
         .await?;
+    // The time reply travels after the state report, so the member is ready before the stream
+    // opens and anchors the timeline; the anchor is what gives the burst below a fresh timeline.
+    client.barrier(1).await?;
     let mut writer = server.open_stream(TrackInfo::default());
-    // Reading the announcement proves the server processed the state report, so the burst below
-    // has somewhere to go; after it the client reads nothing until the end of the test.
     client.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // The reply proves the start's send report, which completes the anchor before the first write.
+    client.barrier(2).await?;
 
     // The client's socket is not drained while the host pushes: a write only queues the chunk.
     let chunk = [0u8; 480 * 4];
@@ -760,7 +766,7 @@ async fn pausing_ends_the_stream_and_playing_announces_it_again() -> Result<()> 
 
     server.play();
     client.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // The group update is queued after the start; read it before the barrier consumes the stream.
     let group = client
         .read_until(|message| match message {
             Incoming::GroupUpdate(group) => Some(group),
@@ -768,6 +774,8 @@ async fn pausing_ends_the_stream_and_playing_announces_it_again() -> Result<()> 
         })
         .await?;
     assert_eq!(group.playback_state, "playing");
+    // The reply proves the restart's send report, which completes its anchor before the write.
+    client.barrier(1).await?;
 
     // Audio written after the resume goes out again.
     assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
@@ -801,13 +809,19 @@ async fn two_players_receive_the_same_frames() -> Result<()> {
     first
         .connect_and_activate(&server, Suite::ChaChaPoly)
         .await?;
+    // Each time reply proves its state report reached the group, so both members are ready before
+    // the stream opens and anchor its timeline.
+    first.barrier(1).await?;
     let mut second = FakeClient::connect(port).await?;
     second.connect_and_activate(&server, Suite::AesGcm).await?;
+    second.barrier(1).await?;
 
     let mut writer = server.open_stream(TrackInfo::default());
     first.read_stream_start().await?;
     second.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // Both sends are reported before the chunks below, so both members are released by the anchor.
+    first.barrier(2).await?;
+    second.barrier(2).await?;
 
     let chunk = [5u8; 480 * 4];
     assert_eq!(writer.write(&chunk), WriteOutcome::Written);
@@ -859,13 +873,13 @@ async fn the_start_lead_follows_the_reported_timing() -> Result<()> {
         .await?;
     // The time reply travels after the report on the same connection, so the member is ready
     // before the stream opens and anchors the timeline rather than joining late.
-    assert_eq!(client.round_trip_time(1).await?.client_transmitted, 1);
+    client.barrier(1).await?;
 
     let mut writer = server.open_stream(TrackInfo::default());
     let start = client.read_stream_start().await?;
     // The time reply is handled after the start's send report on the same task, so the member's
     // gate is clear before the first write without waiting out the 3.5 s lead.
-    assert_eq!(client.round_trip_time(1).await?.client_transmitted, 1);
+    client.barrier(2).await?;
     assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
     let (header, _payload) = client.read_audio().await?;
     assert!(
@@ -897,14 +911,14 @@ async fn send_ahead_measures_the_transmit_interval_of_a_delayed_chunk() -> Resul
         .send_json(&player_state_with_timing(true, 100, false, 3_000, 500))
         .await?;
     // The time reply travels after the report, so the member is ready before the stream opens.
-    assert_eq!(client.round_trip_time(1).await?.client_transmitted, 1);
+    client.barrier(1).await?;
 
     let lead_us = 3_500_000;
     let mut writer = server.open_stream(TrackInfo::default());
     client.read_stream_start().await?;
     // The time reply proves the start's send report has cleared the member's gate, without
     // waiting out the lead the test is about.
-    assert_eq!(client.round_trip_time(2).await?.client_transmitted, 2);
+    client.barrier(2).await?;
     // Delay the write inside the lead, so the chunk's send time is not the segment's start.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
@@ -947,7 +961,7 @@ async fn a_late_joiner_is_gated_on_its_own_start_and_keeps_the_timeline() -> Res
         .await?;
     // The time reply travels after the state report on the same connection, so the early member
     // is ready before the stream opens and anchors the timeline.
-    assert_eq!(early.round_trip_time(1).await?.client_transmitted, 1);
+    early.barrier(1).await?;
 
     // The late client holds the player role but has not reported its state yet.
     let mut late = FakeClient::connect(port).await?;
@@ -959,6 +973,8 @@ async fn a_late_joiner_is_gated_on_its_own_start_and_keeps_the_timeline() -> Res
     let chunk = [4u8; 480 * 4];
     let mut writer = server.open_stream(TrackInfo::default());
     let early_start = early.read_stream_start().await?;
+    // The reply proves the start's send report, which completes the anchor before the write.
+    early.barrier(2).await?;
     assert_eq!(writer.write(&chunk), WriteOutcome::Written);
     let (opening, _) = early.read_audio().await?;
     assert!(opening.timestamp_us >= early_start.server_transmitted);
@@ -968,7 +984,8 @@ async fn a_late_joiner_is_gated_on_its_own_start_and_keeps_the_timeline() -> Res
     late.send_json(&player_state_with_timing(true, 100, false, 300, 0))
         .await?;
     let late_start = late.read_stream_start().await?;
-    assert_eq!(late.round_trip_time(2).await?.client_transmitted, 2);
+    // The reply proves the late start's report, so its own floor is in force before the write.
+    late.barrier(1).await?;
 
     // The chunk written now is before the late member's floor.
     assert_eq!(writer.write(&[5u8; 480 * 4]), WriteOutcome::Written);
@@ -1018,9 +1035,13 @@ async fn a_chunk_longer_than_150_ms_is_refused() -> Result<()> {
     client
         .connect_and_activate(&server, Suite::ChaChaPoly)
         .await?;
+    // The time reply travels after the state report, so the member is ready before the stream
+    // opens and anchors the timeline.
+    client.barrier(1).await?;
     let mut writer = server.open_stream(TrackInfo::default());
     client.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // The reply proves the start's send report, which completes the anchor before the writes.
+    client.barrier(2).await?;
 
     // 160 ms of 16-bit stereo PCM at 48 kHz: 48 frames per millisecond.
     let too_long = [0u8; 48 * 160 * 4];
@@ -1052,9 +1073,13 @@ async fn a_member_with_no_room_is_skipped_until_its_buffer_drains() -> Result<()
             client_hello_with_capacity(2_000),
         )
         .await?;
+    // The time reply travels after the state report, so the member is ready before the stream
+    // opens and anchors the timeline.
+    client.barrier(1).await?;
     let mut writer = server.open_stream(TrackInfo::default());
     client.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // The reply proves the start's send report, which completes the anchor before the first write.
+    client.barrier(2).await?;
 
     let first = [1u8; 480 * 4];
     assert_eq!(writer.write(&first), WriteOutcome::Written);
@@ -1085,7 +1110,8 @@ async fn a_member_with_no_room_is_skipped_until_its_buffer_drains() -> Result<()
 async fn an_out_of_range_role_value_closes_the_connection() -> Result<()> {
     // The typed decode accepts a `u8` volume and a `u32` timing value, so the protocol's narrower
     // range is checked after it. A wrong-typed active object fails the decode itself.
-    let timing = player_state_with_timing(true, 100, false, 6_000, 0);
+    let timing = player_state_with_timing(true, 100, false, 5_001, 0);
+    let delay = player_state_with_timing(true, 100, false, 100, 5_001);
     let loud = player_state_with_timing(true, 101, false, 100, 0);
     let controller = Incoming::ClientCommand(ClientCommand {
         controller: Some(ControllerCommand {
@@ -1100,6 +1126,7 @@ async fn an_out_of_range_role_value_closes_the_connection() -> Result<()> {
 
     for (case, message) in [
         ("a player timing above the range", timing),
+        ("a player output delay above the range", delay),
         ("a player volume above the range", loud),
         ("a controller volume above the range", controller),
     ] {
@@ -1130,6 +1157,39 @@ async fn an_out_of_range_role_value_closes_the_connection() -> Result<()> {
         left_reason(&mut events).await,
         "protocol error",
         "a wrong-typed value in an active player object must close the connection"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_inclusive_role_range_edges_stay_open() -> Result<()> {
+    // The ranges are bounds, not exclusive limits: 0 and 5000 ms of timing and a volume of 100
+    // are valid, and only a value above one closes the connection.
+    let (server, port, mut events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+
+    for message in [
+        player_state_with_timing(true, 100, false, 0, 5_000),
+        player_state_with_timing(true, 100, false, 5_000, 0),
+        Incoming::ClientCommand(ClientCommand {
+            controller: Some(ControllerCommand {
+                command: "volume".to_owned(),
+                volume: Some(100),
+                ..ControllerCommand::default()
+            }),
+        }),
+    ] {
+        client.send_json(&message).await?;
+    }
+    client.goodbye("shutdown").await?;
+    assert_eq!(
+        left_reason(&mut events).await,
+        "shutdown",
+        "the range bounds themselves stay inside the protocol"
     );
     server.shutdown().await?;
     Ok(())
@@ -1188,11 +1248,17 @@ async fn a_stalled_member_does_not_hold_up_the_other() -> Result<()> {
     moving
         .connect_and_activate(&server, Suite::ChaChaPoly)
         .await?;
+    // Each time reply proves its state report reached the group, so both members are ready before
+    // the stream opens and anchor its timeline.
+    stalled.barrier(1).await?;
+    moving.barrier(1).await?;
 
     let mut writer = server.open_stream(TrackInfo::default());
     stalled.read_stream_start().await?;
     moving.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // Both sends are reported before the burst, so the anchor does not gate the member that reads.
+    stalled.barrier(2).await?;
+    moving.barrier(2).await?;
 
     // `stalled` is not polled from here on. The group queues its frames and keeps serving `moving`,
     // because a write only queues the chunk per member and never waits for a reader.
@@ -1386,9 +1452,14 @@ async fn a_player_hears_nothing_before_it_reports_its_state() -> Result<()> {
     client.expect_no_stream(Duration::from_millis(300)).await?;
 
     // The report is what lets the server announce the stream; what was written before it is gone.
-    client.send_json(&player_state(true, 100, false)).await?;
+    // A zero lead removes the late-joiner floor, so the barrier below is all the wait this row
+    // needs before its write.
+    client
+        .send_json(&player_state_with_timing(true, 100, false, 0, 0))
+        .await?;
     let start = client.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // The reply proves the start's send report, so its floor and gate are in force before the write.
+    client.barrier(1).await?;
     assert_eq!(
         start
             .player
@@ -1415,11 +1486,16 @@ async fn a_member_that_reports_itself_unavailable_receives_no_audio() -> Result<
     let mut here = FakeClient::connect(port).await?;
     here.connect_and_activate(&server, Suite::ChaChaPoly)
         .await?;
+    // Each time reply proves its state report reached the group, so both members anchor the stream.
+    away.barrier(1).await?;
+    here.barrier(1).await?;
 
     let mut writer = server.open_stream(TrackInfo::default());
     away.read_stream_start().await?;
     here.read_stream_start().await?;
-    wait_out_player_lead().await;
+    // Both sends are reported before the first write, so neither member starts gated.
+    away.barrier(2).await?;
+    here.barrier(2).await?;
 
     away.send_json(&player_state(false, 100, false)).await?;
     // A time request travels the same connection and is read after the report, so its reply proves
@@ -1694,6 +1770,64 @@ async fn a_controller_command_pauses_plays_and_stops_the_group() -> Result<()> {
     );
 
     writer.end();
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ending_a_track_sends_an_end_and_the_next_start_opens_a_new_stream() -> Result<()> {
+    let (server, port, _events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+    let mut first = server.open_stream(TrackInfo::default());
+    client.read_stream_start().await?;
+
+    // The host ends the track it played. The group has no queue, so it cannot tell this from a
+    // real stop: the players are told the stream ended before the next one starts (deviation 22).
+    first.end();
+    let mut second = server.open_stream(TrackInfo {
+        title: Some("The next track".to_owned()),
+        ..TrackInfo::default()
+    });
+
+    // The order is the one the host API produces: `stream/end`, then the new `stream/start`. A
+    // `stream/clear` between them would be the track-jump path and would fail this row.
+    let mut stream_messages = Vec::new();
+    while stream_messages.len() < 2 {
+        if let Received::Json(message) = client.next_received().await? {
+            if matches!(
+                message.as_ref(),
+                Incoming::StreamEnd(_) | Incoming::StreamStart(_) | Incoming::StreamClear(_)
+            ) {
+                stream_messages.push(*message);
+            }
+        }
+    }
+    match &stream_messages[0] {
+        Incoming::StreamEnd(end) => assert_eq!(
+            end.roles,
+            Some(vec!["player".to_owned()]),
+            "the first stream message is the end of the old track"
+        ),
+        other => panic!("expected stream/end first, got {other:?}"),
+    }
+    match &stream_messages[1] {
+        Incoming::StreamStart(start) => assert_eq!(
+            start
+                .player
+                .as_ref()
+                .expect("the new stream carries its format")
+                .codec,
+            "pcm",
+            "the second stream message is the new track's start"
+        ),
+        other => panic!("expected stream/start second, got {other:?}"),
+    }
+
+    second.end();
     client.goodbye("shutdown").await?;
     server.shutdown().await?;
     Ok(())
