@@ -1814,29 +1814,56 @@ fn stamp_send_ahead(chunk: &mut [u8], now_us: i64) {
 ///
 /// A role object belongs to the role named in its envelope: `player` to `player@v1` and
 /// `controller` to `controller@v1`. `messaging.md` leaves an inactive role's object unvalidated,
-/// so it is removed before the typed decode; a wrong-typed value there must not close the
-/// connection. An active object stays and is decoded and range-checked like any other message.
+/// so it is dropped from the decoded message and a wrong-typed value there must not close the
+/// connection. An active object stays and is range-checked like any other message.
+///
+/// The frame is decoded once. Only a frame the typed decode refuses takes the second path, which
+/// removes an inactive role object from the document and decodes again. A repeated key inside an
+/// active role object is an error here, as it already was for every other message type.
 fn parse_report(text: &str, roles: &[String]) -> Result<Option<Incoming>, DecodeError> {
-    let mut document: serde_json::Value =
-        serde_json::from_str(text).map_err(DecodeError::Malformed)?;
-    let (role, name) = match document.get("type").and_then(serde_json::Value::as_str) {
-        Some("client/state") => (PLAYER_ROLE, "player"),
-        Some("client/command") => (CONTROLLER_ROLE, "controller"),
-        // Every other message keeps the classification `Incoming::parse` gives it, including the
-        // unknown type a later revision may send and this one must ignore.
-        _ => return Incoming::parse(text),
-    };
-    if !roles.iter().any(|active| active == role) {
-        if let Some(payload) = document
-            .get_mut("payload")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            payload.remove(name);
+    let active = |role: &str| roles.iter().any(|held| held == role);
+    match Incoming::parse(text) {
+        Ok(Some(Incoming::ClientState(mut state))) => {
+            if !active(PLAYER_ROLE) {
+                state.player = None;
+            }
+            Ok(Some(Incoming::ClientState(state)))
         }
+        Ok(Some(Incoming::ClientCommand(mut command))) => {
+            if !active(CONTROLLER_ROLE) {
+                command.controller = None;
+            }
+            Ok(Some(Incoming::ClientCommand(command)))
+        }
+        Ok(other) => Ok(other),
+        Err(error) => reparse_without_inactive_role(text, &active).unwrap_or(Err(error)),
     }
-    serde_json::from_value(document)
-        .map(Some)
-        .map_err(DecodeError::Malformed)
+}
+
+/// Decodes a `client/state` or `client/command` again after removing the role object of an
+/// inactive role, or returns `None` when the frame is neither or has no such object to remove.
+fn reparse_without_inactive_role(
+    text: &str,
+    active: &dyn Fn(&str) -> bool,
+) -> Option<Result<Option<Incoming>, DecodeError>> {
+    let mut document: serde_json::Value = serde_json::from_str(text).ok()?;
+    let (role, name) = match document.get("type").and_then(serde_json::Value::as_str)? {
+        "client/state" => (PLAYER_ROLE, "player"),
+        "client/command" => (CONTROLLER_ROLE, "controller"),
+        _ => return None,
+    };
+    if active(role) {
+        return None;
+    }
+    document
+        .get_mut("payload")
+        .and_then(serde_json::Value::as_object_mut)?
+        .remove(name)?;
+    Some(
+        serde_json::from_value(document)
+            .map(Some)
+            .map_err(DecodeError::Malformed),
+    )
 }
 
 /// Whether the bounded values of an active role object are inside the protocol's ranges.
@@ -2170,6 +2197,39 @@ mod tests {
             }
             other => panic!("expected client/state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_well_typed_inactive_object_is_dropped_and_never_range_checked() {
+        let roles = vec![METADATA_ROLE.to_owned()];
+        let state = r#"{"type":"client/state","payload":{"available":true,
+            "player":{"volume":101,"muted":false,"output_delay_ms":9000,
+                      "required_lead_time_ms":200,"min_buffer_ms":6000}}}"#;
+        let message = parse_report(state, &roles)
+            .expect("the frame decodes")
+            .expect("client/state is a known message");
+        assert!(
+            report_values_in_range(&message),
+            "an inactive role's out-of-range values are not validated"
+        );
+        assert!(matches!(&message, Incoming::ClientState(s) if s.player.is_none()));
+
+        let command = r#"{"type":"client/command","payload":{"controller":
+            {"command":"volume","volume":101}}}"#;
+        let message = parse_report(command, &roles)
+            .expect("the frame decodes")
+            .expect("client/command is a known message");
+        assert!(report_values_in_range(&message));
+        assert!(matches!(&message, Incoming::ClientCommand(c) if c.controller.is_none()));
+
+        assert!(parse_report("not json", &roles).is_err());
+        assert!(parse_report("[1, 2]", &roles).is_err());
+        assert!(
+            parse_report(r#"{"type":"client/future","payload":{}}"#, &roles)
+                .expect("an unknown type is not an error")
+                .is_none(),
+            "an unknown type is ignored as before"
+        );
     }
 
     #[test]

@@ -222,7 +222,8 @@ impl ServerConfig {
 /// The stream carries the lifecycle of a connection and of the stream, not its content: a client is
 /// reported once it has said who it is, again once the server has decided its roles, and once when
 /// it leaves; a stream is reported when it starts and when it ends, whoever ended it. Pairing is
-/// reported when the operator has something to do and when a record is stored.
+/// reported when the operator has something to do and when a record is stored. One delivery report
+/// completes it: held audio some player did not get at an anchor flush.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
@@ -317,6 +318,16 @@ pub enum Event {
     StreamStarted,
     /// The stream ended: by the host, or because the group paused or stopped.
     StreamEnded,
+    /// Held audio was flushed at an anchor and some player did not get all of it.
+    ///
+    /// [`WriteOutcome::Held`] promised nothing about a player, and the flush is where each held
+    /// chunk meets the player's `buffer_capacity` and start gate. `chunks` is how many of the
+    /// flushed chunks at least one streaming player skipped: those players hear a hole while the
+    /// group timeline moves on. Emitted once per flush that skipped something.
+    HeldAudioSkipped {
+        /// Number of flushed chunks that at least one streaming player did not receive.
+        chunks: usize,
+    },
 }
 
 /// The receiving end of a server's [`Event`] stream.

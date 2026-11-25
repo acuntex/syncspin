@@ -278,6 +278,9 @@ struct Stream {
     anchor_us: i64,
     /// Whether a chunk has been assigned a timestamp since the last restart.
     wrote_any: bool,
+    /// The sub-microsecond remainder of the PCM playtime written so far, in units of
+    /// `1 / sample_rate` microseconds, so chunk durations add up without a rounding drift.
+    pcm_carry: u64,
     /// The ready members whose trigger reports the anchor still waits for.
     anchor: Option<Anchor>,
     /// Host payloads held until the anchor completes.
@@ -324,6 +327,8 @@ struct Inner {
     next_member_id: u64,
     /// Increments on every superseding restart or stop.
     epoch: u64,
+    /// The host's event stream, for what only a flush under the lock can tell it.
+    events: mpsc::UnboundedSender<Event>,
 }
 
 /// The group of one server.
@@ -352,7 +357,7 @@ impl Group {
         let runtime = Handle::try_current().ok();
         Ok(Arc::new_cyclic(|me| Group {
             clock: Clock::new(),
-            events,
+            events: events.clone(),
             runtime,
             me: me.clone(),
             inner: Mutex::new(Inner {
@@ -366,6 +371,7 @@ impl Group {
                 stream: None,
                 next_member_id: 0,
                 epoch: 0,
+                events,
             }),
         }))
     }
@@ -701,6 +707,7 @@ impl Group {
             start_position: Duration::ZERO,
             anchor_us: now,
             wrote_any: false,
+            pcm_carry: 0,
             anchor: None,
             held: VecDeque::new(),
         });
@@ -745,12 +752,18 @@ impl Group {
             return WriteOutcome::Dropped(WriteError::Empty);
         }
         let format = inner.format.clone();
+        let mut next_carry = None;
         let duration = match (&format.codec, duration) {
             (Codec::Pcm, None) => {
                 if bytes.len() % format.frame_bytes() != 0 {
                     return WriteOutcome::Dropped(WriteError::Incomplete);
                 }
-                format.duration(bytes.len())
+                // The remainder is only kept once the chunk is accepted, so a refused chunk that
+                // the host writes again does not move the timeline by its fraction each time.
+                let mut carry = inner.stream.as_ref().map_or(0, |stream| stream.pcm_carry);
+                let duration = format.duration_carrying(bytes.len(), &mut carry);
+                next_carry = Some(carry);
+                duration
             }
             (Codec::Pcm, Some(_)) => return WriteOutcome::Dropped(WriteError::WrongMethod),
             (_, None) => return WriteOutcome::Dropped(WriteError::WrongMethod),
@@ -792,7 +805,8 @@ impl Group {
                 // seen `Held`. The queue is therefore also bounded by the framed bytes the
                 // smallest ready player that can take a chunk. The first chunk is always accepted.
                 // A player that joins during the anchor with less room, or is gated at its
-                // deadline, can still miss held chunks at the flush; that skip is not reported.
+                // deadline, can still miss held chunks at the flush; `Event::HeldAudioSkipped`
+                // reports that.
                 let framed = |len: usize| {
                     u64::try_from(len.saturating_add(AudioChunkHeader::LEN)).unwrap_or(u64::MAX)
                 };
@@ -806,8 +820,14 @@ impl Group {
                         return WriteOutcome::Dropped(WriteError::Backpressure);
                     }
                 }
+                if let Some(carry) = next_carry {
+                    stream.pcm_carry = carry;
+                }
                 stream.held.push_back((bytes.to_vec(), duration));
                 return WriteOutcome::Held;
+            }
+            if let Some(carry) = next_carry {
+                stream.pcm_carry = carry;
             }
             if stream.next_us < now {
                 let old_next = stream.next_us;
@@ -1571,9 +1591,22 @@ impl Inner {
             .as_mut()
             .map(|stream| stream.held.drain(..).collect::<Vec<_>>())
             .unwrap_or_default();
+        let mut skipped_chunks = 0;
         for (payload, duration) in held {
             // The flush assigns each held chunk's timestamp now, never provisionally.
-            let _ = self.assign_and_send(&payload, duration, now_us);
+            if matches!(
+                self.assign_and_send(&payload, duration, now_us),
+                WriteOutcome::Partial { .. }
+            ) {
+                skipped_chunks += 1;
+            }
+        }
+        if skipped_chunks > 0 {
+            // The host was told `Held` for these chunks, so the flush is where it can still learn
+            // that some player did not get them.
+            let _ = self.events.send(Event::HeldAudioSkipped {
+                chunks: skipped_chunks,
+            });
         }
     }
 
@@ -2407,6 +2440,82 @@ mod tests {
             1,
             "the reset drops what preceded the clear and counts what follows it"
         );
+    }
+
+    #[test]
+    fn the_timeline_follows_the_sample_count_at_a_rate_that_does_not_divide_a_chunk() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let group = Group::new("g".into(), AudioFormat::pcm(44_100, 2, 16), events)
+            .expect("a group builds");
+        let (id, mut receiver) = add_player(&group, 0, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        let start = group.lock().stream.as_ref().expect("a stream").next_us;
+
+        let chunk = [0u8; 480 * 4];
+        for _ in 0..1_000 {
+            let _ = group.write_audio(&chunk, None);
+        }
+        let end = group.lock().stream.as_ref().expect("a stream").next_us;
+        assert_eq!(
+            end - start,
+            480_000 * 1_000_000 / 44_100,
+            "a thousand 480-frame chunks span the exact playtime of 480 000 frames"
+        );
+    }
+
+    #[test]
+    fn a_refused_chunk_does_not_move_the_pcm_remainder() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let group = Group::new("g".into(), AudioFormat::pcm(44_100, 2, 16), events)
+            .expect("a group builds");
+        let (id, mut receiver) = add_player(&group, 0, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        group.pause();
+
+        // A paused stream refuses the chunk; retrying must not accumulate its fraction.
+        for _ in 0..1_000 {
+            assert_eq!(
+                group.write_audio(&[0u8; 480 * 4], None),
+                WriteOutcome::Dropped(WriteError::Paused)
+            );
+        }
+        assert_eq!(
+            group.lock().stream.as_ref().expect("a stream").pcm_carry,
+            0,
+            "refused chunks leave the carry where it was"
+        );
+    }
+
+    #[test]
+    fn a_flush_that_skips_a_player_is_reported_as_an_event() {
+        let (events, mut event_receiver) = mpsc::unbounded_channel();
+        let group = Group::new("g".into(), AudioFormat::pcm(48_000, 2, 16), events)
+            .expect("a group builds");
+        let (first, mut first_receiver) = add_player(&group, 0, 0);
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(&mut first_receiver);
+        let chunk = [0u8; 480 * 4];
+        for _ in 0..3 {
+            assert_eq!(group.write_audio(&chunk, None), WriteOutcome::Held);
+        }
+        // A player that joins during the anchor is pending, and one that has not reported by the
+        // deadline stays gated, so the flush does not feed it the held chunks.
+        let (_second, _second_receiver) = add_player(&group, 0, 0);
+        while event_receiver.try_recv().is_ok() {}
+
+        group.trigger_sent(first, epoch, anchor, reset, Some(group.now_us() + 100_000));
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "the anchor still waits for the second player"
+        );
+        let deadline = group.now_us() + 2_000_000;
+        group.lock().check_anchor_at(deadline);
+        assert_eq!(
+            event_receiver.try_recv(),
+            Ok(Event::HeldAudioSkipped { chunks: 3 }),
+            "the host learns that the held chunks did not reach every player"
+        );
+        assert_eq!(drain_audio(&mut first_receiver).len(), 3);
     }
 
     #[test]
@@ -3324,6 +3433,7 @@ mod tests {
             start_position: Duration::ZERO,
             anchor_us: 0,
             wrote_any: true,
+            pcm_carry: 0,
             anchor: None,
             held: VecDeque::new(),
         };

@@ -182,6 +182,10 @@ impl AudioFormat {
     /// map over the announced sample rate, channel count and bit depth, which is wrong for the
     /// shorter byte stream of `opus` or a variable-rate FLAC. A host streaming one calls
     /// [`StreamWriter::write_encoded`] with the playtime its decoder reports.
+    ///
+    /// The writer path uses [`AudioFormat::duration_carrying`], which keeps the remainder this
+    /// per-chunk map floors away; this one states the nominal map the tests compare against.
+    #[cfg(test)]
     pub(crate) fn duration(&self, bytes: usize) -> Duration {
         let frames = bytes / self.frame_bytes();
         if self.sample_rate == 0 {
@@ -189,6 +193,26 @@ impl AudioFormat {
         }
         let micros = (frames as u64).saturating_mul(1_000_000) / u64::from(self.sample_rate);
         Duration::from_micros(micros)
+    }
+
+    /// Returns the playtime of PCM `bytes`, carrying the sub-microsecond remainder from chunk to
+    /// chunk.
+    ///
+    /// [`AudioFormat::duration`] floors every chunk to whole microseconds, which at 44.1 kHz drops
+    /// about a third of a microsecond per 10 ms chunk and lets the timeline fall behind the sample
+    /// count by roughly 115 ms an hour. `carry` holds the remainder in units of `1 / sample_rate`
+    /// microseconds, so the sum of the returned durations never trails the exact playtime of the
+    /// frames written by more than one microsecond.
+    pub(crate) fn duration_carrying(&self, bytes: usize, carry: &mut u64) -> Duration {
+        if self.sample_rate == 0 {
+            return Duration::ZERO;
+        }
+        let frames = (bytes / self.frame_bytes()) as u64;
+        let rate = u64::from(self.sample_rate);
+        let total = u128::from(frames) * 1_000_000 + u128::from(*carry);
+        let micros = total / u128::from(rate);
+        *carry = u64::try_from(total % u128::from(rate)).unwrap_or(0);
+        Duration::from_micros(u64::try_from(micros).unwrap_or(u64::MAX))
     }
 
     /// Returns the bytes of one interleaved frame at the nominal sample width.
@@ -283,7 +307,8 @@ pub enum WriteOutcome {
     /// The chunk is held until the group has anchored the start of the stream. A held chunk can
     /// still be lost: a seek, pause, stop, end or restart before the anchor flushes discards it,
     /// and a player that cannot take it at the flush (it joined with less room, or was gated at
-    /// the deadline) is skipped. The host is not told again in either case.
+    /// the deadline) is skipped; [`crate::Event::HeldAudioSkipped`] reports that. A chunk lost to a
+    /// supersede is not reported again.
     Held,
     /// The chunk was refused; the error names the reason. The server never retries a
     /// refused chunk. None of them moved the timeline, but only [`WriteError::Backpressure`] is
@@ -461,6 +486,28 @@ mod tests {
             format.duration(3),
             Duration::ZERO,
             "a partial frame has no playtime"
+        );
+    }
+
+    #[test]
+    fn the_carried_playtime_does_not_drift_from_the_sample_count() {
+        // 480 frames at 44.1 kHz are 10 884.35... us: flooring each chunk loses 0.35 us.
+        let format = AudioFormat::pcm(44_100, 2, 16);
+        let mut carry = 0;
+        let mut total = Duration::ZERO;
+        for _ in 0..1_000 {
+            total += format.duration_carrying(480 * 4, &mut carry);
+        }
+        let exact_us = 480_000u64 * 1_000_000 / 44_100;
+        assert_eq!(
+            total,
+            Duration::from_micros(exact_us),
+            "a thousand chunks add up to the exact playtime of their frames"
+        );
+        let floored: Duration = (0..1_000).map(|_| format.duration(480 * 4)).sum();
+        assert!(
+            floored < total - Duration::from_micros(300),
+            "the per-chunk floor the carry replaces falls behind"
         );
     }
 
