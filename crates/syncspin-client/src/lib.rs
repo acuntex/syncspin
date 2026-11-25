@@ -88,6 +88,11 @@
 //! its server timestamp, with its position, duration and playback speed. The end and clear events arrive before the client
 //! discards or flushes the buffered audio, so the host can mute, stop or restart its output first.
 //!
+//! The roles are cargo features: `player`, `controller` and `metadata` are on by default, and
+//! `artwork` and `color` are off. `Event::Track` and `Event::Color` are delivered at their server
+//! timestamp, and `Event::Artwork` carries the encoded image for a channel the host configured in
+//! `ClientConfig::artwork_channels`, bounded by `ClientConfig::max_artwork_bytes`.
+//!
 //! A host with no audio output uses [`connect_headless`] instead: the client then has no sink, does
 //! not offer the `player@v1` role and reports no player state, and it starts its first
 //! `client/state` and its clock as soon as the server activates a role.

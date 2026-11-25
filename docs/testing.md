@@ -554,9 +554,11 @@ nothing answers.
    finds, so a LAN with several players exercises the first one only. Neither example keeps state,
    and the player's working directory still gets an identity and pairing store.
 
-## Manual Music Assistant check for the metadata role (not yet performed)
+## Manual Music Assistant check for metadata, artwork and color (not yet performed)
 
-The scheduled metadata delivery, `Event::TrackCleared` and the role-removal handling are covered by
-the fake-server suites only. Nothing in this series was run against a live Music Assistant server.
-A manual run has to connect a client with the metadata role, change tracks with a scheduled update
+The scheduled metadata delivery, `Event::TrackCleared`, the artwork transfer and the color delivery
+are covered by the fake-server suites only. The role files were read from the specification at the
+commit named in `docs/spec-deviations.md`, and the behaviour of Music Assistant's artwork and color
+senders (which legacy forms it may still use) is unverified. Nothing in this series was run against a live Music Assistant server.
+A manual run has to connect a client with the metadata, artwork and color roles, change tracks with a scheduled update
 pending and compare the moment of `Event::Track` with the audible change. It has not been done.
