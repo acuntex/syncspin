@@ -2,8 +2,9 @@
 //!
 //! The host owns the queue and the decoder, the server owns the clock and the wire. A host calls
 //! [`ServerHandle::open_stream`](crate::ServerHandle::open_stream), pushes bytes with
-//! [`StreamWriter::write`] and the server stamps every chunk with the server-clock timestamp of its
-//! first sample and fans it out to the players of the group.
+//! [`StreamWriter::write`] for PCM or [`StreamWriter::write_encoded`] for a format whose playtime
+//! only the decoder knows, and the server stamps every chunk with the server-clock timestamp of
+//! its first sample and fans it out to the players of the group.
 //!
 //! Nothing here decodes. Bytes arrive exactly as the host produced them and leave the same way, so
 //! the format is the host's statement about what those bytes are, not something the server checks.
@@ -173,22 +174,53 @@ impl AudioFormat {
         }
     }
 
-    /// Returns the playtime of `bytes` of this format.
+    /// Returns the playtime of `bytes` of this format at the nominal byte rate.
     ///
     /// For [`Codec::Pcm`] the value is exact: whole interleaved frames at the announced width and
-    /// rate, with a trailing partial frame counting as nothing. The server does not decode, so a
-    /// compressed codec reuses the same map over the announced sample rate, channel count and bit
-    /// depth; a host streaming one must therefore keep its chunks at the nominal byte rate this
-    /// implies, which holds for a constant-bitrate codec and not for `opus` or a variable-rate
-    /// FLAC stream. A duration hint on [`StreamWriter::write`] is the fix when a host needs one.
+    /// rate. [`StreamWriter::write`] refuses a trailing partial frame, so only whole frames reach
+    /// this map from that path. The server does not decode, so a compressed codec reuses the same
+    /// map over the announced sample rate, channel count and bit depth, which is wrong for the
+    /// shorter byte stream of `opus` or a variable-rate FLAC. A host streaming one calls
+    /// [`StreamWriter::write_encoded`] with the playtime its decoder reports.
+    ///
+    /// The writer path uses [`AudioFormat::duration_carrying`], which keeps the remainder this
+    /// per-chunk map floors away; this one states the nominal map the tests compare against.
+    #[cfg(test)]
     pub(crate) fn duration(&self, bytes: usize) -> Duration {
-        let sample_bytes = usize::from(self.channels) * usize::from(self.bit_depth / 8).max(1);
-        let frames = bytes / sample_bytes;
+        let frames = bytes / self.frame_bytes();
         if self.sample_rate == 0 {
             return Duration::ZERO;
         }
         let micros = (frames as u64).saturating_mul(1_000_000) / u64::from(self.sample_rate);
         Duration::from_micros(micros)
+    }
+
+    /// Returns the playtime of PCM `bytes`, carrying the sub-microsecond remainder from chunk to
+    /// chunk.
+    ///
+    /// [`AudioFormat::duration`] floors every chunk to whole microseconds, which at 44.1 kHz drops
+    /// about a third of a microsecond per 10 ms chunk and lets the timeline fall behind the sample
+    /// count by roughly 115 ms an hour. `carry` holds the remainder in units of `1 / sample_rate`
+    /// microseconds, so the sum of the returned durations never trails the exact playtime of the
+    /// frames written by more than one microsecond.
+    pub(crate) fn duration_carrying(&self, bytes: usize, carry: &mut u64) -> Duration {
+        if self.sample_rate == 0 {
+            return Duration::ZERO;
+        }
+        let frames = (bytes / self.frame_bytes()) as u64;
+        let rate = u64::from(self.sample_rate);
+        let total = u128::from(frames) * 1_000_000 + u128::from(*carry);
+        let micros = total / u128::from(rate);
+        *carry = u64::try_from(total % u128::from(rate)).unwrap_or(0);
+        Duration::from_micros(u64::try_from(micros).unwrap_or(u64::MAX))
+    }
+
+    /// Returns the bytes of one interleaved frame at the nominal sample width.
+    ///
+    /// The width is at least one byte per sample, and [`AudioFormat::validate`] rejects a format
+    /// with no channels, so this is never zero for a format a stream may announce.
+    pub(crate) fn frame_bytes(&self) -> usize {
+        usize::from(self.channels) * usize::from(self.bit_depth / 8).max(1)
     }
 
     /// Rejects a format the server cannot schedule a stream for.
@@ -231,11 +263,16 @@ impl fmt::Display for AudioFormat {
     }
 }
 
+/// The longest title, artist, album artist or album the metadata role allows, in UTF-8 bytes.
+pub(crate) const MAX_METADATA_TEXT_BYTES: usize = 255;
+
 /// The track a stream carries.
 ///
 /// Every field is optional: the server forwards what the host knows and leaves the rest absent,
 /// so a client shows what exists instead of an empty string. `duration` of `None` means the
-/// length is unknown, which a live stream reports as `0` in the metadata state.
+/// length is unknown, which a live stream reports as `0` in the metadata state. The metadata role
+/// allows at most 255 UTF-8 bytes per text field, so a longer one is cut at the last character
+/// boundary that fits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrackInfo {
     /// Track title.
@@ -250,6 +287,111 @@ pub struct TrackInfo {
     pub duration: Option<Duration>,
 }
 
+impl TrackInfo {
+    /// Returns the track with every text field cut to the metadata role's byte limit.
+    pub(crate) fn limited(mut self) -> TrackInfo {
+        for text in [
+            &mut self.title,
+            &mut self.artist,
+            &mut self.album_artist,
+            &mut self.album,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            truncate_utf8(text, MAX_METADATA_TEXT_BYTES);
+        }
+        self
+    }
+}
+
+/// Cuts `text` to at most `max` bytes at the last character boundary that fits.
+fn truncate_utf8(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+/// What became of one chunk a host wrote.
+///
+/// A host that treats every write as accepted loses audio without noticing: the server refuses a
+/// chunk it cannot schedule, holds one whose stream is not anchored yet and skips a player that
+/// has no room. The outcome says which happened, and a [`WriteOutcome::Dropped`] chunk is not
+/// retried, because resending audio is worse than losing it.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WriteOutcome {
+    /// The chunk was assigned a timestamp and handed to every player that streams, or no player
+    /// was streaming to hand it to.
+    Written,
+    /// The chunk was assigned a timestamp, but at least one streaming player did not get it:
+    /// `skipped` of them are gated on their own start, still ahead of this chunk, or out of
+    /// `buffer_capacity`. Those players hear a hole while the group timeline moves on. The count
+    /// does not say why: a late joiner's start gate passes by itself, while a full buffer is the
+    /// case a host that decodes faster than real time can act on by pacing its writes.
+    Partial {
+        /// How many streaming players were skipped for this chunk.
+        skipped: usize,
+    },
+    /// The chunk is held until the group has anchored the start of the stream. A held chunk can
+    /// still be lost: a seek, pause, stop, end or restart before the anchor flushes discards it,
+    /// and a player that cannot take it at the flush (it joined with less room, or was gated at
+    /// the deadline) is skipped; [`crate::Event::HeldAudioSkipped`] reports that. A chunk lost to a
+    /// supersede is not reported again.
+    Held,
+    /// The chunk was refused; the error names the reason. The server never retries a
+    /// refused chunk. None of them moved the timeline, but only [`WriteError::Backpressure`] is
+    /// transient: the host may write the same chunk again once the anchor has flushed.
+    Dropped(WriteError),
+}
+
+/// Why the server refused a chunk.
+///
+/// The variants describe the chunk and the stream, never its audio: a host may log one without
+/// exposing what it was playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WriteError {
+    /// The chunk is empty or has no playtime.
+    Empty,
+    /// A PCM chunk does not contain a whole number of interleaved frames.
+    Incomplete,
+    /// The chunk is longer than the 150 ms a player must be able to buffer.
+    TooLong,
+    /// The queue of audio held for an anchor is full, either of one second of audio or of the
+    /// framed bytes the smallest ready player can buffer, so the new chunk was dropped.
+    Backpressure,
+    /// The stream is open but not running: the group paused, stopped or ended it.
+    Paused,
+    /// The stream has ended, or none was open when the chunk was written.
+    Ended,
+    /// The chunk was written with the method its format does not use.
+    WrongMethod,
+}
+
+impl fmt::Display for WriteError {
+    /// Names the reason without exposing the audio.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "the chunk is empty or has no playtime",
+            Self::Incomplete => "a PCM chunk must contain whole interleaved frames",
+            Self::TooLong => "the chunk is longer than the 150 ms a player must buffer",
+            Self::Backpressure => "the queue of held audio is full",
+            Self::Paused => "the stream is paused",
+            Self::Ended => "the stream has ended",
+            Self::WrongMethod => "the chunk was written with the wrong method for its format",
+        })
+    }
+}
+
+impl std::error::Error for WriteError {}
+
 /// The host's handle on one stream.
 ///
 /// [`ServerHandle::open_stream`](crate::ServerHandle::open_stream) returns it; every call applies to
@@ -258,11 +400,16 @@ pub struct TrackInfo {
 /// timeline and the playout timestamps.
 ///
 /// Calls are synchronous and never wait for a client. A write only queues the chunk for the
-/// connection tasks, so a client that has stopped reading cannot hold the host up; the price is that
-/// its queue grows, which is the backpressure question the next milestone answers.
+/// connection tasks, so a client that has stopped reading cannot hold the host up; the audio
+/// outstanding to a member is bounded by the `buffer_capacity` it announced, and a chunk that
+/// would overrun it is skipped rather than queued.
 ///
 /// Dropping the writer without [`StreamWriter::end`] ends the stream, so a host that returns early
 /// does not leave a stream running that it can no longer feed.
+///
+/// The writer must not outlive the Tokio runtime that started the server either: a restart that
+/// anchors a ready member arms a deadline timer on that runtime, and a timer spawned after the
+/// runtime has shut down never runs. The anchor then waits for the next write or report to flush it.
 #[derive(Debug)]
 pub struct StreamWriter {
     group: Arc<Group>,
@@ -278,25 +425,47 @@ impl StreamWriter {
         }
     }
 
-    /// Sends one chunk of audio.
+    /// Sends one chunk of PCM audio.
     ///
-    /// The chunk must carry whole codec units as the negotiated format defines them: for `pcm`
-    /// any whole number of interleaved frames, for `flac` one or more complete FLAC frames, for
-    /// `opus` exactly one packet. The server derives the playtime of the chunk from the format, so
-    /// a chunk that crosses a codec boundary shifts every later timestamp.
+    /// The chunk must carry a whole number of interleaved frames, as the negotiated format defines
+    /// them; a partial frame is refused instead of shifting every later timestamp by the playtime
+    /// of a frame the client cannot decode. [`StreamWriter::write_encoded`] is the call for a
+    /// compressed format, where the server cannot derive the playtime from the byte count.
     ///
-    /// Bytes are dropped, without an error the host could act on, while the group is paused or the
-    /// stream has ended: there is no timeline to put them on until playback resumes, and resending
-    /// audio is worse than losing it.
-    pub fn write(&mut self, bytes: &[u8]) {
-        self.group.write_audio(bytes);
+    /// The returned [`WriteOutcome`] says what happened: `Written` when the chunk got a timestamp
+    /// and reached every streaming player, `Partial` when some were skipped, `Held` while the
+    /// group anchors the start of the stream, `Dropped` with the reason otherwise.
+    /// A dropped chunk is not queued for retry: bytes written to a paused or ended stream have no
+    /// timeline to land on, and resending audio is worse than losing it.
+    pub fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
+        if self.ended {
+            return WriteOutcome::Dropped(WriteError::Ended);
+        }
+        self.group.write_audio(bytes, None)
+    }
+
+    /// Sends one chunk of encoded audio with the playtime the host decoded.
+    ///
+    /// The server cannot derive the playtime of a compressed chunk from its byte count, so the host
+    /// supplies it; the timeline and the player buffering follow that value. The chunk must be one
+    /// whole codec unit - one FLAC frame or one Opus packet, as the format states - which the server
+    /// cannot check and therefore trusts. A PCM format uses [`StreamWriter::write`] instead, and the
+    /// outcome is the same [`WriteOutcome`].
+    pub fn write_encoded(&mut self, bytes: &[u8], duration: Duration) -> WriteOutcome {
+        if self.ended {
+            return WriteOutcome::Dropped(WriteError::Ended);
+        }
+        self.group.write_audio(bytes, Some(duration))
     }
 
     /// Moves the stream to `position` and drops everything the clients have buffered for it.
     ///
-    /// The next chunk plays `START_LEAD` after the seek, which is long enough for a player that is
-    /// already running to refill. A position beyond the track's known duration is clamped to the
-    /// end; an unknown duration is not clamped at all.
+    /// An active group clears the players, and the next chunk is scheduled the largest reported
+    /// `min_buffer_ms` + `output_delay_ms` after that `stream/clear` was transmitted, so a player
+    /// that is already running can refill; a report that arrives after that instant re-leads from
+    /// the current time. A seek while the group is paused sends no clear: the next `play` restarts
+    /// the stream a lead ahead from the new position. A position beyond the track's known duration
+    /// is clamped to the end; an unknown duration is not clamped at all.
     pub fn seek(&mut self, position: Duration) {
         self.group.seek(position);
     }
@@ -343,6 +512,46 @@ mod tests {
     }
 
     #[test]
+    fn metadata_text_is_cut_at_a_character_boundary_within_255_bytes() {
+        let track = TrackInfo {
+            title: Some("a".repeat(300)),
+            // 128 two-byte characters are 256 bytes: the last one does not fit.
+            artist: Some("\u{e9}".repeat(128)),
+            album: Some("short".to_owned()),
+            ..TrackInfo::default()
+        }
+        .limited();
+        assert_eq!(track.title.as_deref().map(str::len), Some(255));
+        assert_eq!(
+            track.artist.as_deref().map(str::len),
+            Some(254),
+            "a character that would cross the limit is dropped whole"
+        );
+        assert_eq!(track.album.as_deref(), Some("short"));
+        assert_eq!(track.album_artist, None);
+    }
+
+    #[test]
+    fn the_metadata_limit_holds_at_its_edges() {
+        let mut exact = "a".repeat(255);
+        truncate_utf8(&mut exact, 255);
+        assert_eq!(exact.len(), 255, "exactly 255 bytes stay as they are");
+
+        // 63 four-byte characters are 252 bytes; one more would cross the limit.
+        let mut wide = "\u{1f3b5}".repeat(64);
+        truncate_utf8(&mut wide, 255);
+        assert_eq!(
+            wide.len(),
+            252,
+            "a 4-byte character that crosses is dropped whole"
+        );
+
+        let mut none = "abc".to_owned();
+        truncate_utf8(&mut none, 0);
+        assert!(none.is_empty(), "a limit of zero leaves nothing");
+    }
+
+    #[test]
     fn pcm_playtime_is_exact_for_whole_frames() {
         let format = AudioFormat::pcm(48_000, 2, 16);
         // 480 frames of stereo 16-bit is 10 ms at 48 kHz.
@@ -352,6 +561,28 @@ mod tests {
             format.duration(3),
             Duration::ZERO,
             "a partial frame has no playtime"
+        );
+    }
+
+    #[test]
+    fn the_carried_playtime_does_not_drift_from_the_sample_count() {
+        // 480 frames at 44.1 kHz are 10 884.35... us: flooring each chunk loses 0.35 us.
+        let format = AudioFormat::pcm(44_100, 2, 16);
+        let mut carry = 0;
+        let mut total = Duration::ZERO;
+        for _ in 0..1_000 {
+            total += format.duration_carrying(480 * 4, &mut carry);
+        }
+        let exact_us = 480_000u64 * 1_000_000 / 44_100;
+        assert_eq!(
+            total,
+            Duration::from_micros(exact_us),
+            "a thousand chunks add up to the exact playtime of their frames"
+        );
+        let floored: Duration = (0..1_000).map(|_| format.duration(480 * 4)).sum();
+        assert!(
+            floored < total - Duration::from_micros(300),
+            "the per-chunk floor the carry replaces falls behind"
         );
     }
 

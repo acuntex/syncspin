@@ -16,8 +16,8 @@
 //!
 //! The first client is unpaired, so the demo approves it on arrival; approval is the operator
 //! action `pairing.md` requires before a server may activate roles. Once the client has the
-//! `player@v1` role, the demo opens a stream and writes a quiet 440 Hz tone, one 10 ms chunk every
-//! 10 ms, until Ctrl-C. The identity is generated per run: this example holds no key material on
+//! `player@v1` role, the demo opens a stream and writes a quiet 440 Hz tone, one 20 ms chunk every
+//! 20 ms, until Ctrl-C. The identity is generated per run: this example holds no key material on
 //! disk, so every start is a new server to a client that paired with the previous one.
 //!
 //! Nothing here decodes, queues or reads a file. A real host replaces the tone with its own frames
@@ -41,8 +41,9 @@ const SAMPLE_RATE: u32 = 48_000;
 /// Channel count of the demo stream.
 const CHANNELS: u8 = 2;
 
-/// Frames in one 10 ms chunk at [`SAMPLE_RATE`].
-const FRAMES_PER_CHUNK: usize = 480;
+/// Frames in one 20 ms chunk at [`SAMPLE_RATE`]: the specification asks a server not to send a
+/// chunk shorter than 15 ms.
+const FRAMES_PER_CHUNK: usize = 960;
 
 /// Width of one sample in bytes.
 const SAMPLE_BYTES: usize = 2;
@@ -261,7 +262,7 @@ async fn run(options: Options) -> Result<()> {
     let tone = tone();
     let mut events = server.events();
     let mut stream: Option<(StreamWriter, usize)> = None;
-    let mut pace = interval(Duration::from_millis(10));
+    let mut pace = interval(Duration::from_millis(20));
     pace.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -299,7 +300,10 @@ async fn run(options: Options) -> Result<()> {
             },
             _ = pace.tick(), if stream.is_some() => {
                 if let Some((writer, offset)) = stream.as_mut() {
-                    writer.write(&tone[*offset..*offset + CHUNK_BYTES]);
+                    // A chunk the server cannot schedule - the group is paused, or the stream has
+                    // ended - is dropped; resending audio is worse than losing it, so the demo
+                    // moves on to the next one.
+                    let _ = writer.write(&tone[*offset..*offset + CHUNK_BYTES]);
                     *offset = (*offset + CHUNK_BYTES) % tone.len();
                 }
             }

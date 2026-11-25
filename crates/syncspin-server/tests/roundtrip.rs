@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use syncspin_client::{AudioFrame, Client, ClientConfig, Event, GoodbyeReason, Identity, Sink};
-use syncspin_server::{AudioFormat, Server, ServerConfig, TrackInfo};
+use syncspin_server::{AudioFormat, Server, ServerConfig, TrackInfo, WriteOutcome};
 use tokio::sync::mpsc;
 
 /// How long the test waits for anything at all.
@@ -37,10 +37,12 @@ const CHUNK: Duration = Duration::from_millis(10);
 /// How often the test re-seeds the timeline while it waits for the clock estimate.
 ///
 /// The client schedules only after three clock bursts, and before that it writes each frame on
-/// arrival. A seek re-seeds the server timeline one start lead ahead, so re-seeding until a
-/// scheduled write appears keeps a slow burst from pushing every later stamp into the past. Once
-/// the estimate is ready, the first queued frame is written well inside this window.
-const RESEED: Duration = Duration::from_millis(200);
+/// arrival. A seek re-seeds the server timeline one reported lead ahead - 250 ms in the first
+/// `client/state`, before the client has arrival samples - so re-seeding at the same interval
+/// keeps a slow burst from pushing every later stamp into the past. The window and the lead are
+/// equal, so the margin is the pre-port delay alone: once the estimate is ready, a queued frame is
+/// written `PRE_PORT` (100 ms) before its deadline, 150 ms after the seek that queued it.
+const RESEED: Duration = Duration::from_millis(250);
 
 /// A sink that reports every frame to the test and plays nothing.
 ///
@@ -126,13 +128,13 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
         }
     }
 
-    // 480 stereo frames of 16-bit PCM are 10 ms at 48 kHz. The server seeds the stream timeline one
-    // start lead ahead of now and advances it by the chunk playtime, so a writer paced at the
-    // playtime keeps every frame ahead of the clock. The client schedules from its clock estimate
-    // only after three bursts; re-seeding the timeline until a scheduled write appears gives that
-    // estimate a fresh window without ever letting the writer outrun it. Each write is paced at the
-    // playtime of the chunk, because a writer that ran ahead would push the deadlines into the past
-    // and prove nothing.
+    // 480 stereo frames of 16-bit PCM are 10 ms at 48 kHz. The server schedules the first chunk one
+    // reported lead after the start - and after each seek's clear - and advances the timeline by
+    // the chunk playtime, so a writer paced at the playtime keeps every frame ahead of the clock.
+    // The client schedules from its clock estimate only after three bursts; re-seeding the timeline
+    // until a scheduled write appears gives that estimate a fresh window without ever letting the
+    // writer outrun it. Each write is paced at the playtime of the chunk, because a writer that ran
+    // ahead would push the deadlines into the past and prove nothing.
     let chunk = [9u8; 480 * 4];
     let mut last_seed = Instant::now() - RESEED;
     let give_up = Instant::now() + TIMEOUT;
@@ -144,7 +146,13 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
             writer.seek(Duration::ZERO);
             last_seed = Instant::now();
         }
-        writer.write(&chunk);
+        assert!(
+            matches!(
+                writer.write(&chunk),
+                WriteOutcome::Written | WriteOutcome::Held
+            ),
+            "a chunk is scheduled, or held until the restart trigger has been sent"
+        );
         tokio::time::sleep(CHUNK).await;
         while let Ok((arrival, due, length)) = received.try_recv() {
             assert_eq!(

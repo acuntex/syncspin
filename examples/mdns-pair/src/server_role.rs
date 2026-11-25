@@ -110,9 +110,10 @@ pub async fn serve(
                             title: Some("mdns-pair smoke test".to_owned()),
                             ..TrackInfo::default()
                         }));
-                        // The writer stamps each chunk with the group's fixed start lead, so a
-                        // chunk is on the wire well before the instant it must play; the pacing
-                        // here only keeps the host from sending the whole stream at once.
+                        // The shared timeline starts a lead ahead that the group derives from the
+                        // players' reported timing, so a chunk is on the wire well before the
+                        // instant it must play; the pacing here only keeps the host from sending
+                        // the whole stream at once.
                         println!(
                             "streaming silent chunks of {CHUNK_BYTES} bytes, one every {CHUNK_MS} ms \
                              until the run stops"
@@ -141,7 +142,9 @@ pub async fn serve(
                 // state late joins it at the playhead and hears what follows, so the host keeps
                 // writing in real time until the run stops it.
                 if let Some(writer) = stream.as_mut() {
-                    writer.write(&silence);
+                    // A chunk the server cannot schedule is dropped; the smoke test only needs the
+                    // stream to keep running, so the outcome has nothing to change here.
+                    let _ = writer.write(&silence);
                 }
             }
         }

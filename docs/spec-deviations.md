@@ -24,10 +24,11 @@ harmless.
 | 14  | A reconnect keeps the last known `active_roles` while playback-capable | [`messaging.md` — `server/activate`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serveractivate)                                                                                                                                            | Accepted, `handshake`              |
 | 15  | A malformed control message is ignored, not fatal                      | [`messaging.md` — Communication](https://github.com/Sendspin/spec/blob/main/messaging.md#communication)                                                                                                                                                                | Accepted, `handle_control_message` |
 | 16  | A server keeps an unavailable client in the group                      | [`messaging.md` — `client/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server-behavior-when-a-client-becomes-unavailable-available-false)                                                                                                           | Open, one group                    |
-| 17  | The server's send-ahead ignores the reported timing                    | [`roles/player/v1.md` — Server Audio Send Constraints](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server-audio-send-constraints)                                                                                                                    | Open, shared timeline              |
+| 17  | The live queue, the lead hint and the 15 ms lower bound                | [`roles/player/v1.md` — Server Audio Send Constraints](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server-audio-send-constraints)                                                                                                                    | Open, live queue, hint, 15 ms      |
 | 19  | A foreign `group_id` is accepted unless strict mode is set             | [`messaging.md` — `group/update`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-groupupdate)                                                                                                                                                  | Accepted, `strict_group_id`        |
 | 20  | No drift correction: the ±1 ms steady-state window is not guaranteed   | [`roles/player/v1.md` — Sync Accuracy](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#sync-accuracy)                                                                                                                                                    | Open, no correction loop           |
 | 21  | A `set_output_delay` above 5000 ms is capped, not rejected             | [`roles/player/v1.md` — `server/command` player object](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-servercommand-player-object)                                                                                                      | Accepted, `output_delay_control`   |
+| 22  | A natural track transition is sent as `stream/end` then `stream/start` | [`messaging.md` — `stream/end`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamend)                                                                                                                                                     | Open, host API                     |
 
 ## 1. Server-initiated connections: the last-playback server is not persisted
 
@@ -368,10 +369,19 @@ through an explicit `switch`, never automatically.
 **What we do:** the server has one group. A member that reports `available: false` stays in it; the
 group stops sending it audio, and `Group::report_client_state` records the report without touching
 group volume, mute or playback. No `group/update` and no `stream/end` follow, and a member that
-reports `available: true` again receives the running stream without an announcement, because its
-stream was never ended. `a_member_that_reports_itself_unavailable_receives_no_audio` pins the
-withheld audio, and `group_state_applies_to_every_member_and_a_report_is_not_a_command` pins that a
-report never becomes a command.
+reports `available: true` again rejoins the running stream on its existing announcement, because its
+stream was never ended. A track jump forgets every announcement: the clear reaches an announced
+unavailable member so it discards its buffers, but the new stream's `stream/start` does not, so a
+member that returns after one gets that start rather than a second start for the old track. A
+member that stays unavailable across a later pause keeps the cleared stream open and misses that
+pause's `stream/end`, because the group ends only the streams it has announced; the next `play`
+announces a new stream to it, or, if it stays unavailable through that too, it is announced when it
+returns.
+`a_member_that_reports_itself_unavailable_receives_no_audio` pins the withheld audio,
+`a_returning_member_keeps_its_larger_old_start_at_and_gets_no_second_start` pins the returning
+member, `an_unavailable_member_misses_a_jumps_start_and_the_next_pause_end` pins the missed jump
+start and pause end, and `group_state_applies_to_every_member_and_a_report_is_not_a_command` pins
+that a report never becomes a command.
 
 **Why:** a solo group and the `switch` command cycle need several groups per server, which this
 milestone does not have; the one thing that must not happen - audio to a client that says it will
@@ -381,47 +391,83 @@ not play it - is kept, and the rest of the rule cannot be followed without the g
 `stream/end` the spec requires in that order, and serve the controller's `switch` command; then flip
 the first test so an unavailable member ends in a stopped solo group.
 
-## 17. The server's send-ahead ignores the reported timing
+## 17. The live queue, the lead hint and the 15 ms lower bound
 
 **Spec:** `roles/player/v1.md`, _Server Audio Send Constraints_. After a `stream/start` that begins
 buffering from empty, the server MUST schedule the first audio timestamp at least `min_buffer_ms` +
-`output_delay_ms` ahead for each player, and for grouped playback uses the maximum of those
-send-aheads across the group, recomputed when players join, leave or update their timing. The
-`required_lead_time_ms` is a hint: the server SHOULD extend the lead toward it only when that adds
-no latency (buffered sources, not live streams). Separately, `messaging.md` (`stream/start`) has the
-server wait for a role's `client/state` object before starting that role's stream.
+`output_delay_ms` ahead for each player, and for grouped playback uses a common send-ahead equal to
+the maximum per-player send-ahead across the group, recomputed when players join, leave or update
+their timing. A `stream/clear` without `from_timestamp` restarts the same way. During live playback
+the server MUST schedule timestamps so each player's queued duration stays at or above its
+`min_buffer_ms`. The `required_lead_time_ms` is a hint: the server SHOULD extend the lead toward it
+only when that adds no latency (buffered sources, not live streams). A server MUST NOT send a chunk
+longer than 150 ms and SHOULD NOT send one shorter than 15 ms. Separately, `messaging.md`
+(`stream/start`) has the server wait for a role's `client/state` object before starting that role's
+stream.
 
-**What we do:** the stream waits for the update (the group announces nothing to a member without its
-`player` object) but schedules the first sample at `START_LEAD`, 200 ms after the stream opens, for
-every member. The reported `min_buffer_ms`, `required_lead_time_ms` and `output_delay_ms` are
-received but not used, and the lead is not recomputed when a member joins or updates its timing.
-A player that reports `min_buffer_ms` + `output_delay_ms` above 200 ms is therefore started with
-less lead than the spec's MUST requires. The group fans one timeline out to every member, so all of
-them share the timestamps; the tests `two_players_receive_the_same_frames` and
-`a_player_hears_nothing_before_it_reports_its_state` pin that, and
-`the_start_lead_ignores_the_reported_timing` pins that a player reporting `min_buffer_ms` +
-`output_delay_ms` above 200 ms still gets the fixed lead.
+**What we do:** the lead rules are kept wherever a restart has a ready member.
+`Group::group_lead_us` takes the largest `min_buffer_ms` + `output_delay_ms` over the members that
+`plays()`, and a restart from empty that has one - a new stream, a `play` restart or a seek's
+`stream/clear` - anchors the shared timeline on the transmit time of its trigger plus that lead; a
+report that arrives after the instant re-leads from `now` instead of using a past timestamp. With
+no ready member no anchor is armed and the provisional timeline stands; the first member to report
+joins it as a late joiner, with its own lead when the common one does not cover it. A late joiner
+after the anchor never moves the timeline and never gets a past timestamp. Each member's
+outstanding audio is capped at the `buffer_capacity` its `client/hello` announced, itself held to
+1 MiB so a huge announcement is not an unbounded queue: a chunk that
+would overrun it is not started, and a queued or sent chunk counts until its transmission is
+finished and `timestamp + duration - output_delay_ms` has passed. A member skipped for capacity or
+because its own start is still ahead hears a hole while the group timeline moves on, and the host
+sees it as `WriteOutcome::Partial`, or as `Event::HeldAudioSkipped` when the skip happens while a
+held queue flushes. The `client/state` wait is kept too: the group announces no stream to a member
+without its `player` object.
 
-Two neighbouring rules of the same section are not met either. A seek is a `stream/clear` without
-`from_timestamp`, and the spec requires the first timestamp after it to satisfy each player's
-send-ahead; the group uses `START_LEAD` there too. And the server MUST keep each player's queued
-duration at or above its `min_buffer_ms` during live playback; the group does not track queued
-duration at all, it only paces chunks on the shared timeline. A third rule is met only because the
-group never uses it: a `stream/clear` that carries `from_timestamp` MUST set it at least the larger
-of `min_buffer_ms` and `required_lead_time_ms`, plus `output_delay_ms`, after `server_transmitted`.
-The server sends `from_timestamp: None` everywhere; the first change that sends one has to derive it
-from the reported timing.
+What remains is the live queue: the group does not keep a player's queued duration at
+`min_buffer_ms` during playback, and does not restore it after a join or an increase of the reported
+timing. `required_lead_time_ms` is received and ignored; the group cannot tell a buffered source
+from a live stream, and extending toward the hint is a SHOULD only in the buffered case. The 15 ms
+lower bound is the host's chunk size: the server forwards what `StreamWriter` is given and refuses a
+chunk above 150 ms.
 
-**Why:** a stream is one timeline: starting it at each member's own reported lead would give the
-members different timestamps for the same audio, which the server fan-out and the group design do
-not allow. The spec's own answer is a common send-ahead equal to the group maximum, which is what
-removing this deviation implements for stream starts.
+The `stream/clear` `from_timestamp` rule is not triggered: the server always sends
+`from_timestamp: None`, so a clear drops every buffer. The first change that sends a timestamp has
+to derive it from the reported timing - at least the larger of `min_buffer_ms` and
+`required_lead_time_ms`, plus `output_delay_ms`, after `server_transmitted`.
 
-**Removing it:** schedule a new stream at the largest `min_buffer_ms` + `output_delay_ms` among the
-players that are ready when it opens (extending toward `required_lead_time_ms` only for buffered
-sources), apply the same lead to a seek, recompute it when a member joins or updates its timing,
-track queued duration against `min_buffer_ms`, wait for a late member's report before announcing to
-it, and test a stream with two members whose reported values differ.
+The closed parts are pinned by `the_group_lead_is_the_maximum_of_the_ready_members`,
+`the_anchor_waits_for_every_report_and_starts_at_the_maximum`,
+`a_member_pending_at_the_deadline_stays_gated_and_re_leads_late`,
+`a_seek_clears_as_the_anchor_and_resets_the_count`,
+`the_start_lead_follows_the_reported_timing`,
+`a_late_joiner_is_gated_on_its_own_start_and_keeps_the_timeline`,
+`a_member_with_capacity_one_is_skipped_for_every_chunk`,
+`a_member_with_no_room_is_skipped_until_its_buffer_drains`,
+`held_audio_is_discarded_when_a_pause_supersedes_the_anchor`,
+`held_audio_is_bounded_by_the_smallest_ready_capacity`,
+`a_reset_report_keeps_the_chunks_queued_behind_its_trigger`,
+`a_stale_clear_report_still_resets_what_the_client_discarded`,
+`a_late_clear_report_does_not_open_a_hole_for_a_member_that_already_streams_again`,
+`a_flush_that_skips_a_player_is_reported_as_an_event`,
+`the_carried_playtime_does_not_drift_from_the_sample_count`,
+`a_refused_chunk_does_not_move_the_pcm_remainder`,
+`a_reported_buffer_capacity_is_held_to_the_server_cap`,
+`the_timeline_follows_the_sample_count_at_a_rate_that_does_not_divide_a_chunk`,
+`a_chunk_longer_than_150_ms_is_refused` and
+`a_player_hears_nothing_before_it_reports_its_state`. `two_players_receive_the_same_frames` still
+pins that the timestamps are identical across the group, as the group maximum requires.
+
+**Why:** one timeline serves the whole group, and the spec's own answer is a common send-ahead equal
+to the group maximum, which a restart now applies. The live queue is the host's feed: the group can
+place and pace the chunks it receives, but it has no audio of its own to refill a player that runs
+low, and after a join or a timing increase the only ways to raise the queued duration are to move
+the shared timeline or resend audio, which break group sync or duplicate what was played. The hint
+needs the host to say that a source is buffered, which the API does not carry. The lower bound is a
+property of the host's chunking, which the server cannot change.
+
+**Removing it:** track each member's queued duration against its `min_buffer_ms` and refill after a
+join or a timing increase; add a buffered-source signal the host sets so the lead may extend toward
+`required_lead_time_ms`; and state the 15 ms floor as the host's contract, or split a shorter chunk
+at the API boundary. Then delete this entry.
 
 ## 19. A foreign `group_id` is accepted unless strict mode is set
 
@@ -507,6 +553,35 @@ nearest legal delay is unambiguous. This is the same tolerance deviation 12 reco
 **Removing it:** give `handle_command` a typed rejection path and close the connection with a
 protocol-error reason once that path exists, together with the volume case in deviation 12. Test the
 closed connection instead of the capped value.
+
+## 22. A natural track transition is sent as `stream/end` then `stream/start`
+
+**Spec:** `messaging.md`,
+[`stream/end`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamend).
+For a track that ends and is followed naturally by the next one, the stream continues uninterrupted
+for gapless playback: servers SHOULD send no stream command except a `stream/start` that updates the
+configuration, and MUST NOT send `stream/end` for a track transition, a seek or a track jump. A jump
+is a `stream/clear` instead.
+
+**What we do:** the host API has no transition call. A host that ends one track and opens the next
+through `StreamWriter::end()` followed by `ServerHandle::open_stream()` makes the server send
+`stream/end` and then the new `stream/start`; the group has no queue, so it cannot tell a natural
+transition from a track that really ended. A host that opens the next track while the old one still
+runs gets the jump instead - a `stream/clear` and an in-place `stream/start` - which the spec
+prescribes. `opening_a_second_track_is_a_jump_not_an_in_place_change` pins the jump, and
+`ending_a_track_sends_an_end_and_the_next_start_opens_a_new_stream` pins the end-then-start
+sequence.
+
+**Why:** a server without a queue cannot know whether the host has more audio for the same stream or
+has stopped playback. `end()` is the host saying the stream is over, and the API must not guess
+otherwise. The transition cannot be promised as gapless either: the next track's first sample is
+scheduled a fresh lead after its start, not at the old stream's next timestamp, so treating
+`end()` as a transition would claim a continuity the server does not provide.
+
+**Removing it:** give the writer a transition call that clears and restarts in place without ending
+the stream - the start is the spec's in-place configuration update - or let a queue in the server
+drive the transition; then test that a natural transition sends `stream/clear` and `stream/start`
+without a `stream/end`, and that `end()` still means playback termination.
 
 ## How to update this file
 

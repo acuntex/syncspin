@@ -9,13 +9,16 @@
 //! three pairing methods and the approval gate. A client connects, `client/init` is answered with
 //! `server/init` and Noise message 1, the handshake completes, and the server sends `server/hello`,
 //! `server/activate` with the roles that connection may use, `server/state` and `group/update`.
-//! Every member of the group receives the same stream frames with the same playout timestamps, and
-//! each one measures its own offset by sending `client/time`, which the server answers with the
-//! receive and transmit stamps of the request. The host pushes audio into a [`StreamWriter`]; the
+//! Every member of the group reads one shared timeline, so the chunks it receives carry the same
+//! playout timestamps as the other members'. A gated start, a full `buffer_capacity` or a late join
+//! can skip chunks for it, and it hears a hole instead of a delayed chunk. Each member measures its
+//! own offset by sending `client/time`, which the server answers with the receive and transmit
+//! stamps of the request. The host pushes audio into a [`StreamWriter`]; the
 //! server stamps every chunk with the server-clock playout timestamp and fans it out. Volume, mute
 //! and playback belong to the group, and a member's `client/state` is a report rather than a
-//! command: the group takes from it only whether the member is available and has reported the
-//! `player` object its activation requires, which is what a stream waits for.
+//! command: the group takes from it whether the member is available, the `player` object its
+//! activation requires, and that object's `min_buffer_ms` and `output_delay_ms`, which set the
+//! member's lead; its volume and mute are the client's own and never the group's.
 //!
 //! # Pairing and approval
 //!
@@ -83,7 +86,7 @@ pub use crate::discovery::{
 pub use crate::pairing::{
     CodeFormat, PairingMethod, PairingRecord, PairingStore, DEFAULT_PAIRING_TIMEOUT,
 };
-pub use crate::stream::{AudioFormat, Codec, StreamWriter, TrackInfo};
+pub use crate::stream::{AudioFormat, Codec, StreamWriter, TrackInfo, WriteError, WriteOutcome};
 
 /// The address the listener binds when the configuration does not narrow it.
 ///
@@ -219,7 +222,8 @@ impl ServerConfig {
 /// The stream carries the lifecycle of a connection and of the stream, not its content: a client is
 /// reported once it has said who it is, again once the server has decided its roles, and once when
 /// it leaves; a stream is reported when it starts and when it ends, whoever ended it. Pairing is
-/// reported when the operator has something to do and when a record is stored.
+/// reported when the operator has something to do and when a record is stored. One delivery report
+/// completes it: held audio some player did not get at an anchor flush.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
@@ -314,6 +318,16 @@ pub enum Event {
     StreamStarted,
     /// The stream ended: by the host, or because the group paused or stopped.
     StreamEnded,
+    /// Held audio was flushed at an anchor and some player did not get all of it.
+    ///
+    /// [`WriteOutcome::Held`] promised nothing about a player, and the flush is where each held
+    /// chunk meets the player's `buffer_capacity` and start gate. `chunks` is how many of the
+    /// flushed chunks at least one streaming player skipped: those players hear a hole while the
+    /// group timeline moves on. Emitted once per flush that skipped something.
+    HeldAudioSkipped {
+        /// Number of flushed chunks that at least one streaming player did not receive.
+        chunks: usize,
+    },
 }
 
 /// The receiving end of a server's [`Event`] stream.
@@ -542,6 +556,10 @@ pub(crate) enum Command {
 /// hands the stream out once; the group operations are what a host calls while it plays, and the
 /// pairing and approval methods reach the connections by `client_id`. [`ServerHandle::shutdown`]
 /// ends the server, and dropping the handle does the same without waiting for it.
+///
+/// The handle must not outlive the Tokio runtime [`Server::start`] ran on: a restart with a ready
+/// member arms a deadline timer on that runtime, and a timer spawned after the runtime has shut
+/// down never runs. The anchor then waits for the next write or report to flush it.
 pub struct ServerHandle {
     task: Option<JoinHandle<Result<()>>>,
     /// The discovery loop, when the host supplied a backend.
@@ -592,8 +610,16 @@ impl ServerHandle {
     ///
     /// The group is told before the host writes anything: every player receives `stream/start` with
     /// the configured format, the metadata role receives the track, and the writer's first chunk is
-    /// scheduled 200 ms ahead of now. A stream that is still running is cleared first, so opening a
-    /// track while another plays is a track jump rather than an in-place format change.
+    /// scheduled at the largest `min_buffer_ms` + `output_delay_ms` the ready players report,
+    /// counted from the transmit time of the restart trigger (a start, or a clear for a track
+    /// jump). A stream that is still running is cleared first, so opening a track while another
+    /// plays is a track jump rather than an in-place format change. A host that ends a track with
+    /// [`StreamWriter::end`] before opening the next one sends `stream/end` in between: the group
+    /// has no queue and cannot tell a natural transition from a stopped stream (deviation 22 in
+    /// `docs/spec-deviations.md`).
+    ///
+    /// The title, artist, album artist and album are cut to 255 UTF-8 bytes, the limit of the
+    /// metadata role (see [`TrackInfo`]).
     ///
     /// A group with no player still accepts the writer: a stream that nobody hears is the host's
     /// business, and its timestamps stay consistent for a player that joins later.
