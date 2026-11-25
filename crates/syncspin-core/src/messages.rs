@@ -35,6 +35,15 @@ pub const NOISE_SUITE: &str = crate::noise::Suite::ChaChaPoly.wire_name();
 /// Binary message id of a player audio chunk.
 pub const AUDIO_CHUNK_ID: u8 = 4;
 
+/// Binary message id of artwork channel 0; channels 1-3 use the three ids that follow.
+pub const ARTWORK_ID_BASE: u8 = 8;
+
+/// Number of artwork channels a client can have, and so of artwork binary message ids.
+pub const MAX_ARTWORK_CHANNELS: usize = 4;
+
+/// Largest artwork binary message, id byte included, that fits in one Noise transport message.
+pub const MAX_ARTWORK_MESSAGE_LEN: usize = 65_519;
+
 // ---------------------------------------------------------------------------
 // Handshake: cleartext, before the Noise transport
 // ---------------------------------------------------------------------------
@@ -530,10 +539,55 @@ pub struct PlayerState {
     pub format: Option<SupportedFormat>,
 }
 
+/// One entry of the `channels` array of the artwork objects: the configuration of one channel.
+///
+/// The same shape is used by [`ArtworkState`] (what the client wants) and [`StreamStartArtwork`]
+/// (what the server streams). `source` is `album`, `artist` or `none`; an unknown value is
+/// preserved. For every source but `none` the format and size are present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ArtworkChannelState {
+    /// Artwork source type: `album`, `artist` or `none`.
+    pub source: String,
+    /// Image format, `jpeg` or `png`; required unless `source` is `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Width in pixels of the delivered image; required unless `source` is `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Height in pixels of the delivered image; required unless `source` is `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl ArtworkChannelState {
+    /// A channel that is not streamed: `source` is `none` and nothing else is sent.
+    pub fn none() -> Self {
+        Self {
+            source: "none".to_owned(),
+            format: None,
+            width: None,
+            height: None,
+        }
+    }
+}
+
+/// The `artwork` object of [`ClientState`].
+///
+/// The array is positional from channel 0 and has one to four entries. A channel it does not
+/// cover counts as `source: none`, so the sender may truncate after its last active channel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ArtworkState {
+    /// Configuration the client wants for each channel; the index is the channel number.
+    #[serde(default)]
+    pub channels: Vec<ArtworkChannelState>,
+}
+
 /// `client/state`: client availability plus the state of each active role.
 ///
 /// A role object that is absent keeps its previous state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ClientState {
     /// Whether the client is available to take part in playback.
@@ -541,6 +595,9 @@ pub struct ClientState {
     /// Player state; present exactly when the `player` role is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player: Option<PlayerState>,
+    /// Artwork state; present exactly when the `artwork` role is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<ArtworkState>,
 }
 
 /// The `progress` object of [`Metadata`]. Times and durations are milliseconds.
@@ -618,6 +675,38 @@ pub struct ControllerState {
     pub seek_max_ms: Option<u64>,
 }
 
+/// An RGB color as `[R, G, B]`, each component 0-255.
+pub type Rgb = [u8; 3];
+
+/// The `color` object of [`ServerState`].
+///
+/// A component outside 0-255 fails to parse, so a message carrying one never yields a value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct Color {
+    /// Server clock time in microseconds at which these colors take effect; a past or present
+    /// value describes the audio playing now, a future one schedules the update.
+    pub timestamp: i64,
+    /// Background suitable for dark mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_dark: Option<Rgb>,
+    /// Background suitable for light mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_light: Option<Rgb>,
+    /// The dominant color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<Rgb>,
+    /// A secondary or complementary color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<Rgb>,
+    /// A light color suitable for use on dark backgrounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_dark: Option<Rgb>,
+    /// A dark color suitable for use on light backgrounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_light: Option<Rgb>,
+}
+
 /// `server/state`: the state of each active server role.
 ///
 /// A role object that is absent keeps its previous state.
@@ -630,6 +719,9 @@ pub struct ServerState {
     /// Controller state; present exactly when the `controller` role is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller: Option<ControllerState>,
+    /// Color state; present exactly when the `color` role is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Color>,
 }
 
 /// `group/update`: the state and identity of the group this client is part of.
@@ -672,6 +764,18 @@ pub struct StreamStartPlayer {
     pub codec_header: Option<String>,
 }
 
+/// The `artwork` object of [`StreamStart`]: the configuration of each artwork channel.
+///
+/// The array is positional from channel 0 and never longer than four. A channel it does not
+/// cover, or whose `source` is `none`, is not streamed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StreamStartArtwork {
+    /// Configuration of each channel; the index is the channel number.
+    #[serde(default)]
+    pub channels: Vec<ArtworkChannelState>,
+}
+
 /// `stream/start`: announces a stream and its format.
 ///
 /// Sent again with a new format to change the configuration of a running stream.
@@ -684,6 +788,9 @@ pub struct StreamStart {
     /// Player format of the stream; present exactly when the `player` role is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player: Option<StreamStartPlayer>,
+    /// Artwork channels of the stream; present exactly when the `artwork` role is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<StreamStartArtwork>,
 }
 
 /// `stream/clear`: drops buffered data without ending the stream.
@@ -867,6 +974,150 @@ impl AudioChunkHeader {
         message.extend_from_slice(&self.timestamp_us.to_be_bytes());
         message.extend_from_slice(&self.send_ahead.to_be_bytes());
         message.extend_from_slice(audio);
+        message
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary artwork
+// ---------------------------------------------------------------------------
+
+/// One artwork binary message, ids [`ARTWORK_ID_BASE`] to `ARTWORK_ID_BASE + 3`.
+///
+/// An image is an announce followed by parts; a cancel discards a channel's pending image. The
+/// layout is `[id][flags]` followed by the timestamp and total size for an announce (bit 1 of
+/// `flags`), the next bytes of the image for a part (no flag), or nothing for a cancel (bit 0).
+/// [`Self::parse`] performs the message-level checks the specification makes a protocol error;
+/// the sequence checks (a part with no announce, a part past the total) need state and belong to
+/// the receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkMessage<'a> {
+    /// The start of an image: when it is displayed and how many bytes follow in parts.
+    Announce {
+        /// Channel number, 0-3.
+        channel: u8,
+        /// Server clock time in microseconds at which the image is displayed.
+        timestamp_us: i64,
+        /// Size in bytes of the encoded image; zero is an empty image with no parts.
+        total_size: u32,
+    },
+    /// The next bytes of the image in flight.
+    Part {
+        /// Channel number, 0-3.
+        channel: u8,
+        /// The bytes.
+        data: &'a [u8],
+    },
+    /// Discards the channel's pending image.
+    Cancel {
+        /// Channel number, 0-3.
+        channel: u8,
+    },
+}
+
+impl ArtworkMessage<'_> {
+    /// Flag bit set on a cancel message.
+    pub const FLAG_CANCEL: u8 = 0b01;
+    /// Flag bit set on an announce message.
+    pub const FLAG_ANNOUNCE: u8 = 0b10;
+    /// The flag bits the specification defines; every other bit is reserved.
+    const DEFINED_FLAGS: u8 = 0b11;
+    /// Length of an announce, id byte included.
+    pub const ANNOUNCE_LEN: usize = 14;
+    /// Length of a cancel, id byte included.
+    pub const CANCEL_LEN: usize = 2;
+
+    /// Whether `id` is an artwork binary message id.
+    pub fn is_artwork_id(id: u8) -> bool {
+        (ARTWORK_ID_BASE..ARTWORK_ID_BASE + MAX_ARTWORK_CHANNELS as u8).contains(&id)
+    }
+}
+
+impl<'a> ArtworkMessage<'a> {
+    /// Parses one complete artwork binary message, id byte included.
+    ///
+    /// # Errors
+    /// Returns an error for the malformed messages the specification lists: an id outside the
+    /// artwork range, a message shorter than 2 or longer than [`MAX_ARTWORK_MESSAGE_LEN`] bytes,
+    /// an announce that is not 14 bytes, a cancel longer than 2 bytes, a nonzero reserved flag bit
+    /// and a message with both the cancel and the announce bit set.
+    pub fn parse(message: &'a [u8]) -> Result<Self> {
+        let Some((&id, rest)) = message.split_first() else {
+            bail!("empty binary message");
+        };
+        if !Self::is_artwork_id(id) {
+            bail!("binary message id {id} is not an artwork message");
+        }
+        if message.len() < 2 {
+            bail!("artwork message shorter than 2 bytes");
+        }
+        if message.len() > MAX_ARTWORK_MESSAGE_LEN {
+            bail!(
+                "artwork message of {} bytes exceeds {MAX_ARTWORK_MESSAGE_LEN}",
+                message.len()
+            );
+        }
+        let channel = id - ARTWORK_ID_BASE;
+        let (flags, body) = (rest[0], &rest[1..]);
+        if flags & !Self::DEFINED_FLAGS != 0 {
+            bail!("artwork message with reserved flag bits set: {flags:#04x}");
+        }
+        match flags {
+            0 => Ok(Self::Part {
+                channel,
+                data: body,
+            }),
+            Self::FLAG_CANCEL => {
+                if message.len() != Self::CANCEL_LEN {
+                    bail!("artwork cancel of {} bytes, expected 2", message.len());
+                }
+                Ok(Self::Cancel { channel })
+            }
+            Self::FLAG_ANNOUNCE => {
+                if message.len() != Self::ANNOUNCE_LEN {
+                    bail!("artwork announce of {} bytes, expected 14", message.len());
+                }
+                let mut timestamp = [0u8; 8];
+                timestamp.copy_from_slice(&body[..8]);
+                let mut total = [0u8; 4];
+                total.copy_from_slice(&body[8..12]);
+                Ok(Self::Announce {
+                    channel,
+                    timestamp_us: i64::from_be_bytes(timestamp),
+                    total_size: u32::from_be_bytes(total),
+                })
+            }
+            _ => bail!("artwork message with both the cancel and the announce flag"),
+        }
+    }
+
+    /// Builds the complete binary message for this value.
+    ///
+    /// # Panics
+    /// Panics when `channel` is not 0-3, which is a caller bug rather than input.
+    pub fn encode(&self) -> Vec<u8> {
+        let (channel, flags) = match *self {
+            Self::Announce { channel, .. } => (channel, Self::FLAG_ANNOUNCE),
+            Self::Part { channel, .. } => (channel, 0),
+            Self::Cancel { channel } => (channel, Self::FLAG_CANCEL),
+        };
+        assert!(
+            usize::from(channel) < MAX_ARTWORK_CHANNELS,
+            "artwork channel {channel} is out of range"
+        );
+        let mut message = vec![ARTWORK_ID_BASE + channel, flags];
+        match *self {
+            Self::Announce {
+                timestamp_us,
+                total_size,
+                ..
+            } => {
+                message.extend_from_slice(&timestamp_us.to_be_bytes());
+                message.extend_from_slice(&total_size.to_be_bytes());
+            }
+            Self::Part { data, .. } => message.extend_from_slice(data),
+            Self::Cancel { .. } => {}
+        }
         message
     }
 }

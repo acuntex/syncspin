@@ -724,6 +724,7 @@ fn inert_state() -> String {
     serde_json::to_string(&Incoming::ServerState(ServerState {
         metadata: None,
         controller: None,
+        ..Default::default()
     }))
     .expect("an empty server/state encodes")
 }
@@ -743,6 +744,7 @@ fn controller_state(commands: &[&str], seek_max_ms: Option<u64>) -> String {
             shuffle: None,
             seek_max_ms,
         }),
+        ..Default::default()
     }))
     .expect("the state must encode")
 }
@@ -3415,6 +3417,7 @@ async fn controller_state_is_reported() {
             shuffle: None,
             seek_max_ms: Some(245_000),
         }),
+        ..Default::default()
     }))
     .unwrap();
     server.json(state);
@@ -3673,6 +3676,7 @@ async fn group_update_is_the_authoritative_playback_state() {
             shuffle: None,
             seek_max_ms: None,
         }),
+        ..Default::default()
     }))
     .unwrap();
     server.json(state);
@@ -3899,6 +3903,7 @@ async fn metadata_fields_are_reported() {
             ..Default::default()
         }),
         controller: None,
+        ..Default::default()
     }))
     .unwrap();
     server.json(state);
@@ -3948,6 +3953,7 @@ async fn the_track_event_carries_the_playback_speed() {
             ..Default::default()
         }),
         controller: None,
+        ..Default::default()
     }))
     .unwrap();
     server.json(state);
@@ -4310,6 +4316,7 @@ async fn metadata_is_ignored_when_its_role_is_inactive() {
                 shuffle: None,
                 seek_max_ms: None,
             }),
+            ..Default::default()
         }))
         .unwrap(),
     );
@@ -4344,6 +4351,7 @@ async fn controller_state_is_ignored_when_its_role_is_inactive() {
                 shuffle: None,
                 seek_max_ms: None,
             }),
+            ..Default::default()
         }))
         .unwrap(),
     );

@@ -168,6 +168,7 @@ fn controller_state(commands: &[&str]) -> String {
             shuffle: None,
             seek_max_ms: None,
         }),
+        ..Default::default()
     }))
     .expect("the state must encode")
 }

@@ -437,6 +437,7 @@ impl Group {
                     Incoming::ServerState(ServerState {
                         controller: None,
                         metadata: Some(scheduled),
+                        ..Default::default()
                     }),
                 );
             }
@@ -1140,6 +1141,7 @@ impl Inner {
         Incoming::StreamStart(StreamStart {
             server_transmitted: now_us,
             player: Some(self.format.stream_start()),
+            ..Default::default()
         })
     }
 
@@ -1148,6 +1150,7 @@ impl Inner {
         let state = Incoming::ServerState(ServerState {
             controller: Some(self.controller()),
             metadata: None,
+            ..Default::default()
         });
         self.send(&state, |member| member.has(CONTROLLER_ROLE));
     }
@@ -1157,6 +1160,7 @@ impl Inner {
         let state = Incoming::ServerState(ServerState {
             controller: None,
             metadata: Some(self.metadata(now_us)),
+            ..Default::default()
         });
         self.send(&state, |member| member.has(METADATA_ROLE));
     }
@@ -1777,6 +1781,7 @@ mod tests {
                     supported_commands: Vec::new(),
                     format: None,
                 }),
+                ..Default::default()
             },
         );
     }
@@ -2427,6 +2432,7 @@ mod tests {
             &ClientState {
                 available: false,
                 player: None,
+                ..Default::default()
             },
         );
         group.report_client_state(
@@ -2434,6 +2440,7 @@ mod tests {
             &ClientState {
                 available: true,
                 player: None,
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -2570,6 +2577,7 @@ mod tests {
                 &ClientState {
                     available,
                     player: None,
+                    ..Default::default()
                 },
             );
         }
@@ -3075,6 +3083,7 @@ mod tests {
             &ClientState {
                 available: false,
                 player: None,
+                ..Default::default()
             },
         );
         let future = group.now_us() + 5_000_000;
@@ -3306,6 +3315,7 @@ mod tests {
             &ClientState {
                 available: false,
                 player: None,
+                ..Default::default()
             },
         );
         report_timing(&group, late, 3000, 500);
@@ -3974,6 +3984,7 @@ mod tests {
             &ClientState {
                 available: false,
                 player: None,
+                ..Default::default()
             },
         );
 
@@ -4002,6 +4013,7 @@ mod tests {
             &ClientState {
                 available: false,
                 player: None,
+                ..Default::default()
             },
         );
 
@@ -4062,6 +4074,7 @@ mod tests {
             &ClientState {
                 available: true,
                 player: None,
+                ..Default::default()
             },
         );
         group.open_stream(TrackInfo::default());

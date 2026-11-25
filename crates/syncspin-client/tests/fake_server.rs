@@ -1247,6 +1247,7 @@ async fn serve_connection(
                             bit_depth,
                             codec_header,
                         }),
+                        ..Default::default()
                     }),
                 )
                 .await?;
@@ -1376,6 +1377,7 @@ async fn serve_connection(
                             ..Metadata::default()
                         }),
                         controller: None,
+                        ..Default::default()
                     }),
                 )
                 .await?;
@@ -1948,6 +1950,7 @@ async fn rehandshake(
                     ..Metadata::default()
                 }),
                 controller: None,
+                ..Default::default()
             }),
         )
         .await?;

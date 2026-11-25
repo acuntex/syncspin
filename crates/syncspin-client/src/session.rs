@@ -2214,6 +2214,7 @@ impl Session<'_> {
                 supported_commands: supported_player_commands(self.config),
                 format: None,
             }),
+            artwork: None,
         });
         self.send_json(&state).await
     }
