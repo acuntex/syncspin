@@ -415,8 +415,10 @@ joins it as a late joiner, with its own lead when the common one does not cover 
 after the anchor never moves the timeline and never gets a past timestamp. Each member's
 outstanding audio is capped at the `buffer_capacity` its `client/hello` announced: a chunk that
 would overrun it is not started, and a queued or sent chunk counts until its transmission is
-finished and `timestamp + duration - output_delay_ms` has passed. The `client/state` wait is kept
-too: the group announces no stream to a member without its `player` object.
+finished and `timestamp + duration - output_delay_ms` has passed. A member skipped for capacity or
+because its own start is still ahead hears a hole while the group timeline moves on, and the host
+sees it as `WriteOutcome::Partial`, but not when the skip happens while a held queue flushes. The
+`client/state` wait is kept too: the group announces no stream to a member without its `player` object.
 
 What remains is the live queue: the group does not keep a player's queued duration at
 `min_buffer_ms` during playback, and does not restore it after a join or an increase of the reported
@@ -438,6 +440,11 @@ The closed parts are pinned by `the_group_lead_is_the_maximum_of_the_ready_membe
 `a_late_joiner_is_gated_on_its_own_start_and_keeps_the_timeline`,
 `a_member_with_capacity_one_is_skipped_for_every_chunk`,
 `a_member_with_no_room_is_skipped_until_its_buffer_drains`,
+`held_audio_is_discarded_when_a_pause_supersedes_the_anchor`,
+`held_audio_is_bounded_by_the_smallest_ready_capacity`,
+`a_reset_report_keeps_the_chunks_queued_behind_its_trigger`,
+`a_stale_clear_report_still_resets_what_the_client_discarded`,
+`a_late_clear_report_does_not_open_a_hole_for_a_member_that_already_streams_again`,
 `a_chunk_longer_than_150_ms_is_refused` and
 `a_player_hears_nothing_before_it_reports_its_state`. `two_players_receive_the_same_frames` still
 pins that the timestamps are identical across the group, as the group maximum requires.

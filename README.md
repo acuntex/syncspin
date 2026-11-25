@@ -324,8 +324,11 @@ back a handle and an event stream. The host writes frames into the `StreamWriter
 let mut server = Server::start(config).await?;
 let mut events = server.events();
 let mut stream = server.open_stream(track);
-if let WriteOutcome::Dropped(error) = stream.write(&pcm) {
-    eprintln!("the chunk was not scheduled: {error}");
+match stream.write(&pcm) {
+    WriteOutcome::Dropped(error) => eprintln!("the chunk was not scheduled: {error}"),
+    // Some player did not get it (a full buffer or a late start): it hears a hole.
+    WriteOutcome::Partial { skipped } => eprintln!("{skipped} player(s) skipped the chunk"),
+    _ => {}
 }
 while let Some(event) = events.next().await {
     // ClientConnected, ClientActivated, PairingRequested, Paired, ClientLeft, ...

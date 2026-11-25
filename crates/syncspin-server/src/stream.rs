@@ -261,17 +261,33 @@ pub struct TrackInfo {
 /// What became of one chunk a host wrote.
 ///
 /// A host that treats every write as accepted loses audio without noticing: the server refuses a
-/// chunk it cannot schedule and holds one whose stream is not anchored yet. The outcome says which
-/// of the three happened, and a [`WriteOutcome::Dropped`] chunk is not retried, because resending
-/// audio is worse than losing it.
+/// chunk it cannot schedule, holds one whose stream is not anchored yet and skips a player that
+/// has no room. The outcome says which happened, and a [`WriteOutcome::Dropped`] chunk is not
+/// retried, because resending audio is worse than losing it.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriteOutcome {
-    /// The chunk was assigned a timestamp and handed to the players that can take it.
+    /// The chunk was assigned a timestamp and handed to every player that streams, or no player
+    /// was streaming to hand it to.
     Written,
-    /// The chunk is held until the group has anchored the start of the stream.
+    /// The chunk was assigned a timestamp, but at least one streaming player did not get it:
+    /// `skipped` of them are gated on their own start, still ahead of this chunk, or out of
+    /// `buffer_capacity`. Those players hear a hole while the group timeline moves on. The count
+    /// does not say why: a late joiner's start gate passes by itself, while a full buffer is the
+    /// case a host that decodes faster than real time can act on by pacing its writes.
+    Partial {
+        /// How many streaming players were skipped for this chunk.
+        skipped: usize,
+    },
+    /// The chunk is held until the group has anchored the start of the stream. A held chunk can
+    /// still be lost: a seek, pause, stop, end or restart before the anchor flushes discards it,
+    /// and a player that cannot take it at the flush (it joined with less room, or was gated at
+    /// the deadline) is skipped. The host is not told again in either case.
     Held,
-    /// The chunk was refused; the error names the reason.
+    /// The chunk was refused; the error names the reason. The server never retries a
+    /// refused chunk. None of them moved the timeline, but only [`WriteError::Backpressure`] is
+    /// transient: the host may write the same chunk again once the anchor has flushed.
     Dropped(WriteError),
 }
 
@@ -280,6 +296,7 @@ pub enum WriteOutcome {
 /// The variants describe the chunk and the stream, never its audio: a host may log one without
 /// exposing what it was playing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriteError {
     /// The chunk is empty or has no playtime.
     Empty,
@@ -287,7 +304,8 @@ pub enum WriteError {
     Incomplete,
     /// The chunk is longer than the 150 ms a player must be able to buffer.
     TooLong,
-    /// The queue of audio held for an anchor is full, so the new chunk was dropped.
+    /// The queue of audio held for an anchor is full, either of one second of audio or of the
+    /// framed bytes the smallest ready player can buffer, so the new chunk was dropped.
     Backpressure,
     /// The stream is open but not running: the group paused, stopped or ended it.
     Paused,
@@ -330,8 +348,8 @@ impl std::error::Error for WriteError {}
 /// does not leave a stream running that it can no longer feed.
 ///
 /// The writer must not outlive the Tokio runtime that started the server either: a restart that
-/// anchors a ready member arms a deadline timer on that runtime, and spawning it after the runtime
-/// has shut down panics.
+/// anchors a ready member arms a deadline timer on that runtime, and a timer spawned after the
+/// runtime has shut down never runs. The anchor then waits for the next write or report to flush it.
 #[derive(Debug)]
 pub struct StreamWriter {
     group: Arc<Group>,
@@ -354,8 +372,9 @@ impl StreamWriter {
     /// of a frame the client cannot decode. [`StreamWriter::write_encoded`] is the call for a
     /// compressed format, where the server cannot derive the playtime from the byte count.
     ///
-    /// The returned [`WriteOutcome`] says what happened: `Written` when the chunk got a timestamp,
-    /// `Held` while the group anchors the start of the stream, `Dropped` with the reason otherwise.
+    /// The returned [`WriteOutcome`] says what happened: `Written` when the chunk got a timestamp
+    /// and reached every streaming player, `Partial` when some were skipped, `Held` while the
+    /// group anchors the start of the stream, `Dropped` with the reason otherwise.
     /// A dropped chunk is not queued for retry: bytes written to a paused or ended stream have no
     /// timeline to land on, and resending audio is worse than losing it.
     pub fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
@@ -371,7 +390,7 @@ impl StreamWriter {
     /// supplies it; the timeline and the player buffering follow that value. The chunk must be one
     /// whole codec unit - one FLAC frame or one Opus packet, as the format states - which the server
     /// cannot check and therefore trusts. A PCM format uses [`StreamWriter::write`] instead, and the
-    /// outcome is the same three-way [`WriteOutcome`].
+    /// outcome is the same [`WriteOutcome`].
     pub fn write_encoded(&mut self, bytes: &[u8], duration: Duration) -> WriteOutcome {
         if self.ended {
             return WriteOutcome::Dropped(WriteError::Ended);

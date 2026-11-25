@@ -763,6 +763,16 @@ impl Group {
             return WriteOutcome::Dropped(WriteError::TooLong);
         }
         let lead = inner.group_lead_us();
+        // Only a player that can take this chunk at all sets the bound: one whose capacity is
+        // below a single framed chunk is skipped for every chunk and gains nothing from it.
+        let framed_len =
+            u64::try_from(bytes.len().saturating_add(AudioChunkHeader::LEN)).unwrap_or(u64::MAX);
+        let room = inner
+            .members
+            .iter()
+            .filter(|member| member.plays() && member.capacity >= framed_len)
+            .map(|member| member.capacity)
+            .min();
         let reseeded = {
             let Some(stream) = inner.stream.as_mut() else {
                 return WriteOutcome::Dropped(WriteError::Ended);
@@ -776,6 +786,25 @@ impl Group {
                 });
                 if queued.saturating_add(micros_i64(duration)) > micros_i64(ANCHOR_DEADLINE) {
                     return WriteOutcome::Dropped(WriteError::Backpressure);
+                }
+                // The flush is subject to each player's `buffer_capacity`: a chunk it could not
+                // take would be assigned a timestamp and skipped, and the host would only have
+                // seen `Held`. The queue is therefore also bounded by the framed bytes the
+                // smallest ready player that can take a chunk. The first chunk is always accepted.
+                // A player that joins during the anchor with less room, or is gated at its
+                // deadline, can still miss held chunks at the flush; that skip is not reported.
+                let framed = |len: usize| {
+                    u64::try_from(len.saturating_add(AudioChunkHeader::LEN)).unwrap_or(u64::MAX)
+                };
+                let held_bytes = stream.held.iter().fold(0u64, |total, (held, _)| {
+                    total.saturating_add(framed(held.len()))
+                });
+                if let Some(room) = room {
+                    if !stream.held.is_empty()
+                        && held_bytes.saturating_add(framed(bytes.len())) > room
+                    {
+                        return WriteOutcome::Dropped(WriteError::Backpressure);
+                    }
                 }
                 stream.held.push_back((bytes.to_vec(), duration));
                 return WriteOutcome::Held;
@@ -855,9 +884,10 @@ impl Group {
     /// A report for another epoch belongs to a superseded segment and changes nothing. Every
     /// report clears the member's start gate, because the start it waited for has gone out. A
     /// member still in an armed anchor set contributes its transmit time and is released with the
-    /// shared timeline; any other ready member gets its own start lead, so a late joiner's start
-    /// from empty holds even when the group's timeline is behind (at the price of a hole). A
-    /// report from a member that is not ready applies only the reset.
+    /// shared timeline. A member that was gated on this start gets its own start lead, so a late
+    /// joiner's start from empty holds even when the group's timeline is behind (at the price of
+    /// a hole), also when it is unavailable at the time and takes the floor back with it. A
+    /// streaming member that was not gated keeps the timeline it is already on.
     pub(crate) fn trigger_sent(
         &self,
         member: u64,
@@ -868,15 +898,22 @@ impl Group {
     ) {
         let now = self.clock.now_us();
         let mut inner = self.lock();
-        if inner.epoch != epoch {
-            return;
-        }
         let Some(index) = inner.members.iter().position(|held| held.id == member) else {
             return;
         };
         if reset {
-            inner.members[index].sent.clear();
+            // The reset describes what the client discarded on the wire, so it holds whatever
+            // epoch the trigger belonged to. The connection sends its queue in order and marks a
+            // chunk transmitted right after the write, so at this point exactly the chunks queued
+            // before the trigger are marked: the ones queued behind it are still outstanding.
+            inner.members[index]
+                .sent
+                .retain(|sent| !sent.transmitted.load(Ordering::Relaxed));
         }
+        if inner.epoch != epoch {
+            return;
+        }
+        let was_gated = inner.members[index].start_gate;
         inner.members[index].start_gate = false;
 
         let mut recorded = false;
@@ -897,14 +934,28 @@ impl Group {
         }
         if !recorded {
             if let Some(t) = t {
-                if inner.members[index].plays() {
-                    let member_lead = inner.members[index].member_lead_us();
+                if !inner.members[index].plays() {
+                    if was_gated {
+                        // Not ready now, but it waited for this start: keep the floor for when it
+                        // returns. `start_at` only matters to a streaming member.
+                        let floor = t.saturating_add(inner.members[index].member_lead_us());
+                        let old = inner.members[index].start_at;
+                        inner.members[index].start_at = old.max(floor);
+                    }
+                } else {
+                    // Only a member that waited for this start takes its own lead from the
+                    // report: one that already streams again (it left and returned during the
+                    // anchor) would otherwise skip chunks the group has been sending it, an
+                    // audible hole in a running stream.
+                    let member_lead = if was_gated {
+                        t.saturating_add(inner.members[index].member_lead_us())
+                    } else {
+                        0
+                    };
                     let next_us = inner.stream.as_ref().map_or(0, |stream| stream.next_us);
                     let old = inner.members[index].start_at;
-                    inner.members[index].start_at = old
-                        .max(next_us)
-                        .max(t.saturating_add(member_lead))
-                        .max(now.saturating_add(1));
+                    inner.members[index].start_at =
+                        old.max(next_us).max(member_lead).max(now.saturating_add(1));
                 }
             }
         }
@@ -1268,16 +1319,25 @@ impl Inner {
     /// is used up by chunks it has not finished playing. The count is rebuilt from the sent list
     /// on every chunk, so an ack, a passing playtime or a reported output delay all take effect
     /// without a separate pass. A skipped member hears a hole while the group timeline moves on;
-    /// the wire has no per-member skip signal.
-    fn send_audio(&mut self, chunk: &[u8], timestamp_us: i64, duration: Duration, now_us: i64) {
+    /// the wire has no per-member skip signal. Returns how many streaming members were skipped.
+    fn send_audio(
+        &mut self,
+        chunk: &[u8],
+        timestamp_us: i64,
+        duration: Duration,
+        now_us: i64,
+    ) -> usize {
+        let mut skipped = 0;
         let framed = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
         for member in self.members.iter_mut().filter(|member| member.streams()) {
             if member.start_gate || member.start_at > timestamp_us {
+                skipped += 1;
                 continue;
             }
             member.prune_sent(now_us);
             let count = member.counted_bytes(now_us);
             if framed > member.capacity.saturating_sub(count) {
+                skipped += 1;
                 continue;
             }
             let transmitted = Arc::new(AtomicBool::new(false));
@@ -1293,6 +1353,7 @@ impl Inner {
             });
             member.start_at = 0;
         }
+        skipped
     }
 
     /// Stops the player stream if it is running and freezes its position.
@@ -1538,8 +1599,10 @@ impl Inner {
             .encode(payload);
             (chunk, timestamp_us)
         };
-        self.send_audio(&chunk, timestamp_us, duration, now_us);
-        WriteOutcome::Written
+        match self.send_audio(&chunk, timestamp_us, duration, now_us) {
+            0 => WriteOutcome::Written,
+            skipped => WriteOutcome::Partial { skipped },
+        }
     }
 }
 
@@ -1713,6 +1776,20 @@ mod tests {
             {
                 return (chunk, transmitted);
             }
+        }
+    }
+
+    /// Marks everything queued to a member as written to its socket, as its connection does for
+    /// the chunks that precede a trigger in its queue.
+    fn mark_transmitted(group: &Group, id: u64) {
+        let inner = group.lock();
+        let member = inner
+            .members
+            .iter()
+            .find(|member| member.id == id)
+            .expect("the member");
+        for sent in &member.sent {
+            sent.transmitted.store(true, Ordering::Relaxed);
         }
     }
 
@@ -2288,6 +2365,159 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_report_keeps_the_chunks_queued_behind_its_trigger() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 0, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        mark_transmitted(&group, id);
+        group.seek(Duration::from_secs(1));
+        let (_, epoch, anchor, reset) = next_trigger(&mut receiver);
+        assert!(reset);
+
+        // The member drops out of the anchor and returns before its clear is written, so it
+        // streams again, ungated, with the clear still ahead of it in its queue.
+        group.report_client_state(
+            id,
+            &ClientState {
+                available: false,
+                player: None,
+            },
+        );
+        group.report_client_state(
+            id,
+            &ClientState {
+                available: true,
+                player: None,
+            },
+        );
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written,
+            "the returned member takes the chunk behind its clear"
+        );
+        assert_eq!(sent_len(&group, id), 2, "the old chunk and the new one");
+
+        group.trigger_sent(id, epoch, anchor, reset, Some(group.now_us() + 100_000));
+        assert_eq!(
+            sent_len(&group, id),
+            1,
+            "the reset drops what preceded the clear and counts what follows it"
+        );
+    }
+
+    #[test]
+    fn a_late_clear_report_does_not_open_a_hole_for_a_member_that_already_streams_again() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 100, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        mark_transmitted(&group, id);
+        group.seek(Duration::from_secs(1));
+        let (_, epoch, anchor, reset) = next_trigger(&mut receiver);
+        for available in [false, true] {
+            group.report_client_state(
+                id,
+                &ClientState {
+                    available,
+                    player: None,
+                },
+            );
+        }
+        let chunk = [0u8; 480 * 4];
+        assert_eq!(group.write_audio(&chunk, None), WriteOutcome::Written);
+
+        // The clear is written late; its transmit time plus the member's lead is past the
+        // timeline the member is already being fed from.
+        group.trigger_sent(id, epoch, anchor, reset, Some(group.now_us() + 5_000_000));
+        assert_eq!(
+            group.write_audio(&chunk, None),
+            WriteOutcome::Written,
+            "a member that is already streaming is not skipped by a late report"
+        );
+    }
+
+    #[test]
+    fn a_stale_clear_report_still_resets_what_the_client_discarded() {
+        let group = test_group();
+        let (id, mut receiver) = add_player(&group, 0, 0);
+        open_stream_reported(&group, id, &mut receiver);
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Written
+        );
+        mark_transmitted(&group, id);
+        group.seek(Duration::from_secs(1));
+        let (_, epoch, anchor, reset) = next_trigger(&mut receiver);
+        group.pause();
+
+        group.trigger_sent(id, epoch, anchor, reset, Some(group.now_us() + 100_000));
+        assert_eq!(
+            sent_len(&group, id),
+            0,
+            "the clear reached the client even though a pause superseded it"
+        );
+    }
+
+    #[test]
+    fn held_audio_is_bounded_by_the_smallest_ready_capacity() {
+        // The client announces 131_072 bytes; one second of 48 kHz stereo PCM is 192 kB.
+        let group = test_group();
+        let (id, mut receiver) = add_player_with_capacity(&group, 100, 0, 131_072);
+        group.open_stream(TrackInfo::default());
+        let (_, epoch, anchor, reset) = next_trigger(&mut receiver);
+
+        let ten_ms = [0u8; 480 * 4];
+        let framed = (ten_ms.len() + AudioChunkHeader::LEN) as u64;
+        let fits = usize::try_from(131_072 / framed).expect("a small count");
+        for _ in 0..fits {
+            assert_eq!(group.write_audio(&ten_ms, None), WriteOutcome::Held);
+        }
+        assert_eq!(
+            group.write_audio(&ten_ms, None),
+            WriteOutcome::Dropped(WriteError::Backpressure),
+            "a chunk the flush could not hand to the player is refused while it is held"
+        );
+
+        group.trigger_sent(id, epoch, anchor, reset, Some(group.now_us() + 500_000));
+        assert_eq!(
+            drain_audio(&mut receiver).len(),
+            fits,
+            "everything the host was told was held reaches the player"
+        );
+    }
+
+    #[test]
+    fn held_audio_is_discarded_when_a_pause_supersedes_the_anchor() {
+        let group = test_group();
+        let (_id, mut receiver) = add_player(&group, 100, 0);
+        group.open_stream(TrackInfo::default());
+        let _ = next_trigger(&mut receiver);
+
+        assert_eq!(
+            group.write_audio(&[0u8; 480 * 4], None),
+            WriteOutcome::Held,
+            "the stream is not anchored yet"
+        );
+        group.pause();
+
+        assert!(
+            group
+                .lock()
+                .stream
+                .as_ref()
+                .is_some_and(|stream| stream.held.is_empty()),
+            "the chunk the host was told was held is gone after the pause"
+        );
+        assert!(
+            drain_audio(&mut receiver).is_empty(),
+            "and it never reaches the player"
+        );
+    }
+
+    #[test]
     fn a_play_restart_moves_the_epoch_and_a_stale_end_report_cannot_clear_its_gate() {
         let group = test_group();
         let (id, mut receiver) = add_player(&group, 100, 0);
@@ -2411,6 +2641,7 @@ mod tests {
         assert_eq!(sent_len(&group, id), 1, "the report resets, not the send");
 
         let t = group.now_us() + 100_000;
+        mark_transmitted(&group, id);
         group.trigger_sent(id, epoch, anchor, reset, Some(t));
         let inner = group.lock();
         let member = inner
@@ -2700,6 +2931,7 @@ mod tests {
             },
         );
         let future = group.now_us() + 5_000_000;
+        mark_transmitted(&group, second);
         group.trigger_sent(second, jump_epoch, true, true, Some(future));
         {
             let inner = group.lock();
@@ -3207,8 +3439,8 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 group.write_audio(&[0u8; 480 * 4], None),
-                WriteOutcome::Written,
-                "the group still schedules the chunk"
+                WriteOutcome::Partial { skipped: 1 },
+                "the group still schedules the chunk and says the member did not get it"
             );
         }
         assert!(
@@ -3275,8 +3507,8 @@ mod tests {
 
         assert_eq!(
             group.write_audio(&[0u8; 480 * 4], None),
-            WriteOutcome::Written,
-            "the host's write is accepted even though a member is skipped"
+            WriteOutcome::Partial { skipped: 1 },
+            "the host's write is scheduled and told that the member was skipped"
         );
         let third = group.lock().stream.as_ref().expect("a stream").next_us;
         assert_eq!(
@@ -3502,6 +3734,7 @@ mod tests {
             1,
             "neither the clear's send nor the in-place start resets the list"
         );
+        mark_transmitted(&group, id);
         group.trigger_sent(id, epoch, anchor, reset, Some(group.now_us() + 1_000_000));
         assert_eq!(sent_len(&group, id), 0, "the clear's report is the reset");
 
@@ -3515,6 +3748,7 @@ mod tests {
         assert!(matches!(end, Incoming::StreamEnd(_)));
         assert!(!anchor && reset);
         assert_eq!(sent_len(&group, id), 1, "the end's send does not reset yet");
+        mark_transmitted(&group, id);
         group.trigger_sent(id, epoch, anchor, reset, None);
         assert_eq!(sent_len(&group, id), 0, "the end's report is a reset");
     }

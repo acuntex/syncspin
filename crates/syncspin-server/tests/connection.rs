@@ -988,7 +988,10 @@ async fn a_late_joiner_is_gated_on_its_own_start_and_keeps_the_timeline() -> Res
     late.barrier(1).await?;
 
     // The chunk written now is before the late member's floor.
-    assert_eq!(writer.write(&[5u8; 480 * 4]), WriteOutcome::Written);
+    assert_eq!(
+        writer.write(&[5u8; 480 * 4]),
+        WriteOutcome::Partial { skipped: 1 }
+    );
     let (early_second_header, early_second) = early.read_audio().await?;
     assert_eq!(early_second, [5u8; 480 * 4]);
     late.expect_no_audio(Duration::from_millis(200)).await?;
@@ -1088,7 +1091,10 @@ async fn a_member_with_no_room_is_skipped_until_its_buffer_drains() -> Result<()
 
     // The second chunk would push the outstanding framed bytes past the capacity, so the member
     // is skipped instead of overrun.
-    assert_eq!(writer.write(&[2u8; 480 * 4]), WriteOutcome::Written);
+    assert_eq!(
+        writer.write(&[2u8; 480 * 4]),
+        WriteOutcome::Partial { skipped: 1 }
+    );
     client.expect_no_audio(Duration::from_millis(200)).await?;
 
     // The first chunk has played out; the next one fits again.

@@ -547,8 +547,8 @@ pub(crate) enum Command {
 /// ends the server, and dropping the handle does the same without waiting for it.
 ///
 /// The handle must not outlive the Tokio runtime [`Server::start`] ran on: a restart with a ready
-/// member arms a deadline timer on that runtime, and spawning it after the runtime has shut down
-/// panics.
+/// member arms a deadline timer on that runtime, and a timer spawned after the runtime has shut
+/// down never runs. The anchor then waits for the next write or report to flush it.
 pub struct ServerHandle {
     task: Option<JoinHandle<Result<()>>>,
     /// The discovery loop, when the host supplied a backend.

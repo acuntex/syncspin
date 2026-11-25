@@ -1864,6 +1864,7 @@ fn report_values_in_range(message: &Incoming) -> bool {
     }
 }
 
+/// Why a `client/init` was refused, as the `reason` of `server/error`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitFailure {
     /// The client speaks another core message format.
