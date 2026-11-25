@@ -4,6 +4,10 @@
 place where this library knowingly departs from it is listed here, with the spec section it
 concerns, the reason for the departure and what closing the gap requires.
 
+The specification text was read at `Sendspin/spec` commit `2cfe19725e26087801985e1d47b31c437bb39099`
+(the head when the role-feature series was written); re-check the role files against the current
+head before relying on a quoted rule.
+
 A deviation is only acceptable when it is in this file and, where the behaviour is observable,
 pinned by a test. "Not implemented yet" entries are staged work, not a claim that the deviation is
 harmless.
@@ -257,7 +261,8 @@ accept, so the observable outcome is the same, but the client has broken the MUS
 `seek_relative` shares that window: an offset needs no range, so nothing has to be known first.
 Absolute `seek` is the deliberate exception - it additionally requires the seekable range from the
 same controller state, and with no range known yet it is refused before the first controller state
-rather than sent unvalidated.
+rather than sent unvalidated. When the controller role is removed the recorded set is dropped and the
+window opens again (`roles_removal_headless`).
 
 **Why:** a host may offer a play button before the first `server/state` arrives - it has no other
 source of truth - and refusing there would make the button dead for an unbounded time. The window
@@ -286,7 +291,10 @@ stays active across a reconnect even when the server omits the field: the new se
 `unpaired_access` off that reconnects into an activation whose activity set has no `playback` is not
 playback-capable, so the carried roles are cleared and no state or burst follows. Roles the client
 has no `client/state` object for - `metadata@v1` and `controller@v1` - are kept in the set but
-produce no state of their own.
+produce no state of their own; a role that is later removed from the set (explicitly, by the implicit
+clear above, or by a version replacement) has its state dropped and reported as `Event::TrackCleared`
+or a reset `Event::State`. The new session starts with empty role state, so a reconnect reports no
+clear for the roles the previous session had.
 `an_activation_without_roles_keeps_the_roles_of_the_previous_connection` pins the player case, and
 covers only the setting-on case: the second connection's first activation carries no roles while
 `unpaired_access` is on, and the client still reports its player state.

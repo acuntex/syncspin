@@ -88,13 +88,13 @@ use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_
 use crate::playout::{Dropped, OwnedFrame, PlayoutQueue, BUFFER_CAPACITY};
 #[cfg(feature = "metadata")]
 use crate::roles::sched::Pending;
-use crate::roles::supported_roles;
 #[cfg(feature = "controller")]
 use crate::roles::CONTROLLER_ROLE;
 #[cfg(feature = "metadata")]
 use crate::roles::METADATA_ROLE;
 #[cfg(feature = "player")]
 use crate::roles::PLAYER_ROLE;
+use crate::roles::{role_changes, supported_roles};
 #[cfg(feature = "player")]
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 use crate::storage::persist_pairing;
@@ -1691,6 +1691,7 @@ impl Session<'_> {
         }
 
         let had_player = self.player_active();
+        let previous_roles = self.active_roles.clone();
         // The spec re-evaluates playback capability against the persisted roles instead of rejecting
         // a later activation for them: a connection that can no longer carry playback loses its
         // roles, and `had_player` above is what turns that loss into `StreamEnd` below.
@@ -1703,6 +1704,7 @@ impl Session<'_> {
             self.active_roles = roles;
         }
         let has_player = self.player_active();
+        let (_added, removed) = role_changes(&previous_roles, &self.active_roles);
 
         if had_player && !has_player {
             // The player role is gone: nothing that is still buffered may become audible.
@@ -1720,6 +1722,9 @@ impl Session<'_> {
                 self.start_burst();
             }
         }
+
+        // The player's stream ended above, so its event precedes the other roles' clears.
+        self.reconcile_removed(&removed);
 
         // Only the player waits for the clock before its first `client/state`: a client that has
         // roles but no player owes the initial report as soon as the activation names them.
@@ -2896,6 +2901,34 @@ impl Session<'_> {
         self.config.required_lead_time_ms.max(pre_port_ms)
     }
 
+    /// Drops the state of every role that is no longer active.
+    ///
+    /// Role removal happens through an explicit new set, through the implicit clear when an
+    /// activation that omits `active_roles` leaves the connection unable to carry playback, and
+    /// through a version replacement, so the caller passes the diff of the sets rather than the
+    /// activation. The player is handled by the caller, which also ends its stream. Group fields of
+    /// [`PlaybackState`] belong to `group/update`, not to a role, and are kept.
+    fn reconcile_removed(&mut self, removed: &[String]) {
+        for role in removed {
+            #[cfg(feature = "controller")]
+            if role == CONTROLLER_ROLE {
+                self.controller_commands = None;
+                self.playback.supported_commands = Vec::new();
+                self.playback.volume = None;
+                self.playback.muted = None;
+                self.playback.seek_max_ms = None;
+                self.emit(Event::State(self.playback.clone()));
+            }
+            #[cfg(feature = "metadata")]
+            if role == METADATA_ROLE {
+                self.track.clear();
+                self.emit(Event::TrackCleared);
+            }
+            #[cfg(not(any(feature = "controller", feature = "metadata")))]
+            let _ = role;
+        }
+    }
+
     /// Turns a `metadata` object into a [`Event::Track`] and delivers it at its timestamp.
     ///
     /// A state whose timestamp is past or present, or that arrives with no clock estimate, is
@@ -4001,20 +4034,24 @@ fn admits_pairing(activate: &ServerActivate) -> Result<Option<PairingActivation>
     Ok(Some(activation))
 }
 
-/// Whether a `stream/end` or `stream/clear` role list affects the player stream.
+/// Whether a `stream/end` or `stream/clear` role list names a role.
 ///
-/// An absent list means every role. Otherwise it has to name the player: `messaging.md` lists the
-/// role names in this message as bare `'player'`, `'artwork'` and `'visualizer'`, while
-/// `server/activate` uses the versioned `player@v1` form. Both spellings are accepted so a server
-/// that reuses the versioned identifier is not silently ignored.
+/// An absent list means every role. Otherwise it has to name `family`: `messaging.md` lists the
+/// role names in these messages as bare `'player'`, `'artwork'` and `'visualizer'`, while
+/// `server/activate` uses the versioned form (`player@v1`). Both spellings are accepted for every
+/// family so a server that reuses the versioned identifier is not silently ignored.
 #[cfg(feature = "player")]
-fn affects_player(roles: Option<&[String]>) -> bool {
+fn names_role(roles: Option<&[String]>, family: &str, versioned: &str) -> bool {
     match roles {
         None => true,
-        Some(roles) => roles
-            .iter()
-            .any(|role| role == PLAYER_STREAM_ROLE || role == PLAYER_ROLE),
+        Some(roles) => roles.iter().any(|role| role == family || role == versioned),
     }
+}
+
+/// Whether a `stream/end` or `stream/clear` role list affects the player stream.
+#[cfg(feature = "player")]
+fn affects_player(roles: Option<&[String]>) -> bool {
+    names_role(roles, PLAYER_STREAM_ROLE, PLAYER_ROLE)
 }
 
 /// Decodes the server's static public key from the `server_id` it announced.
@@ -5609,5 +5646,28 @@ mod tests {
             1,
             "one request yields at most one sample even if the peer echoes it twice"
         );
+    }
+
+    #[test]
+    fn a_role_list_names_a_role_bare_or_versioned() {
+        let list = |roles: &[&str]| Some(roles.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>());
+        assert!(
+            names_role(None, "player", "player@v1"),
+            "no list means every role"
+        );
+        for roles in [list(&["player"]), list(&["artwork", "player@v1"])] {
+            assert!(names_role(roles.as_deref(), "player", "player@v1"));
+        }
+        assert!(!names_role(
+            list(&["artwork"]).as_deref(),
+            "player",
+            "player@v1"
+        ));
+        assert!(!names_role(
+            list(&["artwork@v1"]).as_deref(),
+            "player",
+            "player@v1"
+        ));
+        assert!(affects_player(list(&["player@v1"]).as_deref()));
     }
 }

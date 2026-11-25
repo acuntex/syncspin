@@ -5460,7 +5460,12 @@ async fn turning_it_off_closes_a_playback_only_session() {
         Some("pairing_required"),
         "a declared playback activity is enough to rely on the setting"
     );
-    match next_event(&mut events).await {
+    // The activation that dropped every role also reported the role states cleared.
+    let mut event = next_event(&mut events).await;
+    while matches!(event, Event::TrackCleared | Event::State(_)) {
+        event = next_event(&mut events).await;
+    }
+    match event {
         Event::Disconnected { reason, .. } => assert!(
             reason.contains("stopped admitting unpaired access"),
             "the reason must name the host's choice, got: {reason}"

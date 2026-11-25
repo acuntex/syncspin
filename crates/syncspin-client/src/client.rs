@@ -436,6 +436,12 @@ pub enum Event {
         /// Position, length and speed of the track at `timestamp_us`.
         progress: TrackProgress,
     },
+    /// The metadata state was dropped because the role was removed.
+    ///
+    /// Not an empty [`Event::Track`], which a server can send legitimately: this is the client
+    /// saying that whatever track the host displays no longer has a source.
+    #[cfg(feature = "metadata")]
+    TrackCleared,
     /// The server's view of playback state changed.
     State(PlaybackState),
     /// The server sent a `group_id` the spec does not allow, and the client accepted it.
@@ -625,6 +631,8 @@ impl fmt::Debug for Event {
                 .field("late_by", late_by)
                 .field("dropped", dropped)
                 .finish(),
+            #[cfg(feature = "metadata")]
+            Self::TrackCleared => formatter.write_str("TrackCleared"),
             #[cfg(feature = "metadata")]
             Self::Track {
                 title,

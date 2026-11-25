@@ -37,6 +37,24 @@ pub(crate) fn supported_roles(sink: bool) -> Vec<&'static str> {
     roles.iter().flatten().copied().collect()
 }
 
+/// The roles that are in `new` and not in `old` (added), and in `old` and not in `new` (removed).
+///
+/// Roles are compared as versioned identifiers, so replacing `controller@v1` by another version of
+/// it is a removal and an addition. Order within each list follows the input.
+pub(crate) fn role_changes(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
+    let added = new
+        .iter()
+        .filter(|role| !old.contains(role))
+        .cloned()
+        .collect();
+    let removed = old
+        .iter()
+        .filter(|role| !new.contains(role))
+        .cloned()
+        .collect();
+    (added, removed)
+}
+
 /// Refuses to start a client that would have no role to offer.
 ///
 /// A build with none of the role features, and a headless client in a build without `controller`
@@ -64,6 +82,27 @@ mod tests {
             ["player@v1", "controller@v1", "metadata@v1"]
         );
         assert_eq!(supported_roles(false), ["controller@v1", "metadata@v1"]);
+    }
+
+    #[test]
+    fn a_role_diff_names_additions_and_removals() {
+        let set = |roles: &[&str]| roles.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
+        let (added, removed) = role_changes(
+            &set(&["player@v1", "controller@v1"]),
+            &set(&["controller@v1", "metadata@v1"]),
+        );
+        assert_eq!(
+            (added, removed),
+            (set(&["metadata@v1"]), set(&["player@v1"]))
+        );
+        let (added, removed) = role_changes(&set(&["controller@v1"]), &set(&["controller@v2"]));
+        assert_eq!(
+            (added, removed),
+            (set(&["controller@v2"]), set(&["controller@v1"])),
+            "a replaced version is removed and added"
+        );
+        let (added, removed) = role_changes(&set(&["metadata@v1"]), &set(&["metadata@v1"]));
+        assert!(added.is_empty() && removed.is_empty());
     }
 
     #[test]

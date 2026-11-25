@@ -1024,7 +1024,8 @@ async fn a_pairing_after_a_rehandshake_uses_index_one() {
                 assert_eq!(reason, PairingFailure::MethodNotSupported);
                 break;
             }
-            Event::StreamEnd { .. } => continue,
+            // The activation drops every role, so the role states are reported cleared too.
+            Event::StreamEnd { .. } | Event::TrackCleared | Event::State(_) => continue,
             other => panic!("expected PairingFailed, got {other:?}"),
         }
     }

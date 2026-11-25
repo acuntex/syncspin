@@ -86,7 +86,6 @@ impl<T> Pending<T> {
     }
 
     /// Drops the held value, for a role that was removed or a connection that was reset.
-    #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.held = None;
     }
