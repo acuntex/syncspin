@@ -413,7 +413,8 @@ report that arrives after the instant re-leads from `now` instead of using a pas
 no ready member no anchor is armed and the provisional timeline stands; the first member to report
 joins it as a late joiner, with its own lead when the common one does not cover it. A late joiner
 after the anchor never moves the timeline and never gets a past timestamp. Each member's
-outstanding audio is capped at the `buffer_capacity` its `client/hello` announced: a chunk that
+outstanding audio is capped at the `buffer_capacity` its `client/hello` announced, itself held to
+1 MiB so a huge announcement is not an unbounded queue: a chunk that
 would overrun it is not started, and a queued or sent chunk counts until its transmission is
 finished and `timestamp + duration - output_delay_ms` has passed. A member skipped for capacity or
 because its own start is still ahead hears a hole while the group timeline moves on, and the host
@@ -449,6 +450,7 @@ The closed parts are pinned by `the_group_lead_is_the_maximum_of_the_ready_membe
 `a_flush_that_skips_a_player_is_reported_as_an_event`,
 `the_carried_playtime_does_not_drift_from_the_sample_count`,
 `a_refused_chunk_does_not_move_the_pcm_remainder`,
+`a_reported_buffer_capacity_is_held_to_the_server_cap`,
 `the_timeline_follows_the_sample_count_at_a_rate_that_does_not_divide_a_chunk`,
 `a_chunk_longer_than_150_ms_is_refused` and
 `a_player_hears_nothing_before_it_reports_its_state`. `two_players_receive_the_same_frames` still

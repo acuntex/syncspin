@@ -618,6 +618,9 @@ impl ServerHandle {
     /// has no queue and cannot tell a natural transition from a stopped stream (deviation 22 in
     /// `docs/spec-deviations.md`).
     ///
+    /// The title, artist, album artist and album are cut to 255 UTF-8 bytes, the limit of the
+    /// metadata role (see [`TrackInfo`]).
+    ///
     /// A group with no player still accepts the writer: a stream that nobody hears is the host's
     /// business, and its timestamps stay consistent for a player that joins later.
     pub fn open_stream(&self, track: TrackInfo) -> StreamWriter {

@@ -70,6 +70,12 @@ const PLAYBACK_ACTIVITY: &str = "playback";
 /// misses the opening.
 const ANCHOR_DEADLINE: Duration = Duration::from_secs(1);
 
+/// The most outstanding audio the server counts toward one member, whatever its `client/hello`
+/// announced. A client that reports a huge `buffer_capacity` would otherwise get an effectively
+/// unbounded queue and a sent list that grows with it. One MiB is eight times the 128 KiB this
+/// project's own client announces.
+const MAX_BUFFER_CAPACITY: u64 = 1 << 20;
+
 /// The longest chunk the server may send, as the player role states it.
 ///
 /// `roles/player/v1.md` forbids a chunk longer than 150 ms, because a player would have to buffer
@@ -392,7 +398,9 @@ impl Group {
     /// activity - goes into the member's queue before it becomes visible to broadcasts, and the
     /// lock keeps a change from slipping between the snapshot and the join. The stream itself
     /// waits for the `client/state` that declares the member ready; [`Group::report_client_state`]
-    /// announces it then. `buffer_capacity` is the hello's largest outstanding audio size.
+    /// announces it then. `buffer_capacity` is the hello's largest outstanding audio size, which the
+    /// server holds to at most [`MAX_BUFFER_CAPACITY`]: the client's number is not a license for an
+    /// unbounded queue.
     pub(crate) fn join(
         &self,
         roles: Vec<String>,
@@ -445,7 +453,7 @@ impl Group {
             playback_declared: false,
             min_buffer_ms: 0,
             output_delay_ms: 0,
-            capacity: buffer_capacity,
+            capacity: buffer_capacity.min(MAX_BUFFER_CAPACITY),
             start_at: 0,
             start_gate: false,
             sent: Vec::new(),
@@ -674,6 +682,7 @@ impl Group {
     /// Opening a stream means audio is playing, so the group reports `playing` from here on; the
     /// host does not have to call [`Group::play`] as well.
     pub(crate) fn open_stream(&self, track: TrackInfo) {
+        let track = track.limited();
         let now = self.clock.now_us();
         let mut inner = self.lock();
         let advanced = inner.stream.as_ref().is_some_and(|stream| stream.active);
@@ -2461,6 +2470,35 @@ mod tests {
             480_000 * 1_000_000 / 44_100,
             "a thousand 480-frame chunks span the exact playtime of 480 000 frames"
         );
+    }
+
+    #[test]
+    fn a_reported_buffer_capacity_is_held_to_the_server_cap() {
+        let group = test_group();
+        let (id, _receiver) = add_player_with_capacity(&group, 0, 0, u64::MAX);
+        let inner = group.lock();
+        let member = inner
+            .members
+            .iter()
+            .find(|member| member.id == id)
+            .expect("the member");
+        assert_eq!(member.capacity, MAX_BUFFER_CAPACITY);
+    }
+
+    #[test]
+    fn open_stream_cuts_long_metadata_text() {
+        let group = test_group();
+        let (_id, _receiver) = add_player(&group, 0, 0);
+        group.open_stream(TrackInfo {
+            title: Some("t".repeat(400)),
+            ..TrackInfo::default()
+        });
+        let inner = group.lock();
+        let title = inner
+            .stream
+            .as_ref()
+            .and_then(|stream| stream.track.title.as_deref());
+        assert_eq!(title.map(str::len), Some(255));
     }
 
     #[test]

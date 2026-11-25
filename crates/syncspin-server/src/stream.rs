@@ -263,11 +263,16 @@ impl fmt::Display for AudioFormat {
     }
 }
 
+/// The longest title, artist, album artist or album the metadata role allows, in UTF-8 bytes.
+pub(crate) const MAX_METADATA_TEXT_BYTES: usize = 255;
+
 /// The track a stream carries.
 ///
 /// Every field is optional: the server forwards what the host knows and leaves the rest absent,
 /// so a client shows what exists instead of an empty string. `duration` of `None` means the
-/// length is unknown, which a live stream reports as `0` in the metadata state.
+/// length is unknown, which a live stream reports as `0` in the metadata state. The metadata role
+/// allows at most 255 UTF-8 bytes per text field, so a longer one is cut at the last character
+/// boundary that fits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrackInfo {
     /// Track title.
@@ -280,6 +285,36 @@ pub struct TrackInfo {
     pub album: Option<String>,
     /// Length of the track; `None` when it is unknown.
     pub duration: Option<Duration>,
+}
+
+impl TrackInfo {
+    /// Returns the track with every text field cut to the metadata role's byte limit.
+    pub(crate) fn limited(mut self) -> TrackInfo {
+        for text in [
+            &mut self.title,
+            &mut self.artist,
+            &mut self.album_artist,
+            &mut self.album,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            truncate_utf8(text, MAX_METADATA_TEXT_BYTES);
+        }
+        self
+    }
+}
+
+/// Cuts `text` to at most `max` bytes at the last character boundary that fits.
+fn truncate_utf8(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 /// What became of one chunk a host wrote.
@@ -474,6 +509,46 @@ mod tests {
                 .collect(),
             buffer_capacity: 1 << 20,
         }
+    }
+
+    #[test]
+    fn metadata_text_is_cut_at_a_character_boundary_within_255_bytes() {
+        let track = TrackInfo {
+            title: Some("a".repeat(300)),
+            // 128 two-byte characters are 256 bytes: the last one does not fit.
+            artist: Some("\u{e9}".repeat(128)),
+            album: Some("short".to_owned()),
+            ..TrackInfo::default()
+        }
+        .limited();
+        assert_eq!(track.title.as_deref().map(str::len), Some(255));
+        assert_eq!(
+            track.artist.as_deref().map(str::len),
+            Some(254),
+            "a character that would cross the limit is dropped whole"
+        );
+        assert_eq!(track.album.as_deref(), Some("short"));
+        assert_eq!(track.album_artist, None);
+    }
+
+    #[test]
+    fn the_metadata_limit_holds_at_its_edges() {
+        let mut exact = "a".repeat(255);
+        truncate_utf8(&mut exact, 255);
+        assert_eq!(exact.len(), 255, "exactly 255 bytes stay as they are");
+
+        // 63 four-byte characters are 252 bytes; one more would cross the limit.
+        let mut wide = "\u{1f3b5}".repeat(64);
+        truncate_utf8(&mut wide, 255);
+        assert_eq!(
+            wide.len(),
+            252,
+            "a 4-byte character that crosses is dropped whole"
+        );
+
+        let mut none = "abc".to_owned();
+        truncate_utf8(&mut none, 0);
+        assert!(none.is_empty(), "a limit of zero leaves nothing");
     }
 
     #[test]
