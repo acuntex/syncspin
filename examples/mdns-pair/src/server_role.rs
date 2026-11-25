@@ -110,9 +110,10 @@ pub async fn serve(
                             title: Some("mdns-pair smoke test".to_owned()),
                             ..TrackInfo::default()
                         }));
-                        // The writer stamps each chunk with the group's fixed start lead, so a
-                        // chunk is on the wire well before the instant it must play; the pacing
-                        // here only keeps the host from sending the whole stream at once.
+                        // The shared timeline starts a lead ahead that the group derives from the
+                        // players' reported timing, so a chunk is on the wire well before the
+                        // instant it must play; the pacing here only keeps the host from sending
+                        // the whole stream at once.
                         println!(
                             "streaming silent chunks of {CHUNK_BYTES} bytes, one every {CHUNK_MS} ms \
                              until the run stops"
