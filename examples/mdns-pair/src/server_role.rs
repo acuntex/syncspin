@@ -141,7 +141,9 @@ pub async fn serve(
                 // state late joins it at the playhead and hears what follows, so the host keeps
                 // writing in real time until the run stops it.
                 if let Some(writer) = stream.as_mut() {
-                    writer.write(&silence);
+                    // A chunk the server cannot schedule is dropped; the smoke test only needs the
+                    // stream to keep running, so the outcome has nothing to change here.
+                    let _ = writer.write(&silence);
                 }
             }
         }

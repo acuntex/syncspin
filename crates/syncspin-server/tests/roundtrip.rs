@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use syncspin_client::{AudioFrame, Client, ClientConfig, Event, GoodbyeReason, Identity, Sink};
-use syncspin_server::{AudioFormat, Server, ServerConfig, TrackInfo};
+use syncspin_server::{AudioFormat, Server, ServerConfig, TrackInfo, WriteOutcome};
 use tokio::sync::mpsc;
 
 /// How long the test waits for anything at all.
@@ -144,7 +144,7 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
             writer.seek(Duration::ZERO);
             last_seed = Instant::now();
         }
-        writer.write(&chunk);
+        assert_eq!(writer.write(&chunk), WriteOutcome::Written);
         tokio::time::sleep(CHUNK).await;
         while let Ok((arrival, due, length)) = received.try_recv() {
             assert_eq!(

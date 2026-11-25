@@ -2,8 +2,9 @@
 //!
 //! The host owns the queue and the decoder, the server owns the clock and the wire. A host calls
 //! [`ServerHandle::open_stream`](crate::ServerHandle::open_stream), pushes bytes with
-//! [`StreamWriter::write`] and the server stamps every chunk with the server-clock timestamp of its
-//! first sample and fans it out to the players of the group.
+//! [`StreamWriter::write`] for PCM or [`StreamWriter::write_encoded`] for a format whose playtime
+//! only the decoder knows, and the server stamps every chunk with the server-clock timestamp of
+//! its first sample and fans it out to the players of the group.
 //!
 //! Nothing here decodes. Bytes arrive exactly as the host produced them and leave the same way, so
 //! the format is the host's statement about what those bytes are, not something the server checks.
@@ -173,22 +174,29 @@ impl AudioFormat {
         }
     }
 
-    /// Returns the playtime of `bytes` of this format.
+    /// Returns the playtime of `bytes` of this format at the nominal byte rate.
     ///
     /// For [`Codec::Pcm`] the value is exact: whole interleaved frames at the announced width and
-    /// rate, with a trailing partial frame counting as nothing. The server does not decode, so a
-    /// compressed codec reuses the same map over the announced sample rate, channel count and bit
-    /// depth; a host streaming one must therefore keep its chunks at the nominal byte rate this
-    /// implies, which holds for a constant-bitrate codec and not for `opus` or a variable-rate
-    /// FLAC stream. A duration hint on [`StreamWriter::write`] is the fix when a host needs one.
+    /// rate. [`StreamWriter::write`] refuses a trailing partial frame, so only whole frames reach
+    /// this map from that path. The server does not decode, so a compressed codec reuses the same
+    /// map over the announced sample rate, channel count and bit depth, which is wrong for the
+    /// shorter byte stream of `opus` or a variable-rate FLAC. A host streaming one calls
+    /// [`StreamWriter::write_encoded`] with the playtime its decoder reports.
     pub(crate) fn duration(&self, bytes: usize) -> Duration {
-        let sample_bytes = usize::from(self.channels) * usize::from(self.bit_depth / 8).max(1);
-        let frames = bytes / sample_bytes;
+        let frames = bytes / self.frame_bytes();
         if self.sample_rate == 0 {
             return Duration::ZERO;
         }
         let micros = (frames as u64).saturating_mul(1_000_000) / u64::from(self.sample_rate);
         Duration::from_micros(micros)
+    }
+
+    /// Returns the bytes of one interleaved frame at the nominal sample width.
+    ///
+    /// The width is at least one byte per sample, and [`AudioFormat::validate`] rejects a format
+    /// with no channels, so this is never zero for a format a stream may announce.
+    pub(crate) fn frame_bytes(&self) -> usize {
+        usize::from(self.channels) * usize::from(self.bit_depth / 8).max(1)
     }
 
     /// Rejects a format the server cannot schedule a stream for.
@@ -250,6 +258,62 @@ pub struct TrackInfo {
     pub duration: Option<Duration>,
 }
 
+/// What became of one chunk a host wrote.
+///
+/// A host that treats every write as accepted loses audio without noticing: the server refuses a
+/// chunk it cannot schedule and holds one whose stream is not anchored yet. The outcome says which
+/// of the three happened, and a [`WriteOutcome::Dropped`] chunk is not retried, because resending
+/// audio is worse than losing it.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The chunk was assigned a timestamp and handed to the players that can take it.
+    Written,
+    /// The chunk is held until the group has anchored the start of the stream.
+    Held,
+    /// The chunk was refused; the error names the reason.
+    Dropped(WriteError),
+}
+
+/// Why the server refused a chunk.
+///
+/// The variants describe the chunk and the stream, never its audio: a host may log one without
+/// exposing what it was playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteError {
+    /// The chunk is empty or has no playtime.
+    Empty,
+    /// A PCM chunk does not contain a whole number of interleaved frames.
+    Incomplete,
+    /// The chunk is longer than the 150 ms a player must be able to buffer.
+    TooLong,
+    /// The queue of audio held for an anchor is full, so the new chunk was dropped.
+    Backpressure,
+    /// The stream is open but not running: the group paused, stopped or ended it.
+    Paused,
+    /// The stream has ended, or none was open when the chunk was written.
+    Ended,
+    /// The chunk was written with the method its format does not use.
+    WrongMethod,
+}
+
+impl fmt::Display for WriteError {
+    /// Names the reason without exposing the audio.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "the chunk is empty or has no playtime",
+            Self::Incomplete => "a PCM chunk must contain whole interleaved frames",
+            Self::TooLong => "the chunk is longer than the 150 ms a player must buffer",
+            Self::Backpressure => "the queue of held audio is full",
+            Self::Paused => "the stream is paused",
+            Self::Ended => "the stream has ended",
+            Self::WrongMethod => "the chunk was written with the wrong method for its format",
+        })
+    }
+}
+
+impl std::error::Error for WriteError {}
+
 /// The host's handle on one stream.
 ///
 /// [`ServerHandle::open_stream`](crate::ServerHandle::open_stream) returns it; every call applies to
@@ -278,18 +342,36 @@ impl StreamWriter {
         }
     }
 
-    /// Sends one chunk of audio.
+    /// Sends one chunk of PCM audio.
     ///
-    /// The chunk must carry whole codec units as the negotiated format defines them: for `pcm`
-    /// any whole number of interleaved frames, for `flac` one or more complete FLAC frames, for
-    /// `opus` exactly one packet. The server derives the playtime of the chunk from the format, so
-    /// a chunk that crosses a codec boundary shifts every later timestamp.
+    /// The chunk must carry a whole number of interleaved frames, as the negotiated format defines
+    /// them; a partial frame is refused instead of shifting every later timestamp by the playtime
+    /// of a frame the client cannot decode. [`StreamWriter::write_encoded`] is the call for a
+    /// compressed format, where the server cannot derive the playtime from the byte count.
     ///
-    /// Bytes are dropped, without an error the host could act on, while the group is paused or the
-    /// stream has ended: there is no timeline to put them on until playback resumes, and resending
-    /// audio is worse than losing it.
-    pub fn write(&mut self, bytes: &[u8]) {
-        self.group.write_audio(bytes);
+    /// The returned [`WriteOutcome`] says what happened: `Written` when the chunk got a timestamp,
+    /// `Held` while the group anchors the start of the stream, `Dropped` with the reason otherwise.
+    /// A dropped chunk is not queued for retry: bytes written to a paused or ended stream have no
+    /// timeline to land on, and resending audio is worse than losing it.
+    pub fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
+        if self.ended {
+            return WriteOutcome::Dropped(WriteError::Ended);
+        }
+        self.group.write_audio(bytes, None)
+    }
+
+    /// Sends one chunk of encoded audio with the playtime the host decoded.
+    ///
+    /// The server cannot derive the playtime of a compressed chunk from its byte count, so the host
+    /// supplies it; the timeline and the player buffering follow that value. The chunk must be one
+    /// whole codec unit - one FLAC frame or one Opus packet, as the format states - which the server
+    /// cannot check and therefore trusts. A PCM format uses [`StreamWriter::write`] instead, and the
+    /// outcome is the same three-way [`WriteOutcome`].
+    pub fn write_encoded(&mut self, bytes: &[u8], duration: Duration) -> WriteOutcome {
+        if self.ended {
+            return WriteOutcome::Dropped(WriteError::Ended);
+        }
+        self.group.write_audio(bytes, Some(duration))
     }
 
     /// Moves the stream to `position` and drops everything the clients have buffered for it.
