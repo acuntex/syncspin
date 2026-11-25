@@ -23,6 +23,11 @@ pairing-code = ["syncspin-client/pairing-code"]
 # The backend is the crates'; the example opens no socket of its own.
 discovery = ["syncspin-client/discovery", "syncspin-client/mdns"]
 
+# Mirror the client's artwork and color features, so a workspace `--all-features` build sees the
+# configuration fields and events that only exist there. Both are off by default, as in the client.
+artwork = ["syncspin-client/artwork"]
+color = ["syncspin-client/color"]
+
 [dependencies]
 syncspin-client = { version = "0.5.0", path = "../../crates/syncspin-client" }
 # The example builds its own version-0 pairing token, which the client has no accessor for yet:
