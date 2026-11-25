@@ -771,6 +771,26 @@ impl Session<'_> {
                             break "connection lost".to_owned();
                         }
                     }
+                    Some(Outbound::Trigger {
+                        message,
+                        epoch,
+                        anchor,
+                        reset,
+                    }) => {
+                        // The group anchors a restart on the instant its trigger was sent; a
+                        // report for a superseded epoch changes nothing.
+                        let now = self.group.now_us();
+                        if self.connection.send_json(noise, &message).await.is_err() {
+                            break "connection lost".to_owned();
+                        }
+                        if let Some(member) = self.member {
+                            let t = match message.as_ref() {
+                                Incoming::StreamEnd(_) => None,
+                                _ => Some(now),
+                            };
+                            self.group.trigger_sent(member, epoch, anchor, reset, t);
+                        }
+                    }
                     Some(Outbound::Audio(chunk)) => {
                         if self.connection.send_plaintext(noise, chunk).await.is_err() {
                             break "connection lost".to_owned();
@@ -957,7 +977,7 @@ impl Session<'_> {
             return;
         }
         let (sender, receiver) = mpsc::unbounded_channel();
-        self.member = Some(self.group.join(roles, sender));
+        self.member = Some(self.group.join(roles, sender, 0));
         self.outbound = Some(receiver);
     }
 
