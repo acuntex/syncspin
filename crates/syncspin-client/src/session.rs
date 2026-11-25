@@ -29,6 +29,8 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
+#[cfg(feature = "metadata")]
+use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{Bytes, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -64,14 +66,14 @@ use syncspin_core::pairing::pake::TAG_LEN;
 
 #[cfg(feature = "player")]
 use crate::buffer::{BufferEstimator, PLAUSIBLE_US, WARMUP};
-#[cfg(feature = "metadata")]
-use crate::client::NORMAL_PLAYBACK_SPEED;
 #[cfg(feature = "player")]
 use crate::client::{check_reported_level, clamp_volume_with, StreamEndReason};
 use crate::client::{
     ControlAction, ControlRequest, Event, GoodbyeReason, PairingFailure, PairingRequiredReason,
     PlaybackState,
 };
+#[cfg(feature = "metadata")]
+use crate::client::{TrackProgress, NORMAL_PLAYBACK_SPEED};
 #[cfg(feature = "player")]
 use crate::config::AudioMode;
 #[cfg(feature = "pairing-code")]
@@ -84,6 +86,8 @@ use crate::pairing::{
 use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_PAIRING_PSK};
 #[cfg(feature = "player")]
 use crate::playout::{Dropped, OwnedFrame, PlayoutQueue, BUFFER_CAPACITY};
+#[cfg(feature = "metadata")]
+use crate::roles::sched::Pending;
 use crate::roles::supported_roles;
 #[cfg(feature = "controller")]
 use crate::roles::CONTROLLER_ROLE;
@@ -602,6 +606,8 @@ enum Wakeup {
     LateFlush,
     /// The fallback read of the sink after a `set_output_delay` is due.
     OutputDelayPoll,
+    /// A scheduled role state is due.
+    RoleSchedule,
     /// The clock deadline elapsed.
     Clock,
     /// The keepalive deadline elapsed: a ping is due, or the one on the wire timed out.
@@ -757,6 +763,12 @@ pub(crate) struct Session<'a> {
     /// state.
     #[cfg(feature = "controller")]
     controller_commands: Option<Vec<String>>,
+    /// The scheduled metadata update, if one is waiting for its server timestamp.
+    #[cfg(feature = "metadata")]
+    track: Pending<Event>,
+    /// Where the server-minus-local clock offset is published for the control handles.
+    #[cfg(feature = "metadata")]
+    server_clock: &'a watch::Sender<Option<i64>>,
     /// The state last reported to the host, merged from `group/update` and `server/state`.
     ///
     /// `group/update` supplies the group fields and `server/state` the controller ones, so either
@@ -824,6 +836,7 @@ pub(crate) async fn attempt(
     psks: &[StoredPsk],
     pairing_psk: Option<PairingPsk>,
     #[cfg(feature = "player")] reported_volume: &AtomicU8,
+    #[cfg(feature = "metadata")] server_clock: &watch::Sender<Option<i64>>,
     carried: Carried,
     shutdown: &mut oneshot::Receiver<GoodbyeReason>,
 ) -> Attempt {
@@ -968,6 +981,10 @@ pub(crate) async fn attempt(
         group_id_tolerance_reported: false,
         #[cfg(feature = "controller")]
         controller_commands: None,
+        #[cfg(feature = "metadata")]
+        track: Pending::new(),
+        #[cfg(feature = "metadata")]
+        server_clock,
         playback: PlaybackState::default(),
         server_id: ready.server_id.clone(),
         matched: ready.matched,
@@ -991,6 +1008,9 @@ pub(crate) async fn attempt(
     };
     #[cfg(feature = "player")]
     session.publish_volume();
+    // A new connection starts without an estimate, and the previous one's offset is not valid for it.
+    #[cfg(feature = "metadata")]
+    session.server_clock.send_replace(None);
 
     session.emit(Event::Connected {
         server_id: ready.server_id,
@@ -1014,6 +1034,8 @@ pub(crate) async fn attempt(
             Err(error) => Ending::Failed(error),
         },
     };
+    #[cfg(feature = "metadata")]
+    session.server_clock.send_replace(None);
     #[cfg(feature = "player")]
     let sink_failed = session.sink_failed;
     #[cfg(not(feature = "player"))]
@@ -1094,6 +1116,10 @@ impl Session<'_> {
 
             // The control receiver outlives individual handles: dropping the last one disables the
             // branch instead of ending the session.
+            #[cfg(feature = "metadata")]
+            let role_deadline = self.role_deadline();
+            #[cfg(not(feature = "metadata"))]
+            let role_deadline: Option<Instant> = None;
             let control = &mut self.control;
             #[cfg(feature = "player")]
             let (next_playout, late_flush, output_delay_poll) = (
@@ -1140,6 +1166,14 @@ impl Session<'_> {
                         None => pending().await,
                     }
                 } => Wakeup::OutputDelayPoll,
+                // A scheduled role state is delivered before the next read for the same reason as
+                // playout: a chatty server must not hold it past its moment.
+                () = async {
+                    match role_deadline {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => pending().await,
+                    }
+                } => Wakeup::RoleSchedule,
                 message = self.transport.read() => Wakeup::Socket(message),
                 () = async {
                     match deadline {
@@ -1188,6 +1222,10 @@ impl Session<'_> {
                 // the three timers above are never armed.
                 #[cfg(not(feature = "player"))]
                 Wakeup::Playout | Wakeup::LateFlush | Wakeup::OutputDelayPoll => {}
+                #[cfg(feature = "metadata")]
+                Wakeup::RoleSchedule => self.fire_scheduled(),
+                #[cfg(not(feature = "metadata"))]
+                Wakeup::RoleSchedule => {}
                 Wakeup::Clock => {
                     if self.rehandshake.is_some() {
                         // The server must send its activation under the new keys; staying silent
@@ -1354,6 +1392,8 @@ impl Session<'_> {
         self.burst_sent_us.clear();
         let pushed = if let Some(sample) = best_sample(&self.burst_samples) {
             self.clock.push(sample);
+            #[cfg(feature = "metadata")]
+            self.publish_server_clock();
             true
         } else {
             false
@@ -2856,6 +2896,68 @@ impl Session<'_> {
         self.config.required_lead_time_ms.max(pre_port_ms)
     }
 
+    /// Turns a `metadata` object into a [`Event::Track`] and delivers it at its timestamp.
+    ///
+    /// A state whose timestamp is past or present, or that arrives with no clock estimate, is
+    /// emitted at once and discards a held update; a future one is held and replaces the previous
+    /// one. An absent progress object maps to [`TrackProgress::default`], the position cleared at
+    /// normal speed.
+    #[cfg(feature = "metadata")]
+    fn offer_track(&mut self, metadata: syncspin_core::messages::Metadata) {
+        let local_now_us = now_us();
+        let timestamp_us = metadata
+            .timestamp
+            .unwrap_or_else(|| self.clock.now_us(local_now_us).unwrap_or(local_now_us));
+        let progress = match metadata.progress {
+            Some(progress) => TrackProgress {
+                position_ms: progress.track_progress,
+                duration_ms: progress.track_duration,
+                speed_permille: progress.playback_speed.unwrap_or(NORMAL_PLAYBACK_SPEED),
+            },
+            None => TrackProgress::default(),
+        };
+        let event = Event::Track {
+            title: metadata.title.unwrap_or_default(),
+            artist: metadata.artist.unwrap_or_default(),
+            album: metadata.album.unwrap_or_default(),
+            album_artist: metadata.album_artist.unwrap_or_default(),
+            artwork_url: metadata.artwork_url.unwrap_or_default(),
+            year: metadata.year,
+            track: metadata.track,
+            timestamp_us,
+            progress,
+        };
+        if let Some(event) = self
+            .track
+            .offer(timestamp_us, event, &self.clock, local_now_us)
+        {
+            self.emit(event);
+        }
+    }
+
+    /// The local instant the next scheduled role state is due, from the current clock estimate.
+    ///
+    /// Recomputed on every loop iteration, because the filter resynchronises and may step.
+    #[cfg(feature = "metadata")]
+    fn role_deadline(&self) -> Option<Instant> {
+        self.track
+            .next_deadline(&self.clock, now_us(), Instant::now())
+    }
+
+    /// Delivers the scheduled role states whose moment has been reached.
+    #[cfg(feature = "metadata")]
+    fn fire_scheduled(&mut self) {
+        if let Some(event) = self.track.fire_due(&self.clock, now_us()) {
+            self.emit(event);
+        }
+    }
+
+    /// Publishes the clock offset for [`ControlHandle::server_time_us`](crate::ControlHandle).
+    #[cfg(feature = "metadata")]
+    fn publish_server_clock(&self) {
+        self.server_clock.send_replace(self.clock.offset_us());
+    }
+
     /// Reports one `server/state` message for the roles this client has active.
     #[cfg_attr(
         not(any(feature = "metadata", feature = "controller")),
@@ -2865,25 +2967,7 @@ impl Session<'_> {
         #[cfg(feature = "metadata")]
         if self.role_active(METADATA_ROLE) {
             if let Some(metadata) = state.metadata {
-                let (progress_ms, duration_ms, playback_speed) = match metadata.progress {
-                    Some(progress) => (
-                        progress.track_progress,
-                        progress.track_duration,
-                        progress.playback_speed.unwrap_or(NORMAL_PLAYBACK_SPEED),
-                    ),
-                    // Without a progress object the track is at its start, at normal speed.
-                    None => (None, None, NORMAL_PLAYBACK_SPEED),
-                };
-                self.emit(Event::Track {
-                    title: metadata.title.unwrap_or_default(),
-                    artist: metadata.artist.unwrap_or_default(),
-                    album: metadata.album.unwrap_or_default(),
-                    album_artist: metadata.album_artist.unwrap_or_default(),
-                    artwork_url: metadata.artwork_url.unwrap_or_default(),
-                    progress_ms,
-                    duration_ms,
-                    playback_speed,
-                });
+                self.offer_track(metadata);
             }
         }
         #[cfg(feature = "controller")]
@@ -3305,9 +3389,13 @@ impl Session<'_> {
 
     /// Whether a role that needs the clock estimate is active.
     ///
-    /// Only the player does today: it schedules audio against the converted clock. A role whose
-    /// state carries a server timestamp joins here with the scheduler that delivers it.
+    /// The player needs it to schedule audio, and metadata needs it to deliver a state at its
+    /// server timestamp. A session with neither runs no clock bursts.
     fn needs_clock(&self) -> bool {
+        #[cfg(feature = "metadata")]
+        if self.role_active(METADATA_ROLE) {
+            return true;
+        }
         self.player_active()
     }
 
@@ -4133,7 +4221,7 @@ fn map_deadline(
 }
 
 /// Current wall clock in microseconds since the Unix epoch, the domain of server timestamps.
-fn now_us() -> i64 {
+pub(crate) fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_micros() as i64)
@@ -4461,6 +4549,9 @@ mod tests {
         control: Option<mpsc::UnboundedReceiver<ControlRequest>>,
     ) -> Session<'a> {
         let estimator = BufferEstimator::new(config.min_buffer_ms);
+        #[cfg(feature = "metadata")]
+        let server_clock: &'a watch::Sender<Option<i64>> =
+            Box::leak(Box::new(watch::channel(None).0));
         Session {
             transport,
             noise,
@@ -4516,6 +4607,10 @@ mod tests {
             group_id_tolerance_reported: false,
             #[cfg(feature = "controller")]
             controller_commands: None,
+            #[cfg(feature = "metadata")]
+            track: Pending::new(),
+            #[cfg(feature = "metadata")]
+            server_clock,
             playback: PlaybackState::default(),
             server_id: SERVER_ID.to_owned(),
             matched: MatchedPsk::Sentinel,

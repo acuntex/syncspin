@@ -15,7 +15,6 @@ harmless.
 | 1   | Server-initiated connections: last-playback server not persisted       | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                                                                                                      | Open, no last-playback record      |
 | 4   | Code pairing is behind a feature (server MUST)                         | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                                                                                                      | Accepted, `pairing-code`           |
 | 6   | Approval is not persisted across restarts                              | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                                                                                                                | Open, server lifetime              |
-| 7   | Scheduled metadata applied immediately                                 | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                                                                                                                  | Stage 1b                           |
 | 8   | In-place format change flushes queued audio                            | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart); [`roles/player/v1.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-streamstart-player-object) | Stage 1b                           |
 | 10  | A stream-clear reaches the sink buffer only through `discard_from`     | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                                                                                                                  | Accepted, `Sink::discard_from`     |
 | 11  | Playout deadlines begin after three clock bursts                       | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                                                                                                                | Documented                         |
@@ -132,26 +131,6 @@ reset - while the SHOULD waits for a store the host owns.
 **Removing it:** add an approval store the host supplies (or a flag on `PairingStore`) keyed by
 `client_id`, write on `approve`, remove on `revoke_approval`, `unpair` and a completed pairing, and
 test that a fresh server reads the approval back.
-
-## 7. Scheduled metadata applied immediately
-
-**Spec:** `messaging.md`, `server/state` → `metadata.timestamp`. The field is the server time at
-which the metadata becomes valid; a client that buffers audio ahead of playout should schedule the
-change rather than apply it on arrival.
-
-**What we do:** `handle_state` emits `Event::Track` as soon as the message is decoded, so the
-timestamp is ignored. A title or artwork overlay can be ahead of the audible position by the buffer
-depth: the `min_buffer_ms` the client asks for - 250 ms until it has enough arrival-delay samples to
-derive one, then the upper tail of the measured distribution - plus whatever the sink buffers.
-
-**Why:** scheduling needs a per-role event queue with a timer tied to the clock filter, which the
-session does not have yet; the extracted consumer treated metadata as immediate. Applying it late
-also needs a rule for a change that is superseded before it becomes valid, which belongs with that
-queue.
-
-**Removing it:** give metadata its own scheduled queue, compare `timestamp` with `clock.now_us`,
-and emit at the mapped deadline. Test a future timestamp, a past one, and a change superseded before
-it becomes valid.
 
 ## 8. In-place format change flushes queued audio
 

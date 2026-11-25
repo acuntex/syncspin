@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use syncspin_core::pairing::token::encode_v0;
+#[cfg(feature = "metadata")]
+use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -398,10 +400,18 @@ pub enum Event {
         /// Frames dropped in the window.
         dropped: u64,
     },
-    /// Now-playing metadata changed.
+    /// Now-playing metadata took effect.
     ///
-    /// Absent text fields are reported as empty strings, so a host can clear its display; absent
-    /// progress fields are `None`.
+    /// Delivered at the moment the state takes effect, not when the message arrived: a state whose
+    /// `timestamp_us` is in the future is held and delivered at that server time, mapped through the
+    /// clock estimate, and a newer scheduled state replaces it. A state that is past or present, or
+    /// that arrives before the client has a clock estimate, is delivered at once. Absent text fields
+    /// are reported as empty strings, so a host can clear its display.
+    ///
+    /// Only states the server sent are reported here. A state that is cleared because the metadata
+    /// role was removed or the connection was reset is not an empty `Track`, which a server can
+    /// send legitimately; it is a separate event.
+    #[cfg(feature = "metadata")]
     Track {
         /// Track title.
         title: String,
@@ -413,15 +423,18 @@ pub enum Event {
         album_artist: String,
         /// URL of the artwork image, empty when the server sent none.
         artwork_url: String,
-        /// Position within the track in milliseconds, when the server reports one.
-        progress_ms: Option<u64>,
-        /// Track length in milliseconds, when the server reports one.
-        duration_ms: Option<u64>,
-        /// Playback speed per mille: `1000` is normal speed, `500` half speed and `0` paused.
+        /// Release year, when the server reports one.
+        year: Option<i32>,
+        /// Track number within its album, when the server reports one.
+        track: Option<u32>,
+        /// Server clock time in microseconds at which this state takes effect and from which
+        /// `progress` extrapolates.
         ///
-        /// Reported as [`NORMAL_PLAYBACK_SPEED`] when the server sends no speed, because a track
-        /// without the field plays at normal speed.
-        playback_speed: u32,
+        /// A server that omits it, which the specification does not allow, is read as "now": the
+        /// estimate of the server time at arrival, or the local time while there is no estimate.
+        timestamp_us: i64,
+        /// Position, length and speed of the track at `timestamp_us`.
+        progress: TrackProgress,
     },
     /// The server's view of playback state changed.
     State(PlaybackState),
@@ -612,15 +625,17 @@ impl fmt::Debug for Event {
                 .field("late_by", late_by)
                 .field("dropped", dropped)
                 .finish(),
+            #[cfg(feature = "metadata")]
             Self::Track {
                 title,
                 artist,
                 album,
                 album_artist,
                 artwork_url,
-                progress_ms,
-                duration_ms,
-                playback_speed,
+                year,
+                track,
+                timestamp_us,
+                progress,
             } => formatter
                 .debug_struct("Track")
                 .field("title", title)
@@ -628,9 +643,10 @@ impl fmt::Debug for Event {
                 .field("album", album)
                 .field("album_artist", album_artist)
                 .field("artwork_url", artwork_url)
-                .field("progress_ms", progress_ms)
-                .field("duration_ms", duration_ms)
-                .field("playback_speed", playback_speed)
+                .field("year", year)
+                .field("track", track)
+                .field("timestamp_us", timestamp_us)
+                .field("progress", progress)
                 .finish(),
             Self::State(state) => formatter.debug_tuple("State").field(state).finish(),
             Self::GroupIdNotCanonical { len } => formatter
@@ -679,6 +695,67 @@ impl fmt::Debug for Event {
                 .field("round", round)
                 .finish(),
         }
+    }
+}
+
+/// Position, length and speed of a track at the moment a [`Event::Track`] state takes effect.
+///
+/// The fields keep the optionality of the wire object: a server that sends no `progress`, or only
+/// part of it, yields `None` for what is missing. [`TrackProgress::default`] is the state of a
+/// message without a `progress` object - no position, no length, normal speed - and is what
+/// [`Event::Track`] carries then. It is not a derived default, because a derived one would read as
+/// speed `0`, which means paused.
+#[cfg(feature = "metadata")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TrackProgress {
+    /// Position within the track in milliseconds at the state's timestamp, when the server reports
+    /// one. Without it the server cleared the position.
+    pub position_ms: Option<u64>,
+    /// Track length in milliseconds. `Some(0)` is passed through: the specification means
+    /// "unlimited or unknown", for example a live stream.
+    pub duration_ms: Option<u64>,
+    /// Playback speed per mille: `1000` is normal speed, `500` half speed and `0` paused.
+    ///
+    /// [`NORMAL_PLAYBACK_SPEED`] when the server sends no speed, because a track without the field
+    /// plays at normal speed.
+    pub speed_permille: u32,
+}
+
+#[cfg(feature = "metadata")]
+impl Default for TrackProgress {
+    fn default() -> Self {
+        Self {
+            position_ms: None,
+            duration_ms: None,
+            speed_permille: NORMAL_PLAYBACK_SPEED,
+        }
+    }
+}
+
+#[cfg(feature = "metadata")]
+impl TrackProgress {
+    /// The position in milliseconds at the server time `server_now_us`, extrapolated from the
+    /// state's `timestamp_us` at [`speed_permille`](Self::speed_permille).
+    ///
+    /// `None` when there is no position. With `server_now_us` of `None` - no clock estimate yet,
+    /// which is what [`ControlHandle::server_time_us`] reports before the first one - the position
+    /// is returned as it was at the timestamp, unextrapolated. Otherwise the result follows the
+    /// specification: clamped to the length when there is one that is not `0`, and never below `0`.
+    /// A `server_now_us` before the timestamp moves the position backwards at the same speed.
+    #[must_use]
+    pub fn position_ms_at(&self, timestamp_us: i64, server_now_us: Option<i64>) -> Option<u64> {
+        let position = self.position_ms?;
+        let Some(now) = server_now_us else {
+            return Some(position);
+        };
+        let elapsed_us = i128::from(now) - i128::from(timestamp_us);
+        let moved_ms = elapsed_us * i128::from(self.speed_permille) / 1_000_000;
+        let mut calculated = i128::from(position) + moved_ms;
+        if let Some(duration) = self.duration_ms.filter(|duration| *duration != 0) {
+            calculated = calculated.min(i128::from(duration));
+        }
+        Some(u64::try_from(calculated.max(0)).unwrap_or(u64::MAX))
     }
 }
 
@@ -791,6 +868,9 @@ pub struct ControlHandle {
     pub(crate) commands: mpsc::UnboundedSender<ControlRequest>,
     #[cfg(feature = "player")]
     pub(crate) volume: Arc<AtomicU8>,
+    /// Server-minus-local clock offset the session publishes, `None` while it has no estimate.
+    #[cfg(feature = "metadata")]
+    pub(crate) server_clock: watch::Receiver<Option<i64>>,
     pub(crate) pairing_token: Option<PairingToken>,
 }
 
@@ -963,6 +1043,18 @@ impl ControlHandle {
         self.send(ControlAction::SetUnpairedAccess(enabled))
             .await
             .map(|_level| ())
+    }
+
+    /// The server's clock now, in microseconds, from the session's clock estimate.
+    ///
+    /// `None` until the first estimate exists and between connections. It is the value to hand to
+    /// [`TrackProgress::position_ms_at`] to extrapolate the position of the current track. The
+    /// drift the clock filter models is ignored here, which is below the resolution a display needs.
+    #[cfg(feature = "metadata")]
+    #[must_use]
+    pub fn server_time_us(&self) -> Option<i64> {
+        let offset = (*self.server_clock.borrow())?;
+        Some(crate::session::now_us().saturating_add(offset))
     }
 
     /// Returns the volume level in force.
@@ -1314,6 +1406,8 @@ async fn start(
     let (shutdown, shutdown_rx) = oneshot::channel();
     #[cfg(feature = "player")]
     let reported_volume = Arc::new(AtomicU8::new(config.volume));
+    #[cfg(feature = "metadata")]
+    let (server_clock, server_clock_rx) = watch::channel(None::<i64>);
     // The dynamic flow's round counter belongs to the process, not to a connection or a server:
     // only a verified `server_kc` or a deliberate operator action resets it.
     #[cfg(feature = "pairing-code")]
@@ -1339,6 +1433,8 @@ async fn start(
         events: events.clone(),
         #[cfg(feature = "player")]
         reported_volume: Arc::clone(&reported_volume),
+        #[cfg(feature = "metadata")]
+        server_clock,
     };
 
     let task = tokio::spawn(serve_until_dropped(connection, carried, shutdown_rx));
@@ -1349,6 +1445,8 @@ async fn start(
             commands,
             #[cfg(feature = "player")]
             volume: reported_volume,
+            #[cfg(feature = "metadata")]
+            server_clock: server_clock_rx,
             pairing_token,
         },
         shutdown: Some(shutdown),
@@ -1374,6 +1472,9 @@ struct Connection {
     /// Level shared with every [`ControlHandle`].
     #[cfg(feature = "player")]
     reported_volume: Arc<AtomicU8>,
+    /// Where the session publishes the clock offset for every [`ControlHandle`].
+    #[cfg(feature = "metadata")]
+    server_clock: watch::Sender<Option<i64>>,
 }
 
 impl Connection {
@@ -1508,6 +1609,8 @@ async fn serve_until_dropped(
             connection.pairing,
             #[cfg(feature = "player")]
             &connection.reported_volume,
+            #[cfg(feature = "metadata")]
+            &connection.server_clock,
             carried,
             &mut shutdown,
         )
@@ -1847,6 +1950,8 @@ mod tests {
             pairing: None,
             events,
             reported_volume: Arc::new(AtomicU8::new(42)),
+            #[cfg(feature = "metadata")]
+            server_clock: watch::channel(None).0,
         }
     }
 
@@ -2003,5 +2108,73 @@ mod tests {
             .await
             .expect_err("a TLS address must be rejected before connecting");
         assert!(format!("{error:#}").contains("TLS"));
+    }
+
+    /// Builds a progress object the way a session does: through the default, then the fields.
+    fn progress(position: Option<u64>, duration: Option<u64>, speed: u32) -> TrackProgress {
+        TrackProgress {
+            position_ms: position,
+            duration_ms: duration,
+            speed_permille: speed,
+        }
+    }
+
+    #[test]
+    fn the_position_is_extrapolated_at_the_state_speed() {
+        // One second of server time after the timestamp.
+        let now = Some(5_000_000);
+        assert_eq!(
+            progress(Some(10_000), Some(240_000), 1_000).position_ms_at(4_000_000, now),
+            Some(11_000),
+            "normal speed"
+        );
+        assert_eq!(
+            progress(Some(10_000), Some(240_000), 2_000).position_ms_at(4_000_000, now),
+            Some(12_000),
+            "double speed"
+        );
+        assert_eq!(
+            progress(Some(10_000), Some(240_000), 0).position_ms_at(4_000_000, now),
+            Some(10_000),
+            "paused: the position stands still"
+        );
+    }
+
+    #[test]
+    fn the_position_is_clamped_to_the_length_and_floored_at_zero() {
+        assert_eq!(
+            progress(Some(9_500), Some(10_000), 1_000).position_ms_at(0, Some(5_000_000)),
+            Some(10_000),
+            "past the end of a track of known length"
+        );
+        assert_eq!(
+            progress(Some(9_500), Some(0), 1_000).position_ms_at(0, Some(5_000_000)),
+            Some(14_500),
+            "a length of 0 means unknown, so there is no ceiling"
+        );
+        assert_eq!(
+            progress(Some(9_500), None, 1_000).position_ms_at(0, Some(5_000_000)),
+            Some(14_500),
+            "no length, no ceiling"
+        );
+        assert_eq!(
+            progress(Some(500), Some(10_000), 1_000).position_ms_at(5_000_000, Some(0)),
+            Some(0),
+            "an estimate before the timestamp moves back but never below zero"
+        );
+    }
+
+    #[test]
+    fn without_a_position_or_a_clock_nothing_is_extrapolated() {
+        assert_eq!(
+            progress(None, Some(10_000), 1_000).position_ms_at(0, Some(5_000_000)),
+            None,
+            "no position, nothing to extrapolate"
+        );
+        assert_eq!(
+            progress(Some(1_234), Some(10_000), 1_000).position_ms_at(0, None),
+            Some(1_234),
+            "without a clock estimate the position at the timestamp is returned as it is"
+        );
     }
 }

@@ -840,18 +840,17 @@ async fn stream_start_opens_the_sink_with_the_announced_format() {
             album,
             album_artist,
             artwork_url,
-            progress_ms,
-            duration_ms,
-            playback_speed,
+            progress,
+            ..
         } => {
             assert_eq!(title, "A title");
             assert_eq!(artist, "An artist");
             assert_eq!(album, "");
             assert_eq!(album_artist, "");
             assert_eq!(artwork_url, "");
-            assert_eq!(progress_ms, None);
-            assert_eq!(duration_ms, None);
-            assert_eq!(playback_speed, NORMAL_PLAYBACK_SPEED);
+            assert_eq!(progress.position_ms, None);
+            assert_eq!(progress.duration_ms, None);
+            assert_eq!(progress.speed_permille, NORMAL_PLAYBACK_SPEED);
         }
         other => panic!("expected Track, got {other:?}"),
     }
@@ -3917,18 +3916,17 @@ async fn metadata_fields_are_reported() {
             album,
             album_artist,
             artwork_url,
-            progress_ms,
-            duration_ms,
-            playback_speed,
+            progress,
+            ..
         } => {
             assert_eq!(title, "A title");
             assert_eq!(artist, "An artist");
             assert_eq!(album, "An album");
             assert_eq!(album_artist, "An album artist");
             assert_eq!(artwork_url, "https://example.test/art.png");
-            assert_eq!(progress_ms, Some(1_500));
-            assert_eq!(duration_ms, Some(240_000));
-            assert_eq!(playback_speed, NORMAL_PLAYBACK_SPEED);
+            assert_eq!(progress.position_ms, Some(1_500));
+            assert_eq!(progress.duration_ms, Some(240_000));
+            assert_eq!(progress.speed_permille, NORMAL_PLAYBACK_SPEED);
         }
         other => panic!("expected Track, got {other:?}"),
     }
@@ -3961,16 +3959,12 @@ async fn the_track_event_carries_the_playback_speed() {
     server.json(state);
 
     match next_event(&mut events).await {
-        Event::Track {
-            playback_speed,
-            progress_ms,
-            ..
-        } => {
+        Event::Track { progress, .. } => {
             assert_eq!(
-                playback_speed, 1_500,
+                progress.speed_permille, 1_500,
                 "the reported speed must reach the host unchanged"
             );
-            assert_eq!(progress_ms, Some(1_500));
+            assert_eq!(progress.position_ms, Some(1_500));
         }
         other => panic!("expected Track, got {other:?}"),
     }
@@ -3979,15 +3973,91 @@ async fn the_track_event_carries_the_playback_speed() {
     // a speed rather than a missing value.
     server.metadata("No progress", "An artist");
     match next_event(&mut events).await {
-        Event::Track {
-            playback_speed,
-            progress_ms,
-            ..
-        } => {
-            assert_eq!(playback_speed, NORMAL_PLAYBACK_SPEED);
-            assert_eq!(progress_ms, None);
+        Event::Track { progress, .. } => {
+            assert_eq!(progress.speed_permille, NORMAL_PLAYBACK_SPEED);
+            assert_eq!(progress.position_ms, None);
         }
         other => panic!("expected Track, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn track_progress_mapping_table() {
+    // Every shape of the `progress` object the wire allows, with what the host must see. The
+    // default is normal speed, not zero: a missing speed does not mean paused.
+    assert_eq!(
+        syncspin_client::TrackProgress::default().speed_permille,
+        1_000
+    );
+
+    type Row = (
+        &'static str,
+        serde_json::Value,
+        Option<u64>,
+        Option<u64>,
+        u32,
+    );
+    let cases: [Row; 6] = [
+        ("absent object", serde_json::Value::Null, None, None, 1_000),
+        ("empty object", serde_json::json!({}), None, None, 1_000),
+        (
+            "position only",
+            serde_json::json!({"track_progress": 700}),
+            Some(700),
+            None,
+            1_000,
+        ),
+        (
+            "speed only",
+            serde_json::json!({"playback_speed": 1_500}),
+            None,
+            None,
+            1_500,
+        ),
+        (
+            "all three",
+            serde_json::json!({
+                "track_progress": 5, "track_duration": 90, "playback_speed": 0
+            }),
+            Some(5),
+            Some(90),
+            0,
+        ),
+        (
+            "duration zero",
+            serde_json::json!({"track_progress": 5, "track_duration": 0}),
+            Some(5),
+            Some(0),
+            1_000,
+        ),
+    ];
+
+    let server = FakeServer::start(ServerOptions::default()).await.unwrap();
+    let (_recordings, sink) = recording_sink();
+    let (mut events, _handle) =
+        connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
+    expect_connected(&mut events, &server).await;
+
+    for (name, progress, position, duration, speed) in cases {
+        let mut metadata = serde_json::json!({"title": name});
+        if !progress.is_null() {
+            metadata["progress"] = progress;
+        }
+        server.json(
+            serde_json::json!({"type": "server/state", "payload": {"metadata": metadata}})
+                .to_string(),
+        );
+        match next_event(&mut events).await {
+            Event::Track {
+                title, progress, ..
+            } => {
+                assert_eq!(title, name);
+                assert_eq!(progress.position_ms, position, "{name}: position");
+                assert_eq!(progress.duration_ms, duration, "{name}: duration");
+                assert_eq!(progress.speed_permille, speed, "{name}: speed");
+            }
+            other => panic!("{name}: expected Track, got {other:?}"),
+        }
     }
 }
 
@@ -4192,7 +4262,7 @@ async fn readding_the_player_role_before_the_clock_is_ready_starts_a_burst() {
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
-    // No player role was active, so no clock burst ran, and the initial report - owed to any client
+    // No player role was active, and the initial report - owed to any client
     // with a role - carries no player object. Adding the role has to start a burst, and the state
     // report that follows the first sample carries the player.
     let initial = wait_for_client_state(&mut server).await;

@@ -3,6 +3,9 @@
 //! The list of roles is written once, in [`supported_roles`], so the roles announced in
 //! `client/hello` and the roles the activation check admits cannot drift apart.
 
+#[cfg(feature = "metadata")]
+pub(crate) mod sched;
+
 /// Versioned role identifier of the audio player.
 #[cfg(feature = "player")]
 pub(crate) const PLAYER_ROLE: &str = "player@v1";

@@ -84,8 +84,8 @@
 //!
 //! A host that renders the stream sees its lifecycle as events: `Event::StreamStart` for a new
 //! format, `Event::StreamEnd` when the server pauses or removes the player role, and
-//! `Event::StreamClear` for a seek, plus [`Event::Track`] for the now-playing metadata with its
-//! position, duration and playback speed. The end and clear events arrive before the client
+//! `Event::StreamClear` for a seek, plus `Event::Track` for the now-playing metadata, delivered at
+//! its server timestamp, with its position, duration and playback speed. The end and clear events arrive before the client
 //! discards or flushes the buffered audio, so the host can mute, stop or restart its output first.
 //!
 //! A host with no audio output uses [`connect_headless`] instead: the client then has no sink, does
@@ -110,6 +110,8 @@ mod sink;
 
 pub mod storage;
 
+#[cfg(feature = "metadata")]
+pub use client::TrackProgress;
 pub use client::{
     clamp_volume, clamp_volume_with, connect_headless, connect_headless_with_psks, next_backoff,
     Client, ClientHandle, ControlHandle, Event, EventStream, GoodbyeReason, PairingFailure,

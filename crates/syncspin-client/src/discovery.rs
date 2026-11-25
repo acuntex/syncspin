@@ -333,6 +333,8 @@ mod inbound {
     use anyhow::{anyhow, Context, Result};
     use syncspin_core::pairing::token::encode_v0;
     use tokio::net::{TcpListener, TcpStream};
+    #[cfg(feature = "metadata")]
+    use tokio::sync::watch;
     use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinSet;
     use tokio_tungstenite::accept_hdr_async;
@@ -517,6 +519,8 @@ mod inbound {
         let (shutdown, shutdown_rx) = oneshot::channel();
         #[cfg(feature = "player")]
         let reported_volume = Arc::new(AtomicU8::new(config.volume));
+        #[cfg(feature = "metadata")]
+        let (server_clock, server_clock_rx) = watch::channel(None::<i64>);
         // The dynamic flow's round counter belongs to the process, not to a connection: it starts
         // clean here and is carried across every inbound session.
         #[cfg(feature = "pairing-code")]
@@ -545,6 +549,8 @@ mod inbound {
             events,
             #[cfg(feature = "player")]
             Arc::clone(&reported_volume),
+            #[cfg(feature = "metadata")]
+            server_clock,
             shutdown_rx,
         ));
 
@@ -554,6 +560,8 @@ mod inbound {
                 commands,
                 #[cfg(feature = "player")]
                 volume: reported_volume,
+                #[cfg(feature = "metadata")]
+                server_clock: server_clock_rx,
                 pairing_token,
             },
             shutdown: Some(shutdown),
@@ -572,6 +580,7 @@ mod inbound {
         carried: Carried,
         events: mpsc::UnboundedSender<Event>,
         #[cfg(feature = "player")] reported_volume: Arc<AtomicU8>,
+        #[cfg(feature = "metadata")] server_clock: watch::Sender<Option<i64>>,
         mut shutdown: oneshot::Receiver<GoodbyeReason>,
     ) -> Result<()> {
         let outcome = accept_loop(
@@ -583,6 +592,8 @@ mod inbound {
             &events,
             #[cfg(feature = "player")]
             &reported_volume,
+            #[cfg(feature = "metadata")]
+            &server_clock,
             &mut shutdown,
         )
         .await;
@@ -608,6 +619,7 @@ mod inbound {
         mut carried: Carried,
         events: &mpsc::UnboundedSender<Event>,
         #[cfg(feature = "player")] reported_volume: &AtomicU8,
+        #[cfg(feature = "metadata")] server_clock: &watch::Sender<Option<i64>>,
         shutdown: &mut oneshot::Receiver<GoodbyeReason>,
     ) -> Result<()> {
         loop {
@@ -644,6 +656,8 @@ mod inbound {
                 pairing,
                 #[cfg(feature = "player")]
                 reported_volume,
+                #[cfg(feature = "metadata")]
+                server_clock,
                 carried,
                 shutdown,
             ));

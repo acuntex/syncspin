@@ -137,8 +137,10 @@ The stream lifecycle is visible on the event stream: `Event::StreamStart` announ
 `Event::StreamEnd` reports a pause or a removed player role, and `Event::StreamClear` reports a seek
 with its timestamp. The end and clear events arrive before the client discards or flushes buffered
 audio, so a host can mute, stop or restart its output first; a reconnect flush produces no stream
-event. `Event::Track` carries the now-playing metadata with the position, the duration and the
-playback speed in per-mille, where `1000` is normal speed.
+event. `Event::Track` carries the now-playing metadata - with the year, track number, the server timestamp
+and a `TrackProgress` of position, duration and speed in per-mille, where `1000` is normal speed -
+delivered at that timestamp: a future-dated state is held and replaced by a newer one, and
+`ControlHandle::server_time_us` with `TrackProgress::position_ms_at` extrapolates the position.
 
 Playout is scheduled in the client. Each audio frame is mapped from its server timestamp through the
 clock estimate, queued in deadline order and written one `pre_port_delay` before its port deadline,
