@@ -11,7 +11,7 @@ use common::*;
 use syncspin_core::messages::{
     ClientCommand, ControllerCommand, Incoming, ServerError, ServerState, StreamEnd,
 };
-use syncspin_server::{TrackInfo, WriteOutcome};
+use syncspin_server::{TrackInfo, WriteError, WriteOutcome};
 #[tokio::test]
 async fn a_client_connects_and_is_activated() -> Result<()> {
     for suite in Suite::ALL {
@@ -393,6 +393,7 @@ async fn a_player_receives_the_stream_with_playout_timestamps() -> Result<()> {
         ..TrackInfo::default()
     });
     let start = client.read_stream_start().await?;
+    wait_out_player_lead().await;
     let player = start
         .player
         .expect("an active player stream carries its format");
@@ -696,6 +697,7 @@ async fn a_client_that_never_answers_does_not_stall_the_writer() -> Result<()> {
     // Reading the announcement proves the server processed the state report, so the burst below
     // has somewhere to go; after it the client reads nothing until the end of the test.
     client.read_stream_start().await?;
+    wait_out_player_lead().await;
 
     // The client's socket is not drained while the host pushes: a write only queues the chunk.
     let chunk = [0u8; 480 * 4];
@@ -758,6 +760,7 @@ async fn pausing_ends_the_stream_and_playing_announces_it_again() -> Result<()> 
 
     server.play();
     client.read_stream_start().await?;
+    wait_out_player_lead().await;
     let group = client
         .read_until(|message| match message {
             Incoming::GroupUpdate(group) => Some(group),
@@ -804,6 +807,7 @@ async fn two_players_receive_the_same_frames() -> Result<()> {
     let mut writer = server.open_stream(TrackInfo::default());
     first.read_stream_start().await?;
     second.read_stream_start().await?;
+    wait_out_player_lead().await;
 
     let chunk = [5u8; 480 * 4];
     assert_eq!(writer.write(&chunk), WriteOutcome::Written);
@@ -812,7 +816,7 @@ async fn two_players_receive_the_same_frames() -> Result<()> {
     let (first_header, first_payload) = first.read_audio().await?;
     let (second_header, second_payload) = second.read_audio().await?;
     assert_eq!(
-        first_header, second_header,
+        first_header.timestamp_us, second_header.timestamp_us,
         "one timeline serves the whole group, so the timestamps are identical"
     );
     assert_eq!(first_payload, chunk);
@@ -823,7 +827,10 @@ async fn two_players_receive_the_same_frames() -> Result<()> {
 
     let (next_first, _) = first.read_audio().await?;
     let (next_second, _) = second.read_audio().await?;
-    assert_eq!(next_first, next_second);
+    assert_eq!(
+        next_first.timestamp_us, next_second.timestamp_us,
+        "the shared timeline advances the same way for both members"
+    );
     assert_eq!(
         next_first.timestamp_us - first_header.timestamp_us,
         10_000,
@@ -838,39 +845,336 @@ async fn two_players_receive_the_same_frames() -> Result<()> {
 }
 
 #[tokio::test]
-async fn the_start_lead_ignores_the_reported_timing() -> Result<()> {
-    // Pins `docs/spec-deviations.md`, entry 17: the group schedules one fixed lead and does not
-    // derive it from `min_buffer_ms` + `output_delay_ms`. When the group starts honouring them,
-    // this test is the one to change.
+async fn the_start_lead_follows_the_reported_timing() -> Result<()> {
+    // The group derives its lead from `min_buffer_ms` + `output_delay_ms` and anchors it on the
+    // trigger's transmit time. A fixed lead could not pass a deliberately non-default report.
     let (server, port, _events) = start().await?;
     let mut client = FakeClient::connect(port).await?;
     client.handshake(Suite::ChaChaPoly).await?;
     client.activate().await?;
     server.approve(&client.identity.public_base64()).await?;
     client.read_activate(|_| true).await?;
-    let Incoming::ClientState(mut state) = player_state(true, 100, false) else {
-        unreachable!("player_state builds a client/state");
-    };
-    let player = state.player.as_mut().expect("the player object is present");
-    player.min_buffer_ms = 3_000;
-    player.output_delay_ms = 500;
-    player.required_lead_time_ms = 3_000;
-    client.send_json(&Incoming::ClientState(state)).await?;
+    client
+        .send_json(&player_state_with_timing(true, 100, false, 3_000, 500))
+        .await?;
+    // The time reply travels after the report on the same connection, so the member is ready
+    // before the stream opens and anchors the timeline rather than joining late.
+    assert_eq!(client.round_trip_time(1).await?.client_transmitted, 1);
 
     let mut writer = server.open_stream(TrackInfo::default());
-    client.read_stream_start().await?;
+    let start = client.read_stream_start().await?;
+    // The time reply is handled after the start's send report on the same task, so the member's
+    // gate is clear before the first write without waiting out the 3.5 s lead.
+    assert_eq!(client.round_trip_time(1).await?.client_transmitted, 1);
     assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
     let (header, _payload) = client.read_audio().await?;
     assert!(
-        (100_000..=200_000).contains(&header.send_ahead),
-        "the first chunk is sent about the fixed 200 ms ahead, not the reported 3500 ms, got {} us",
-        header.send_ahead
+        header.timestamp_us >= start.server_transmitted + 3_500_000,
+        "the first chunk is scheduled a full reported lead after the start was transmitted, \
+         start at {} and chunk at {}",
+        start.server_transmitted,
+        header.timestamp_us
     );
 
     writer.end();
     client.goodbye("shutdown").await?;
     server.shutdown().await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn send_ahead_measures_the_transmit_interval_of_a_delayed_chunk() -> Result<()> {
+    // `send_ahead` is stamped when the chunk leaves, not when the host wrote it: after a delay
+    // inside the lead it is smaller than the lead, and it matches the server clock that the
+    // chunk's timestamp is measured against.
+    let (server, port, _events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client.handshake(Suite::ChaChaPoly).await?;
+    client.activate().await?;
+    server.approve(&client.identity.public_base64()).await?;
+    client.read_activate(|_| true).await?;
+    client
+        .send_json(&player_state_with_timing(true, 100, false, 3_000, 500))
+        .await?;
+    // The time reply travels after the report, so the member is ready before the stream opens.
+    assert_eq!(client.round_trip_time(1).await?.client_transmitted, 1);
+
+    let lead_us = 3_500_000;
+    let mut writer = server.open_stream(TrackInfo::default());
+    client.read_stream_start().await?;
+    // The time reply proves the start's send report has cleared the member's gate, without
+    // waiting out the lead the test is about.
+    assert_eq!(client.round_trip_time(2).await?.client_transmitted, 2);
+    // Delay the write inside the lead, so the chunk's send time is not the segment's start.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(writer.write(&[0u8; 480 * 4]), WriteOutcome::Written);
+    let (header, _payload) = client.read_audio().await?;
+
+    let send_ahead = i64::from(header.send_ahead);
+    assert!(
+        send_ahead > 0,
+        "the delayed chunk is still ahead of its due time"
+    );
+    assert!(
+        send_ahead < lead_us,
+        "a chunk sent after the start measures less than the lead, got {send_ahead} us"
+    );
+    let server_now = client.server_time().await?;
+    let from_clock = header.timestamp_us - server_now;
+    assert!(
+        from_clock <= send_ahead,
+        "the reply's clock is later than the chunk's send, so it measures {from_clock} us \
+         against the stamped {send_ahead} us"
+    );
+    assert!(
+        send_ahead - from_clock < 100_000,
+        "the stamped send_ahead is {} us away from the transmit interval the clock implies",
+        send_ahead - from_clock
+    );
+
+    writer.end();
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_late_joiner_is_gated_on_its_own_start_and_keeps_the_timeline() -> Result<()> {
+    let (server, port, _events) = start().await?;
+    let mut early = FakeClient::connect(port).await?;
+    early
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+    // The time reply travels after the state report on the same connection, so the early member
+    // is ready before the stream opens and anchors the timeline.
+    assert_eq!(early.round_trip_time(1).await?.client_transmitted, 1);
+
+    // The late client holds the player role but has not reported its state yet.
+    let mut late = FakeClient::connect(port).await?;
+    late.handshake(Suite::ChaChaPoly).await?;
+    late.activate().await?;
+    server.approve(&late.identity.public_base64()).await?;
+    late.read_activate(|_| true).await?;
+
+    let chunk = [4u8; 480 * 4];
+    let mut writer = server.open_stream(TrackInfo::default());
+    let early_start = early.read_stream_start().await?;
+    assert_eq!(writer.write(&chunk), WriteOutcome::Written);
+    let (opening, _) = early.read_audio().await?;
+    assert!(opening.timestamp_us >= early_start.server_transmitted);
+
+    // The late member reports a 300 ms startup lead, so its own floor is well beyond the group's
+    // next chunk: the opening it missed is a hole, not a retroactive start.
+    late.send_json(&player_state_with_timing(true, 100, false, 300, 0))
+        .await?;
+    let late_start = late.read_stream_start().await?;
+    assert_eq!(late.round_trip_time(2).await?.client_transmitted, 2);
+
+    // The chunk written now is before the late member's floor.
+    assert_eq!(writer.write(&[5u8; 480 * 4]), WriteOutcome::Written);
+    let (early_second_header, early_second) = early.read_audio().await?;
+    assert_eq!(early_second, [5u8; 480 * 4]);
+    late.expect_no_audio(Duration::from_millis(200)).await?;
+
+    // Enough further chunks pass the floor; the member receives the group timeline, not a new one
+    // of its own.
+    let mut timestamps = vec![opening.timestamp_us, early_second_header.timestamp_us];
+    for _ in 0..40 {
+        assert_eq!(writer.write(&chunk), WriteOutcome::Written);
+        let (header, _) = early.read_audio().await?;
+        timestamps.push(header.timestamp_us);
+    }
+    let (late_first, late_payload) = late.read_audio().await?;
+    assert_eq!(late_payload, chunk);
+    assert!(
+        late_first.timestamp_us >= late_start.server_transmitted + 300_000,
+        "the late member's first chunk at {} is before its own start floor {}",
+        late_first.timestamp_us,
+        late_start.server_transmitted
+    );
+    assert!(
+        timestamps.contains(&late_first.timestamp_us),
+        "the late member joins the group timeline: {} is not one of its chunks",
+        late_first.timestamp_us
+    );
+    let (late_second, _) = late.read_audio().await?;
+    assert_eq!(
+        late_second.timestamp_us - late_first.timestamp_us,
+        10_000,
+        "the late member keeps the group's spacing"
+    );
+
+    writer.end();
+    early.goodbye("shutdown").await?;
+    late.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_chunk_longer_than_150_ms_is_refused() -> Result<()> {
+    let (server, port, _events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+    let mut writer = server.open_stream(TrackInfo::default());
+    client.read_stream_start().await?;
+    wait_out_player_lead().await;
+
+    // 160 ms of 16-bit stereo PCM at 48 kHz: 48 frames per millisecond.
+    let too_long = [0u8; 48 * 160 * 4];
+    assert_eq!(
+        writer.write(&too_long),
+        WriteOutcome::Dropped(WriteError::TooLong),
+        "a chunk above the protocol's 150 ms bound must not be started"
+    );
+    let chunk = [7u8; 480 * 4];
+    assert_eq!(writer.write(&chunk), WriteOutcome::Written);
+    let (_, payload) = client.read_audio().await?;
+    assert_eq!(payload, chunk, "the refused chunk leaves no hole");
+
+    writer.end();
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_member_with_no_room_is_skipped_until_its_buffer_drains() -> Result<()> {
+    let (server, port, _events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    // One framed chunk is 13 + 480*4 = 1933 bytes, so a 2000-byte capacity holds one at a time.
+    client
+        .connect_and_activate_with(
+            &server,
+            Suite::ChaChaPoly,
+            client_hello_with_capacity(2_000),
+        )
+        .await?;
+    let mut writer = server.open_stream(TrackInfo::default());
+    client.read_stream_start().await?;
+    wait_out_player_lead().await;
+
+    let first = [1u8; 480 * 4];
+    assert_eq!(writer.write(&first), WriteOutcome::Written);
+    let (_, payload) = client.read_audio().await?;
+    assert_eq!(payload, first);
+
+    // The second chunk would push the outstanding framed bytes past the capacity, so the member
+    // is skipped instead of overrun.
+    assert_eq!(writer.write(&[2u8; 480 * 4]), WriteOutcome::Written);
+    client.expect_no_audio(Duration::from_millis(200)).await?;
+
+    // The first chunk has played out; the next one fits again.
+    let third = [3u8; 480 * 4];
+    assert_eq!(writer.write(&third), WriteOutcome::Written);
+    let (_, payload) = client.read_audio().await?;
+    assert_eq!(
+        payload, third,
+        "the member receives audio once its buffer drains"
+    );
+
+    writer.end();
+    client.goodbye("shutdown").await?;
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_out_of_range_role_value_closes_the_connection() -> Result<()> {
+    // The typed decode accepts a `u8` volume and a `u32` timing value, so the protocol's narrower
+    // range is checked after it. A wrong-typed active object fails the decode itself.
+    let timing = player_state_with_timing(true, 100, false, 6_000, 0);
+    let loud = player_state_with_timing(true, 101, false, 100, 0);
+    let controller = Incoming::ClientCommand(ClientCommand {
+        controller: Some(ControllerCommand {
+            command: "volume".to_owned(),
+            volume: Some(101),
+            ..ControllerCommand::default()
+        }),
+    });
+    let wrong_type = r#"{"type":"client/state","payload":{"available":true,"player":
+        {"volume":100,"muted":false,"output_delay_ms":0,"required_lead_time_ms":200,
+         "min_buffer_ms":"soon"}}}"#;
+
+    for (case, message) in [
+        ("a player timing above the range", timing),
+        ("a player volume above the range", loud),
+        ("a controller volume above the range", controller),
+    ] {
+        let (server, port, mut events) = start().await?;
+        let mut client = FakeClient::connect(port).await?;
+        client
+            .connect_and_activate(&server, Suite::ChaChaPoly)
+            .await?;
+        client.send_json(&message).await?;
+        client.expect_closed().await?;
+        assert_eq!(
+            left_reason(&mut events).await,
+            "protocol error",
+            "{case} must close the connection as a protocol error"
+        );
+        server.shutdown().await?;
+    }
+
+    // An active object of the wrong type is a decode error, which is the same close.
+    let (server, port, mut events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    client
+        .connect_and_activate(&server, Suite::ChaChaPoly)
+        .await?;
+    client.send_raw_json(wrong_type).await?;
+    client.expect_closed().await?;
+    assert_eq!(
+        left_reason(&mut events).await,
+        "protocol error",
+        "a wrong-typed value in an active player object must close the connection"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_inactive_role_object_is_ignored_whatever_it_contains() -> Result<()> {
+    let (server, port, mut events) = start().await?;
+    let mut client = FakeClient::connect(port).await?;
+    // The server streams PCM and this client plays Opus only, so its player role stays inactive.
+    let hello = client_hello_with_formats(vec![SupportedFormat {
+        codec: "opus".to_owned(),
+        channels: 2,
+        sample_rate: 48_000,
+        bit_depth: 16,
+    }]);
+    client
+        .connect_and_activate_with(&server, Suite::ChaChaPoly, hello)
+        .await?;
+
+    // The player object belongs to a role that is not active; `messaging.md` leaves it
+    // unvalidated, so a wrong-typed value must not close the connection.
+    client
+        .send_raw_json(
+            r#"{"type":"client/state","payload":{"available":true,"player":
+                {"volume":"loud","min_buffer_ms":"soon"}}}"#,
+        )
+        .await?;
+    client.goodbye("shutdown").await?;
+    assert_eq!(
+        left_reason(&mut events).await,
+        "shutdown",
+        "an inactive role object is dropped before the typed decode"
+    );
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Reads events until the connection leaves and returns its reason.
+async fn left_reason(events: &mut EventStream) -> String {
+    loop {
+        if let Event::ClientLeft { reason } = next_event(events).await {
+            return reason;
+        }
+    }
 }
 
 #[tokio::test]
@@ -888,6 +1192,7 @@ async fn a_stalled_member_does_not_hold_up_the_other() -> Result<()> {
     let mut writer = server.open_stream(TrackInfo::default());
     stalled.read_stream_start().await?;
     moving.read_stream_start().await?;
+    wait_out_player_lead().await;
 
     // `stalled` is not polled from here on. The group queues its frames and keeps serving `moving`,
     // because a write only queues the chunk per member and never waits for a reader.
@@ -1083,6 +1388,7 @@ async fn a_player_hears_nothing_before_it_reports_its_state() -> Result<()> {
     // The report is what lets the server announce the stream; what was written before it is gone.
     client.send_json(&player_state(true, 100, false)).await?;
     let start = client.read_stream_start().await?;
+    wait_out_player_lead().await;
     assert_eq!(
         start
             .player
@@ -1113,6 +1419,7 @@ async fn a_member_that_reports_itself_unavailable_receives_no_audio() -> Result<
     let mut writer = server.open_stream(TrackInfo::default());
     away.read_stream_start().await?;
     here.read_stream_start().await?;
+    wait_out_player_lead().await;
 
     away.send_json(&player_state(false, 100, false)).await?;
     // A time request travels the same connection and is read after the report, so its reply proves

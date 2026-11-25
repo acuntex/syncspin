@@ -614,7 +614,8 @@ async fn an_unapproved_client_gets_no_roles_and_no_audio() -> Result<()> {
         "pcm"
     );
     // The chunk written before the report was addressed to nobody; the next one reaches the
-    // approved member.
+    // approved member once its start lead has passed.
+    wait_out_player_lead().await;
     assert_eq!(writer.write(&[4u8; 480 * 4]), WriteOutcome::Written);
     let (_, audio) = client.read_audio().await?;
     assert_eq!(audio, [4u8; 480 * 4], "the approved client hears the group");
@@ -645,6 +646,7 @@ async fn revoking_an_approval_takes_the_roles_and_the_audio_away() -> Result<()>
     let mut writer = server.open_stream(TrackInfo::default());
     client.send_json(&player_state(true, 100, false)).await?;
     client.read_stream_start().await?;
+    wait_out_player_lead().await;
     assert_eq!(writer.write(&[5u8; 480 * 4]), WriteOutcome::Written);
     let (_, audio) = client.read_audio().await?;
     assert_eq!(
