@@ -5,6 +5,8 @@
 //!
 //! A token is a credential: no assertion in this file prints one.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 

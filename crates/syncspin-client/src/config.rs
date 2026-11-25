@@ -111,15 +111,15 @@ pub enum AudioMode {
     /// Play raw samples.
     ///
     /// The session advertises PCM only, so the server delivers raw samples and the sink receives
-    /// [`AudioFrame::Pcm`](crate::AudioFrame::Pcm). An encoded stream would need a decoder this
+    /// `AudioFrame::Pcm`. An encoded stream would need a decoder this
     /// build does not carry, so the session rejects one instead of handing encoded bytes to a
     /// sink that expects samples.
     Decode,
     /// Forward encoded frames.
     ///
     /// The session advertises the encoded formats it can forward and the sink receives
-    /// [`AudioFrame::Encoded`](crate::AudioFrame::Encoded). A PCM stream still arrives as
-    /// [`AudioFrame::Pcm`](crate::AudioFrame::Pcm), because there is nothing to decode.
+    /// `AudioFrame::Encoded`. A PCM stream still arrives as
+    /// `AudioFrame::Pcm`, because there is nothing to decode.
     Passthrough,
 }
 
@@ -287,13 +287,13 @@ pub struct ClientConfig {
     ///
     /// Off by default. A host that can change the delay after its audio port (external speakers,
     /// an amplifier, a soundbar) opts in: the client then advertises the command, reports
-    /// [`Event::OutputDelay`](crate::Event::OutputDelay) for a command it accepts, and the host
+    /// `Event::OutputDelay` for a command it accepts, and the host
     /// applies the value to its sink and persists it. A host that cannot apply the command must
     /// leave this off, because `roles/player/v1.md` lets a client advertise only what it applies.
     ///
     /// The command is an instruction to the host, not a value the session applies itself: the sink
     /// remains the authority for `output_delay_ms`. Once the host applied the value it calls
-    /// [`ControlHandle::output_delay_applied`](crate::ControlHandle::output_delay_applied), and the
+    /// `ControlHandle::output_delay_applied`, and the
     /// session reads the sink, re-maps queued deadlines and reports it. A host that never calls it
     /// is still reported: the session reads the sink once, half a second after the command, and
     /// sends a `client/state` if the sink adopted a new value by then. A host that applies the
@@ -334,7 +334,7 @@ pub struct ClientConfig {
     /// Limits applied to every volume request.
     ///
     /// The session applies the policy to a command from the server and to a level the host sets
-    /// through [`ControlHandle::set_volume`](crate::ControlHandle::set_volume); the value it
+    /// through `ControlHandle::set_volume`; the value it
     /// reports back is always the applied one. [`VolumePolicy::default`] keeps the fixed rule of
     /// earlier releases.
     pub volume_policy: VolumePolicy,
@@ -424,8 +424,8 @@ pub struct ClientConfig {
     /// The server-initiated half of the connection mode, or `None` for client-initiated
     /// connections.
     ///
-    /// Setting it makes [`advertise`](crate::advertise) publish `_sendspin._tcp` and accept the
-    /// servers that connect, and makes a manual [`connect`](crate::connect) fail: `connection.md`
+    /// Setting it makes `advertise` publish `_sendspin._tcp` and accept the
+    /// servers that connect, and makes a manual `connect` fail: `connection.md`
     /// lets a client use one of the two methods at a time, never both. [`Inbound::new`] fills the
     /// listen address and the path with the values the spec recommends.
     ///

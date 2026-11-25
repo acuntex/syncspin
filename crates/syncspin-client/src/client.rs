@@ -3,7 +3,9 @@
 use std::fmt;
 #[cfg(feature = "pairing-code")]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+#[cfg(feature = "player")]
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +18,9 @@ use tokio::task::JoinHandle;
 use crate::config::CodeFormat;
 use crate::config::{ClientConfig, StoredPsk, VolumePolicy};
 use crate::pairing::{load_or_draw_pairing_psk, PairingPsk};
+use crate::roles::ensure_roles;
 use crate::session::{self, Carried, Transport};
+#[cfg(feature = "player")]
 use crate::sink::{AudioFormat, Sink};
 
 /// How long the TCP and WebSocket handshake may take before it is treated as unreachable.
@@ -108,6 +112,7 @@ pub fn clamp_volume_with(policy: VolumePolicy, current: u8, requested: u8) -> u8
 ///
 /// # Errors
 /// Returns an error naming the value when it is above [`MAX_VOLUME`].
+#[cfg(feature = "player")]
 pub(crate) fn check_reported_level(level: u8) -> Result<()> {
     if level > MAX_VOLUME {
         bail!(
@@ -149,7 +154,7 @@ pub fn next_backoff(previous: Duration, connected: bool, max: Duration) -> Durat
 /// Why a player stream ended.
 ///
 /// A seek is not an end: the stream stays open and later chunks still belong to it, so it is
-/// reported as [`Event::StreamClear`] instead.
+/// reported as `Event::StreamClear` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StreamEndReason {
@@ -347,6 +352,7 @@ pub enum Event {
     /// A stream was announced with the given format.
     ///
     /// The sink has been opened for this format before the event is emitted.
+    #[cfg(feature = "player")]
     StreamStart {
         /// Format of the new stream.
         format: AudioFormat,
@@ -357,6 +363,7 @@ pub enum Event {
     /// client flushes the sink itself as well, after this event. A seek does not end the stream;
     /// it is reported as [`Event::StreamClear`], and chunks after it still belong to the open
     /// stream.
+    #[cfg(feature = "player")]
     StreamEnd {
         /// Why the stream ended.
         reason: StreamEndReason,
@@ -366,6 +373,7 @@ pub enum Event {
     /// Reported before the buffered audio is discarded or flushed, so a host can restart its
     /// output or drop the matching part of its own queue first. The announced format stays open,
     /// and chunks that follow still belong to it.
+    #[cfg(feature = "player")]
     StreamClear {
         /// Server timestamp the audio should resume from, when the server named one.
         from_timestamp: Option<i64>,
@@ -383,6 +391,7 @@ pub enum Event {
     /// frames accumulated since the last report follow as one more event, so the tail of a burst
     /// is not lost. Diagnostic only: the frames are dropped either way, and the host has nothing
     /// to recover.
+    #[cfg(feature = "player")]
     LateAudio {
         /// Worst lateness in the window.
         late_by: Duration,
@@ -439,6 +448,7 @@ pub enum Event {
     /// see what the server asked for and what the policy allowed without repeating the policy.
     /// `muted` is present for a mute command and absent for a volume command; a mute leaves the
     /// level unchanged, so both numbers then name the level already in force.
+    #[cfg(feature = "player")]
     Volume {
         /// Level the server asked for, as it arrived on the wire.
         ///
@@ -462,6 +472,7 @@ pub enum Event {
     ///
     /// The event follows every accepted command, also when `applied` equals the delay already in
     /// force, so a host must tolerate repeats.
+    #[cfg(feature = "player")]
     OutputDelay {
         /// Delay the server asked for, as it arrived on the wire.
         requested: u32,
@@ -487,7 +498,7 @@ pub enum Event {
     /// server lands in the Sentinel fallback unless the host pairs again.
     ///
     /// A record the host passed through
-    /// [`connect_with_psks`](crate::connect_with_psks) is not in a store the client may write, so
+    /// `connect_with_psks` is not in a store the client may write, so
     /// the client reports it and ends the connection without removing it: the host owns that
     /// record and has to drop it.
     Unpaired {
@@ -580,18 +591,22 @@ impl fmt::Debug for Event {
                 .debug_struct("ServerError")
                 .field("reason", reason)
                 .finish(),
+            #[cfg(feature = "player")]
             Self::StreamStart { format } => formatter
                 .debug_struct("StreamStart")
                 .field("format", format)
                 .finish(),
+            #[cfg(feature = "player")]
             Self::StreamEnd { reason } => formatter
                 .debug_struct("StreamEnd")
                 .field("reason", reason)
                 .finish(),
+            #[cfg(feature = "player")]
             Self::StreamClear { from_timestamp } => formatter
                 .debug_struct("StreamClear")
                 .field("from_timestamp", from_timestamp)
                 .finish(),
+            #[cfg(feature = "player")]
             Self::LateAudio { late_by, dropped } => formatter
                 .debug_struct("LateAudio")
                 .field("late_by", late_by)
@@ -622,6 +637,7 @@ impl fmt::Debug for Event {
                 .debug_struct("GroupIdNotCanonical")
                 .field("len", len)
                 .finish(),
+            #[cfg(feature = "player")]
             Self::Volume {
                 requested,
                 applied,
@@ -632,6 +648,7 @@ impl fmt::Debug for Event {
                 .field("applied", applied)
                 .field("muted", muted)
                 .finish(),
+            #[cfg(feature = "player")]
             Self::OutputDelay { requested, applied } => formatter
                 .debug_struct("OutputDelay")
                 .field("requested", requested)
@@ -679,12 +696,12 @@ pub struct PlaybackState {
     pub volume: Option<u8>,
     /// Group mute state, when the server reports one.
     pub muted: Option<bool>,
-    /// Highest absolute position [`ControlHandle::seek`] may target, in milliseconds.
+    /// Highest absolute position `ControlHandle::seek` may target, in milliseconds.
     ///
     /// [`supported_commands`](PlaybackState::supported_commands) says whether the server offers
     /// absolute or relative seek; this says how far an absolute target may go. It is `None`
     /// before the first controller state and when the server advertised `seek` without naming a
-    /// range, and in both cases [`ControlHandle::seek`] refuses rather than sending a target it
+    /// range, and in both cases `ControlHandle::seek` refuses rather than sending a target it
     /// cannot check. A `group/update` leaves it alone, because it belongs to the controller state.
     pub seek_max_ms: Option<u64>,
     /// Playback state of the group, once a `group/update` arrived.
@@ -772,6 +789,7 @@ impl Drop for ClientHandle {
 #[derive(Debug, Clone)]
 pub struct ControlHandle {
     pub(crate) commands: mpsc::UnboundedSender<ControlRequest>,
+    #[cfg(feature = "player")]
     pub(crate) volume: Arc<AtomicU8>,
     pub(crate) pairing_token: Option<PairingToken>,
 }
@@ -791,21 +809,25 @@ impl fmt::Debug for PairingToken {
 
 impl ControlHandle {
     /// Resumes playback.
+    #[cfg(feature = "controller")]
     pub async fn play(&self) -> Result<()> {
         self.transport("play").await
     }
 
     /// Pauses playback at the current position.
+    #[cfg(feature = "controller")]
     pub async fn pause(&self) -> Result<()> {
         self.transport("pause").await
     }
 
     /// Skips to the next track.
+    #[cfg(feature = "controller")]
     pub async fn next(&self) -> Result<()> {
         self.transport("next").await
     }
 
     /// Skips to the previous track.
+    #[cfg(feature = "controller")]
     pub async fn previous(&self) -> Result<()> {
         self.transport("previous").await
     }
@@ -823,6 +845,7 @@ impl ControlHandle {
     /// server did not activate `controller@v1`, when it did not offer `seek`, when it reported no
     /// seekable range, and when `position_ms` is beyond that range. The last error names both the
     /// target and the range.
+    #[cfg(feature = "controller")]
     pub async fn seek(&self, position_ms: u64) -> Result<()> {
         self.send(ControlAction::Seek(position_ms))
             .await
@@ -839,6 +862,7 @@ impl ControlHandle {
     /// # Errors
     /// Returns an error when the connection has ended, when no session is established, when the
     /// server did not activate `controller@v1`, and when it did not offer `seek_relative`.
+    #[cfg(feature = "controller")]
     pub async fn seek_relative(&self, offset_ms: i64) -> Result<()> {
         self.send(ControlAction::SeekRelative(offset_ms))
             .await
@@ -853,6 +877,7 @@ impl ControlHandle {
     /// still pending, and every reconnect keeps it. A new connection starts from
     /// [`ClientConfig::volume`], so a host passes the level it restored there and uses this call
     /// for changes after that. [`ControlHandle::volume`] answers what is in force without a call.
+    #[cfg(feature = "player")]
     pub async fn set_volume(&self, level: u8) -> Result<u8> {
         self.send(ControlAction::Volume(level)).await
     }
@@ -872,6 +897,7 @@ impl ControlHandle {
     /// # Errors
     /// Returns an error for a level above 100, for a connection that has ended, and when the
     /// server did not activate `player@v1`.
+    #[cfg(feature = "player")]
     pub async fn report_volume(&self, level: u8) -> Result<()> {
         check_reported_level(level)?;
         self.send(ControlAction::ReportVolume(level))
@@ -893,6 +919,7 @@ impl ControlHandle {
     /// # Errors
     /// Returns an error for a connection that has ended, and when the server did not activate
     /// `player@v1`.
+    #[cfg(feature = "player")]
     pub async fn output_delay_applied(&self) -> Result<()> {
         self.send(ControlAction::OutputDelayApplied)
             .await
@@ -903,6 +930,7 @@ impl ControlHandle {
     ///
     /// The reported level therefore stays what it was, and the server sees the mute in the
     /// `muted` field alone.
+    #[cfg(feature = "player")]
     pub async fn set_muted(&self, muted: bool) -> Result<()> {
         self.send(ControlAction::Mute(muted)).await.map(|_level| ())
     }
@@ -943,6 +971,7 @@ impl ControlHandle {
     /// leaves it untouched. It is available without a call, so a host can render its slider while
     /// the connection is reconnecting.
     #[must_use]
+    #[cfg(feature = "player")]
     pub fn volume(&self) -> u8 {
         self.volume.load(Ordering::Relaxed)
     }
@@ -997,6 +1026,7 @@ impl ControlHandle {
     }
 
     /// Sends one controller command.
+    #[cfg(feature = "controller")]
     async fn transport(&self, command: &'static str) -> Result<()> {
         self.send(ControlAction::Transport(command))
             .await
@@ -1019,18 +1049,25 @@ impl ControlHandle {
 #[derive(Debug)]
 pub(crate) enum ControlAction {
     /// A controller command, by wire name.
+    #[cfg(feature = "controller")]
     Transport(&'static str),
     /// Seek to an absolute position in milliseconds.
+    #[cfg(feature = "controller")]
     Seek(u64),
     /// Seek by an offset in milliseconds; negative rewinds.
+    #[cfg(feature = "controller")]
     SeekRelative(i64),
     /// Set the output level, subject to the volume limit.
+    #[cfg(feature = "player")]
     Volume(u8),
     /// Record the level the output is actually at, without the volume limit.
+    #[cfg(feature = "player")]
     ReportVolume(u8),
     /// Set the mute state, keeping the level.
+    #[cfg(feature = "player")]
     Mute(bool),
     /// The host applied an output delay to its sink: read it and report it.
+    #[cfg(feature = "player")]
     OutputDelayApplied,
     /// Whether the connection admits an unpaired session, applied to the shared value.
     SetUnpairedAccess(bool),
@@ -1077,6 +1114,7 @@ impl EventStream {
 pub struct Client;
 
 impl Client {
+    #[cfg(feature = "player")]
     /// Connects to `config.server` and returns the handle and event stream.
     ///
     /// See [`connect`] for the details.
@@ -1087,6 +1125,7 @@ impl Client {
         connect(config, sink).await
     }
 
+    #[cfg(feature = "player")]
     /// Connects with pairing keys the host stores for known servers.
     ///
     /// See [`connect_with_psks`] for the details.
@@ -1115,6 +1154,7 @@ impl Client {
         connect_headless_with_psks(config, psks).await
     }
 
+    #[cfg(feature = "player")]
     /// Advertises this client and serves the servers that connect to it.
     ///
     /// See [`advertise`](crate::advertise) for the details.
@@ -1135,6 +1175,7 @@ impl Client {
     }
 }
 
+#[cfg(feature = "player")]
 /// Connects to a server and returns its handle and event stream.
 ///
 /// The configuration is validated before this returns; the connection itself runs in a spawned
@@ -1161,6 +1202,7 @@ pub async fn connect(
     connect_with_psks(config, sink, Vec::new()).await
 }
 
+#[cfg(feature = "player")]
 /// Connects with pairing keys the host stores for known servers.
 ///
 /// The server announces a `psk_id` and `psk_category` in Noise message 1. A candidate matches when
@@ -1190,10 +1232,10 @@ pub async fn connect_with_psks(
 
 /// Connects without an audio output and returns its handle and event stream.
 ///
-/// A headless client has no [`Sink`]: it does not advertise or take the `player@v1` role, plays no
+/// A headless client has no `Sink`: it does not advertise or take the `player@v1` role, plays no
 /// audio and reports no player state. It takes part in the other roles the build supports -
 /// controller and metadata - so it suits a remote control, a display or a bridge. Everything else
-/// is as for [`connect`]: the configuration is validated before this returns, the connection runs
+/// is as for `connect`: the configuration is validated before this returns, the connection runs
 /// in a spawned task and reconnects on its own, and the player fields of [`ClientConfig`]
 /// (`audio_mode`, `volume`, `muted`, `volume_policy`, `output_delay_control`,
 /// `required_lead_time_ms` and `min_buffer_ms`) are ignored.
@@ -1202,7 +1244,7 @@ pub async fn connect_with_psks(
 /// role, because only the player waits for the clock.
 ///
 /// # Errors
-/// Same as [`connect`].
+/// Same as `connect`.
 ///
 /// # Panics
 /// Panics when called outside a Tokio runtime, because the connection is spawned.
@@ -1212,24 +1254,35 @@ pub async fn connect_headless(config: ClientConfig) -> Result<(ClientHandle, Eve
 
 /// Connects without an audio output, with pairing keys the host stores for known servers.
 ///
-/// The headless counterpart of [`connect_with_psks`]; see [`connect_headless`] for what headless
+/// The headless counterpart of `connect_with_psks`; see [`connect_headless`] for what headless
 /// means.
 ///
 /// # Errors
-/// Same as [`connect_with_psks`].
+/// Same as `connect_with_psks`.
 pub async fn connect_headless_with_psks(
     config: ClientConfig,
     psks: Vec<StoredPsk>,
 ) -> Result<(ClientHandle, EventStream)> {
-    start(config, None, psks).await
+    start(
+        config,
+        #[cfg(feature = "player")]
+        None,
+        psks,
+    )
+    .await
 }
 
 /// Shared body of the connect entry points; `sink` is `None` for a headless client.
 async fn start(
     config: ClientConfig,
-    sink: Option<Box<dyn Sink>>,
+    #[cfg(feature = "player")] sink: Option<Box<dyn Sink>>,
     psks: Vec<StoredPsk>,
 ) -> Result<(ClientHandle, EventStream)> {
+    #[cfg(feature = "player")]
+    let has_sink = sink.is_some();
+    #[cfg(not(feature = "player"))]
+    let has_sink = false;
+    ensure_roles(has_sink)?;
     // connection.md, _Server Initiated Connections_: "Clients MUST NOT manually connect to servers
     // while advertising `_sendspin._tcp`." A client uses one of the two methods at a time, so a
     // configuration that advertises is refused here rather than connected on the side.
@@ -1259,6 +1312,7 @@ async fn start(
     let (events, receiver) = mpsc::unbounded_channel();
     let (commands, control) = mpsc::unbounded_channel();
     let (shutdown, shutdown_rx) = oneshot::channel();
+    #[cfg(feature = "player")]
     let reported_volume = Arc::new(AtomicU8::new(config.volume));
     // The dynamic flow's round counter belongs to the process, not to a connection or a server:
     // only a verified `server_kc` or a deliberate operator action resets it.
@@ -1266,9 +1320,11 @@ async fn start(
     let failed_rounds = Arc::new(AtomicU32::new(0));
 
     let carried = Carried {
+        #[cfg(feature = "player")]
         sink,
         control: Some(control),
         volume: config.volume,
+        #[cfg(feature = "player")]
         muted: config.muted,
         active_roles: Vec::new(),
         unpaired_access: Arc::new(AtomicBool::new(config.unpaired_access)),
@@ -1281,6 +1337,7 @@ async fn start(
         psks,
         pairing,
         events: events.clone(),
+        #[cfg(feature = "player")]
         reported_volume: Arc::clone(&reported_volume),
     };
 
@@ -1290,6 +1347,7 @@ async fn start(
         task: Some(task),
         control: ControlHandle {
             commands,
+            #[cfg(feature = "player")]
             volume: reported_volume,
             pairing_token,
         },
@@ -1314,6 +1372,7 @@ struct Connection {
     pairing: Option<PairingPsk>,
     events: mpsc::UnboundedSender<Event>,
     /// Level shared with every [`ControlHandle`].
+    #[cfg(feature = "player")]
     reported_volume: Arc<AtomicU8>,
 }
 
@@ -1340,6 +1399,10 @@ enum Wakeup {
 /// to the process and is honoured, and a change of the unpaired-access setting is stored for the
 /// next `client/hello`, so an operator gesture made between connections is not lost.
 pub(crate) fn answer_without_session(carried: &Carried, request: ControlRequest) {
+    #[cfg_attr(
+        not(any(feature = "player", feature = "controller", feature = "pairing-code")),
+        allow(irrefutable_let_patterns)
+    )]
     if let ControlAction::SetUnpairedAccess(enabled) = &request.action {
         carried.unpaired_access.store(*enabled, Ordering::Relaxed);
         let _ = request.reply.send(Ok(carried.volume));
@@ -1443,6 +1506,7 @@ async fn serve_until_dropped(
             &connection.events,
             &connection.psks,
             connection.pairing,
+            #[cfg(feature = "player")]
             &connection.reported_volume,
             carried,
             &mut shutdown,
@@ -1453,13 +1517,9 @@ async fn serve_until_dropped(
         // Nothing buffered for the session that ended may become audible later; the flush runs
         // before the host hears about the drop so the output stops even if the next attempt takes
         // a while.
-        let flush_error = carried
-            .sink
-            .as_mut()
-            .and_then(|sink| sink.flush().err())
-            .map(|error| {
-                error.context("the audio sink rejected a flush after the connection ended")
-            });
+        let flush_error = carried.flush_sink().map(|error| {
+            error.context("the audio sink rejected a flush after the connection ended")
+        });
 
         // A deliberate close is not a drop: nothing is reported and no attempt follows. The
         // goodbye was best effort, so neither its send nor the flush can turn it into an error.
@@ -1556,7 +1616,7 @@ fn endpoint(server: &str) -> Result<String> {
     Ok(format!("ws://{before_marker}/sendspin{after_marker}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "player", feature = "controller", feature = "metadata"))]
 mod tests {
     use super::*;
 

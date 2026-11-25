@@ -2,6 +2,8 @@
 //! which capability objects ride along. The hello is read as text, because the typed form drops
 //! keys it does not know and so cannot show that a key is absent.
 
+#![cfg(feature = "player")]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 
@@ -77,14 +79,35 @@ async fn hello_text() -> String {
         .expect("the server saw a client/hello")
 }
 
+/// The roles this build advertises, in the order the client lists them.
+fn expected_roles() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut roles = vec!["player@v1"];
+    #[cfg(feature = "controller")]
+    roles.push("controller@v1");
+    #[cfg(feature = "metadata")]
+    roles.push("metadata@v1");
+    roles
+}
+
 #[tokio::test]
-async fn the_default_hello_lists_the_roles_in_order() {
+async fn the_hello_lists_the_built_roles_in_order() {
     let text = hello_text().await;
     let hello: serde_json::Value = serde_json::from_str(&text).expect("the hello is JSON");
     assert_eq!(
         hello["payload"]["supported_roles"],
-        serde_json::json!(["player@v1", "controller@v1", "metadata@v1"]),
-        "the default build advertises exactly these roles, in this order"
+        serde_json::json!(expected_roles()),
+        "the build advertises exactly the roles its features compile in, in this order"
+    );
+}
+
+#[cfg(all(feature = "controller", feature = "metadata"))]
+#[test]
+fn the_default_set_is_player_controller_metadata() {
+    assert_eq!(
+        expected_roles(),
+        ["player@v1", "controller@v1", "metadata@v1"],
+        "a build with all three role features is the set every client of this crate always had"
     );
 }
 

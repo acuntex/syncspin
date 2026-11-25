@@ -11,6 +11,8 @@
 //! (the runtime advances to the next timer instead). Each silence assertion states the virtual
 //! interval it measured, so a session that pinged early cannot pass by accident.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 

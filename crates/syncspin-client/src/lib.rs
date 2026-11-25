@@ -2,14 +2,14 @@
 //!
 //! This crate owns the session: it connects to a server, runs the Noise handshake, keeps a clock
 //! estimate and feeds audio to a sink the host provides. It stays device agnostic - the
-//! application that owns the speakers implements [`Sink`] and decides what playout means.
+//! application that owns the speakers implements `Sink` and decides what playout means.
 //!
 //! A connection always ends in Noise: the client refuses a server that does not complete the
 //! handshake and never falls back to cleartext. A successful attempt reports [`Event::Connected`]
 //! and then one event per change; an attempt that ends reports [`Event::Disconnected`] with the
 //! delay before the next one, and the crate reconnects on its own with the same sink and identity.
 //!
-//! [`connect`] validates the configuration and spawns the connection; the first attempt and every
+//! `connect` validates the configuration and spawns the connection; the first attempt and every
 //! retry run in that task and reach the caller through the [`EventStream`]. Only an invalid
 //! configuration or an address this build cannot use returns an error - an unreachable server is
 //! reported as [`Event::Disconnected`]. The [`ClientHandle`] waits for the connection to end and
@@ -18,7 +18,7 @@
 //! for the default - and the value the server receives is the applied one. [`ClientConfig::volume`]
 //! and [`ClientConfig::muted`] are the level and mute state the first report carries, so a host
 //! passes the values it restored instead of letting the server see a baseline the output is not at.
-//! [`ControlHandle::report_volume`] is the other direction: a level the host reads from its own
+//! `ControlHandle::report_volume` is the other direction: a level the host reads from its own
 //! output is recorded and sent unchanged, because the policy limits requests rather than the level
 //! the device is at.
 //!
@@ -75,16 +75,16 @@
 //! records - and then serves one server at a time through the same session as a dialled connection.
 //! An upgrade that carries an `Origin` header is refused, as the spec requires, and the Noise
 //! handshake is unchanged because the server initiates it in both directions. A client uses one of
-//! the two methods at a time: while `ClientConfig::inbound` is set, [`connect`] refuses to dial.
+//! the two methods at a time: while `ClientConfig::inbound` is set, `connect` refuses to dial.
 //! A second server that arrives while one is admitted is rejected with `client/goodbye` reason
 //! `concurrent_attempt` and closed, which is the spec's admission rule for a client that caps
 //! itself at one connection. The `mdns` feature carries the `mdns-sd` implementation of
 //! [`Discovery`]; without it the trait is the seam, so a host can supply its own backend and a
 //! fake drives the tests.
 //!
-//! A host that renders the stream sees its lifecycle as events: [`Event::StreamStart`] for a new
-//! format, [`Event::StreamEnd`] when the server pauses or removes the player role, and
-//! [`Event::StreamClear`] for a seek, plus [`Event::Track`] for the now-playing metadata with its
+//! A host that renders the stream sees its lifecycle as events: `Event::StreamStart` for a new
+//! format, `Event::StreamEnd` when the server pauses or removes the player role, and
+//! `Event::StreamClear` for a seek, plus [`Event::Track`] for the now-playing metadata with its
 //! position, duration and playback speed. The end and clear events arrive before the client
 //! discards or flushes the buffered audio, so the host can mute, stop or restart its output first.
 //!
@@ -95,24 +95,29 @@
 //! The connection keeps running until the audio sink fails, which the host has to repair, or until
 //! the handle or the event stream is dropped.
 
+#[cfg(feature = "player")]
 mod buffer;
 mod client;
 mod config;
 mod discovery;
 mod pairing;
+#[cfg(feature = "player")]
 mod playout;
 mod roles;
 mod session;
+#[cfg(feature = "player")]
 mod sink;
 
 pub mod storage;
 
 pub use client::{
-    clamp_volume, clamp_volume_with, connect, connect_headless, connect_headless_with_psks,
-    connect_with_psks, next_backoff, Client, ClientHandle, ControlHandle, Event, EventStream,
-    GoodbyeReason, PairingFailure, PairingRequiredReason, PlaybackState, StreamEndReason,
-    DEFAULT_PAIRING_TIMEOUT, INITIAL_BACKOFF, NORMAL_PLAYBACK_SPEED,
+    clamp_volume, clamp_volume_with, connect_headless, connect_headless_with_psks, next_backoff,
+    Client, ClientHandle, ControlHandle, Event, EventStream, GoodbyeReason, PairingFailure,
+    PairingRequiredReason, PlaybackState, StreamEndReason, DEFAULT_PAIRING_TIMEOUT,
+    INITIAL_BACKOFF, NORMAL_PLAYBACK_SPEED,
 };
+#[cfg(feature = "player")]
+pub use client::{connect, connect_with_psks};
 pub use config::{
     AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, DEFAULT_MAX_BACKOFF,
     MAX_PLAYER_NAME_LEN,
@@ -122,16 +127,17 @@ pub use config::{
     CodeFormat, CodeOutChannel, DEFAULT_PAIRING_WINDOW, MAX_PAIRING_PENDING_TEXT_LEN,
     STATIC_PAIRING_CODE_LEN,
 };
+#[cfg(all(feature = "discovery", feature = "player"))]
+pub use discovery::advertise;
 #[cfg(feature = "mdns")]
 pub use discovery::MdnsDiscovery;
 #[cfg(feature = "discovery")]
-pub use discovery::{
-    advertise, advertise_headless, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT,
-};
+pub use discovery::{advertise_headless, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT};
 pub use discovery::{
     discover_reachable_endpoint, discover_servers, reachable_endpoint, DiscoveredServer, Discovery,
     ServiceAdvertisement, CLIENT_SERVICE_TYPE, DEFAULT_SENDSPIN_PATH, SERVER_SERVICE_TYPE,
 };
+#[cfg(feature = "player")]
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};
 
 // The identity is part of [`ClientConfig`], so a host that builds a configuration needs it. A
@@ -149,17 +155,21 @@ pub(crate) mod test_support {
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
+    #[cfg(feature = "player")]
     use std::time::Instant;
 
     use anyhow::{bail, Result};
 
     use crate::config::StoredPsk;
+    #[cfg(feature = "player")]
     use crate::sink::{AudioFormat, AudioFrame, Sink};
     use crate::storage::Storage;
 
     /// A sink that accepts every call and keeps the trait's default output delay and underrun count.
+    #[cfg(feature = "player")]
     pub(crate) struct NullSink;
 
+    #[cfg(feature = "player")]
     impl Sink for NullSink {
         fn open(&mut self, _format: AudioFormat) -> anyhow::Result<()> {
             Ok(())
@@ -174,6 +184,7 @@ pub(crate) mod test_support {
         }
     }
 
+    #[cfg(feature = "player")]
     #[test]
     fn the_test_sink_reports_the_trait_defaults() {
         let mut sink = NullSink;

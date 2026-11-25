@@ -1,6 +1,8 @@
 //! Handshake refusals: every stage of the cleartext exchange and the Noise handshake has a rule,
 //! and a server that breaks it must end the attempt with a named reason. No test here plays audio.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 

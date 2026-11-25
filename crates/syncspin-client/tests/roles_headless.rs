@@ -1,6 +1,8 @@
 //! A client without an audio sink: it offers no player role, reports no player state, still takes
 //! part in the other roles, and sends its first `client/state` without waiting for a player's clock.
 
+#![cfg(all(feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 
@@ -111,6 +113,7 @@ async fn a_headless_client_refuses_the_player_role() {
     );
 }
 
+#[cfg(feature = "player")]
 #[tokio::test]
 async fn a_headless_handle_has_no_volume_to_set() {
     let server = FakeServer::start(headless_roles()).await.unwrap();

@@ -327,6 +327,20 @@ while let Some(event) = events.next().await {
 }
 ```
 
+The client crate has cargo features for the roles it takes part in:
+
+| Feature      | Default | What it compiles in                                                                  |
+| ------------ | ------- | ------------------------------------------------------------------------------------ |
+| `player`     | on      | `Sink`, the playout queue, `connect`, the volume and mute controls and stream events |
+| `controller` | on      | the transport and seek controls and the group's controller state                     |
+| `metadata`   | on      | the now-playing track                                                                |
+
+A consumer with `default-features = false` gets none of them and has to name the roles it wants; a
+build with no role at all has nothing to offer, so `connect_headless` and `advertise_headless` return
+an error instead of connecting. The other features, `storage-file`, `pairing-code`, `discovery` and
+`mdns`, are off by default. `scripts/check-roles.sh` builds, tests and lints the client for the sets
+that turn a role off.
+
 ## Integrating a server
 
 A host supplies the server's identity, an optional

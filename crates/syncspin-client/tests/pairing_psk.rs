@@ -5,6 +5,8 @@
 //! PSK and the record a pairing produces in an in-memory [`Storage`], which is the only thing that
 //! makes the Pairing PSK method available at all.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 

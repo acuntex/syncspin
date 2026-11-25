@@ -3,6 +3,8 @@
 //! Every test binds one loopback port, runs the Noise initiator with `snow` on the server side and
 //! records the frames a [`Sink`] receives. No test touches an audio device or another host.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 

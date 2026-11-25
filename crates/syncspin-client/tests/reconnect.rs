@@ -3,6 +3,8 @@
 //! The crate owns the loop, so these tests cover both the pure backoff sequence and what a drop
 //! does to the sink and to the event stream.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 

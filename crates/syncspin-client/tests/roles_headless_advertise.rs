@@ -1,6 +1,7 @@
 //! A headless client that advertises and is dialled by a server (`connection.md`, server-initiated
 //! mode): it listens, offers no player role and takes part in the others.
-#![cfg(feature = "discovery")]
+
+#![cfg(all(feature = "discovery", feature = "metadata"))]
 
 #[path = "fake_server.rs"]
 mod fake_server;
@@ -53,7 +54,7 @@ async fn a_headless_advertiser_serves_a_dialling_server_without_the_player_role(
     let url = format!("ws://127.0.0.1:{}{}", record.port, record.path);
 
     let options = ServerOptions {
-        active_roles: vec!["controller@v1".to_owned(), "metadata@v1".to_owned()],
+        active_roles: vec!["metadata@v1".to_owned()],
         ..ServerOptions::default()
     };
     let mut server = FakeServer::dial(&url, options).await.unwrap();
@@ -61,9 +62,13 @@ async fn a_headless_advertiser_serves_a_dialling_server_without_the_player_role(
         .await
         .expect("the client announces itself")
         .expect("a client/hello arrived");
+    // The roles this build offers without a sink: the player is never among them.
+    #[cfg(feature = "controller")]
+    let expected = ["controller@v1", "metadata@v1"];
+    #[cfg(not(feature = "controller"))]
+    let expected = ["metadata@v1"];
     assert_eq!(
-        hello.supported_roles,
-        ["controller@v1", "metadata@v1"],
+        hello.supported_roles, expected,
         "a headless advertiser offers no player role"
     );
     assert!(hello.player_support.is_none());

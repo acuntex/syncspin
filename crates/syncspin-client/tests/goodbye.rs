@@ -5,6 +5,8 @@
 //!
 //! Everything runs against the hermetic fake server in `fake_server.rs`.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 

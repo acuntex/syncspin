@@ -40,7 +40,12 @@ cargo check -p syncspin-core -p syncspin-client --all-features \
   --target armv7-unknown-linux-gnueabihf --locked       # the ARM guard, as CI runs it
 cargo check -p syncspin-server --all-features \
   --target armv7-unknown-linux-gnueabihf --locked       # the same guard for the server, run it too
-cargo zigbuild --target armv7-unknown-linux-gnueabihf  # once the player/controller features land
+cargo check -p syncspin-client \
+  --target armv7-unknown-linux-gnueabihf --locked       # the client with its default roles
+cargo check -p syncspin-client --no-default-features \
+  --target armv7-unknown-linux-gnueabihf --locked       # and with no role feature at all
+scripts/check-roles.sh                                 # every role feature set: tests, docs, clippy
+cargo zigbuild --target armv7-unknown-linux-gnueabihf  # once a dependency needs a C toolchain
 cargo deny check                                       # licences, advisories, sources
 scripts/coverage.sh                                    # coverage, all features, advisory
 ```
@@ -73,10 +78,13 @@ here rather than a preference.
   There is no plaintext fallback and no downgrade - not behind a flag, not in a test.
 - **Never log key material or pairing records.** No static keys, no PSKs, no pairing blobs, no
   Noise handshake hashes - not at `trace`, not in `Debug` output, not in error strings.
-- **When the role feature flags land, the defaults stay `player`, `controller`, `metadata`.**
-  `artwork`, `visualizer`, `color` and `source` stay off unless a caller opts in. The role features
-  do not exist yet: the only tables today are `storage-file` (client), `pairing-code`
-  (core/client/server), `discovery` (client) and `mdns` (client/server). `storage-file` is off in
+- **The role feature defaults stay `player`, `controller`, `metadata`.**
+  `artwork`, `visualizer`, `color` and `source` stay off unless a caller opts in, and only
+  `syncspin-client` has role features: `player`, `controller` and `metadata` (on by default) and the
+  tables `storage-file`, `pairing-code` (core/client/server), `discovery` and `mdns`
+  (client/server). `artwork` and `color` do not exist yet; `visualizer` and `source` are not
+  implemented. A set that turns a role off compiles other test files, so a change in the client
+  runs `scripts/check-roles.sh` as well. `storage-file` is off in
   `syncspin-client` but on in `player-pipe`, so a workspace build enables it through feature
   unification; `pairing-code`, `discovery` and `mdns` are off unless requested. `mdns-pair` has its
   own `mdns` feature, which forwards to the client and server ones and is off by default: the flow

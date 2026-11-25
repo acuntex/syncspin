@@ -3,6 +3,8 @@
 //! Every test binds one loopback port and runs the hermetic fake server from `fake_server.rs`; no
 //! audio device and no other host is involved.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 

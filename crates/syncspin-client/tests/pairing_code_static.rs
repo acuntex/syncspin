@@ -8,7 +8,13 @@
 //! What the tests decide: the window gates every attempt, the flow takes one round, a failed
 //! `server_kc` aborts without a retry, the fifth failure closes the window, and the delivered key is
 //! a record under the server's id.
-#![cfg(feature = "pairing-code")]
+
+#![cfg(all(
+    feature = "pairing-code",
+    feature = "player",
+    feature = "controller",
+    feature = "metadata"
+))]
 
 #[path = "fake_server.rs"]
 mod fake_server;
