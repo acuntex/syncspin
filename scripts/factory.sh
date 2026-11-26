@@ -637,7 +637,8 @@ build_cmd_opencode1() {
 
 # build_cmd_opencode2: the 2.x shape. No --dir (the phase runs in the repository root the driver has
 # entered), the variant lives in --model, --server attaches to a long-lived server and --standalone
-# starts a private one otherwise, and --archived keeps the scripted sessions out of session lists.
+# starts a private one otherwise, and --archived keeps the scripted sessions of a private server out of
+# session lists (an attached run is not archived: it is meant to be followed).
 build_cmd_opencode2() {
   local role=$1 phase=$3 prompt=$4 model
   model=$(opencode_model "$role")
@@ -645,7 +646,9 @@ build_cmd_opencode2() {
   if [ -n "$opencode_attach" ]; then cmd+=(--server "$opencode_attach"); else cmd+=(--standalone); fi
   cmd+=(--agent "factory-$role")
   if [ -n "$model" ]; then cmd+=(--model "$model"); fi
-  cmd+=(--archived --title "${run_id:-RUN_ID}:$phase" "$prompt")
+  # An attached session stays visible in the server's lists so that a run can be followed there.
+  if [ -z "$opencode_attach" ]; then cmd+=(--archived); fi
+  cmd+=(--title "${run_id:-RUN_ID}:$phase" "$prompt")
 }
 
 build_cmd_claude() {
