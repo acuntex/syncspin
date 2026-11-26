@@ -7,7 +7,7 @@
 #   scripts/test-factory.sh              all sections
 #   scripts/test-factory.sh gate hooks   only the named sections
 #
-# Sections: gate, fixture, hooks, static.
+# Sections: gate, fixture, hooks, sync, static.
 #
 # FACTORY_TEST_PRETTIER=1 enables the checks that need prettier (the gate sets it when npx exists);
 # without it they run only when prettier is already installed.
@@ -384,6 +384,125 @@ section_hooks() {
   refute "H2 the remote has no main" git -C "$remote" show-ref --verify --quiet refs/heads/main
 }
 
+# The prettier command the tests may use, or nothing: an explicit FACTORY_TEST_PRETTIER_CMD, a
+# prettier already on PATH, or (only with FACTORY_TEST_PRETTIER=1, which the gate sets when npx
+# exists) the version pinned for the repository. Tests never fetch anything on their own.
+prettier_for_tests() {
+  if [ -n "${FACTORY_TEST_PRETTIER_CMD:-}" ]; then
+    printf '%s' "$FACTORY_TEST_PRETTIER_CMD"
+  elif command -v prettier >/dev/null 2>&1; then
+    printf 'prettier'
+  elif [ "${FACTORY_TEST_PRETTIER:-0}" = 1 ] && command -v npx >/dev/null 2>&1; then
+    printf 'npx --yes prettier@3.9.10'
+  fi
+}
+
+# Top-level frontmatter keys of a generated file, one per line; fails without a closing fence.
+frontmatter_keys() {
+  awk 'NR==1 { if ($0 != "---") exit 1; next } /^---$/ { closed=1; exit } /^[A-Za-z]/ { sub(/:.*/, ""); print } END { exit !closed }' "$1"
+}
+
+section_sync() {
+  local root=$tmp/sync out rc f key allowed
+  mkdir -p "$root/scripts" "$root/docs" "$root/.claude"
+  cp "$repo/scripts/factory-sync.sh" "$root/scripts/"
+  cp -r "$repo/docs/factory" "$root/docs/"
+  cp -r "$repo/.opencode" "$root/"
+  cp -r "$repo/.claude/agents" "$repo/.claude/commands" "$root/.claude/"
+
+  # The committed files match their sources.
+  rc=0
+  (cd "$repo" && scripts/factory-sync.sh --check >/dev/null 2>&1) || rc=$?
+  assert "sync: --check is clean in the repository" test "$rc" = 0
+
+  rc=0
+  out=$(cd "$root" && scripts/factory-sync.sh --check 2>&1) || rc=$?
+  assert "sync: --check is clean in the copy" test "$rc" = 0
+
+  # Idempotent: writing twice changes nothing.
+  local before after
+  before=$(cd "$root" && find .opencode .claude -type f -exec sha256sum {} + | LC_ALL=C sort)
+  (cd "$root" && scripts/factory-sync.sh && scripts/factory-sync.sh)
+  after=$(cd "$root" && find .opencode .claude -type f -exec sha256sum {} + | LC_ALL=C sort)
+  assert "sync: writing is idempotent" test "$before" = "$after"
+
+  # Drift in a generated file.
+  printf 'x' >>"$root/.claude/agents/factory-planner.md"
+  rc=0
+  out=$(cd "$root" && scripts/factory-sync.sh --check 2>&1) || rc=$?
+  assert "sync: a changed generated file fails --check" test "$rc" = 1
+  assert "sync: the stale file is named" has "$out" '\.claude/agents/factory-planner\.md'
+  assert "sync: the fix command is named" has "$out" 'scripts/factory-sync\.sh'
+  (cd "$root" && scripts/factory-sync.sh)
+
+  # Drift in a source.
+  printf '\nExtra line.\n' >>"$root/docs/factory/roles/implementer.md"
+  rc=0
+  out=$(cd "$root" && scripts/factory-sync.sh --check 2>&1) || rc=$?
+  assert "sync: a changed source fails --check" test "$rc" = 1
+  assert "sync: the OpenCode file of the changed source is named" has "$out" '\.opencode/agents/factory-implementer\.md'
+  assert "sync: the Claude file of the changed source is named" has "$out" '\.claude/agents/factory-implementer\.md'
+  (cd "$root" && scripts/factory-sync.sh)
+  rc=0
+  (cd "$root" && scripts/factory-sync.sh --check >/dev/null 2>&1) || rc=$?
+  assert "sync: regenerating after a source change is clean" test "$rc" = 0
+
+  # A missing file and a stale file.
+  rm "$root/.opencode/agents/factory-pr-writer.md"
+  printf 'old\n' >"$root/.opencode/agents/factory-gone.md"
+  rc=0
+  out=$(cd "$root" && scripts/factory-sync.sh --check 2>&1) || rc=$?
+  assert "sync: a missing file fails --check" has "$out" 'factory-pr-writer\.md'
+  assert "sync: a stale file fails --check" has "$out" 'factory-gone\.md'
+  (cd "$root" && scripts/factory-sync.sh)
+  assert "sync: writing removes the stale file" test ! -e "$root/.opencode/agents/factory-gone.md"
+  assert "sync: writing restores the missing file" test -f "$root/.opencode/agents/factory-pr-writer.md"
+
+  # A bad source is a usage error, not a generated file.
+  printf 'surprise=1\n' >>"$root/docs/factory/meta/planner.conf"
+  rc=0
+  (cd "$root" && scripts/factory-sync.sh --check >/dev/null 2>&1) || rc=$?
+  assert "sync: an unknown conf key is rejected" test "$rc" = 2
+
+  # Frontmatter fence and key whitelist of every generated file in the repository.
+  for f in "$repo"/.opencode/agents/factory-*.md; do
+    allowed=" description mode permission "
+    assert "sync: $(basename "$f") (opencode) has a closed fence" frontmatter_keys "$f" >/dev/null
+    for key in $(frontmatter_keys "$f"); do
+      assert "sync: opencode key $key is whitelisted" has "$allowed" " $key "
+    done
+    assert "sync: $(basename "$f") (opencode) keeps the readonly overlay deny-only" test -z "$(grep -E '^    "\*": "(ask|allow)"' "$f" || true)"
+  done
+  for f in "$repo"/.claude/agents/factory-*.md; do
+    allowed=" name description tools model maxTurns "
+    assert "sync: $(basename "$f") (claude agent) has a closed fence" frontmatter_keys "$f" >/dev/null
+    for key in $(frontmatter_keys "$f"); do
+      assert "sync: claude agent key $key is whitelisted" has "$allowed" " $key "
+    done
+  done
+  allowed=" description argument-hint allowed-tools "
+  for key in $(frontmatter_keys "$repo/.claude/commands/factory.md"); do
+    assert "sync: command key $key is whitelisted" has "$allowed" " $key "
+  done
+  # shellcheck disable=SC2016  # a literal $ARGUMENTS, not a shell expansion
+  assert "sync: the command passes the task as data once" test "$(grep -c '^\$ARGUMENTS$' "$repo/.claude/commands/factory.md")" = 1
+  refute "sync: the command never uses the task in a shell block" grep -q '!`' "$repo/.claude/commands/factory.md"
+  assert "sync: every generated file starts with a fence" test -z "$(for f in "$repo"/.opencode/agents/*.md "$repo"/.claude/agents/*.md "$repo"/.claude/commands/*.md; do head -n1 "$f" | grep -qx -- '---' || echo "$f"; done)"
+  assert "sync: every generated file names its source" test -z "$(for f in "$repo"/.opencode/agents/*.md "$repo"/.claude/agents/*.md "$repo"/.claude/commands/*.md; do grep -q 'generated by scripts/factory-sync.sh from docs/factory/roles/' "$f" || echo "$f"; done)"
+
+  # Prettier stability of the generated files and the sources.
+  local pcmd
+  pcmd=$(prettier_for_tests)
+  if [ -n "$pcmd" ]; then
+    rc=0
+    # shellcheck disable=SC2086  # the command is a word list on purpose
+    (cd "$repo" && $pcmd --check docs/factory .opencode .claude/agents .claude/commands >/dev/null 2>&1) || rc=$?
+    assert "sync: generated files and sources are prettier-clean" test "$rc" = 0
+  else
+    printf 'skip: prettier is not installed and FACTORY_TEST_PRETTIER is not set\n'
+  fi
+}
+
 section_static() {
   if command -v shellcheck >/dev/null 2>&1; then
     assert "static: shellcheck is clean over scripts and hooks" bash -c "git -C '$repo' ls-files -z '*.sh' '.githooks/*' | (cd '$repo' && xargs -0 shellcheck)"
@@ -394,13 +513,13 @@ section_static() {
 
 sections=("$@")
 if [ ${#sections[@]} -eq 0 ]; then
-  sections=(gate fixture hooks static)
+  sections=(gate fixture hooks sync static)
 fi
 for s in "${sections[@]}"; do
   case "$s" in
-    gate | fixture | hooks | static) "section_$s" ;;
+    gate | fixture | hooks | sync | static) "section_$s" ;;
     *)
-      printf 'usage: %s [gate] [fixture] [hooks] [static]\n' "$0" >&2
+      printf 'usage: %s [gate] [fixture] [hooks] [sync] [static]\n' "$0" >&2
       exit 2
       ;;
   esac

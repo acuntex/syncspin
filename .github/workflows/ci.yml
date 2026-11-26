@@ -67,6 +67,10 @@ jobs:
       # The gate and hook tests: stub CLIs and a generated fixture workspace, no network, no model.
       - name: factory tests
         run: scripts/test-factory.sh
+      # The agent files for OpenCode and Claude Code are generated from docs/factory/; a source
+      # change without the regenerated files fails here.
+      - name: factory agents are up to date
+        run: scripts/factory-sync.sh --check
 
   test:
     name: test

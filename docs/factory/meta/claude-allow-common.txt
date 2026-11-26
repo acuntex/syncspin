@@ -1,0 +1,19 @@
+Bash(cargo *)
+Bash(scripts/*)
+Bash(git status *)
+Bash(git diff *)
+Bash(git log *)
+Bash(git show *)
+Bash(git rev-parse *)
+Bash(git merge-base *)
+Bash(git ls-files *)
+Bash(git for-each-ref *)
+Bash(git write-tree *)
+Bash(ls *)
+Bash(rg *)
+Bash(grep *)
+Bash(wc *)
+Bash(diff *)
+Read
+Glob
+Grep
