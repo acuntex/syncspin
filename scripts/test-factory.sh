@@ -7,8 +7,10 @@
 #   scripts/test-factory.sh              all sections
 #   scripts/test-factory.sh gate hooks   only the named sections
 #
-# Sections: gate, fixture, hooks, sync, static.
+# Sections: gate, fixture, hooks, sync, perm, static.
 #
+# FACTORY_TEST_SKIP_CLI=1 skips every check that starts a real opencode or claude binary (they only
+# print configuration, never run a model, but a contributor may not want them started).
 # FACTORY_TEST_PRETTIER=1 enables the checks that need prettier (the gate sets it when npx exists);
 # without it they run only when prettier is already installed.
 
@@ -503,23 +505,83 @@ section_sync() {
   fi
 }
 
+# Permission tests: the two configuration files, the generated OpenCode agent overlays and, when
+# OpenCode is installed, the rules it resolves for each agent. The evaluator is
+# scripts/test-factory-perm.py (python3, standard library only).
+section_perm() {
+  local line role agents_dir=$tmp/agents
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'skip: python3 is not installed, the permission evaluator is not run\n'
+    return
+  fi
+  if [ "${FACTORY_TEST_SKIP_CLI:-0}" != 1 ] && command -v opencode >/dev/null 2>&1; then
+    mkdir -p "$agents_dir"
+    # The output holds the contributor's global configuration: parse it, never print it.
+    assert "perm: the OpenCode config resolves" bash -c "cd '$repo' && opencode debug config >/dev/null 2>&1"
+    for role in planner plan-reviewer implementer code-reviewer pr-writer; do
+      assert "perm: the OpenCode agent factory-$role resolves" bash -c "cd '$repo' && opencode debug agent factory-$role >'$agents_dir/factory-$role.json' 2>/dev/null"
+    done
+  else
+    agents_dir=""
+    printf 'skip: opencode is not installed, its resolved rules are not checked\n'
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "PASS "*) ok ;;
+      "FAIL "*) bad "perm: ${line#FAIL }" ;;
+      "SKIP "*) printf '%s\n' "$line" ;;
+    esac
+  done < <(python3 -I "$repo/scripts/test-factory-perm.py" "$repo" "$agents_dir")
+}
+
 section_static() {
   if command -v shellcheck >/dev/null 2>&1; then
     assert "static: shellcheck is clean over scripts and hooks" bash -c "git -C '$repo' ls-files -z '*.sh' '.githooks/*' | (cd '$repo' && xargs -0 shellcheck)"
   else
     printf 'skip: shellcheck is not installed\n'
   fi
+
+  # CLAUDE.md is a symlink to AGENTS.md, with no content of its own.
+  assert "static: CLAUDE.md is a git symlink" has "$(git -C "$repo" ls-files -s CLAUDE.md)" '^120000 '
+  assert "static: CLAUDE.md points at AGENTS.md" test "$(readlink "$repo/CLAUDE.md")" = AGENTS.md
+  assert "static: CLAUDE.md and AGENTS.md have identical bytes" cmp -s "$repo/CLAUDE.md" "$repo/AGENTS.md"
+
+  # Files that ship with the factory hold no credentials, no local paths and no personal names.
+  # docs/factory, scripts/factory.sh and this script necessarily contain the patterns they look for.
+  local files f hits="" user host word generic=" root runner ubuntu user admin build home test dev github docker localhost "
+  files=$(git -C "$repo" ls-files scripts/gate.sh scripts/factory-sync.sh scripts/test-factory-perm.py .githooks .opencode .claude opencode.json)
+  user=$(id -un 2>/dev/null || true)
+  host=$(hostname -s 2>/dev/null || true)
+  for f in $files; do
+    if grep -Eq 'apiKey|\bsk-[A-Za-z0-9]|ghp_' "$repo/$f"; then hits="$hits $f(credential)"; fi
+    if grep -E '/(home|Users)/[A-Za-z0-9._-]{3,}/' "$repo/$f" | grep -Evq '/(home|Users)/(<name>|you|user|alice|runner|name)/'; then hits="$hits $f(path)"; fi
+    if [ -n "${HOME:-}" ] && [ "$(tr -cd '/' <<<"$HOME" | wc -c)" -ge 2 ] && grep -Fq -- "$HOME" "$repo/$f"; then hits="$hits $f(home)"; fi
+    for word in $user $host; do
+      if [ "${#word}" -le 4 ]; then continue; fi
+      case "$generic" in *" $word "*) continue ;; esac
+      if grep -iqw -- "$word" "$repo/$f"; then hits="$hits $f(name)"; fi
+    done
+  done
+  assert "static: no credential, local path or personal name in factory files:$hits" test -z "$hits"
+  refute "static: generated prompts never claim to be official" grep -rilE 'official' "$repo/.opencode" "$repo/.claude/agents" "$repo/.claude/commands" "$repo/docs/factory"
+
+  local pcmd
+  pcmd=$(prettier_for_tests)
+  if [ -n "$pcmd" ]; then
+    # Explicit paths only: prettier refuses a symlink argument, and CLAUDE.md is one.
+    assert "static: configuration files are prettier-clean" bash -c "cd '$repo' && $pcmd --check opencode.json .claude/settings.json >/dev/null 2>&1"
+  fi
 }
 
 sections=("$@")
 if [ ${#sections[@]} -eq 0 ]; then
-  sections=(gate fixture hooks sync static)
+  sections=(gate fixture hooks sync perm static)
 fi
 for s in "${sections[@]}"; do
   case "$s" in
-    gate | fixture | hooks | sync | static) "section_$s" ;;
+    gate | fixture | hooks | sync | perm | static) "section_$s" ;;
     *)
-      printf 'usage: %s [gate] [fixture] [hooks] [sync] [static]\n' "$0" >&2
+      printf 'usage: %s [gate] [fixture] [hooks] [sync] [perm] [static]\n' "$0" >&2
       exit 2
       ;;
   esac

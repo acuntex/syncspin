@@ -11,3 +11,8 @@
 # the name older checkouts used.
 /identity.key
 /identity.json
+
+# Code factory: run artifacts, per-machine Claude Code settings and personal Claude Code notes.
+/.factory/
+/.claude/settings.local.json
+CLAUDE.local.md
