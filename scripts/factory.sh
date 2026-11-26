@@ -464,7 +464,9 @@ build_cmd() {
     claude)
       cmd=(claude -p "$prompt" --agent "factory-$role")
       if [ -n "$model" ]; then cmd+=(--model "$model"); fi
-      cmd+=(--permission-mode dontAsk --allowedTools "$(claude_tools "$access" "$artifact")" --no-session-persistence --output-format text)
+      # --strict-mcp-config without --mcp-config: no MCP server is loaded, so nothing from the user's
+      # own configuration runs inside a factory run or creates files the snapshot would flag.
+      cmd+=(--permission-mode dontAsk --allowedTools "$(claude_tools "$access" "$artifact")" --strict-mcp-config --no-session-persistence --output-format text)
       ;;
   esac
 }

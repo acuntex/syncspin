@@ -517,7 +517,7 @@ section_sync() {
 
 
 # ---------------------------------------------------------------------------
-# Driver tests (cases D1 to D29). The driver runs in a clone of a fake origin whose main branch is a
+# Driver tests (cases D1 to D36). The driver runs in a clone of a fake origin whose main branch is a
 # copy of the files the factory needs. There are two origins: one whose gate is a stub that only
 # stamps the tree (the default), and one whose gate is the real scripts/gate.sh (the real-gate cases).
 # The agent CLIs are stubs on PATH: they write canned artifacts and log their argv and environment.
@@ -779,6 +779,8 @@ section_driver() {
     refute "D18 [$be] no continue, session or resume flag" grep -Eq -- '^ARGV.*(--continue|--session|--resume)' "$sd/calls.log"
     if [ "$be" = claude ]; then
       id=$(basename "$(run_dir_of)")
+      assert "D35 every claude phase passes --strict-mcp-config" test "$(grep -c '^ARGV.* --strict-mcp-config' "$sd/calls.log")" = "$(grep -c '^CALL ' "$sd/calls.log")"
+      refute "D35 no claude phase passes --mcp-config" grep -Eq '^ARGV.* --mcp-config' "$sd/calls.log"
       assert "D17 the readonly grant starts with the run-directory Edit rule" test "$(sed -n 's/^ALLOWED //p' "$sd/calls.log" | head -n 1 | cut -d, -f1)" = "Edit(/.factory/runs/$id/plan.md)"
       refute "D17 no Write rule in a readonly grant" grep -q '^ALLOWED Edit(/.factory/runs/.*Write(' "$sd/calls.log"
       refute "D17 no double slash or home path in a grant" grep -Eq "^ALLOWED .*(//|$hm/|/Users/)" "$sd/calls.log"
@@ -1010,6 +1012,8 @@ HOOK
   assert "D13 it names the caps" has "$drv_out" 'plan review 4 rounds, code review 3 rounds'
   assert "D13 it names the phases" has "$drv_out" 'phases: plan, plan-review, owner-gate, implement, code-review, final-gate, pr'
   assert "D13 it shows the claude command shape" has "$drv_out" 'claude -p .*--permission-mode dontAsk .*--allowedTools'
+  assert "D13 it shows the strict MCP flag for claude" has "$drv_out" '--strict-mcp-config'
+  refute "D13 it passes no --mcp-config" has "$drv_out" '--mcp-config'
   drive --dry-run --backend opencode "t"
   assert "D13 it shows the opencode command shape" has "$drv_out" 'opencode run --agent factory-planner'
   assert "D13 it called nothing" test ! -s "$sd/calls.log"
@@ -1375,7 +1379,7 @@ section_probes() {
   fi
   if command -v claude >/dev/null 2>&1; then
     help=$(claude --help 2>&1 || true)
-    for flag in -p --agent --model --permission-mode --allowedTools --no-session-persistence --output-format; do
+    for flag in -p --agent --model --permission-mode --allowedTools --strict-mcp-config --no-session-persistence --output-format; do
       assert "probe: claude lists $flag" has "$help" "(^|[^A-Za-z-])$flag([^A-Za-z-]|$)"
     done
   else
