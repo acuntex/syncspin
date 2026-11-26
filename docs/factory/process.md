@@ -20,7 +20,8 @@ agent files, and `scripts/factory.sh` fills in the phase templates. The human pa
 | `scripts/factory-sync.sh`                    | Generates the agent files for both tools from the sources; `--check`. |
 | `.opencode/agents/`, `.claude/agents/`       | Generated agent files. Never edit them by hand.                       |
 | `.claude/commands/factory.md`                | Generated interactive `/factory` command (Claude Code only).          |
-| `opencode.json`, `.claude/settings.json`     | Project permissions for the two tools.                                |
+| `opencode.json`, `.claude/settings.json`     | Project permissions: only the `AGENTS.md` denies, for every session.  |
+| `docs/factory/meta/deny-*.txt`               | Deny rules (project level and factory only).                          |
 | `CLAUDE.md`                                  | Git symlink to `AGENTS.md`; no content of its own.                    |
 | `scripts/factory.sh`                         | Deterministic driver; the only OpenCode path and the unattended path. |
 | `scripts/test-factory.sh`                    | Hermetic tests with stub CLIs; no model is ever run.                  |
@@ -122,34 +123,101 @@ can run arbitrary code. See "Limits".
 
 ## Permissions
 
-Both tools get guardrails, not boundaries. Commands the implementer may run without asking: `cargo *`,
-`scripts/*`, `git status|diff|log|show|rev-parse|merge-base|ls-files|for-each-ref|write-tree`,
-`git add|commit|rm|mv|restore`, `ls`, `mkdir`, `rg`, `grep`, `wc`, `diff`, `chmod +x`. Everything else
-that could change state is denied or needs approval; `git push`, `gh pr merge`, `gh api`, `git config`,
-`bash -c`, `curl`, `sudo` and `rm -rf` are denied.
+Both tools get guardrails, not boundaries.
 
-Readonly overlay for OpenCode: the generated readonly agents add only edit rules (`"*"` denied, the
-run directory allowed) and a deny-only bash overlay for `git fetch *`, `git add *`, `git commit *`,
-`git rm *`, `git mv *` and `git restore *`. The overlay never repeats a `"*"` rule: OpenCode appends
-agent rules after the global ones and the last matching rule wins, so a repeated `"*": "ask"` would
-override the global allows for `git diff`, `rg` and `grep` and hang a headless reviewer.
+Project level. `opencode.json` and `.claude/settings.json` are read in every session in this
+repository, interactive ones included, so they hold only what `AGENTS.md` states for every agent:
+`gh pr merge`, `gh pr *--auto*`, pushes to `main`, force pushes and `--no-verify` forms
+(`docs/factory/meta/deny-project.txt`). They set no `"*"` baseline, no allow list, no `ask` rule, no
+`edit` rule and no `external_directory` rule, so a developer's own `plan` and `build` agents and
+Claude Code sessions behave as usual. `scripts/test-factory.sh` pins this.
 
-Claude Code readonly phases get a per-phase `--allowedTools` grant: the only file-edit grant is
-`Edit(/.factory/runs/<run id>/<artifact file>)`: the one file the phase writes, so `state`, the
-snapshots and the other run files are not agent-writable. The driver launches Claude with the repository root as working
-directory, which is what anchors that path. The bash grants are split: every role gets the common,
-read-only set (`docs/factory/meta/claude-allow-common.txt`), the implementer also the mutating git
-commands (`claude-allow-code.txt`), and nobody but the driver or the interactive command gets
-fetch, branch creation or `gh pr create` (`claude-allow-orchestrator.txt`). `.claude/settings.json`
-allows only the common set, because `dontAsk` honours project allow rules in every phase.
+Factory level. Everything else lives only in the factory layer.
+
+- Allowed commands: `docs/factory/meta/claude-allow-common.txt` (every role) and `claude-allow-code.txt`
+  (implementer). Common set: `cargo *`, `scripts/*`, read-only `git` subcommands (`status`, `diff`,
+  `log`, `show`, `rev-parse`, `merge-base`, `ls-files`, `for-each-ref`, `write-tree`, `describe`,
+  `ls-tree`, `cat-file`, `blame`, `shortlog`, `grep`, `branch`, `stash list`, `tag -l`, `remote -v`,
+  `worktree list`) and the inspection commands `ls`, `rg`, `grep`, `wc`, `diff`, `cat`, `head`, `tail`,
+  `find`, `stat`, `file`, `tree`, `sort`, `uniq`, `cut`, `tr`, `basename`, `dirname`, `realpath`, `pwd`,
+  `which` and `sed -n`. The implementer adds `git add|commit|rm|mv|restore`, `mkdir` and `chmod +x`.
+  No command that writes by itself is allowed (no `tee`, `dd`, `cp`, `mv`, `rm`, `touch`, `truncate`,
+  `install`, `ln`, `sed -i`, `find -exec`).
+- Denied commands: `docs/factory/meta/deny-project.txt` plus `deny-factory.txt`: every `git push`,
+  `git config`, `git -c`, `git -C`, `git reset --hard`, `gh api|repo|workflow|release|auth`,
+  `bash -c`, `sh -c`, `env`, `python*`, `curl`, `wget`, `sudo`, `rm -rf`, the `--output` option of
+  `git diff|log|show`, `find` with `-exec`, `-execdir`, `-ok`, `-delete`, `-fprint` or `-fls`, the
+  `git branch` forms that delete, move, copy, force or set upstream, `git grep -O`, `sed -i`,
+  `sort -o` and `tree -o`.
+- OpenCode: `scripts/factory-sync.sh` writes the whole ordered bash map into each generated agent:
+  `"*": "deny"` first, then the allows of the role's access class, then every deny last. The baseline
+  is `deny`, not `ask`: a headless run cannot answer a prompt, so an `ask` would hang until the
+  phase timeout, while a deny fails at once with a message the model can act on. The readonly
+  agents get no mutating allow, and `edit` denied except `.factory/runs/*`; the implementer gets
+  `edit` allowed.
+- Claude Code: the driver passes `--allowedTools <grant>` and `--disallowedTools <denies>` per phase
+  (`claude_tools` and `claude_denies` in `scripts/factory.sh`). The only file-edit grant of a
+  readonly phase is `Edit(/.factory/runs/<run id>/<artifact file>)`: the one file the phase writes,
+  so `state`, the snapshots and the other run files are not agent-writable. The driver launches
+  Claude with the repository root as working directory, which anchors that path. The grants are
+  split: every role gets the common set, the implementer also the mutating git commands, and
+  nobody but the driver or the interactive command gets fetch, branch creation or `gh pr create`
+  (`claude-allow-orchestrator.txt`). `.claude/settings.json` carries no allow list, because the
+  driver's grant is complete. The interactive `/factory` command pre-approves the allow lists but has
+  no deny list of its own: its restrictions are the user's own session settings plus the
+  `AGENTS.md` denies.
+
+Redirection is not covered. Command-prefix rules match the command text, so `cat x > y` matches
+`cat *`, and `sed`, `sort` or `uniq` can name an output file. The read-only guarantee for the
+planner and the reviewers does not rest on the allow list: it rests on the driver's post-phase
+snapshot check (a changed file is exit 13) and on the artifact-only `Edit` grant.
+
+How the layers merge, and how sure we are.
+
+- Verified (OpenCode 1.19.5, `opencode debug agent factory-planner`, read-only, no model): the
+  resolved rule list holds the project file's rules first and the agent's frontmatter rules after
+  them, and the order inside the agent's bash map is kept. With last-match-wins, the agent's deny
+  rules therefore decide over its own allows and over the project file. The user's own agents
+  (`build`) resolve with only the project file's denies. `scripts/test-factory.sh` repeats the
+  agent resolution when `opencode` is installed (not under `FACTORY_TEST_SKIP_CLI=1`) and runs the
+  same checks on the resolved rules.
+- Reasoned, not run: that the last-match-wins evaluation is what a live OpenCode applies at run time
+  (documented for 1.x), that a deny returns at once in a headless run, and that matching is
+  case-sensitive.
+- Reasoned, not run: for Claude Code, that `--disallowedTools` entries win over `--allowedTools` and
+  over the project settings under `dontAsk` (deny wins over allow in Claude's rule order), and that
+  a long deny list in the argument is accepted. Claude agent frontmatter was not used for denies:
+  its support for `Bash(...)` rules in `disallowedTools` is not established here.
+- Known glob limits: combined short flags (`git branch -vD`, `git commit -an`) cannot be told from
+  other text; the snapshot, the hooks and CI are the walls there.
 
 The Claude command shape is `claude -p <prompt> --agent factory-<role> [--model M] --permission-mode
-dontAsk --allowedTools <grant> --strict-mcp-config --no-session-persistence --output-format text`.
-`--strict-mcp-config` without `--mcp-config` loads no MCP server at all, so the user's own servers
-neither run in a factory run nor leave files in the tree. `--bare` and `--setting-sources` are not
-used. The project allow rules apply only in a workspace the user has trusted once (an interactive
-`claude` in the clone); without that, a headless phase ignores them. OpenCode has no equivalent
-switch and still loads the user's MCP servers.
+dontAsk --allowedTools <grant> --disallowedTools <denies> --strict-mcp-config --no-session-persistence
+--output-format text`. `--strict-mcp-config` without `--mcp-config` loads no MCP server at all, so the
+user's own servers neither run in a factory run nor leave files in the tree. `--bare` and
+`--setting-sources` are not used. OpenCode has no equivalent switch and still loads the user's MCP
+servers.
+
+## OpenCode options: variant and attach
+
+- `--variant-main V` / `--variant-helper V` (`FACTORY_VARIANT_MAIN`, `FACTORY_VARIANT_HELPER`) add
+  `--variant V` to the OpenCode phases of the main roles (planner, implementer) and the helper roles
+  (reviewers, pull request writer). `V` must match `^[a-z0-9][a-z0-9._-]*$`; an empty value adds nothing. The
+  Claude backend has no such flag: the driver warns and ignores the option.
+- `--opencode-attach URL` (`FACTORY_OPENCODE_ATTACH`) adds `--attach URL` to every OpenCode phase, next
+  to the `--dir <repository root>` the driver always passes. `URL` must match
+  `^https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?/?$`: no user, path or query. The Claude backend warns and
+  ignores it. The server credentials `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` are
+  passed to a phase only with `--opencode-attach`, only when set, and through a file descriptor and
+  an `exec` shim inside the scrubbed environment, never as an argument. A log line holding either
+  value is withheld from `handoff.md` and from stderr.
+- With an attached server the environment scrub and the MCP isolation of the driver do not apply: the
+  server has its own environment, user-level configuration, MCP servers and OpenCode version, and the
+  permission semantics are the server's. Interoperability of a client and a server of different OpenCode
+  generations is unverified. The snapshot checks still apply, because they look at the files. Each
+  phase is a new session. A server restart (for example after high memory use) ends the running
+  phase: exit 20, resumable. Plain-HTTP basic auth over a network is unencrypted. See the README for
+  the by-hand check and the recommended use.
 
 ## Hooks
 

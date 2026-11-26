@@ -16,3 +16,11 @@
 /.factory/
 /.claude/settings.local.json
 CLAUDE.local.md
+
+# `cargo test` (via an external tool or runner) leaves `trait_test*` files in the repository root
+# when invoked from there. Root-anchored to avoid masking any intentional files in subdirectories.
+/trait_test*
+
+# proptest writes a sibling regression file when a property test fails. Ignored everywhere so that
+# a transient failure does not produce an untracked file in the working tree.
+**/*.proptest-regressions

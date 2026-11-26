@@ -483,7 +483,9 @@ section_sync() {
     for key in $(frontmatter_keys "$f"); do
       assert "sync: opencode key $key is whitelisted" has "$allowed" " $key "
     done
-    assert "sync: $(basename "$f") (opencode) keeps the readonly overlay deny-only" test -z "$(grep -E '^    "\*": "(ask|allow)"' "$f" || true)"
+    assert "sync: $(basename "$f") (opencode) bash rules start with the deny baseline" test "$(grep -A1 '^  bash:$' "$f" | tail -n 1)" = '    "*": "deny"'
+    refute "sync: $(basename "$f") (opencode) has no ask rule" grep -q '": "ask"' "$f"
+    assert "sync: $(basename "$f") (opencode) orders baseline, allows, denies" has "$(sed -n '/^  bash:$/,/^---$/p' "$f" | grep -o '": "\(allow\|deny\)"' | tr -d '\n')" '^": "deny"(": "allow")+(": "deny")+$'
   done
   for f in "$repo"/.claude/agents/factory-*.md; do
     allowed=" name description tools model maxTurns "
@@ -517,7 +519,7 @@ section_sync() {
 
 
 # ---------------------------------------------------------------------------
-# Driver tests (cases D1 to D36). The driver runs in a clone of a fake origin whose main branch is a
+# Driver tests (cases D1 to D38). The driver runs in a clone of a fake origin whose main branch is a
 # copy of the files the factory needs. There are two origins: one whose gate is a stub that only
 # stamps the tree (the default), and one whose gate is the real scripts/gate.sh (the real-gate cases).
 # The agent CLIs are stubs on PATH: they write canned artifacts and log their argv and environment.
@@ -543,6 +545,7 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     --agent) role=${args[$((i + 1))]#factory-} ;;
     -p) prompt=${args[$((i + 1))]} ;;
     --allowedTools) allowed=${args[$((i + 1))]} ;;
+    --disallowedTools) denied=${args[$((i + 1))]} ;;
   esac
 done
 if [ "$name" = opencode ]; then prompt=${args[$((${#args[@]} - 1))]}; fi
@@ -564,6 +567,7 @@ esac
   printf ' %q' "$@"
   echo
   echo "ALLOWED ${allowed:-}"
+  echo "DENIED ${denied:-}"
   echo "ENVNAMES $(env | cut -d= -f1 | LC_ALL=C sort | tr '\n' ' ')"
   env | grep '^GIT_CONFIG' | LC_ALL=C sort | sed 's/^/ENV /'
   echo "PROMPT $(printf '%s' "$prompt" | tr '\n' '~')"
@@ -775,7 +779,7 @@ section_driver() {
     assert "D1 [$be] the factory branch is on origin" test -n "$(git -C "$origin_dir" for-each-ref "refs/heads/$(git -C "$clone" rev-parse --abbrev-ref HEAD)")"
     assert "D1 [$be] state is done" test "$(state_of status)" = "done"
     assert "D1 [$be] local main did not move" test "$(git -C "$clone" rev-parse main)" = "$before"
-    refute "D18 [$be] no forbidden flag in any call" grep -Eq -- '--auto|--bare|--dangerously-skip-permissions|bypassPermissions' "$sd/calls.log"
+    refute "D18 [$be] no forbidden flag in any call" bash -c "sed -E -e '/^DENIED /d' -e 's/ --disallowedTools (\\\\ |[^ ])+//' '$sd/calls.log' | grep -Eq -- '--auto|--bare|--dangerously-skip-permissions|bypassPermissions'"
     refute "D18 [$be] no continue, session or resume flag" grep -Eq -- '^ARGV.*(--continue|--session|--resume)' "$sd/calls.log"
     if [ "$be" = claude ]; then
       id=$(basename "$(run_dir_of)")
@@ -786,6 +790,10 @@ section_driver() {
       refute "D17 no double slash or home path in a grant" grep -Eq "^ALLOWED .*(//|$hm/|/Users/)" "$sd/calls.log"
       refute "D17 a readonly grant has no mutating git command" grep -Eq '^ALLOWED Edit\(/.factory/.*(git (add|commit|rm|mv|restore)|mkdir|chmod)' "$sd/calls.log"
       refute "D17 no agent gets pull request creation" grep -Eq '^ALLOWED .*(gh pr|git push|git fetch|git switch)' "$sd/calls.log"
+      assert "D37 every claude phase passes --disallowedTools" test "$(grep -c '^ARGV.* --disallowedTools' "$sd/calls.log")" = "$(grep -c '^CALL ' "$sd/calls.log")"
+      assert "D37 the deny list holds the factory-layer denies" has "$(sed -n 's/^DENIED //p' "$sd/calls.log" | head -n 1)" 'Bash\(git config \*\),Bash\(git -c \*\).*Bash\(python\*\).*Bash\(rm -rf \*\)'
+      assert "D37 the deny list holds the AGENTS.md denies" has "$(sed -n 's/^DENIED //p' "$sd/calls.log" | head -n 1)" '^Bash\(gh pr merge \*\),Bash\(gh pr \*--auto\*\)'
+      assert "D37 the deny list is the same in every phase" test "$(sed -n 's/^DENIED //p' "$sd/calls.log" | sort -u | wc -l)" = 1
       assert "D17 the implementer grant is Edit and Write" has "$(grep -A2 'role=implementer' "$sd/calls.log" | grep '^ALLOWED' || true)" '^ALLOWED Edit,Write,'
     fi
   done
@@ -1004,6 +1012,97 @@ HOOK
     refute "D12 nothing was pushed" git -C "$origin_dir" rev-parse -q --verify "refs/heads/$(state_of branch)"
     refute "D12 no pull request was created" grep -q 'pr create' "$sd/gh.log"
   done
+
+  # D38: the OpenCode reasoning variant and the attach option. A dummy credential is built at runtime.
+  local pw_dummy user_dummy att="http://127.0.0.1:4096"
+  pw_dummy="pw-$(printf 'q%.0s' 1 2 3 4 5)-$RANDOM"
+  user_dummy="u-$(printf 'z%.0s' 1 2 3)-$RANDOM"
+  # argv_of <role>: the argv lines the stub logged for that role.
+  argv_of() {
+    awk -v r="role=$1" '/^CALL /{cur=$4} /^ARGV/ && cur==r {print}' "$sd/calls.log"
+  }
+  new_case stub
+  drive --backend opencode --variant-main high --variant-helper minimal "t"
+  assert "D38 variants: the run exits 0" test "$drv_rc" = 0
+  assert "D38 variants: the planner gets the main variant" has "$(argv_of planner)" ' --variant high '
+  assert "D38 variants: the implementer gets the main variant" has "$(argv_of implementer)" ' --variant high '
+  assert "D38 variants: the plan reviewer gets the helper variant" has "$(argv_of plan-reviewer)" ' --variant minimal '
+  assert "D38 variants: the code reviewer gets the helper variant" has "$(argv_of code-reviewer)" ' --variant minimal '
+  assert "D38 variants: the pr writer gets the helper variant" has "$(argv_of pr-writer)" ' --variant minimal '
+  new_case stub
+  drive --backend opencode "t"
+  refute "D38 variants: no --variant when none is set" grep -q -- '--variant' "$sd/calls.log"
+  refute "D38 attach: no --attach when none is set" grep -q -- '--attach' "$sd/calls.log"
+  new_case stub
+  drv_extra=(FACTORY_VARIANT_MAIN=max)
+  drive --backend opencode "t"
+  drv_extra=()
+  assert "D38 variants: the environment variable works" has "$(argv_of planner)" ' --variant max '
+  refute "D38 variants: an unset helper variant is absent" has "$(argv_of plan-reviewer)" '--variant'
+  # shellcheck disable=SC2016  # a literal command substitution is the point of the case
+  for bad in 'high;x' 'High' 'a b' '-x' '$(id)'; do
+    new_case stub
+    drive --backend opencode --variant-main "$bad" "t"
+    assert "D38 variants: '$bad' is a usage error" test "$drv_rc" = 2
+    assert "D38 variants: '$bad' started nothing" test ! -s "$sd/calls.log"
+  done
+  new_case stub
+  drive --backend claude --variant-main high --variant-helper low "t"
+  assert "D38 variants: claude runs on" test "$drv_rc" = 0
+  assert "D38 variants: claude warns once" test "$(grep -c 'variant.*OpenCode backend only' <<<"$drv_out")" = 1
+  refute "D38 variants: claude never sees --variant" grep -q -- '--variant' "$sd/calls.log"
+  drive --dry-run --backend opencode --variant-main high --opencode-attach "$att" "t"
+  assert "D38 dry run shows the variants" has "$drv_out" 'variants: main=high helper=\(none\)'
+  assert "D38 dry run shows the attach URL" has "$drv_out" "opencode server: $att"
+  assert "D38 dry run shows --variant in the command" has "$drv_out" 'command \(plan\): opencode run --attach .* --variant high '
+
+  new_case stub
+  drv_extra=("OPENCODE_SERVER_PASSWORD=$pw_dummy" "OPENCODE_SERVER_USERNAME=$user_dummy")
+  drive --backend opencode --opencode-attach "$att" "t"
+  drv_extra=()
+  assert "D38 attach: the run exits 0" test "$drv_rc" = 0
+  assert "D38 attach: every phase has --attach URL --dir <abs>" test "$(grep -c "^ARGV run --attach $att --agent " "$sd/calls.log" || true)" = "$(grep -c '^CALL ' "$sd/calls.log")"
+  assert "D38 attach: every phase has an absolute --dir" test "$(grep -c "^ARGV.* --dir $clone " "$sd/calls.log" || true)" = "$(grep -c '^CALL ' "$sd/calls.log")"
+  refute "D38 attach: the password is never in argv" grep -q -- "$pw_dummy" "$sd/calls.log"
+  refute "D38 attach: the user name is never in argv" grep -q -- "$user_dummy" "$sd/calls.log"
+  assert "D38 attach: the password reaches the phase environment" test "$(grep -c '^ENVNAMES .*OPENCODE_SERVER_PASSWORD ' "$sd/calls.log")" = "$(grep -c '^CALL ' "$sd/calls.log")"
+  assert "D38 attach: the user name reaches the phase environment" test "$(grep -c '^ENVNAMES .*OPENCODE_SERVER_USERNAME ' "$sd/calls.log")" = "$(grep -c '^CALL ' "$sd/calls.log")"
+  refute "D38 attach: the password is not in the driver output" has "$drv_out" "$pw_dummy"
+  # Without --opencode-attach the credentials are not passed on.
+  new_case stub
+  drv_extra=("OPENCODE_SERVER_PASSWORD=$pw_dummy" "OPENCODE_SERVER_USERNAME=$user_dummy")
+  drive --backend opencode "t"
+  drv_extra=()
+  refute "D38 attach: no credentials without --opencode-attach" grep -q '^ENVNAMES .*OPENCODE_SERVER_' "$sd/calls.log"
+  # Attached but no credentials set: nothing is passed.
+  new_case stub
+  drive --backend opencode --opencode-attach "$att/" "t"
+  assert "D38 attach: a trailing slash and no credentials work" test "$drv_rc" = 0
+  refute "D38 attach: no credential variable when none is set" grep -q '^ENVNAMES .*OPENCODE_SERVER_' "$sd/calls.log"
+  # A phase that prints the credentials and fails: handoff.md and stderr withhold them.
+  new_case stub
+  # shellcheck disable=SC2016  # the hook expands the variables inside the stub
+  printf 'echo "login $OPENCODE_SERVER_USERNAME:$OPENCODE_SERVER_PASSWORD"\necho "other line"\nhandled=1\n' >"$sd/hook-plan.sh"
+  drv_extra=("OPENCODE_SERVER_PASSWORD=$pw_dummy" "OPENCODE_SERVER_USERNAME=$user_dummy")
+  drive --backend opencode --opencode-attach "$att" "t"
+  drv_extra=()
+  assert "D38 attach: the failing phase exits 20" test "$drv_rc" = 20
+  assert "D38 attach: the other log line is quoted" has "$(cat "$(run_dir_of)/handoff.md")" 'other line'
+  refute "D38 attach: the password is not in handoff.md" grep -q -- "$pw_dummy" "$(run_dir_of)/handoff.md"
+  refute "D38 attach: the user name is not in handoff.md" grep -q -- "$user_dummy" "$(run_dir_of)/handoff.md"
+  refute "D38 attach: the password is not on stderr" has "$drv_out" "$pw_dummy"
+  refute "D38 attach: the user name is not on stderr" has "$drv_out" "$user_dummy"
+  for bad in 'ftp://localhost:4096' 'http://user:x@localhost:4096' 'http://localhost:4096/path' 'http://localhost:4096?x=1' 'localhost:4096' 'http://localhost:99999x' 'http://local host'; do
+    new_case stub
+    drive --backend opencode --opencode-attach "$bad" "t"
+    assert "D38 attach: '$bad' is a usage error" test "$drv_rc" = 2
+    assert "D38 attach: '$bad' started nothing" test ! -s "$sd/calls.log"
+  done
+  new_case stub
+  drive --backend claude --opencode-attach "$att" "t"
+  assert "D38 attach: claude runs on" test "$drv_rc" = 0
+  assert "D38 attach: claude warns once" test "$(grep -c 'opencode-attach.*OpenCode backend only' <<<"$drv_out")" = 1
+  refute "D38 attach: claude never sees --attach" grep -q -- '--attach' "$sd/calls.log"
 
   # D13: dry run.
   new_case stub
