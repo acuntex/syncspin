@@ -1,0 +1,191 @@
+# The code factory
+
+A small, tool-neutral process that takes a task text to a reviewed pull request: a planner writes a
+plan, a fresh reviewer checks it, an implementer makes small verified commits, a fresh code reviewer
+checks them, and a pull request is opened. It works in OpenCode and in Claude Code. Agents never
+merge: the owner reviews and merges.
+
+The specification (process, caps, exit codes, state files, protected paths, hooks) is
+[`process.md`](process.md). This page is the human guide.
+
+## Prerequisites
+
+- `opencode` and/or `claude` installed and logged in, `git` 2.31 or newer, `gh` logged in,
+  `shellcheck`. The ARMv7 target (`rustup target add armv7-unknown-linux-gnueabihf`) is optional: the
+  gate skips that step without it and says so.
+- For unattended runs, a throwaway clone or container and a scoped, non-admin credential (push to
+  feature branches and pull request creation only). The agent process keeps `HOME`, so
+  `~/.config/gh`, `~/.ssh` and git credential helpers stay reachable, and anything run through
+  `cargo` (build scripts, tests) is arbitrary code that can use them. The driver does not pass
+  `GH_TOKEN` or `GITHUB_TOKEN` to the agents, but that is hygiene, not isolation.
+
+## Starting a run
+
+|                       | OpenCode                                      | Claude Code                                                                  |
+| --------------------- | --------------------------------------------- | ---------------------------------------------------------------------------- |
+| Interactive           | not available (see below)                     | `/factory <task text>` in a session                                          |
+| Driver (unattended)   | `scripts/factory.sh --backend opencode "..."` | `scripts/factory.sh --backend claude "..."`                                  |
+| Agents                | `.opencode/agents/factory-*.md` (generated)   | `.claude/agents/factory-*.md` and `.claude/commands/factory.md`              |
+| Permissions           | `opencode.json`                               | `.claude/settings.json`                                                      |
+| Project rules         | reads `AGENTS.md` directly                    | reads `CLAUDE.md`, a symlink to `AGENTS.md`                                  |
+| Non-interactive slash | -                                             | `claude -p "/factory ..."` stops at the push request (not approved headless) |
+
+OpenCode has no `/factory` command: its subagents run in the background and report when idle, and
+there is no documented way to wait for one. The driver is the OpenCode path.
+
+`claude -p "/factory ..."` expands the command, but a headless run has nobody to approve the `ask`
+rule on `git push` (a `-p` run denies a call that needs approval unless a hook or tool approves it), so
+such a run stops before the push. The driver is the unattended path for both tools.
+
+## Deterministic driver or prompt-driven command
+
+`scripts/factory.sh` is the deterministic path: the control flow, the round caps (4 plan reviews, 3
+code reviews, flags can only lower them), the verdict parsing, the snapshot checks, the commit and
+pull request text checks and the push are shell code with tests. The agents do the thinking.
+
+The Claude Code `/factory` command is prompt-driven: the same procedure, but the caps and checks are
+instructions to a model. Prefer the driver when the outcome matters.
+
+```sh
+scripts/factory.sh --backend claude "add a --list flag to the player example"
+scripts/factory.sh --backend opencode --no-push --stop-after review --task-file task.md
+scripts/factory.sh --dry-run --backend claude "anything"   # print the phases and command shapes, call nothing
+```
+
+Options: `--resume ID`, `--stop-after plan|implement|review|pr`, `--no-push`, `--dry-run`,
+`--allow-protected`, `--plan-rounds N`, `--code-rounds N`, `--model-helper M`, `--model-main M`,
+`--phase-timeout SECS`. `FACTORY_PASS_ENV` names the variables to pass to the agent (for a model
+provider key); everything else is removed from its environment.
+
+`--stop-after plan` stops after the reviewed plan and leaves the branch that preflight created in the
+local repository. Delete it by hand when you abandon the run.
+
+## Writing a task text
+
+A task text is data, not a command: it is the owner's request in a few sentences. Name the outcome,
+the crate or file if you know it, and what must not change. Put long requests in a file and use
+`--task-file`. The planner turns it into a plan with commits, tests and open owner decisions.
+
+## What the human decides
+
+- Owner decisions: when the plan lists open questions (public API, breaking changes, scope, limits)
+  the run stops with exit 10. Write the answers to `decisions.md` in the run directory and run
+  `scripts/factory.sh --resume <run id>`. The plan is revised and reviewed once more.
+- Everything after a stop that is not resumable (exit 11 to 16): read `handoff.md`, then fix by hand
+  or start a new run.
+- The pull request: read it, in particular the protected-path diff, and merge it yourself.
+
+## Run directory and artifacts
+
+`.factory/runs/<run id>/` is gitignored and holds `task.md`, `plan.md`, `review-plan-N.md`,
+`review-plan-post.md`, `decisions.md`, `review-code-N.md`, `pr.md`, `blocked.md`, `handoff.md`,
+`state` and `logs/<phase>.log`. Logs can contain paths and model provider output: never attach them
+to a public issue.
+
+## Exit codes
+
+| Code | Meaning                                                 | Resumable |
+| ---- | ------------------------------------------------------- | --------- |
+| 0    | Done, or stopped by `--stop-after`                      | -         |
+| 2    | Usage error, including a refused `--resume`             | -         |
+| 3    | Preflight failed, or resume prerequisites are missing   | -         |
+| 10   | Owner decisions are open                                | yes       |
+| 11   | Plan review cap reached, or post-decision review failed | no        |
+| 12   | Code review cap reached                                 | no        |
+| 13   | Sandbox violation (state changed that must not change)  | no        |
+| 14   | Bad commits, `blocked.md`, or a phase made no progress  | no        |
+| 15   | The final `scripts/gate.sh --full` failed               | no        |
+| 16   | The pull request text failed its lint                   | no        |
+| 20   | Timeout, backend failure, push or pull request failure  | yes       |
+
+## Model and cost
+
+The Claude agents use `sonnet`. For OpenCode no model is committed: set `FACTORY_MODEL_HELPER` (the
+reviewers and the pull request writer) and `FACTORY_MODEL_MAIN` (planner and implementer) or the flags
+above; without a helper model the driver warns once and the reviewers use the session default. A
+run makes one planner call, one to five plan reviews, one implementer call, one to three code reviews
+(plus fixes) and one pull request writer call. Phases time out after 45 minutes (implement and fix:
+two hours) unless `--phase-timeout` says otherwise.
+
+## Permissions
+
+Both tools get guardrails, not security boundaries; the vendors say so too. The real layers are the
+driver's snapshot verification, its own final gate, CI and the review of the protected-path diff.
+
+| Aspect                   | OpenCode (`opencode.json`, generated overlays)               | Claude Code (`.claude/settings.json`, per-phase grants)          |
+| ------------------------ | ------------------------------------------------------------ | ---------------------------------------------------------------- |
+| Rule shape               | Ordered map per tool; the last matching rule wins            | `allow`, `ask`, `deny`; deny wins                                |
+| Baseline                 | `bash "*": "ask"`, allows next, every deny last              | Nothing is allowed that is not listed; `dontAsk` denies the rest |
+| Readonly roles           | Edit denied except the run directory; deny-only bash overlay | Driver grants `Edit` on the one artifact file only               |
+| Implementer              | Global rules                                                 | Driver grants `Edit,Write` plus the common and code bash grants  |
+| Push                     | Denied; only the driver pushes                               | `ask` (denied under `dontAsk`); `main` and force forms denied    |
+| Knows the current branch | No; the pre-push hook and the driver do                      | No; the pre-push hook and the driver do                          |
+
+Headless behaviour of an `ask` rule in OpenCode is not documented: a hung phase ends by timeout, and
+the driver never uses `--auto`.
+
+## Known limits
+
+- Pattern rules match command text. Wrappers and other shells (`bash -c`, an absolute path) can get
+  around them; the allow list is the control, the deny list adds clarity.
+- `cargo` and `scripts/*` are allowed, so a build script or a test can run arbitrary code with the
+  user's credentials. The hooks cannot stop that.
+- The hooks under `.githooks/` are driver-only and local; a human never opts in, and an agent with a
+  shell can edit them. The pre-commit stamp catches an agent committing something it did not check;
+  it is not a gate. The per-commit check is `scripts/gate.sh --commit`. The deny lists block
+  `--no-verify`, `-n` and `--no-v*` for `git commit`, but not every combined short form (`-an`,
+  `-anm`): a glob cannot tell flag letters from a commit message.
+- The snapshot ignores ignored paths on purpose (`target/`, `mutants.out*`, identity files): a new
+  file in some other ignored location is invisible to it.
+- The deny lists also block the `--output` option of `git diff`, `git log` and `git show`, which
+  would write a file from a read-only grant.
+- The check that no branch commit reached remote `main` fails closed: it can report a violation
+  (exit 13) when the branch legitimately merged `origin/main`, when `main` was force-pushed during
+  the run, or in a shallow clone that lacks the history. Check the remote by hand and start a new
+  run.
+- `opencode debug config` and `opencode debug agent` print the contributor's global configuration
+  (providers, URLs, headers). The tests parse that output silently; never paste it into an issue.
+- OpenCode and Claude Code evolve. The OpenCode rules here use the 1.x shape (`permission`, `bash`,
+  `edit`); an installation that expects the newer `permissions` array rejects them. `scripts/test-factory.sh`
+  probes the installed CLIs when they exist.
+
+## `CLAUDE.md` on Windows
+
+`CLAUDE.md` is a git symlink to `AGENTS.md`. A Windows checkout without symlink support yields a
+one-line text file instead, and Claude Code then loses the project rules. Enable `core.symlinks`
+(Developer Mode or an elevated shell) and check out again, or use WSL. OpenCode reads `AGENTS.md`
+directly. Always edit `AGENTS.md`, never the link.
+
+## Generated files
+
+`scripts/factory-sync.sh` writes `.opencode/agents/`, `.claude/agents/` and
+`.claude/commands/factory.md` from `roles/`, `meta/` and `meta/claude-allow-*.txt`. `--check` (run by the
+`lint` job) fails when a generated file differs from its source. Edit the source, run the script,
+commit both.
+
+## Verified with
+
+Not yet verified against a live model. What runs in CI and locally is the hermetic suite
+(`scripts/test-factory.sh`), which uses stub CLIs. Record here, after the first manual run, the
+versions used and the result of each of these checks:
+
+- a tiny task on each backend with `--no-push`;
+- `gh pr merge` and `git push origin main` refused inside both tools;
+- a readonly OpenCode role cannot edit `src/` but can write its artifact (this confirms the `edit`
+  path form and the rule order on OpenCode 1.x);
+- the Claude Code `/factory` command waits for its foreground subagents;
+- Claude Code follows the `CLAUDE.md` symlink (ask it to quote one rule from `AGENTS.md`);
+- what OpenCode does headless when a rule says `ask`.
+
+## Manual cleanup
+
+After an abandoned run: `git switch main`, `git branch -D factory/<name>-<id>` for the leftover
+branch, and `rm -r .factory/runs/<run id>`. If a push happened, delete the remote branch and close
+the pull request on GitHub.
+
+## Not included
+
+Deferred on purpose: rewriting history with `--force-with-lease`, a `--worktree` mode, a
+`--verify-each` mode, an OpenCode `/factory` command, a CI check that compares the permission files
+with the CI jobs, and changes to the contributor guide or the pull request template beyond the
+required-check count.

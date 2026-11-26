@@ -1,8 +1,8 @@
 # Continuous integration for the syncspin workspace.
 #
-# The job names `lint`, `test`, `msrv`, `arm`, `deny`, `docs` and `secrets` are
-# the gates branch protection refers to; renaming one silently drops it from the
-# required set, so keep the names stable.
+# The job names `lint`, `test`, `msrv`, `arm`, `deny`, `docs` and `secrets`, and the four
+# `mutants` shards (`mutants (0)` to `mutants (3)`), are the eleven gates branch protection
+# refers to; renaming one silently drops it from the required set, so keep the names stable.
 #
 # Actions are pinned by commit SHA with the version in a trailing comment, which is
 # what Renovate's `helpers:pinGitHubActionDigests` preset (see `renovate.json5`)
@@ -57,6 +57,20 @@ jobs:
       # set (see the script). The `test` job runs the matching tests and docs.
       - name: cargo clippy (role feature sets)
         run: scripts/check-roles.sh lint
+      # Every tracked shell script, including the extension-less hooks under `.githooks/`. The
+      # runner image may not ship shellcheck, so it is installed on demand; `-r` keeps the step
+      # green while no file matches.
+      - name: shellcheck
+        run: |
+          command -v shellcheck || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+          git ls-files -z '*.sh' '.githooks/*' | xargs -0 -r shellcheck
+      # The gate and hook tests: stub CLIs and a generated fixture workspace, no network, no model.
+      - name: factory tests
+        run: scripts/test-factory.sh
+      # The agent files for OpenCode and Claude Code are generated from docs/factory/; a source
+      # change without the regenerated files fails here.
+      - name: factory agents are up to date
+        run: scripts/factory-sync.sh --check
 
   test:
     name: test

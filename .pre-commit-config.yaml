@@ -24,6 +24,14 @@ repos:
         files: \.(rs|toml)$
         pass_filenames: false
 
+      # Shell scripts are linted with the system `shellcheck`; CI installs it in the `lint` job.
+      # The pattern also covers extension-less hook scripts under `.githooks/`.
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        files: \.sh$|^\.githooks/
+
       # Prettier is not vendored: the version is pinned here so formatting
       # cannot drift between machines. Markdown is included because `docs/`,
       # `AGENTS.md` and `README.md` are kept prettier-clean; the hook checks
@@ -33,6 +41,9 @@ repos:
         entry: npx --yes prettier@3.9.10 --check
         language: system
         files: \.(md|ya?ml|json|json5)$
+        # `CLAUDE.md` is a symlink to `AGENTS.md`, and prettier refuses a symlink passed as an
+        # explicit path, which is how this hook passes staged files.
+        exclude: ^CLAUDE\.md$
 
 # `cargo deny check` is deliberately not a hook: it needs `cargo-deny` and the
 # advisory database over the network, and would block a commit on a machine

@@ -1,0 +1,5 @@
+Bash(git fetch origin *)
+Bash(git switch -c factory/*)
+Bash(gh pr view *)
+Bash(gh pr checks *)
+Bash(gh pr create *)

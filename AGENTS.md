@@ -8,15 +8,21 @@ This file is for agents and contributors working in this repository.
 
 ## Layout
 
-| Path                      | Contents                                                                        |
-| ------------------------- | ------------------------------------------------------------------------------- |
-| `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code. |
-| `crates/syncspin-client/` | Client session loop, `Sink` trait, event stream.                                |
-| `crates/syncspin-server/` | Listener, one group, roles, streams, pairing and discovery (`0.2`).             |
-| `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr.               |
-| `examples/server-demo/`   | Runnable reference server: approves one client and streams a tone.              |
-| `examples/mdns-pair/`     | One-command mDNS smoke test: advertises, discovers, approves, streams, exits.   |
-| `docs/`                   | Design, spec deviations and the testing handbook.                               |
+| Path                      | Contents                                                                         |
+| ------------------------- | -------------------------------------------------------------------------------- |
+| `crates/syncspin-core/`   | Noise handshake, framing, messages, clock filter. No transport, no device code.  |
+| `crates/syncspin-client/` | Client session loop, `Sink` trait, event stream.                                 |
+| `crates/syncspin-server/` | Listener, one group, roles, streams, pairing and discovery (`0.2`).              |
+| `examples/player-pipe/`   | Runnable reference player: PCM on stdout, status lines on stderr.                |
+| `examples/server-demo/`   | Runnable reference server: approves one client and streams a tone.               |
+| `examples/mdns-pair/`     | One-command mDNS smoke test: advertises, discovers, approves, streams, exits.    |
+| `docs/`                   | Design, spec deviations and the testing handbook.                                |
+| `docs/factory/`           | The code factory: process, role and phase prompts, the human guide.              |
+| `scripts/`                | Gate, code factory driver, agent generator and their tests, plus the CI helpers. |
+| `.githooks/`              | Driver-only git hooks of the code factory (stamp check, push guard).             |
+| `.opencode/`, `.claude/`  | Generated agent files and project settings for OpenCode and Claude Code.         |
+| `opencode.json`           | OpenCode project permissions.                                                    |
+| `CLAUDE.md`               | A git symlink to this file; edit `AGENTS.md`, never the link.                    |
 
 `player-pipe` is the reference `Sink`: it shows the event loop, the identity file and the reconnect
 policy without device code. `server-demo` is the reference host: it shows the approval gate, the
@@ -45,6 +51,11 @@ cargo check -p syncspin-client \
 cargo check -p syncspin-client --no-default-features \
   --target armv7-unknown-linux-gnueabihf --locked       # and with no role feature at all
 scripts/check-roles.sh                                 # every role feature set: tests, docs, clippy
+scripts/gate.sh --commit                               # the per-commit check; before every commit
+scripts/gate.sh                                        # what the CI lint, test, docs and arm jobs run
+scripts/gate.sh --full                                 # plus msrv, deny, package and secrets
+scripts/test-factory.sh                                # factory tests with stub CLIs, no model
+scripts/factory-sync.sh --check                        # generated agent files match docs/factory
 cargo zigbuild --target armv7-unknown-linux-gnueabihf  # once a dependency needs a C toolchain
 cargo deny check                                       # licences, advisories, sources
 scripts/coverage.sh                                    # coverage, all features, advisory
@@ -55,22 +66,33 @@ stay green. `zigbuild` needs `cargo-zigbuild` and a `zig` binary.
 
 ## Changes land through a pull request
 
-`main` requires seven checks (`lint`, `test`, `msrv`, `arm`, `deny`, `docs`, `secrets`) and has
-`enforce_admins` off. A push from the owner therefore bypasses them, and GitHub says so in the push
-output: `Bypassed rule violations ... required status checks are expected`. The bypass works; it is
-not to be used. No commit goes to `main` directly - not a one-line documentation fix, not a runner
-label bump, not a commit whose checks you expect to pass.
+`main` requires eleven checks (`lint`, `test`, `msrv`, `arm`, `deny`, `docs`, `secrets` and the four
+`mutants` shards, `mutants (0)` to `mutants (3)`) and applies them to administrators as well, so a
+direct push to `main` is rejected. No commit goes to `main` directly - not a one-line documentation
+fix, not a runner label bump, not a commit whose checks you expect to pass.
 
 ```sh
 git switch -c docs/<topic>
 # commit on the branch, then
 git push -u origin docs/<topic>
-# open the pull request, let the seven checks run, merge squashed
+# open the pull request, let the eleven checks run, merge squashed
 ```
 
 Wait for the checks before merging: a green run after the merge proves nothing was gated. A push
 straight to `main` is the one mistake that leaves the gates decorative, which is why it is a rule
 here rather than a preference.
+
+## The code factory
+
+[`docs/factory/README.md`](docs/factory/README.md) describes a process that takes a task to a
+reviewed pull request with OpenCode or Claude Code (`scripts/factory.sh`, or `/factory` in Claude
+Code). Agents that work in it, and any other agent here:
+
+- never merge a pull request, never push to `main`, never pass `--no-verify`;
+- never weaken a test or a lint to get green;
+- run `scripts/gate.sh --commit` before every commit. The stamp it writes for the driver-only
+  pre-commit hook is a speed bump, not a gate: it catches a commit of something that was not
+  checked, and anything with a shell can write it. CI is the authority.
 
 ## Hard rules
 

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#
+# Driver-only hook: reject a commit whose index tree was not checked by `scripts/gate.sh`.
+#
+# A passing gate run writes the index tree hash to `<git dir>/syncspin-gate-ok`; this hook compares
+# it with the tree about to be committed. The stamp is a speed bump: it lives in `.git`, covers only
+# the tree hash, and anything with a shell can write it. It catches an agent committing something it
+# did not check, nothing more. The code factory activates the hook through GIT_CONFIG_* variables;
+# humans use the pre-commit framework instead.
+
+set -euo pipefail
+
+stamp_path=$(git rev-parse --git-path syncspin-gate-ok)
+tree=$(git write-tree)
+
+if [ ! -f "$stamp_path" ] || [ "$(cat "$stamp_path")" != "$tree" ]; then
+  printf 'pre-commit: tree %s has no passing gate stamp; run scripts/gate.sh --commit after staging.\n' "$tree" >&2
+  exit 1
+fi
