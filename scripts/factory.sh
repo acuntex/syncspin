@@ -23,18 +23,21 @@
 #     --model-main M                model for the planner and the implementer ($FACTORY_MODEL_MAIN)
 #     --variant-helper V            OpenCode reasoning variant for the helper roles ($FACTORY_VARIANT_HELPER)
 #     --variant-main V              OpenCode reasoning variant for the main roles ($FACTORY_VARIANT_MAIN)
+#     --opencode-bin PATH           the OpenCode client to run (default $FACTORY_OPENCODE_BIN, else
+#                                   `opencode`); its --version selects the 1.x or 2.x command shape
 #     --opencode-attach URL         run every OpenCode phase against a running OpenCode server
 #                                   ($FACTORY_OPENCODE_ATTACH); http(s)://host[:port], nothing else. The
 #                                   server password travels only as $OPENCODE_SERVER_PASSWORD.
 #     --phase-timeout SECS          timeout of every phase (default 2700; implement and fix 7200)
 #
-# The variant and attach options apply to the OpenCode backend only; the Claude backend ignores them
-# with a warning.
+# The variant, client and attach options apply to the OpenCode backend only; the Claude backend
+# ignores them with a warning.
 #
 # Exit codes: 0 done, 2 usage, 3 preflight, 10 owner decisions open, 11 plan review cap, 12 code
 # review cap, 13 sandbox violation, 14 bad commits, 15 final gate failed, 16 pull request text lint,
 # 20 phase failure (resumable). Environment: FACTORY_BACKEND, FACTORY_MODEL_HELPER, FACTORY_MODEL_MAIN,
-# FACTORY_VARIANT_HELPER, FACTORY_VARIANT_MAIN, FACTORY_OPENCODE_ATTACH, FACTORY_PASS_ENV (names of
+# FACTORY_VARIANT_HELPER, FACTORY_VARIANT_MAIN, FACTORY_OPENCODE_BIN, FACTORY_OPENCODE_ATTACH,
+# FACTORY_PASS_ENV (names of
 # variables to pass to the agent, for a model-provider key), OPENCODE_SERVER_PASSWORD (passed to the
 # OpenCode phases only together with --opencode-attach).
 #
@@ -141,6 +144,19 @@ slugify() {
 
 shortid() {
   od -An -N3 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# detect_opencode_generation <bin>: print the major version (1 or 2) from `<bin> --version`, and fail
+# on anything else. Only the version output is read; no model is started.
+detect_opencode_generation() {
+  local out major
+  out=$("$1" --version 2>/dev/null || true)
+  out=$(grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' <<<"$out" | head -n1 || true)
+  major=${out%%.*}
+  case "$major" in
+    1 | 2) printf '%s' "$major" ;;
+    *) return 1 ;;
+  esac
 }
 
 exit_name() {
@@ -466,6 +482,10 @@ model_helper=${FACTORY_MODEL_HELPER:-}
 model_main=${FACTORY_MODEL_MAIN:-}
 variant_helper=${FACTORY_VARIANT_HELPER:-}
 variant_main=${FACTORY_VARIANT_MAIN:-}
+opencode_bin=${FACTORY_OPENCODE_BIN:-opencode}
+opencode_bin_explicit=0
+[ -z "${FACTORY_OPENCODE_BIN:-}" ] || opencode_bin_explicit=1
+opencode_gen=""
 opencode_attach=${FACTORY_OPENCODE_ATTACH:-}
 phase_timeout=""
 task_text=""
@@ -489,6 +509,7 @@ while [ "$#" -gt 0 ]; do
     --model-main) need_value "$@"; model_main=$2; shift 2 ;;
     --variant-helper) need_value "$@"; variant_helper=$2; shift 2 ;;
     --variant-main) need_value "$@"; variant_main=$2; shift 2 ;;
+    --opencode-bin) need_value "$@"; opencode_bin=$2; opencode_bin_explicit=1; shift 2 ;;
     --opencode-attach) need_value "$@"; opencode_attach=$2; shift 2 ;;
     --phase-timeout) need_value "$@"; phase_timeout=$2; shift 2 ;;
     --task-file) need_value "$@"; task_file=$2; shift 2 ;;
@@ -579,29 +600,91 @@ claude_denies() {
   printf '%s' "$list"
 }
 
+# The value of --model. The 2.x CLI carries the reasoning variant in it; 1.x takes --variant.
+opencode_model() {
+  local role=$1 model variant
+  model=$(model_for "$role")
+  variant=$(variant_for "$role")
+  if [ "${opencode_gen:-}" = 2 ] && [ -n "$variant" ]; then
+    [ -n "$model" ] || die_usage "OpenCode 2.x takes the variant in the model (provider/model#variant): set --model-main/--model-helper for the $role role"
+    printf '%s#%s' "$model" "$variant"
+  else
+    printf '%s' "$model"
+  fi
+}
+
+# A 2.x variant needs a model to travel in; without one there is no flag to carry it.
+check_variant_models() {
+  [ "${opencode_gen:-}" = 2 ] || return 0
+  [ -z "$variant_main" ] || [ -n "$model_main" ] ||
+    die_usage "OpenCode 2.x takes the variant in the model (provider/model#variant): set --model-main or FACTORY_MODEL_MAIN"
+  [ -z "$variant_helper" ] || [ -n "$model_helper" ] ||
+    die_usage "OpenCode 2.x takes the variant in the model (provider/model#variant): set --model-helper or FACTORY_MODEL_HELPER"
+}
+
+# build_cmd_opencode1: the 1.x shape. --dir names the working directory and --variant is its own flag.
+build_cmd_opencode1() {
+  local role=$1 phase=$3 prompt=$4 model variant
+  model=$(model_for "$role")
+  cmd=("$opencode_bin" run)
+  if [ -n "$opencode_attach" ]; then cmd+=(--attach "$opencode_attach"); fi
+  cmd+=(--agent "factory-$role")
+  if [ -n "$model" ]; then cmd+=(--model "$model"); fi
+  variant=$(variant_for "$role")
+  if [ -n "$variant" ]; then cmd+=(--variant "$variant"); fi
+  cmd+=(--title "${run_id:-RUN_ID}:$phase" --dir "$PWD" "$prompt")
+}
+
+# build_cmd_opencode2: the 2.x shape. No --dir (the phase runs in the repository root the driver has
+# entered), the variant lives in --model, --server attaches to a long-lived server and --standalone
+# starts a private one otherwise, and --archived keeps the scripted sessions of a private server out of
+# session lists (an attached run is not archived: it is meant to be followed).
+build_cmd_opencode2() {
+  local role=$1 phase=$3 prompt=$4 model
+  model=$(opencode_model "$role")
+  cmd=("$opencode_bin" run)
+  if [ -n "$opencode_attach" ]; then cmd+=(--server "$opencode_attach"); else cmd+=(--standalone); fi
+  cmd+=(--agent "factory-$role")
+  if [ -n "$model" ]; then cmd+=(--model "$model"); fi
+  # An attached session stays visible in the server's lists so that a run can be followed there.
+  if [ -z "$opencode_attach" ]; then cmd+=(--archived); fi
+  cmd+=(--title "${run_id:-RUN_ID}:$phase" "$prompt")
+}
+
+build_cmd_claude() {
+  local role=$1 access=$2 prompt=$4 artifact=${5:-} model
+  model=$(model_for "$role")
+  cmd=(claude -p "$prompt" --agent "factory-$role")
+  if [ -n "$model" ]; then cmd+=(--model "$model"); fi
+  # --strict-mcp-config without --mcp-config: no MCP server is loaded, so nothing from the user's
+  # own configuration runs inside a factory run or creates files the snapshot would flag.
+  cmd+=(--permission-mode dontAsk --allowedTools "$(claude_tools "$access" "$artifact")" --disallowedTools "$(claude_denies)" --strict-mcp-config --no-session-persistence --output-format text)
+}
+
 # build_cmd <role> <access> <phase> <prompt> [artifact]: fills the global array `cmd`.
 build_cmd() {
-  local role=$1 access=$2 phase=$3 prompt=$4 artifact=${5:-} model variant
-  model=$(model_for "$role")
-  cmd=()
   case "$backend" in
     opencode)
-      cmd=(opencode run)
-      if [ -n "$opencode_attach" ]; then cmd+=(--attach "$opencode_attach"); fi
-      cmd+=(--agent "factory-$role")
-      if [ -n "$model" ]; then cmd+=(--model "$model"); fi
-      variant=$(variant_for "$role")
-      if [ -n "$variant" ]; then cmd+=(--variant "$variant"); fi
-      cmd+=(--title "${run_id:-RUN_ID}:$phase" --dir "$PWD" "$prompt")
+      case "${opencode_gen:-}" in
+        1) build_cmd_opencode1 "$@" ;;
+        2) build_cmd_opencode2 "$@" ;;
+        *) die_usage "the OpenCode client generation is not resolved" ;;
+      esac
       ;;
-    claude)
-      cmd=(claude -p "$prompt" --agent "factory-$role")
-      if [ -n "$model" ]; then cmd+=(--model "$model"); fi
-      # --strict-mcp-config without --mcp-config: no MCP server is loaded, so nothing from the user's
-      # own configuration runs inside a factory run or creates files the snapshot would flag.
-      cmd+=(--permission-mode dontAsk --allowedTools "$(claude_tools "$access" "$artifact")" --disallowedTools "$(claude_denies)" --strict-mcp-config --no-session-persistence --output-format text)
-      ;;
+    claude) build_cmd_claude "$@" ;;
   esac
+}
+
+need_opencode_client() {
+  command -v "$opencode_bin" >/dev/null 2>&1 ||
+    die_preflight "opencode client not found: $opencode_bin (install it, set --opencode-bin, or choose --backend claude)"
+}
+
+# resolve_opencode_generation: read the major version and validate the variant options against it.
+resolve_opencode_generation() {
+  opencode_gen=$(detect_opencode_generation "$opencode_bin") ||
+    die_usage "cannot read the OpenCode generation from '$opencode_bin --version'; this factory supports major 1 and 2"
+  check_variant_models
 }
 
 if [ -z "$backend" ]; then
@@ -613,10 +696,14 @@ if [ -z "$backend" ]; then
   done
 fi
 
-# The variant and attach options are OpenCode flags; build_cmd only passes them to that backend.
+# The variant, client and attach options are OpenCode flags; build_cmd only passes them to that
+# backend.
 if [ "$backend" = claude ]; then
   if [ -n "$variant_helper$variant_main" ]; then
     printf 'factory: warning: --variant-main/--variant-helper apply to the OpenCode backend only; ignored for claude\n' >&2
+  fi
+  if [ "$opencode_bin_explicit" = 1 ]; then
+    printf 'factory: warning: --opencode-bin applies to the OpenCode backend only; ignored for claude\n' >&2
   fi
   if [ -n "$opencode_attach" ]; then
     printf 'factory: warning: --opencode-attach applies to the OpenCode backend only; ignored for claude\n' >&2
@@ -625,12 +712,17 @@ fi
 
 if [ "$dry_run" = 1 ]; then
   [ -n "$backend" ] || backend=opencode
+  if [ "$backend" = opencode ]; then
+    need_opencode_client
+    resolve_opencode_generation
+  fi
   printf 'factory dry run: nothing is called, nothing is changed\n'
   printf 'backend: %s\n' "$backend"
   printf 'caps: plan review %s rounds, code review %s rounds\n' "$plan_cap" "$code_cap"
   printf 'phases: plan, plan-review, owner-gate, implement, code-review, final-gate, pr\n'
   printf 'stop after: %s%s\n' "$stop_after" "$( [ "$no_push" = 1 ] && printf ', no push' || true)"
   if [ "$backend" = opencode ]; then
+    printf 'opencode client: %s (generation %s)\n' "$opencode_bin" "$opencode_gen"
     printf 'variants: main=%s helper=%s\n' "${variant_main:-(none)}" "${variant_helper:-(none)}"
     printf 'opencode server: %s\n' "${opencode_attach:-(own, started per phase)}"
   fi
@@ -668,7 +760,7 @@ save_state() {
   [ -n "$run_dir" ] || return 0
   local k
   {
-    for k in run_id backend branch base_sha phase step plan_round code_round post_decision_review status exit_code stopped_at; do
+    for k in run_id backend branch base_sha phase step plan_round code_round post_decision_review status exit_code stopped_at opencode_bin opencode_gen; do
       printf '%s=%s\n' "$k" "${!k}"
     done
   } >"$run_dir/state.tmp"
@@ -682,7 +774,7 @@ load_state() {
     key=${BASH_REMATCH[1]}
     value=${BASH_REMATCH[2]}
     case "$key" in
-      run_id | backend | branch | base_sha | phase | step | plan_round | code_round | post_decision_review | status | exit_code | stopped_at)
+      run_id | backend | branch | base_sha | phase | step | plan_round | code_round | post_decision_review | status | exit_code | stopped_at | opencode_bin | opencode_gen)
         printf -v "$key" '%s' "$value"
         ;;
     esac
@@ -802,7 +894,11 @@ need_tools() {
     command -v "$t" >/dev/null 2>&1 || die_preflight "required tool not found: $t"
   done
   [ -n "$backend" ] || die_preflight "neither opencode nor claude is installed (install one, or set --backend)"
-  command -v "$backend" >/dev/null 2>&1 || die_preflight "backend not found: $backend (install it or choose the other with --backend)"
+  if [ "$backend" = opencode ]; then
+    need_opencode_client
+  else
+    command -v "$backend" >/dev/null 2>&1 || die_preflight "backend not found: $backend (install it or choose the other with --backend)"
+  fi
   if [ "$no_push" = 0 ] && [ "$stop_after" = pr ]; then
     command -v gh >/dev/null 2>&1 || die_preflight "gh not found (needed to open the pull request; install it or use --no-push)"
   fi
@@ -815,6 +911,7 @@ snap_take_to() {
 if [ -z "$resume_id" ]; then
   export_hooks
   need_tools
+  if [ "$backend" = opencode ]; then resolve_opencode_generation; fi
   git rev-parse --show-toplevel >/dev/null 2>&1 || die_preflight "not a git repository"
   [ -z "$(git status --porcelain)" ] || die_preflight "the working tree is not clean; commit or stash first"
   git remote get-url origin >/dev/null 2>&1 || die_preflight "no remote named origin"
@@ -850,11 +947,26 @@ else
   export_hooks
   run_dir="$ROOT/.factory/runs/$resume_id"
   [ -f "$run_dir/state" ] || die_usage "no such run: $resume_id"
+  opencode_bin_requested=$opencode_bin
   load_state
   if [ "$status" != stopped ] || { [ "$exit_code" != 10 ] && [ "$exit_code" != 20 ]; }; then
     die_usage "run $resume_id cannot be resumed (status $status, exit code ${exit_code:-none}); see $(rel "$run_dir")/handoff.md"
   fi
   need_tools
+  if [ "$backend" = opencode ]; then
+    if [ "$opencode_bin_explicit" = 1 ] && [ "$opencode_bin_requested" != "$opencode_bin" ]; then
+      die_usage "the run was started with --opencode-bin $opencode_bin; a resume uses that client"
+    fi
+    now_gen=$(detect_opencode_generation "$opencode_bin") ||
+      die_preflight "cannot read the OpenCode generation from '$opencode_bin --version'; the run was started with generation ${opencode_gen:-unknown}"
+    if [ -n "$opencode_gen" ]; then
+      [ "$now_gen" = "$opencode_gen" ] ||
+        die_preflight "the run was started with OpenCode generation $opencode_gen, but $opencode_bin now reports generation $now_gen; resume with the recorded client"
+    else
+      opencode_gen=$now_gen
+    fi
+    check_variant_models
+  fi
   if [ "$exit_code" = 10 ]; then
     [ -s "$run_dir/decisions.md" ] || die_preflight "write the owner decisions to $(rel "$run_dir")/decisions.md first"
   fi

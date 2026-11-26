@@ -537,6 +537,17 @@ make_driver_stubs() {
 #   commits          number of commits the implementer makes (default 1)
 d=${STUB_DIR:?}
 name=$(basename "$0")
+# The driver reads the generation from --version; answer without logging, so a version probe is
+# never mistaken for a phase call.
+case "${1:-}" in
+  --version)
+    case "$name" in
+      opencode2) printf '%s\n' "${STUB_VERSION:-opencode v2.4.1}" ;;
+      *) printf '%s\n' "${STUB_VERSION:-1.19.5}" ;;
+    esac
+    exit 0
+    ;;
+esac
 args=("$@")
 role=""
 prompt=""
@@ -548,7 +559,7 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     --disallowedTools) denied=${args[$((i + 1))]} ;;
   esac
 done
-if [ "$name" = opencode ]; then prompt=${args[$((${#args[@]} - 1))]}; fi
+case "$name" in opencode | opencode2) prompt=${args[$((${#args[@]} - 1))]} ;; esac
 art=${FACTORY_ARTIFACT:-}
 n=$(($(cat "$d/count" 2>/dev/null || echo 0) + 1))
 echo "$n" >"$d/count"
@@ -625,6 +636,7 @@ fi
 if [ -f "$d/exit-$kind" ]; then exit "$(cat "$d/exit-$kind")"; fi
 exit 0
 STUB
+  cp "$bin/opencode" "$bin/opencode2"
   cp "$bin/opencode" "$bin/claude"
   cat >"$bin/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -644,7 +656,7 @@ case "${1:-} ${2:-}" in
 esac
 exit 0
 STUB
-  chmod +x "$bin/opencode" "$bin/claude" "$bin/gh"
+  chmod +x "$bin/opencode" "$bin/opencode2" "$bin/claude" "$bin/gh"
 }
 
 # make_origin <stub|real>: a bare repository whose main branch holds the files the factory needs.
@@ -1103,6 +1115,120 @@ HOOK
   assert "D38 attach: claude runs on" test "$drv_rc" = 0
   assert "D38 attach: claude warns once" test "$(grep -c 'opencode-attach.*OpenCode backend only' <<<"$drv_out")" = 1
   refute "D38 attach: claude never sees --attach" grep -q -- '--attach' "$sd/calls.log"
+
+  # D39-D45: the OpenCode 2.x generation. The stub answers --version and, like 2.x, takes the
+  # generation's flags: the variant lives in the model string, the working directory is the current
+  # one, and the client has --standalone, --server and --archived.
+  local oc2=$tmp/dbin/opencode2 vb=$tmp/versionbin
+  mkdir -p "$vb"
+  cat >"$vb/agent" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "${STUB_VERSION-}"
+STUB
+  chmod +x "$vb/agent"
+  # shellcheck disable=SC2329  # called through assert and refute
+  version_gen() { STUB_VERSION=$1 lib detect_opencode_generation "$vb/agent"; }
+  assert "D39 version 1.19.5 is generation 1" test "$(version_gen 1.19.5)" = 1
+  assert "D39 'opencode v2.4.1' is generation 2" test "$(version_gen 'opencode v2.4.1')" = 2
+  assert "D39 a pre-release suffix still names its major" test "$(version_gen 'v2.0.0-beta.1')" = 2
+  refute "D39 a 3.x version is refused" version_gen 3.0.0
+  refute "D39 a version without a number is refused" version_gen nightly
+
+  new_case stub
+  drive --backend opencode --opencode-bin "$oc2" \
+    --model-main provider/strong --model-helper provider/quick \
+    --variant-main high --variant-helper minimal "t"
+  assert "D39 the 2.x run exits 0" test "$drv_rc" = 0
+  assert "D39 the generation is recorded" test "$(state_of opencode_gen)" = 2
+  assert "D39 the client path is recorded" test "$(state_of opencode_bin)" = "$oc2"
+  assert "D39 every phase is archived" test "$(grep -c '^ARGV.* --archived ' "$sd/calls.log")" = "$(grep -c '^CALL ' "$sd/calls.log")"
+  assert "D39 every phase uses a private server" test "$(grep -c '^ARGV run --standalone ' "$sd/calls.log")" = "$(grep -c '^CALL ' "$sd/calls.log")"
+  refute "D39 no phase passes --dir" grep -Eq '^ARGV.* --dir ' "$sd/calls.log"
+  refute "D39 no phase passes --attach" grep -Eq '^ARGV.* --attach ' "$sd/calls.log"
+  refute "D39 no phase passes --variant" grep -Eq '^ARGV.* --variant ' "$sd/calls.log"
+  refute "D39 no phase passes the auto flag" grep -Eq '^ARGV.* --auto( |$)' "$sd/calls.log"
+  assert "D39 the planner gets the main model with the variant" has "$(argv_of planner)" ' --model provider/strong#high '
+  assert "D39 the implementer gets the main model with the variant" has "$(argv_of implementer)" ' --model provider/strong#high '
+  assert "D39 the plan reviewer gets the helper model with the variant" has "$(argv_of plan-reviewer)" ' --model provider/quick#minimal '
+  assert "D39 the code reviewer gets the helper model with the variant" has "$(argv_of code-reviewer)" ' --model provider/quick#minimal '
+  assert "D39 the pr writer gets the helper model with the variant" has "$(argv_of pr-writer)" ' --model provider/quick#minimal '
+  refute "D39 the 1.x client name never appears" grep -q '^CALL [0-9]* opencode ' "$sd/calls.log"
+  new_case stub
+  drive --backend opencode "t"
+  assert "D39 the default client records generation 1" test "$(state_of opencode_gen)" = 1
+
+  new_case stub
+  drive --dry-run --backend opencode --opencode-bin "$oc2" --model-main m/x --variant-main high "t"
+  assert "D39 the dry run names the client and generation" has "$drv_out" "opencode client: $oc2 \\(generation 2\\)"
+  assert "D39 the dry run shows the 2.x shape" has "$drv_out" 'command \(plan\): .* run --standalone --agent factory-planner --model m/x#high --archived '
+
+  # D40: the environment selects the client, as the flag does.
+  new_case stub
+  drv_extra=(FACTORY_OPENCODE_BIN="$oc2")
+  drive --backend opencode --model-main m/x "t"
+  drv_extra=()
+  assert "D40 the environment-selected client runs" test "$drv_rc" = 0
+  assert "D40 the environment-selected generation is recorded" test "$(state_of opencode_gen)" = 2
+
+  # D41: --attach becomes --server, credentials still travel only in the environment.
+  new_case stub
+  drv_extra=("OPENCODE_SERVER_PASSWORD=$pw_dummy" "OPENCODE_SERVER_USERNAME=$user_dummy")
+  drive --backend opencode --opencode-bin "$oc2" --opencode-attach "$att" "t"
+  drv_extra=()
+  assert "D41 the attached run exits 0" test "$drv_rc" = 0
+  assert "D41 every phase connects with --server" test "$(grep -c "^ARGV run --server $att --agent " "$sd/calls.log" || true)" = "$(grep -c '^CALL ' "$sd/calls.log")"
+  refute "D41 an attached phase never adds --standalone" grep -q -- '--standalone' "$sd/calls.log"
+  refute "D41 the password is never in argv" grep -q -- "$pw_dummy" "$sd/calls.log"
+  refute "D41 the user name is never in argv" grep -q -- "$user_dummy" "$sd/calls.log"
+  assert "D41 the password reaches the phase environment" test "$(grep -c '^ENVNAMES .*OPENCODE_SERVER_PASSWORD ' "$sd/calls.log")" = "$(grep -c '^CALL ' "$sd/calls.log")"
+
+  # D42: a version that is neither 1.x nor 2.x, or no version at all, is a usage error.
+  for badv in 3.0.0 nightly; do
+    new_case stub
+    drv_extra=("STUB_VERSION=$badv")
+    drive --backend opencode --opencode-bin "$oc2" "t"
+    drv_extra=()
+    assert "D42 version '$badv' is a usage error" test "$drv_rc" = 2
+    assert "D42 version '$badv' starts no phase" test ! -s "$sd/calls.log"
+    assert "D42 version '$badv' names the supported generations" has "$drv_out" 'major 1 and 2'
+  done
+  new_case stub
+  drive --backend opencode --opencode-bin /bin/false "t"
+  assert "D42 a client without a version is a usage error" test "$drv_rc" = 2
+  assert "D42 a client without a version starts no phase" test ! -s "$sd/calls.log"
+
+  # D43: 2.x has no --variant; a variant without a model has no place to go.
+  new_case stub
+  drive --backend opencode --opencode-bin "$oc2" --variant-main high "t"
+  assert "D43 a 2.x variant without a model is a usage error" test "$drv_rc" = 2
+  assert "D43 that error starts no phase" test ! -s "$sd/calls.log"
+  assert "D43 that error names the model" has "$drv_out" 'variant in the model'
+
+  # D44: resume re-validates the recorded client generation.
+  new_case stub
+  : >"$sd/owner-open"
+  drive --backend opencode --opencode-bin "$oc2" "t"
+  assert "D44 the 2.x run stops at the owner gate" test "$drv_rc" = 10
+  id=$(basename "$(run_dir_of)")
+  printf 'Decided.\n' >"$(run_dir_of)/decisions.md"
+  : >"$sd/calls.log"
+  drv_extra=(STUB_VERSION=1.19.5)
+  drive --resume "$id"
+  drv_extra=()
+  assert "D44 a generation change on resume is a preflight failure" test "$drv_rc" = 3
+  assert "D44 the resume names the recorded generation" has "$drv_out" 'generation 2'
+  assert "D44 the refused resume starts no phase" test ! -s "$sd/calls.log"
+
+  # D45: resume uses the recorded client; another one is a usage error.
+  new_case stub
+  : >"$sd/owner-open"
+  drive --backend opencode --opencode-bin "$oc2" "t"
+  id=$(basename "$(run_dir_of)")
+  printf 'Decided.\n' >"$(run_dir_of)/decisions.md"
+  : >"$sd/calls.log"
+  drive --resume "$id" --opencode-bin "$tmp/dbin/opencode"
+  assert "D45 a different client on resume is a usage error" test "$drv_rc" = 2
+  assert "D45 the refused resume starts no phase" test ! -s "$sd/calls.log"
 
   # D13: dry run.
   new_case stub

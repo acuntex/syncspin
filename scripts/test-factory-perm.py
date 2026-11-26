@@ -5,7 +5,9 @@
 
 A small last-match-wins evaluator over opencode.json, the generated OpenCode agent overlays and,
 when a directory is given, the rules `opencode` resolved for each agent (one JSON file per agent,
-a list of {permission, pattern, action}). Claude Code's settings and the per-phase grants plus the
+a list of {permission, pattern, action}). The OpenCode 2.x shape (an ordered list of
+{action, resource, effect}, where `bash` is `shell`) is evaluated by the same tests over the same
+deny and allow lists. Claude Code's settings and the per-phase grants plus the
 driver's deny list are checked with a matcher where deny wins over ask over allow. The
 project-level files must hold only the AGENTS.md denies; every other restriction is checked in the
 factory layer. In both tools a trailing " *" in a pattern is optional, so the bare
@@ -56,6 +58,24 @@ def decide(rules, tool, text):
         if t == tool and matches(pat, text):
             action = act
     return action
+
+
+def to_v2(rules):
+    """The 2.x shape: an ordered list of action/resource/effect entries; `bash` becomes `shell`."""
+    return [
+        {"action": "shell" if tool == "bash" else tool, "resource": pattern, "effect": action}
+        for tool, pattern, action in rules
+    ]
+
+
+def decide_v2(rules, tool, text):
+    """Last matching entry wins, over the ordered 2.x permissions list."""
+    action = "shell" if tool == "bash" else tool
+    effect = "ask"
+    for entry in rules:
+        if entry["action"] == action and matches(entry["resource"], text):
+            effect = entry["effect"]
+    return effect
 
 
 def overlay(path):
@@ -255,34 +275,86 @@ for name, readonly in roles.items():
     check(name + ": the deny rules are the two deny files", got == ["*"] + deny_project + deny_factory)
 
 
-def agent_checks(label, rules, readonly):
-    check(label + " git status allowed", decide(rules, "bash", "git status") == "allow")
-    check(label + " git diff allowed", decide(rules, "bash", "git diff HEAD~1") == "allow")
-    check(label + " rg allowed", decide(rules, "bash", "rg pattern src") == "allow")
-    check(label + " grep allowed", decide(rules, "bash", "grep -n x y") == "allow")
-    check(label + " git push main denied", decide(rules, "bash", "git push origin main") == "deny")
-    check(label + " git push to a factory branch denied", decide(rules, "bash", "git push origin factory/x") == "deny")
-    check(label + " gh pr merge denied", decide(rules, "bash", "gh pr merge 1") == "deny")
-    check(label + " no-verify commit denied", decide(rules, "bash", "git commit --no-verify -m x") == "deny")
-    check(label + " python denied", decide(rules, "bash", "python3 x") == "deny")
+def agent_checks(label, rules, readonly, decide_fn=decide):
+    check(label + " git status allowed", decide_fn(rules, "bash", "git status") == "allow")
+    check(label + " git diff allowed", decide_fn(rules, "bash", "git diff HEAD~1") == "allow")
+    check(label + " rg allowed", decide_fn(rules, "bash", "rg pattern src") == "allow")
+    check(label + " grep allowed", decide_fn(rules, "bash", "grep -n x y") == "allow")
+    check(label + " git push main denied", decide_fn(rules, "bash", "git push origin main") == "deny")
+    check(label + " git push to a factory branch denied", decide_fn(rules, "bash", "git push origin factory/x") == "deny")
+    check(label + " gh pr merge denied", decide_fn(rules, "bash", "gh pr merge 1") == "deny")
+    check(label + " no-verify commit denied", decide_fn(rules, "bash", "git commit --no-verify -m x") == "deny")
+    check(label + " python denied", decide_fn(rules, "bash", "python3 x") == "deny")
     if readonly:
         check(
             label + " run directory artifact editable",
-            decide(rules, "edit", ".factory/runs/x/review-plan-1.md") == "allow",
+            decide_fn(rules, "edit", ".factory/runs/x/review-plan-1.md") == "allow",
         )
-        check(label + " source file not editable", decide(rules, "edit", "crates/a/src/lib.rs") == "deny")
-        check(label + " git commit denied", decide(rules, "bash", "git commit -m x") == "deny")
-        check(label + " git add denied", decide(rules, "bash", "git add x") == "deny")
-        check(label + " git fetch denied", decide(rules, "bash", "git fetch origin main") == "deny")
-        check(label + " mkdir denied", decide(rules, "bash", "mkdir x") == "deny")
-        check(label + " chmod denied", decide(rules, "bash", "chmod +x x") == "deny")
+        check(label + " source file not editable", decide_fn(rules, "edit", "crates/a/src/lib.rs") == "deny")
+        check(label + " git commit denied", decide_fn(rules, "bash", "git commit -m x") == "deny")
+        check(label + " git add denied", decide_fn(rules, "bash", "git add x") == "deny")
+        check(label + " git fetch denied", decide_fn(rules, "bash", "git fetch origin main") == "deny")
+        check(label + " mkdir denied", decide_fn(rules, "bash", "mkdir x") == "deny")
+        check(label + " chmod denied", decide_fn(rules, "bash", "chmod +x x") == "deny")
     else:
-        check(label + " source file editable", decide(rules, "edit", "crates/a/src/lib.rs") == "allow")
-        check(label + " git commit allowed", decide(rules, "bash", "git commit -m x") == "allow")
+        check(label + " source file editable", decide_fn(rules, "edit", "crates/a/src/lib.rs") == "allow")
+        check(label + " git commit allowed", decide_fn(rules, "bash", "git commit -m x") == "allow")
 
 
 for name, readonly in roles.items():
     agent_checks("generated " + name + ":", agent_rules[name], readonly)
+
+# The OpenCode 2.x shape. 2.x resolves the V1 map into an ordered permissions array of
+# action/resource/effect entries and keeps the order (verified with `opencode2 debug agents`; see
+# docs/factory/process.md). The same deny and allow lists must decide the same way in that shape.
+for name, readonly in roles.items():
+    agent_checks("v2 " + name + ":", to_v2(agent_rules[name]), readonly, decide_v2)
+
+
+def v2_shape(readonly):
+    """The ordered list the same sources would produce: baseline deny first, allows, every deny last."""
+    entries = []
+    if readonly:
+        entries.append({"action": "edit", "resource": "*", "effect": "deny"})
+        entries.append({"action": "edit", "resource": ".factory/runs/*", "effect": "allow"})
+    else:
+        entries.append({"action": "edit", "resource": "*", "effect": "allow"})
+    entries.append({"action": "shell", "resource": "*", "effect": "deny"})
+    for name in ["common"] + ([] if readonly else ["code"]):
+        for entry in read_list(name):
+            if entry.startswith("Bash(") and entry.endswith(")"):
+                entries.append({"action": "shell", "resource": entry[5:-1], "effect": "allow"})
+    for pattern in deny_project + deny_factory:
+        entries.append({"action": "shell", "resource": pattern, "effect": "deny"})
+    return entries
+
+
+v2_readonly = v2_shape(True)
+v2_code = v2_shape(False)
+for cmd in denied_project + denied_factory + never:
+    check("v2 shape readonly denies: " + cmd, decide_v2(v2_readonly, "bash", cmd) == "deny")
+    check("v2 shape code denies: " + cmd, decide_v2(v2_code, "bash", cmd) == "deny")
+for cmd in common:
+    check("v2 shape readonly allows: " + cmd, decide_v2(v2_readonly, "bash", cmd) == "allow")
+    check("v2 shape code allows: " + cmd, decide_v2(v2_code, "bash", cmd) == "allow")
+for cmd in code_only:
+    check("v2 shape readonly does not allow: " + cmd, decide_v2(v2_readonly, "bash", cmd) != "allow")
+    check("v2 shape code allows: " + cmd, decide_v2(v2_code, "bash", cmd) == "allow")
+for cmd in orchestrator_only:
+    check("v2 shape code denies: " + cmd, decide_v2(v2_code, "bash", cmd) == "deny")
+check(
+    "v2 shape: the shell baseline is the first shell rule",
+    v2_readonly[2] == {"action": "shell", "resource": "*", "effect": "deny"},
+)
+shell_rules = [entry for entry in v2_readonly if entry["action"] == "shell"]
+last_allow = max(i for i, entry in enumerate(shell_rules) if entry["effect"] == "allow")
+first_deny = min(i for i, entry in enumerate(shell_rules) if i > 0 and entry["effect"] == "deny")
+check("v2 shape: every shell deny follows every shell allow", first_deny > last_allow)
+check("v2 shape: readonly artifacts are editable", decide_v2(v2_readonly, "edit", ".factory/runs/x/plan.md") == "allow")
+check("v2 shape: readonly sources are not editable", decide_v2(v2_readonly, "edit", "src/lib.rs") == "deny")
+check("v2 shape: code sources are editable", decide_v2(v2_code, "edit", "src/lib.rs") == "allow")
+
+for name, readonly in roles.items():
     if agent_json_dir:
         path = agent_json_dir + "/" + name + ".json"
         try:

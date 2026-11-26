@@ -32,7 +32,7 @@ The specification (process, caps, exit codes, state files, protected paths, hook
 
 |                       | OpenCode                                                    | Claude Code                                                                  |
 | --------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Interactive           | not available (see below)                                   | `/factory <task text>` in a session                                          |
+| Interactive           | no `/factory` command; follow and steer (see below)         | `/factory <task text>` in a session                                          |
 | Driver (unattended)   | `scripts/factory.sh --backend opencode "..."`               | `scripts/factory.sh --backend claude "..."`                                  |
 | Agents                | `.opencode/agents/factory-*.md` (generated)                 | `.claude/agents/factory-*.md` and `.claude/commands/factory.md`              |
 | Permissions           | generated agents (`opencode.json`: `AGENTS.md` denies only) | driver flags (`.claude/settings.json`: `AGENTS.md` denies only)              |
@@ -40,7 +40,11 @@ The specification (process, caps, exit codes, state files, protected paths, hook
 | Non-interactive slash | -                                                           | `claude -p "/factory ..."` stops at the push request (not approved headless) |
 
 OpenCode has no `/factory` command: its subagents run in the background and report when idle, and
-there is no documented way to wait for one. The driver is the OpenCode path.
+there is no documented way to wait for one. The driver is the OpenCode path. A run can still be
+followed and steered interactively: with `--opencode-attach URL` every phase is a session on that
+server, visible in its interface, and a person there can answer a permission prompt instead of the
+phase waiting for its timeout. Attached 2.x sessions are not archived, so they show in the server's
+session lists.
 
 `claude -p "/factory ..."` expands the command, but a headless run has nobody to approve the `ask`
 rule on `git push` (a `-p` run denies a call that needs approval unless a hook or tool approves it), so
