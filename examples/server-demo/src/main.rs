@@ -322,7 +322,14 @@ async fn run(options: Options) -> Result<()> {
                 }
                 Some(Event::ClientActivated { roles, .. }) => {
                     eprintln!("activated with roles: {}", roles.join(", "));
-                    if stream.is_none() && roles.iter().any(|role| role == "player@v1") {
+                    // `player@v1` streams the tone; `metadata@v1` alone still gets the track,
+                    // which is what a client whose audio format this demo cannot serve needs
+                    // (and what a `--revoke-after` run is about: the metadata disappears).
+                    if stream.is_none()
+                        && roles
+                            .iter()
+                            .any(|role| role == "player@v1" || role == "metadata@v1")
+                    {
                         let writer = server.open_stream(TrackInfo {
                             title: Some("syncspin demo tone".to_owned()),
                             ..TrackInfo::default()
@@ -334,7 +341,7 @@ async fn run(options: Options) -> Result<()> {
                             Some(delay) => Some(revoke_deadline(delay)?),
                             None => None,
                         };
-                        eprintln!("streaming a {TONE_HZ} Hz tone");
+                        eprintln!("opened the demo track");
                     }
                 }
                 Some(Event::ClientLeft { reason }) => {
