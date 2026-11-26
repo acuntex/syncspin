@@ -310,7 +310,9 @@ pub fn discover_servers(discovery: &dyn Discovery) -> Result<Vec<DiscoveredServe
 }
 
 #[cfg(feature = "discovery")]
-pub use inbound::{advertise, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT};
+pub use inbound::{
+    advertise, advertise_headless, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT,
+};
 
 #[cfg(feature = "mdns")]
 mod mdns;
@@ -436,6 +438,28 @@ mod inbound {
     pub async fn advertise(
         config: ClientConfig,
         sink: Box<dyn Sink>,
+    ) -> Result<(ClientHandle, EventStream)> {
+        advertise_with(config, Some(sink)).await
+    }
+
+    /// Advertises this client without an audio output and serves the servers that connect to it.
+    ///
+    /// The headless counterpart of [`advertise`]: the same listener, advertisement and admission
+    /// rules, but the client has no audio sink and does not offer the `player@v1` role.
+    ///
+    /// # Errors
+    /// Same as [`advertise`].
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, because the listener is spawned.
+    pub async fn advertise_headless(config: ClientConfig) -> Result<(ClientHandle, EventStream)> {
+        advertise_with(config, None).await
+    }
+
+    /// Shared body of [`advertise`] and [`advertise_headless`].
+    async fn advertise_with(
+        config: ClientConfig,
+        sink: Option<Box<dyn Sink>>,
     ) -> Result<(ClientHandle, EventStream)> {
         let inbound = config.inbound.clone().ok_or_else(|| {
             anyhow!(
@@ -589,6 +613,7 @@ mod inbound {
             // The rejection task runs while the admitted session owns the carried state, so it
             // gets the shared unpaired-access value as a handle of its own.
             let unpaired_access = Arc::clone(&carried.unpaired_access);
+            let has_sink = carried.sink.is_some();
             let mut rejections = JoinSet::new();
             let mut attempt = Box::pin(session::attempt(
                 transport,
@@ -614,6 +639,7 @@ mod inbound {
                             path.to_owned(),
                             pairing,
                             Arc::clone(&unpaired_access),
+                            has_sink,
                         ));
                     }
                     joined = rejections.join_next(), if !rejections.is_empty() => {
@@ -630,9 +656,13 @@ mod inbound {
 
             // Nothing buffered for the session that ended may become audible later; the flush runs
             // before the host hears about the drop. A deliberate close is not a drop.
-            let flush_error = carried.sink.flush().err().map(|error| {
-                error.context("the audio sink rejected a flush after the connection ended")
-            });
+            let flush_error = carried
+                .sink
+                .as_mut()
+                .and_then(|sink| sink.flush().err())
+                .map(|error| {
+                    error.context("the audio sink rejected a flush after the connection ended")
+                });
             if matches!(&attempt.ending, session::Ending::Shutdown) {
                 return Ok(());
             }
@@ -673,13 +703,21 @@ mod inbound {
         path: String,
         pairing: Option<PairingPsk>,
         unpaired_access: Arc<AtomicBool>,
+        has_sink: bool,
     ) {
         let Ok(Some(transport)) = upgrade(stream, &path).await else {
             return;
         };
         let _ = tokio::time::timeout(
             REJECT_TIMEOUT,
-            session::reject_concurrent(transport, &config, pairing, &[], &unpaired_access),
+            session::reject_concurrent(
+                transport,
+                &config,
+                pairing,
+                &[],
+                &unpaired_access,
+                has_sink,
+            ),
         )
         .await;
     }
@@ -768,6 +806,8 @@ mod inbound {
             *error.status_mut() = StatusCode::NOT_FOUND;
             Err(error)
         };
+        // As for the dialled socket: small writes must not wait behind an unacknowledged one.
+        let _ = stream.set_nodelay(true);
         match accept_hdr_async(stream, callback).await {
             Ok(socket) => Ok(Some(Transport::accept(socket))),
             // The two answers above: the peer was told why and the socket is closed.

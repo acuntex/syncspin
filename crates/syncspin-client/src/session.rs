@@ -67,6 +67,7 @@ use crate::pairing::{
 };
 use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_PAIRING_PSK};
 use crate::playout::{Dropped, OwnedFrame, PlayoutQueue, BUFFER_CAPACITY};
+use crate::roles::{supported_roles, CONTROLLER_ROLE, METADATA_ROLE, PLAYER_ROLE};
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 use crate::storage::persist_pairing;
 
@@ -115,22 +116,8 @@ const SYNC_BURST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Minimum spacing between consecutive sync bursts, so a long stream keeps tracking the clock.
 const RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Versioned role identifier of the audio player.
-const PLAYER_ROLE: &str = "player@v1";
 /// Bare role name used by `stream/end` and `stream/clear` (see `messaging.md`).
 const PLAYER_STREAM_ROLE: &str = "player";
-
-/// Versioned role identifier of the now-playing metadata.
-const METADATA_ROLE: &str = "metadata@v1";
-
-/// Versioned role identifier of the group controller state.
-const CONTROLLER_ROLE: &str = "controller@v1";
-
-/// The roles this client advertises in `client/hello`.
-///
-/// The list is written here once, so the roles the client announces cannot drift apart from the
-/// roles its activation check admits: both read this constant.
-const SUPPORTED_ROLES: [&str; 3] = [PLAYER_ROLE, CONTROLLER_ROLE, METADATA_ROLE];
 
 /// Largest output delay reported to the server, in milliseconds.
 const MAX_OUTPUT_DELAY_MS: u32 = 5_000;
@@ -270,7 +257,10 @@ pub(crate) enum SocketMessage {
 impl Transport {
     /// Opens a plain WebSocket connection to `url`.
     pub(crate) async fn connect(url: &str) -> Result<Transport> {
-        let (socket, _response) = tokio_tungstenite::connect_async(url)
+        // Nagle's algorithm would hold a small write (a `client/time` request, a keepalive ping)
+        // behind an unacknowledged earlier one, which delays clock-sync round trips. Disabling it
+        // changes latency only, not the protocol.
+        let (socket, _response) = tokio_tungstenite::connect_async_with_config(url, None, true)
             .await
             .with_context(|| format!("failed to connect to the server at {url}"))?;
         Ok(Transport {
@@ -447,8 +437,9 @@ enum AdmittedMethod {
 
 /// State a connection keeps across attempts.
 pub(crate) struct Carried {
-    /// Audio output, moved into each session and returned when it ends.
-    pub(crate) sink: Box<dyn Sink>,
+    /// Audio output, moved into each session and returned when it ends; `None` for a headless
+    /// client, which has no audio output and does not take the player role.
+    pub(crate) sink: Option<Box<dyn Sink>>,
     /// Control requests, or `None` once every handle was dropped.
     pub(crate) control: Option<mpsc::UnboundedReceiver<ControlRequest>>,
     /// Level in force, in the protocol's 0-100 range.
@@ -594,7 +585,8 @@ pub(crate) struct Session<'a> {
     transport: Transport,
     noise: NoiseTransport,
     config: &'a ClientConfig,
-    sink: Box<dyn Sink>,
+    /// Audio output, or `None` for a headless session.
+    sink: Option<Box<dyn Sink>>,
     events: &'a mpsc::UnboundedSender<Event>,
     /// Level shared with every control handle; the session is its only writer.
     reported_volume: &'a AtomicU8,
@@ -774,6 +766,7 @@ pub(crate) async fn attempt(
                 &candidates,
                 &carried.active_roles,
                 &carried.unpaired_access,
+                carried.sink.is_some(),
             ),
         ) => result,
         // The host closed while the handshake was running. There is no session to say goodbye on
@@ -827,8 +820,11 @@ pub(crate) async fn attempt(
     let estimator = BufferEstimator::new(config.min_buffer_ms);
     // The trait has no change notification, so the values are snapshotted here and polled at the
     // points named on `Sink::pre_port_delay` and `Sink::output_delay`.
-    let pre_port_delay = carried.sink.pre_port_delay();
-    let output_delay = carried.sink.output_delay();
+    let pre_port_delay = carried
+        .sink
+        .as_ref()
+        .map_or(Duration::ZERO, |sink| sink.pre_port_delay());
+    let output_delay = carried.sink.as_ref().and_then(|sink| sink.output_delay());
     let mut session = Session {
         transport: ready.transport,
         noise: ready.noise,
@@ -902,7 +898,7 @@ pub(crate) async fn attempt(
     // The handshake consumed the first activation; it is applied here, now that the session can
     // answer it. A pairing activation in it starts the attempt just as a later one does.
     let prepared = session.apply_activate(ready.activate).await;
-    if prepared.is_ok() && session.player_active() {
+    if prepared.is_ok() && session.needs_clock() {
         session.start_burst();
     }
 
@@ -1138,7 +1134,7 @@ impl Session<'_> {
         if self.sync_remaining == 0
             && self.burst_deadline.is_none()
             && self.reply_deadline.is_none()
-            && self.player_active()
+            && self.needs_clock()
             && self.burst_due()
         {
             self.start_burst();
@@ -1478,8 +1474,14 @@ impl Session<'_> {
             Ok(Some(activation)) => self.admitted_method(&activation).is_some(),
             Err(_) => true,
         };
-        if let Some(refusal) =
-            admit_activation(self.matched, unpaired_access, pairing_admissible, &activate).refusal()
+        if let Some(refusal) = admit_activation(
+            self.matched,
+            unpaired_access,
+            self.sink.is_some(),
+            pairing_admissible,
+            &activate,
+        )
+        .refusal()
         {
             return self.refuse_activation(refusal).await;
         }
@@ -1529,11 +1531,19 @@ impl Session<'_> {
             self.stop_stream(StreamEndReason::RoleRemoved)?;
         } else if !had_player && has_player {
             // A re-added role reports itself again, from the existing estimate when there is one.
+            // The report is owed to the player even when a player-less one went out before.
+            self.state_sent = false;
             if self.clock.sample_count() >= 1 {
                 self.send_client_state().await?;
             } else {
                 self.start_burst();
             }
+        }
+
+        // Only the player waits for the clock before its first `client/state`: a client that has
+        // roles but no player owes the initial report as soon as the activation names them.
+        if !self.state_sent && !self.active_roles.is_empty() && !self.player_active() {
+            self.send_client_state().await?;
         }
 
         if let Some(activation) = pairing {
@@ -2188,8 +2198,7 @@ impl Session<'_> {
     /// read could disagree with the cache and make `poll_timing` report a value twice.
     async fn write_client_state(&mut self) -> Result<()> {
         self.state_sent = true;
-        let pre_port_delay = self.sink.pre_port_delay();
-        let output_delay = self.sink.output_delay();
+        let (pre_port_delay, output_delay) = self.sink_delays();
         let output_changed = output_delay != self.output_delay;
         self.pre_port_delay = pre_port_delay;
         self.output_delay = output_delay;
@@ -2202,10 +2211,9 @@ impl Session<'_> {
                 .map_or(MAX_OUTPUT_DELAY_MS, |delay| delay.min(MAX_OUTPUT_DELAY_MS))
         });
         let required_lead_time_ms = self.required_lead_ms(pre_port_delay);
-        self.reported_lead_ms = Some(required_lead_time_ms);
-        let state = Incoming::ClientState(ClientState {
-            available: true,
-            player: Some(PlayerState {
+        let player = self.player_active().then(|| {
+            self.reported_lead_ms = Some(required_lead_time_ms);
+            PlayerState {
                 volume: Some(self.volume),
                 muted: Some(self.muted),
                 output_delay_ms,
@@ -2213,7 +2221,11 @@ impl Session<'_> {
                 min_buffer_ms: self.min_buffer_ms,
                 supported_commands: supported_player_commands(self.config),
                 format: None,
-            }),
+            }
+        });
+        let state = Incoming::ClientState(ClientState {
+            available: true,
+            player,
             artwork: None,
         });
         self.send_json(&state).await
@@ -2520,7 +2532,10 @@ impl Session<'_> {
     fn flush_sink(&mut self) -> Result<()> {
         self.queue.clear();
         self.arm_playout();
-        match self.sink.flush() {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        match sink.flush() {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.sink_failed = true;
@@ -2538,7 +2553,10 @@ impl Session<'_> {
         self.queue.discard_from(server_us);
         self.arm_playout();
         let due = self.playout_deadline(server_us);
-        match self.sink.discard_from(due) {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        match sink.discard_from(due) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.sink_failed = true;
@@ -2549,7 +2567,10 @@ impl Session<'_> {
 
     /// Opens the sink for a stream, recording a failure the caller has to treat as fatal.
     fn open_sink(&mut self, format: AudioFormat) -> Result<()> {
-        match self.sink.open(format) {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        match sink.open(format) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.sink_failed = true;
@@ -2560,7 +2581,10 @@ impl Session<'_> {
 
     /// Writes one frame, recording a failure the caller has to treat as fatal.
     fn write_sink(&mut self, frame: AudioFrame<'_>, due: Instant) -> Result<()> {
-        match self.sink.write(frame, due) {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        match sink.write(frame, due) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.sink_failed = true;
@@ -2626,8 +2650,7 @@ impl Session<'_> {
     /// is the same. Before the first state report exists, no state is sent here: the initial report
     /// that follows the clock estimate carries the new values anyway.
     async fn poll_timing(&mut self) -> Result<()> {
-        let pre_port_delay = self.sink.pre_port_delay();
-        let output_delay = self.sink.output_delay();
+        let (pre_port_delay, output_delay) = self.sink_delays();
         let lead = self.required_lead_ms(pre_port_delay);
         let lead_changed = self
             .reported_lead_ms
@@ -3052,8 +3075,28 @@ impl Session<'_> {
     }
 
     /// Whether the server activated the player role for this connection.
+    ///
+    /// A headless session has no sink and never takes the role, so the sink is part of the answer
+    /// even though the admission check already refuses an activation of the role without one.
     fn player_active(&self) -> bool {
-        self.role_active(PLAYER_ROLE)
+        self.sink.is_some() && self.role_active(PLAYER_ROLE)
+    }
+
+    /// Whether a role that needs the clock estimate is active.
+    ///
+    /// Only the player does today: it schedules audio against the converted clock. A role whose
+    /// state carries a server timestamp joins here with the scheduler that delivers it.
+    fn needs_clock(&self) -> bool {
+        self.player_active()
+    }
+
+    /// The delays the sink reports: before the audio port, and after it. A session without a
+    /// sink has neither.
+    fn sink_delays(&self) -> (Duration, Option<Duration>) {
+        match self.sink.as_deref() {
+            Some(sink) => (sink.pre_port_delay(), sink.output_delay()),
+            None => (Duration::ZERO, None),
+        }
     }
 
     /// Queues one event for the caller.
@@ -3127,6 +3170,7 @@ async fn handshake(
     candidates: &Candidates,
     previous_roles: &[String],
     unpaired_access: &AtomicBool,
+    sink: bool,
 ) -> Result<Ready, HandshakeError> {
     // 1. client/init. Its exact bytes are the first half of the Noise prologue.
     let client_init = Incoming::ClientInit(ClientInit {
@@ -3206,7 +3250,7 @@ async fn handshake(
     }
 
     // 6. client/hello.
-    let hello = client_hello(config, unpaired_access);
+    let hello = client_hello(config, unpaired_access, sink);
     let ciphertext = encrypt_json(&mut noise, &hello)?;
     transport.send_binary(ciphertext).await?;
 
@@ -3258,6 +3302,7 @@ pub(crate) async fn reject_concurrent(
     pairing_psk: Option<PairingPsk>,
     previous_roles: &[String],
     unpaired_access: &AtomicBool,
+    sink: bool,
 ) -> Result<()> {
     let candidates = Candidates::load(config.storage.as_deref(), &[], pairing_psk)?;
     let mut ready = match handshake(
@@ -3266,6 +3311,7 @@ pub(crate) async fn reject_concurrent(
         &candidates,
         previous_roles,
         unpaired_access,
+        sink,
     )
     .await
     {
@@ -3295,8 +3341,10 @@ pub(crate) async fn reject_concurrent(
 /// Builds the `client/hello` the client announces itself with.
 ///
 /// The unpaired-access value is read here, from the atomic the whole connection shares: the hello
-/// is what advertises the value a host may have changed while no session was live.
-fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool) -> Incoming {
+/// is what advertises the value a host may have changed while no session was live. `sink` says
+/// whether the client has an audio output: the player role and its support object are announced
+/// exactly then.
+fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool, sink: bool) -> Incoming {
     let codec = match config.audio_mode {
         AudioMode::Decode => "pcm",
         AudioMode::Passthrough => "flac",
@@ -3309,11 +3357,11 @@ fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool) -> Incoming
             software_version: info.software_version.clone(),
             mac_address: info.mac_address.clone(),
         }),
-        supported_roles: SUPPORTED_ROLES
-            .iter()
-            .map(|role| (*role).to_owned())
+        supported_roles: supported_roles(sink)
+            .into_iter()
+            .map(str::to_owned)
             .collect(),
-        player_support: Some(PlayerSupport {
+        player_support: sink.then(|| PlayerSupport {
             supported_formats: vec![SupportedFormat {
                 codec: codec.to_owned(),
                 channels: SUPPORTED_CHANNELS,
@@ -3566,6 +3614,7 @@ pub(crate) fn playback_capable_for(
 fn activation_admissible(
     matched: MatchedPsk,
     unpaired_access: bool,
+    sink: bool,
     activate: &ServerActivate,
 ) -> bool {
     let paired = is_paired(matched);
@@ -3574,10 +3623,8 @@ fn activation_admissible(
         return false;
     }
     let roles = activate.active_roles.as_deref().unwrap_or_default();
-    if !roles
-        .iter()
-        .all(|role| SUPPORTED_ROLES.contains(&role.as_str()))
-    {
+    let supported = supported_roles(sink);
+    if !roles.iter().all(|role| supported.contains(&role.as_str())) {
         return false;
     }
     roles.is_empty() || playback_capable_for(matched, unpaired_access, &activate.activities)
@@ -3598,10 +3645,11 @@ fn activation_admissible(
 pub(crate) fn admit_activation(
     matched: MatchedPsk,
     unpaired_access: bool,
+    sink: bool,
     pairing_admissible: bool,
     activate: &ServerActivate,
 ) -> Admitted {
-    if activation_admissible(matched, unpaired_access, activate) {
+    if activation_admissible(matched, unpaired_access, sink, activate) {
         return Admitted::Admissible;
     }
     // Rule 1: unpaired access is off, and turning it on would have admitted this activation -
@@ -3609,7 +3657,7 @@ pub(crate) fn admit_activation(
     if !unpaired_access
         && !is_paired(matched)
         && pairing_admissible
-        && activation_admissible(matched, true, activate)
+        && activation_admissible(matched, true, sink, activate)
     {
         return Admitted::PairingRequired;
     }
@@ -4187,7 +4235,7 @@ mod tests {
             transport,
             noise,
             config,
-            sink: Box::new(NullSink),
+            sink: Some(Box::new(NullSink)),
             events,
             reported_volume,
             clock: ClockFilter::new(),
@@ -4525,7 +4573,7 @@ mod tests {
         );
         for unpaired_access in [true, false] {
             assert_eq!(
-                admit_activation(LONG_TERM, unpaired_access, true, &activate),
+                admit_activation(LONG_TERM, unpaired_access, true, true, &activate),
                 Admitted::Admissible
             );
         }
@@ -4534,7 +4582,7 @@ mod tests {
     #[test]
     fn a_paired_session_may_not_declare_the_pairing_activity() {
         assert_eq!(
-            admit_activation(LONG_TERM, true, true, &activation(&["pairing"], None)),
+            admit_activation(LONG_TERM, true, true, true, &activation(&["pairing"], None)),
             Admitted::Unauthorized,
             "a connection keyed by a long-term PSK has nothing left to pair"
         );
@@ -4545,6 +4593,7 @@ mod tests {
         assert_eq!(
             admit_activation(
                 LONG_TERM,
+                true,
                 true,
                 true,
                 &activation(&["playback", "kiosk"], None)
@@ -4560,6 +4609,7 @@ mod tests {
                 LONG_TERM,
                 true,
                 true,
+                true,
                 &activation(&["playback", "playback"], None)
             ),
             Admitted::Unauthorized,
@@ -4573,7 +4623,7 @@ mod tests {
         for matched in [MatchedPsk::Sentinel, MatchedPsk::PairingPsk, LONG_TERM] {
             for unpaired_access in [true, false] {
                 assert_eq!(
-                    admit_activation(matched, unpaired_access, true, &activate),
+                    admit_activation(matched, unpaired_access, true, true, &activate),
                     Admitted::Admissible,
                     "{matched:?} with unpaired access {unpaired_access}"
                 );
@@ -4587,6 +4637,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
+                true,
                 true,
                 &activation(&["pairing"], None)
             ),
@@ -4602,6 +4653,7 @@ mod tests {
                 MatchedPsk::Sentinel,
                 false,
                 true,
+                true,
                 &activation(&["playback"], Some(&["player@v1"]))
             ),
             Admitted::PairingRequired
@@ -4614,6 +4666,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
+                true,
                 true,
                 &activation(&[], Some(&["player@v1"]))
             ),
@@ -4629,6 +4682,7 @@ mod tests {
                 MatchedPsk::Sentinel,
                 false,
                 true,
+                true,
                 &activation(&["playback"], Some(&["source@v1"]))
             ),
             Admitted::Unauthorized,
@@ -4642,6 +4696,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::PairingPsk,
                 false,
+                true,
                 true,
                 &activation(&["playback"], Some(&["player@v1"]))
             ),
@@ -4663,12 +4718,12 @@ mod tests {
             }),
         };
         assert_eq!(
-            admit_activation(MatchedPsk::Sentinel, false, true, &activate),
+            admit_activation(MatchedPsk::Sentinel, false, true, true, &activate),
             Admitted::PairingRequired,
             "with the method assumed acceptable, enabling unpaired access admits the activation"
         );
         assert_eq!(
-            admit_activation(MatchedPsk::Sentinel, false, false, &activate),
+            admit_activation(MatchedPsk::Sentinel, false, true, false, &activate),
             Admitted::Unauthorized,
             "the wrong method keeps the activation refused whatever the setting"
         );
@@ -4679,6 +4734,7 @@ mod tests {
         assert_eq!(
             admit_activation(
                 MatchedPsk::Sentinel,
+                true,
                 true,
                 true,
                 &activation(&[], Some(&["player@v1"]))
@@ -4693,6 +4749,7 @@ mod tests {
             admit_activation(
                 LONG_TERM,
                 false,
+                true,
                 true,
                 &activation(&[], Some(&["player@v1"]))
             ),

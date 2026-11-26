@@ -932,6 +932,8 @@ async fn serve(
             .context("the client never connected")?;
         // The same socket type as the dialling harness: the transport inside is plain either way,
         // and one alias keeps every helper usable for both directions.
+        // Small writes (an answer to `client/time`, a ping) must not wait behind an unacknowledged one.
+        let _ = tcp.set_nodelay(true);
         let socket = accept_async(MaybeTlsStream::Plain(tcp))
             .await
             .context("the WebSocket upgrade failed")?;

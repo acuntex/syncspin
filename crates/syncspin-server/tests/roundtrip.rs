@@ -188,3 +188,50 @@ async fn a_real_client_plays_our_stream_on_schedule() -> Result<()> {
     server.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_headless_client_receives_the_servers_track_metadata() -> Result<()> {
+    let config = ServerConfig {
+        bind: "127.0.0.1:0".parse().expect("a literal address parses"),
+        format: AudioFormat::pcm(48_000, 2, 16),
+        ..ServerConfig::new("A test server", syncspin_server::Identity::generate())
+    };
+    let server = Server::start(config).await?;
+    let port = server.local_addr().port();
+    let identity = Identity::generate();
+    server.approve(&identity.public_base64()).await?;
+
+    // No sink: the client offers controller and metadata only, so the server activates those two
+    // and never starts a player stream for it.
+    let client_config = ClientConfig::new(format!("127.0.0.1:{port}"), "A test display", identity);
+    let (mut handle, mut events) = Client::connect_headless(client_config).await?;
+    let _stream = server.open_stream(TrackInfo {
+        title: Some("A title".to_owned()),
+        artist: Some("An artist".to_owned()),
+        duration: Some(Duration::from_secs(200)),
+        ..TrackInfo::default()
+    });
+
+    loop {
+        let event = tokio::time::timeout(TIMEOUT, events.next())
+            .await
+            .context("the headless client did not report the track")?
+            .context("the client's event stream ended")?;
+        match event {
+            Event::Track { title, artist, .. } => {
+                assert_eq!(title, "A title");
+                assert_eq!(artist, "An artist");
+                break;
+            }
+            Event::StreamStart { .. } => bail!("a headless client must not be given a stream"),
+            Event::Disconnected { reason, .. } => bail!("the client disconnected: {reason}"),
+            _ => continue,
+        }
+    }
+
+    handle.close(GoodbyeReason::Shutdown);
+    drop(events);
+    drop(handle);
+    server.shutdown().await?;
+    Ok(())
+}

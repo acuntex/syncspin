@@ -88,6 +88,10 @@
 //! position, duration and playback speed. The end and clear events arrive before the client
 //! discards or flushes the buffered audio, so the host can mute, stop or restart its output first.
 //!
+//! A host with no audio output uses [`connect_headless`] instead: the client then has no sink, does
+//! not offer the `player@v1` role and reports no player state, and it starts its first
+//! `client/state` and its clock as soon as the server activates a role.
+//!
 //! The connection keeps running until the audio sink fails, which the host has to repair, or until
 //! the handle or the event stream is dropped.
 
@@ -97,16 +101,17 @@ mod config;
 mod discovery;
 mod pairing;
 mod playout;
+mod roles;
 mod session;
 mod sink;
 
 pub mod storage;
 
 pub use client::{
-    clamp_volume, clamp_volume_with, connect, connect_with_psks, next_backoff, Client,
-    ClientHandle, ControlHandle, Event, EventStream, GoodbyeReason, PairingFailure,
-    PairingRequiredReason, PlaybackState, StreamEndReason, DEFAULT_PAIRING_TIMEOUT,
-    INITIAL_BACKOFF, NORMAL_PLAYBACK_SPEED,
+    clamp_volume, clamp_volume_with, connect, connect_headless, connect_headless_with_psks,
+    connect_with_psks, next_backoff, Client, ClientHandle, ControlHandle, Event, EventStream,
+    GoodbyeReason, PairingFailure, PairingRequiredReason, PlaybackState, StreamEndReason,
+    DEFAULT_PAIRING_TIMEOUT, INITIAL_BACKOFF, NORMAL_PLAYBACK_SPEED,
 };
 pub use config::{
     AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, DEFAULT_MAX_BACKOFF,
@@ -120,7 +125,9 @@ pub use config::{
 #[cfg(feature = "mdns")]
 pub use discovery::MdnsDiscovery;
 #[cfg(feature = "discovery")]
-pub use discovery::{advertise, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT};
+pub use discovery::{
+    advertise, advertise_headless, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT,
+};
 pub use discovery::{
     discover_reachable_endpoint, discover_servers, reachable_endpoint, DiscoveredServer, Discovery,
     ServiceAdvertisement, CLIENT_SERVICE_TYPE, DEFAULT_SENDSPIN_PATH, SERVER_SERVICE_TYPE,

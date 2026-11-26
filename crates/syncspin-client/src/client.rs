@@ -1098,6 +1098,23 @@ impl Client {
         connect_with_psks(config, sink, psks).await
     }
 
+    /// Connects without an audio output.
+    ///
+    /// See [`connect_headless`] for the details.
+    pub async fn connect_headless(config: ClientConfig) -> Result<(ClientHandle, EventStream)> {
+        connect_headless(config).await
+    }
+
+    /// Connects without an audio output, with pairing keys the host stores for known servers.
+    ///
+    /// See [`connect_headless_with_psks`] for the details.
+    pub async fn connect_headless_with_psks(
+        config: ClientConfig,
+        psks: Vec<StoredPsk>,
+    ) -> Result<(ClientHandle, EventStream)> {
+        connect_headless_with_psks(config, psks).await
+    }
+
     /// Advertises this client and serves the servers that connect to it.
     ///
     /// See [`advertise`](crate::advertise) for the details.
@@ -1107,6 +1124,14 @@ impl Client {
         sink: Box<dyn Sink>,
     ) -> Result<(ClientHandle, EventStream)> {
         crate::advertise(config, sink).await
+    }
+
+    /// Advertises this client without an audio output and serves the servers that connect to it.
+    ///
+    /// See [`advertise_headless`](crate::advertise_headless) for the details.
+    #[cfg(feature = "discovery")]
+    pub async fn advertise_headless(config: ClientConfig) -> Result<(ClientHandle, EventStream)> {
+        crate::advertise_headless(config).await
     }
 }
 
@@ -1158,6 +1183,51 @@ pub async fn connect(
 pub async fn connect_with_psks(
     config: ClientConfig,
     sink: Box<dyn Sink>,
+    psks: Vec<StoredPsk>,
+) -> Result<(ClientHandle, EventStream)> {
+    start(config, Some(sink), psks).await
+}
+
+/// Connects without an audio output and returns its handle and event stream.
+///
+/// A headless client has no [`Sink`]: it does not advertise or take the `player@v1` role, plays no
+/// audio and reports no player state. It takes part in the other roles the build supports -
+/// controller and metadata - so it suits a remote control, a display or a bridge. Everything else
+/// is as for [`connect`]: the configuration is validated before this returns, the connection runs
+/// in a spawned task and reconnects on its own, and the player fields of [`ClientConfig`]
+/// (`audio_mode`, `volume`, `muted`, `volume_policy`, `output_delay_control`,
+/// `required_lead_time_ms` and `min_buffer_ms`) are ignored.
+///
+/// The client sends its first `client/state` as soon as the server's first activation names a
+/// role, because only the player waits for the clock.
+///
+/// # Errors
+/// Same as [`connect`].
+///
+/// # Panics
+/// Panics when called outside a Tokio runtime, because the connection is spawned.
+pub async fn connect_headless(config: ClientConfig) -> Result<(ClientHandle, EventStream)> {
+    connect_headless_with_psks(config, Vec::new()).await
+}
+
+/// Connects without an audio output, with pairing keys the host stores for known servers.
+///
+/// The headless counterpart of [`connect_with_psks`]; see [`connect_headless`] for what headless
+/// means.
+///
+/// # Errors
+/// Same as [`connect_with_psks`].
+pub async fn connect_headless_with_psks(
+    config: ClientConfig,
+    psks: Vec<StoredPsk>,
+) -> Result<(ClientHandle, EventStream)> {
+    start(config, None, psks).await
+}
+
+/// Shared body of the connect entry points; `sink` is `None` for a headless client.
+async fn start(
+    config: ClientConfig,
+    sink: Option<Box<dyn Sink>>,
     psks: Vec<StoredPsk>,
 ) -> Result<(ClientHandle, EventStream)> {
     // connection.md, _Server Initiated Connections_: "Clients MUST NOT manually connect to servers
@@ -1383,9 +1453,13 @@ async fn serve_until_dropped(
         // Nothing buffered for the session that ended may become audible later; the flush runs
         // before the host hears about the drop so the output stops even if the next attempt takes
         // a while.
-        let flush_error = carried.sink.flush().err().map(|error| {
-            error.context("the audio sink rejected a flush after the connection ended")
-        });
+        let flush_error = carried
+            .sink
+            .as_mut()
+            .and_then(|sink| sink.flush().err())
+            .map(|error| {
+                error.context("the audio sink rejected a flush after the connection ended")
+            });
 
         // A deliberate close is not a drop: nothing is reported and no attempt follows. The
         // goodbye was best effort, so neither its send nor the flush can turn it into an error.
@@ -1718,7 +1792,7 @@ mod tests {
 
     fn empty_carried(control: Option<mpsc::UnboundedReceiver<ControlRequest>>) -> Carried {
         Carried {
-            sink: Box::new(NullSink),
+            sink: Some(Box::new(NullSink)),
             control,
             volume: 42,
             muted: false,

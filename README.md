@@ -312,6 +312,21 @@ while let Some(event) = events.next().await {
 `handle.control()` returns the play/pause/skip, seek, volume and mute controls; dropping the handle
 or the event stream ends the connection.
 
+A host with no audio output - a remote control, a display or a bridge - connects headless. The
+client then has no `Sink`: it does not advertise or take `player@v1`, reports no player state and
+starts its clock and its first `client/state` as soon as the server activates a role.
+`connect_headless`, `connect_headless_with_psks` and, with the `discovery` feature,
+`advertise_headless` are the entry points; a server that activates `player@v1` on such a client gets
+`client/goodbye` reason `unauthorized`, as for any role the client did not offer. The player fields
+of `ClientConfig` are ignored.
+
+```rust
+let (handle, mut events) = Client::connect_headless(config).await?;
+while let Some(event) = events.next().await {
+    // Track, State, Disconnected, ...
+}
+```
+
 ## Integrating a server
 
 A host supplies the server's identity, an optional

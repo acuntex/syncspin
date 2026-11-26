@@ -174,7 +174,9 @@ impl Client {
 }
 ```
 
-Decisions: events as an async stream (no callback trait), reconnect/backoff and volume reporting
+Decisions: a client may run without a `Sink` (`connect_headless`): it then offers no `player@v1`,
+reports no player state and takes part in the other roles only; events as an async stream (no
+callback trait), reconnect/backoff and volume reporting
 inside the crate, `Sink` receives audio frames (decoded or pass-through) when their write time
 arrives and writes them on call, pushback via blocking `write` on its own task. The crate owns the
 time filter, the playout queue and therefore the schedule: each frame's server timestamp becomes a

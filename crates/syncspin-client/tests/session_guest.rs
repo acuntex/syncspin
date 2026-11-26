@@ -4190,8 +4190,11 @@ async fn readding_the_player_role_before_the_clock_is_ready_starts_a_burst() {
         connect_to(&server, syncspin_client::AudioMode::Passthrough, sink).await;
     expect_connected(&mut events, &server).await;
 
-    // No player role was active, so no clock burst ran. Adding it has to start one, and the state
-    // report follows the first sample.
+    // No player role was active, so no clock burst ran, and the initial report - owed to any client
+    // with a role - carries no player object. Adding the role has to start a burst, and the state
+    // report that follows the first sample carries the player.
+    let initial = wait_for_client_state(&mut server).await;
+    assert!(initial.player.is_none(), "no player role, no player object");
     server.activate(&["player@v1", "metadata@v1"]);
     let state = wait_for_client_state(&mut server).await;
     assert_eq!(
