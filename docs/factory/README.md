@@ -68,9 +68,8 @@ scripts/factory.sh --dry-run --backend claude "anything"   # print the phases an
 ```
 
 `--allow-protected`, `--plan-rounds N`, `--code-rounds N`, `--model-helper M`, `--model-main M`,
-`--variant-helper V`, `--variant-main V`, `--opencode-attach URL`,
-`--allow-protected`, `--plan-rounds N`, `--code-rounds N`, `--model-helper M`, `--model-main M`,
-`--phase-timeout SECS`. `FACTORY_PASS_ENV` names the variables to pass to the agent (for a model
+`--variant-helper V`, `--variant-main V`, `--opencode-attach URL`, `--opencode-bin PATH` and
+`--phase-timeout SECS` are the other options. `FACTORY_PASS_ENV` names the variables to pass to the agent (for a model
 provider key); everything else is removed from its environment.
 
 `--stop-after plan` stops after the reviewed plan and leaves the branch that preflight created in the
@@ -173,11 +172,16 @@ through `scripts/factory-launch.sh`. It checks its arguments, then detaches `scr
 systemd user unit `factory-<id>` (when `systemctl --user` answers) or with `setsid` and a log file
 under `.factory/launch/`, and returns a short summary at once.
 
-| Command                    | What it does                                                                     |
-| -------------------------- | -------------------------------------------------------------------------------- |
-| `/factory <task text>`     | Asks how far to go and where to run, writes the task file, starts a detached run |
-| `/factory-resume <run id>` | Reads why the run stopped, asks the open owner decisions, resumes the run        |
-| `/factory-status [run id]` | Summarises the configuration, the launches and a run, and offers the next step   |
+| Command           | What it does                                                                    |
+| ----------------- | ------------------------------------------------------------------------------- |
+| `/factory`        | Asks for the task, how far to go and where to run, then starts a detached run   |
+| `/factory-resume` | Lists the resumable runs, asks which, asks the open owner decisions, resumes it |
+| `/factory-status` | Summarises the configuration, the launches and the runs, and offers a next step |
+
+The commands take no arguments: OpenCode may expand `!` shell substitution and `@` file references in
+a command template after it has substituted the typed arguments (unverified), so the templates hold no
+`$ARGUMENTS`, no `$1` and no such syntax, and everything the owner types comes back as the answer to a
+`question`, which is a tool result and not template text. A static test pins this.
 
 The commands run in the generated `factory-launcher` agent (`.opencode/agents/factory-launcher.md`).
 Its rules: bash denied except `scripts/factory-launch.sh *`, every shared deny last; `edit` only under
@@ -191,7 +195,7 @@ Every question comes from the OpenCode `question` tool: a header, the question, 
 each with a one-sentence explanation of its consequence, and a free-text answer. The recommended option
 comes first and says `(Recommended)`. The agent asks in the language you wrote in.
 
-- `/factory`: one call with the task (only if you gave none), how far to go and, if a server is
+- `/factory`: one call with the task (the free-text answer), how far to go and, if a server is
   configured, where to run. A second call confirms the exact, secret-free command. The confirmation
   cannot share the first call, because the command depends on the first answers.
   - Plan only (recommended for a first run: cheap, no code is written): `--no-push --stop-after plan`.
@@ -199,20 +203,21 @@ comes first and says `(Recommended)`. The agent asks in the language you wrote i
   - Through a pull request: `--stop-after pr` (the driver pushes the factory branch and opens it).
   - Attached to the configured server (recommended, the run is visible and steerable there): no
     argument. A private server of its own: `--no-attach`.
-- `/factory-resume <run id>`: for exit 10 the agent reads the `## Owner decisions` section of `plan.md`
+- `/factory-resume`: the agent lists the runs stopped with exit 10 or 20 (`--status`, read-only) and
+  asks which to resume, recommending the most recent. For exit 10 it reads the `## Owner decisions` section of `plan.md`
   and asks each decision with concrete options, what each means and its own recommendation, labelled
   `(My recommendation)` with the reason. Your answers are written to
   `.factory/launch/decisions-<run id>.md`, which the launcher copies to the run's `decisions.md`
   before the driver resumes. For exit 20 it explains the cause and offers resume, the log tail or
-  nothing. For exits 11 to 16 the run is not resumable: it explains and offers the handoff, a log
-  tail or nothing.
-- `/factory-status`: a summary (phase, step, rounds, exit code, phase durations from the logs) and one
-  question offering what fits: stop a running launch, resume, or nothing.
+  nothing. Runs stopped with exits 11 to 16 are not resumable and are not offered.
+- `/factory-status`: a summary of all launches and runs, then one question offering what fits: look
+  at one run in detail (phase, step, rounds, exit code, phase durations from the logs), stop a running
+  launch, resume (it points to `/factory-resume`), or nothing.
 
 The task text and your answers are data: the prompts say so, and the agent runs nothing but the
-launcher. If the `question` tool is not available (a headless run), the agent says so, uses the
-recommended defaults of the non-destructive choices and, for an owner decision, prints the open
-questions and stops.
+launcher. If the `question` tool is not available (a headless run), the agent says so and stops:
+`/factory` has no task without an answer, `/factory-resume` prints the resumable runs and the open
+owner decisions instead of guessing, and `/factory-status` prints the summary.
 
 ### Configuring the server
 
@@ -255,10 +260,12 @@ on until its own timeout.
 - Anyone who can use the server's interface can start agents on that machine, with the credentials of
   the user the server runs as. The launcher agent is restricted, but the user's own agents on the
   same server are not.
-- A command template is expanded by OpenCode before the agent sees it. OpenCode runs shell
-  substitutions and attaches `@` file references that appear in it, and the task text is part of the
-  template: text typed after `/factory` can reach them outside the agent's permissions. This is
-  unverified; assume it, and read the command as a convenience for the owner, not as a boundary.
+- A command template is expanded by OpenCode before the agent sees it, and OpenCode may run `!`
+  shell substitutions and attach `@` file references that appear in it after substituting typed
+  arguments (unverified). That is why the commands take no arguments and the templates carry none of
+  that syntax; the owner's text only ever arrives as a `question` answer, a tool result. Keep it that
+  way when you edit the sources: the static test fails on `$ARGUMENTS`, `$` and a digit, `!` and a
+  backtick, and `@` and a path character.
 - Plain-HTTP basic auth sends the password unencrypted off loopback.
 - The detached run uses the owner's credentials (`gh`, `ssh`, git helpers) like any driver run. Use a
   throwaway clone and a scoped, non-admin token for anything beyond local, low-risk runs.
@@ -268,8 +275,8 @@ on until its own timeout.
   `read` is matched against is not verified.
 - Unverified until tried by hand, in both generations: that OpenCode finds commands in
   `.opencode/commands/` (the 1.x layout here uses `.opencode/agents/`; the current documentation names
-  `commands/`, and `command/` as the older spelling), that the `description` and `agent` keys and the
-  `$ARGUMENTS` placeholder work as the documentation says in 1.x and in 2.x, that the `question` tool
+  `commands/`, and `command/` as the older spelling), that the `description` and `agent` keys work as the
+  documentation says in 1.x and in 2.x, that the `question` tool
   exists in the generation you run and under the `question` permission key, that a client shows it
   (the documentation says it needs one that supports the interactive form), and what it does in a
   headless `opencode run`.

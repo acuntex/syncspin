@@ -252,10 +252,13 @@ The commands in `.opencode/commands/` run in the `factory-launcher` agent, gener
 class `launcher`: `question` allowed; `read` denied except `.factory/runs/*` and `.factory/launch/*`;
 `edit` denied except `.factory/launch/*`; `bash` denied except `scripts/factory-launch.sh *`, then
 every deny of the shared lists last. They ask the owner with the `question` tool (explanation and a
-recommendation on every question), treat the task text and the answers as data, use the recommended
-defaults without the tool and stop on an owner decision rather than guess. Unverified: the command
-directory and keys, the `question` tool and its permission key, and the template expansion of
-`$ARGUMENTS`, in OpenCode 1.x and 2.x. See the README.
+recommendation on every question), treat the task text and the answers as data and stop without the
+tool rather than guess. The commands take no arguments: a template may be expanded for `!` shell
+substitution and `@` file references after OpenCode substitutes typed arguments (unverified), so
+the templates hold no `$ARGUMENTS`, `$<digit>`, `!` followed by a backtick or `@` followed by a path
+character (a static test pins it), and the owner's text arrives only as a `question` answer.
+Unverified: the command directory and keys and the `question` tool with its permission key, in
+OpenCode 1.x and 2.x. See the README.
 
 ## Hooks
 
