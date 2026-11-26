@@ -2443,6 +2443,11 @@ mod tests {
                 ..Default::default()
             },
         );
+        // `report_returning` floors the member's next chunk at the report instant plus 1 µs, so a
+        // chunk scheduled at that same microsecond is skipped. A fast host usually crosses the
+        // floor before the write below; a loaded CI runner does not, and the write then lands on
+        // the floor. Sleep past it so the test does not depend on the scheduler.
+        std::thread::sleep(Duration::from_millis(1));
         assert_eq!(
             group.write_audio(&[0u8; 480 * 4], None),
             WriteOutcome::Written,
