@@ -20,6 +20,11 @@
 //! 20 ms, until Ctrl-C. The identity is generated per run: this example holds no key material on
 //! disk, so every start is a new server to a client that paired with the previous one.
 //!
+//! With `--revoke-after <secs>` the demo takes its approval back that long after it opened the
+//! stream, which is the operator action that removes the player role from a client that is
+//! playing. A client that leaves before the deadline is not revoked: the deadline is dropped with
+//! the connection.
+//!
 //! Nothing here decodes, queues or reads a file. A real host replaces the tone with its own frames
 //! and keeps its identity in storage it owns.
 
@@ -33,7 +38,7 @@ use syncspin_server::MdnsDiscovery;
 use syncspin_server::{
     Discovery, Event, Identity, Server, ServerConfig, StreamWriter, TrackInfo, MAX_SERVER_NAME_LEN,
 };
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, sleep_until, Instant, MissedTickBehavior};
 
 /// Sample rate of the demo stream, the rate every player must support.
 const SAMPLE_RATE: u32 = 48_000;
@@ -87,6 +92,9 @@ struct Options {
     bind: SocketAddr,
     /// Name announced in `server/hello`.
     name: String,
+    /// How long after the stream opens the demo revokes its approval, when `--revoke-after` asks
+    /// for it.
+    revoke_after: Option<Duration>,
     /// Whether to publish the server over mDNS and dial advertising clients.
     #[cfg(feature = "mdns")]
     mdns: bool,
@@ -107,6 +115,7 @@ where
 {
     let mut bind = DEFAULT_BIND;
     let mut name = DEFAULT_NAME.to_owned();
+    let mut revoke_after = None;
     #[cfg(feature = "mdns")]
     let mut mdns = false;
     let mut args = args.into_iter();
@@ -121,6 +130,13 @@ where
                     .map_err(|_| anyhow!("--bind needs an IP:port address, got {value:?}"))?;
             }
             "--name" => name = take_value(flag, inline, &mut args)?,
+            "--revoke-after" => {
+                let value = take_value(flag, inline, &mut args)?;
+                let secs: u64 = value.parse().map_err(|_| {
+                    anyhow!("--revoke-after needs a whole number of seconds, got {value:?}")
+                })?;
+                revoke_after = Some(Duration::from_secs(secs));
+            }
             #[cfg(feature = "mdns")]
             "--mdns" => mdns = true,
             #[cfg(not(feature = "mdns"))]
@@ -142,6 +158,7 @@ where
     Ok(Parse::Run(Options {
         bind,
         name,
+        revoke_after,
         #[cfg(feature = "mdns")]
         mdns,
     }))
@@ -196,6 +213,8 @@ Usage: server-demo [options]
 Options:
       --bind <ip:port>        Address to listen on [default: {DEFAULT_BIND}]
       --name <server name>    Name this server announces [default: {DEFAULT_NAME}]
+      --revoke-after <secs>   Revoke the approval this many seconds after the
+                              stream opens, to reproduce a role loss
 "
     );
     #[cfg(feature = "mdns")]
@@ -262,6 +281,12 @@ async fn run(options: Options) -> Result<()> {
     let tone = tone();
     let mut events = server.events();
     let mut stream: Option<(StreamWriter, usize)> = None;
+    // The client the demo approved, from the event that names it: the activation would carry the
+    // same id, but the connection is where the approval happened, so that is the id the revocation
+    // names. `revoke_at` is the deadline `--revoke-after` asked for, running only while a stream is
+    // open.
+    let mut approved_client: Option<String> = None;
+    let mut revoke_at: Option<Instant> = None;
     let mut pace = interval(Duration::from_millis(20));
     pace.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let ctrl_c = tokio::signal::ctrl_c();
@@ -282,6 +307,7 @@ async fn run(options: Options) -> Result<()> {
                             eprintln!("could not approve {client_id}: {error}");
                         }
                     }
+                    approved_client = Some(client_id);
                 }
                 Some(Event::ClientActivated { roles, .. }) => {
                     eprintln!("activated with roles: {}", roles.join(", "));
@@ -291,10 +317,20 @@ async fn run(options: Options) -> Result<()> {
                             ..TrackInfo::default()
                         });
                         stream = Some((writer, 0));
+                        // The delay counts from here, not from the connection: the operator's
+                        // stream is what the role loss has to interrupt.
+                        revoke_at = options
+                            .revoke_after
+                            .map(|delay| Instant::now() + delay);
                         eprintln!("streaming a {TONE_HZ} Hz tone");
                     }
                 }
-                Some(Event::ClientLeft { reason }) => eprintln!("client left: {reason}"),
+                Some(Event::ClientLeft { reason }) => {
+                    eprintln!("client left: {reason}");
+                    // A deadline for a client that is gone would only wake the loop to revoke an
+                    // approval nobody holds a connection for, so it is dropped with the client.
+                    revoke_at = None;
+                }
                 Some(other) => eprintln!("{other:?}"),
                 None => break,
             },
@@ -306,6 +342,19 @@ async fn run(options: Options) -> Result<()> {
                     let _ = writer.write(&tone[*offset..*offset + CHUNK_BYTES]);
                     *offset = (*offset + CHUNK_BYTES) % tone.len();
                 }
+            }
+            // A disabled `select!` branch still evaluates its expression, so the unwrap sits
+            // inside the async block: it runs only on an iteration whose deadline exists.
+            _ = async { sleep_until(revoke_at.unwrap()).await }, if revoke_at.is_some() => {
+                if let Some(client_id) = approved_client.as_deref() {
+                    match server.revoke_approval(client_id).await {
+                        Ok(()) => eprintln!("revoked the approval for {client_id}"),
+                        Err(error) => {
+                            eprintln!("could not revoke the approval for {client_id}: {error}");
+                        }
+                    }
+                }
+                revoke_at = None;
             }
         }
     }
@@ -342,6 +391,16 @@ mod tests {
     }
 
     #[test]
+    fn revoke_after_parses_seconds() {
+        let parsed = options(&["--revoke-after", "20"]);
+        assert_eq!(parsed.revoke_after, Some(Duration::from_secs(20)));
+        assert_eq!(
+            options(&["--revoke-after=5"]).revoke_after,
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
     fn flags_accept_an_inline_value() {
         let options = options(&["--bind=127.0.0.1:0", "--name=Test server"]);
 
@@ -364,6 +423,8 @@ mod tests {
             &["--bind", ""][..],
             &["--name"][..],
             &["--name", &too_long][..],
+            &["--revoke-after"][..],
+            &["--revoke-after", "soon"][..],
             &["--bogus"][..],
         ] {
             assert!(parse(args).is_err(), "{args:?} must be rejected");
@@ -433,6 +494,7 @@ mod tests {
         let text = usage();
         assert!(text.contains("--bind"), "got: {text}");
         assert!(text.contains("--name"), "got: {text}");
+        assert!(text.contains("--revoke-after"), "got: {text}");
         assert!(text.contains("--help"), "got: {text}");
         #[cfg(feature = "mdns")]
         assert!(text.contains("--mdns"), "got: {text}");
