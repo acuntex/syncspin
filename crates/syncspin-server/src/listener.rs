@@ -43,7 +43,9 @@ use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{accept_hdr_async, connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    accept_hdr_async, connect_async_with_config, MaybeTlsStream, WebSocketStream,
+};
 
 use crate::group::{Group, Outbound, CONTROLLER_ROLE, METADATA_ROLE, PLAYER_ROLE};
 use crate::pairing::{self, Attempt, CodeFormat, PairingMethod};
@@ -115,6 +117,9 @@ pub(crate) async fn run(
             }
             accepted = listener.accept() => {
                 let (stream, _address) = accepted.context("failed to accept a connection")?;
+                // Small writes (`server/time`, `server/state`, pings) must not wait behind audio
+                // that is still unacknowledged.
+                let _ = stream.set_nodelay(true);
                 let config = config.clone();
                 let group = group.clone();
                 let events = events.clone();
@@ -166,7 +171,8 @@ pub(crate) async fn connect(
     registry: Arc<Registry>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (socket, _response) = connect_async(url)
+    // As for accepted sockets: small writes must not wait behind unacknowledged audio.
+    let (socket, _response) = connect_async_with_config(url, None, true)
         .await
         .with_context(|| format!("failed to connect to the client at {url}"))?;
     serve_socket(socket, config, group, events, registry, shutdown).await
