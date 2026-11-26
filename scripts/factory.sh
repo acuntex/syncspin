@@ -535,6 +535,20 @@ claude_tools() {
   printf '%s' "$list"
 }
 
+# claude_denies: the deny rules of the factory layer as one comma-separated Bash(...) list. They are
+# passed per phase (--disallowedTools) and not committed in .claude/settings.json, so interactive
+# sessions in this repository are not restricted by them.
+claude_denies() {
+  local list="" line f
+  for f in project factory; do
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] || continue
+      list="$list${list:+,}Bash($line)"
+    done <"docs/factory/meta/deny-$f.txt"
+  done
+  printf '%s' "$list"
+}
+
 # build_cmd <role> <access> <phase> <prompt> [artifact]: fills the global array `cmd`.
 build_cmd() {
   local role=$1 access=$2 phase=$3 prompt=$4 artifact=${5:-} model
@@ -551,7 +565,7 @@ build_cmd() {
       if [ -n "$model" ]; then cmd+=(--model "$model"); fi
       # --strict-mcp-config without --mcp-config: no MCP server is loaded, so nothing from the user's
       # own configuration runs inside a factory run or creates files the snapshot would flag.
-      cmd+=(--permission-mode dontAsk --allowedTools "$(claude_tools "$access" "$artifact")" --strict-mcp-config --no-session-persistence --output-format text)
+      cmd+=(--permission-mode dontAsk --allowedTools "$(claude_tools "$access" "$artifact")" --disallowedTools "$(claude_denies)" --strict-mcp-config --no-session-persistence --output-format text)
       ;;
   esac
 }

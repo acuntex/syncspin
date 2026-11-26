@@ -5,8 +5,10 @@
 
 A small last-match-wins evaluator over opencode.json, the generated OpenCode agent overlays and,
 when a directory is given, the rules `opencode` resolved for each agent (one JSON file per agent,
-a list of {permission, pattern, action}). Claude Code's settings are checked with a matcher where
-deny wins over ask over allow. In both tools a trailing " *" in a pattern is optional, so the bare
+a list of {permission, pattern, action}). Claude Code's settings and the per-phase grants plus the
+driver's deny list are checked with a matcher where deny wins over ask over allow. The
+project-level files must hold only the AGENTS.md denies; every other restriction is checked in the
+factory layer. In both tools a trailing " *" in a pattern is optional, so the bare
 command "git status" matches "git status *". Prints one PASS, FAIL or SKIP line per check.
 """
 
@@ -98,27 +100,69 @@ with open(repo + "/.claude/settings.json") as f:
     cc = json.load(f)
 global_rules = flatten(oc["permission"])
 
-denied = [
-    "gh pr merge 1", "gh api repos/x", "git config user.name x", "bash -c true", "sh -c true",
-    "env x", "curl http://x", "wget http://x", "sudo true", "git commit --no-verify -m x",
-    "git commit -n -m x", "git commit -m x -n", "git push origin main", "git push --force origin x",
-    "git push --no-verify origin x", "git -c a=b status", "git -C . status", "rm -rf x", "python3 x",
-    "git commit --no-ver -m x", "git push origin HEAD:refs/heads/main",
-    "git diff --output=x", "git log --output=x", "git show HEAD --output=x",
-]
-for cmd in denied:
-    check("opencode denies: " + cmd, decide(global_rules, "bash", cmd) == "deny")
-    check("claude denies: " + cmd, claude_decide(cc, cmd) == "deny")
 
 def read_list(name):
     with open(repo + "/docs/factory/meta/claude-allow-" + name + ".txt") as f:
         return [line.strip() for line in f if line.strip()]
 
 
+def read_deny(name):
+    with open(repo + "/docs/factory/meta/deny-" + name + ".txt") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+deny_project = read_deny("project")
+deny_factory = read_deny("factory")
+
+# The project-level files hold only what AGENTS.md states for every agent. Everything else that
+# restricts the factory lives in the factory layer (the generated agents, the driver's per-phase flags).
+bash_map = oc["permission"].get("bash", {})
+check("opencode.json: the bash map has no \"*\" key", "*" not in bash_map)
+check("opencode.json: every bash rule is a deny", all(v == "deny" for v in bash_map.values()))
+check("opencode.json: no edit permission", "edit" not in oc["permission"])
+check("opencode.json: no external_directory permission", "external_directory" not in oc["permission"])
+check("opencode.json: only the bash permission is set", list(oc["permission"].keys()) == ["bash"])
+check("opencode.json: the deny list equals deny-project.txt", list(bash_map.keys()) == deny_project)
+check("claude settings: only a deny list", list(cc["permissions"].keys()) == ["deny"])
+check(
+    "claude settings: the deny list equals deny-project.txt",
+    cc["permissions"]["deny"] == ["Bash(" + p + ")" for p in deny_project],
+)
+check("claude settings: no top-level key besides permissions", list(cc.keys()) == ["permissions"])
+
+# What AGENTS.md states for every agent: denied by the project files themselves, in both tools.
+denied_project = [
+    "gh pr merge 1", "gh pr merge 1 --auto", "gh pr edit 1 --auto-merge", "git push origin main",
+    "git push --force origin x", "git push --no-verify origin x", "git push origin HEAD:refs/heads/main",
+    "git commit --no-verify -m x", "git commit -n -m x", "git commit -m x -n", "git commit --no-ver -m x",
+]
+for cmd in denied_project:
+    check("project opencode denies: " + cmd, decide(global_rules, "bash", cmd) == "deny")
+    check("project claude denies: " + cmd, claude_decide(cc, cmd) == "deny")
+
+# What only the factory restricts: not denied by the project files, so an interactive session is free.
+denied_factory = [
+    "gh api repos/x", "git config user.name x", "bash -c true", "sh -c true", "env x", "curl http://x",
+    "wget http://x", "sudo true", "git -c a=b status", "git -C . status", "rm -rf x", "python3 x",
+    "git diff --output=x", "git log --output=x", "git show HEAD --output=x", "git push origin factory/x",
+    "git reset --hard x", "gh repo view", "gh workflow run x", "gh release list", "gh auth status",
+]
+for cmd in denied_factory:
+    check("project opencode does not deny: " + cmd, decide(global_rules, "bash", cmd) != "deny")
+    check("project claude does not deny: " + cmd, claude_decide(cc, cmd) != "deny")
+for cmd in ["cat x", "find . -name x", "git branch -a", "git status", "sed -n 1p x"]:
+    check("project opencode leaves alone: " + cmd, decide(global_rules, "bash", cmd) == "ask")
+    check("project claude leaves alone: " + cmd, claude_decide(cc, cmd) == "none")
+
+
+def factory_claude(entries):
+    """The Claude factory layer: the grant, the project deny list and the driver's --disallowedTools."""
+    deny = cc["permissions"]["deny"] + ["Bash(" + p + ")" for p in deny_project + deny_factory]
+    return {"permissions": {"allow": entries, "deny": deny}}
+
+
 def list_decide(entries, text):
-    """allow when an entry of a grant list matches, then the deny list of the settings still wins."""
-    cfg = {"permissions": {"allow": entries, "ask": cc["permissions"].get("ask", []), "deny": cc["permissions"]["deny"]}}
-    return claude_decide(cfg, text)
+    return claude_decide(factory_claude(entries), text)
 
 
 # Commands every role may run: read-only inspection, cargo and the repository scripts.
@@ -126,45 +170,77 @@ common = [
     "cargo test", "scripts/gate.sh --commit", "ls x", "rg x", "grep x y", "wc -l x", "diff a b",
     "git status", "git diff", "git log", "git show HEAD", "git write-tree",
 ]
-# Commands that change the tree: the implementer only (OpenCode: not the readonly overlays).
+# Commands that change the tree: the implementer only.
 code_only = ["git add x", "git commit -m x", "git rm x", "git mv a b", "git restore x", "mkdir x", "chmod +x x"]
 # Commands only the driver, or the interactive command, may run.
 orchestrator_only = ["git fetch origin main", "git switch -c factory/x", "gh pr view 1", "gh pr create --title x"]
-for cmd in common + code_only:
-    check("opencode allows: " + cmd, decide(global_rules, "bash", cmd) == "allow")
+# Never allowed to a factory agent in either tool.
+never = [
+    "rm x", "git push origin factory/x", "tee x", "cp a b", "mv a b", "touch x", "dd if=a of=b",
+    "sed -i s/a/b/ x", "git branch -D x",
+]
+
+# The OpenCode factory agents: the project rules, then the agent's own rules.
+roles = {
+    "factory-planner": True,
+    "factory-plan-reviewer": True,
+    "factory-code-reviewer": True,
+    "factory-pr-writer": True,
+    "factory-implementer": False,
+}
+agent_rules = {name: global_rules + overlay(repo + "/.opencode/agents/" + name + ".md") for name in roles}
+for name, readonly in roles.items():
+    rules = agent_rules[name]
+    for cmd in denied_project + denied_factory + never:
+        check("opencode " + name + " denies: " + cmd, decide(rules, "bash", cmd) == "deny")
+    for cmd in common:
+        check("opencode " + name + " allows: " + cmd, decide(rules, "bash", cmd) == "allow")
+    for cmd in code_only:
+        want = "deny" if readonly else "allow"
+        check("opencode " + name + " " + want + "s: " + cmd, decide(rules, "bash", cmd) == want)
+    for cmd in orchestrator_only:
+        check("opencode " + name + " denies: " + cmd, decide(rules, "bash", cmd) == "deny")
+
+# The Claude factory layer, per access class.
+for cmd in denied_project + denied_factory:
+    check("claude readonly grant denies: " + cmd, list_decide(read_list("common"), cmd) == "deny")
+    check("claude code grant denies: " + cmd, list_decide(read_list("common") + read_list("code"), cmd) == "deny")
+for cmd in never:
+    check("claude readonly grant does not allow: " + cmd, list_decide(read_list("common"), cmd) != "allow")
+    check("claude code grant does not allow: " + cmd, list_decide(read_list("common") + read_list("code"), cmd) != "allow")
 for cmd in common:
-    check("claude settings allow: " + cmd, claude_decide(cc, cmd) == "allow")
-for cmd in code_only + orchestrator_only:
-    check("claude settings do not allow: " + cmd, claude_decide(cc, cmd) != "allow")
+    check("claude readonly grant allows: " + cmd, list_decide(read_list("common"), cmd) == "allow")
 for cmd in code_only:
+    check("claude readonly grant does not allow: " + cmd, list_decide(read_list("common"), cmd) != "allow")
     check("claude code grant allows: " + cmd, list_decide(read_list("common") + read_list("code"), cmd) == "allow")
 for cmd in orchestrator_only:
     check("claude code grant does not allow: " + cmd, list_decide(read_list("common") + read_list("code"), cmd) != "allow")
     check("claude orchestrator grant allows: " + cmd, list_decide(read_list("common") + read_list("code") + read_list("orchestrator"), cmd) == "allow")
-    check("opencode does not allow: " + cmd, decide(global_rules, "bash", cmd) != "allow")
-for cmd in code_only:
-    check("claude readonly grant does not allow: " + cmd, list_decide(read_list("common"), cmd) != "allow")
-for cmd in ["cat x", "rm x", "find ."]:
-    check("opencode does not allow: " + cmd, decide(global_rules, "bash", cmd) != "allow")
-    check("claude does not allow: " + cmd, claude_decide(cc, cmd) != "allow")
-check("claude asks before a push", claude_decide(cc, "git push origin factory/x") == "ask")
-check("opencode never offers a push", decide(global_rules, "bash", "git push origin factory/x") == "deny")
 
 allow_src = read_list("common") + read_list("code") + read_list("orchestrator")
-check("claude settings allow list equals the common grant", cc["permissions"]["allow"] == read_list("common"))
 check("no push or pull request creation in the common or code grants", not any(("push" in e or "pr create" in e) for e in read_list("common") + read_list("code")))
 with open(repo + "/.claude/commands/factory.md") as f:
     command = f.read()
 m = re.search(r'^allowed-tools: "(.*)"$', command, re.M)
 check("the command pre-approves exactly the allow list", bool(m) and m.group(1) == " ".join(allow_src))
 check(
-    "no Edit or Write rule in the committed allow list",
-    not any(e.startswith(("Edit", "Write")) for e in cc["permissions"]["allow"]),
+    "no Edit or Write rule in the committed settings",
+    not any(e.startswith(("Edit", "Write")) for e in cc["permissions"].get("allow", [])),
 )
 check(
     "no bypass mode is configured",
     "bypass" not in json.dumps(cc).lower() and "bypass" not in json.dumps(oc).lower(),
 )
+
+# Mirror: every grant entry that is a Bash rule is an allow rule of the OpenCode agents, and the
+# deny lists of the generated agents are exactly the two deny files.
+for name, readonly in roles.items():
+    entries = read_list("common") + ([] if readonly else read_list("code"))
+    want = [e[5:-1] for e in entries if e.startswith("Bash(")]
+    got = [pat for tool, pat, act in overlay(repo + "/.opencode/agents/" + name + ".md") if tool == "bash" and act == "allow"]
+    check(name + ": the allow rules mirror the Claude grants", got == want)
+    got = [pat for tool, pat, act in overlay(repo + "/.opencode/agents/" + name + ".md") if tool == "bash" and act == "deny"]
+    check(name + ": the deny rules are the two deny files", got == ["*"] + deny_project + deny_factory)
 
 
 def agent_checks(label, rules, readonly):
@@ -176,6 +252,7 @@ def agent_checks(label, rules, readonly):
     check(label + " git push to a factory branch denied", decide(rules, "bash", "git push origin factory/x") == "deny")
     check(label + " gh pr merge denied", decide(rules, "bash", "gh pr merge 1") == "deny")
     check(label + " no-verify commit denied", decide(rules, "bash", "git commit --no-verify -m x") == "deny")
+    check(label + " python denied", decide(rules, "bash", "python3 x") == "deny")
     if readonly:
         check(
             label + " run directory artifact editable",
@@ -192,16 +269,8 @@ def agent_checks(label, rules, readonly):
         check(label + " git commit allowed", decide(rules, "bash", "git commit -m x") == "allow")
 
 
-roles = {
-    "factory-planner": True,
-    "factory-plan-reviewer": True,
-    "factory-code-reviewer": True,
-    "factory-pr-writer": True,
-    "factory-implementer": False,
-}
 for name, readonly in roles.items():
-    rules = global_rules + overlay(repo + "/.opencode/agents/" + name + ".md")
-    agent_checks("generated " + name + ":", rules, readonly)
+    agent_checks("generated " + name + ":", agent_rules[name], readonly)
     if agent_json_dir:
         path = agent_json_dir + "/" + name + ".json"
         try:

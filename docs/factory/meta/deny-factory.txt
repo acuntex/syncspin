@@ -1,0 +1,21 @@
+git push *
+git diff *--output*
+git log *--output*
+git show *--output*
+git config *
+git -c *
+git -C *
+git reset --hard *
+gh api *
+gh repo *
+gh workflow *
+gh release *
+gh auth *
+bash -c *
+sh -c *
+env *
+python*
+curl *
+wget *
+sudo *
+rm -rf *

@@ -483,7 +483,9 @@ section_sync() {
     for key in $(frontmatter_keys "$f"); do
       assert "sync: opencode key $key is whitelisted" has "$allowed" " $key "
     done
-    assert "sync: $(basename "$f") (opencode) keeps the readonly overlay deny-only" test -z "$(grep -E '^    "\*": "(ask|allow)"' "$f" || true)"
+    assert "sync: $(basename "$f") (opencode) bash rules start with the deny baseline" test "$(grep -A1 '^  bash:$' "$f" | tail -n 1)" = '    "*": "deny"'
+    refute "sync: $(basename "$f") (opencode) has no ask rule" grep -q '": "ask"' "$f"
+    assert "sync: $(basename "$f") (opencode) orders baseline, allows, denies" has "$(sed -n '/^  bash:$/,/^---$/p' "$f" | grep -o '": "\(allow\|deny\)"' | tr -d '\n')" '^": "deny"(": "allow")+(": "deny")+$'
   done
   for f in "$repo"/.claude/agents/factory-*.md; do
     allowed=" name description tools model maxTurns "
@@ -517,7 +519,7 @@ section_sync() {
 
 
 # ---------------------------------------------------------------------------
-# Driver tests (cases D1 to D36). The driver runs in a clone of a fake origin whose main branch is a
+# Driver tests (cases D1 to D37). The driver runs in a clone of a fake origin whose main branch is a
 # copy of the files the factory needs. There are two origins: one whose gate is a stub that only
 # stamps the tree (the default), and one whose gate is the real scripts/gate.sh (the real-gate cases).
 # The agent CLIs are stubs on PATH: they write canned artifacts and log their argv and environment.
@@ -543,6 +545,7 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     --agent) role=${args[$((i + 1))]#factory-} ;;
     -p) prompt=${args[$((i + 1))]} ;;
     --allowedTools) allowed=${args[$((i + 1))]} ;;
+    --disallowedTools) denied=${args[$((i + 1))]} ;;
   esac
 done
 if [ "$name" = opencode ]; then prompt=${args[$((${#args[@]} - 1))]}; fi
@@ -564,6 +567,7 @@ esac
   printf ' %q' "$@"
   echo
   echo "ALLOWED ${allowed:-}"
+  echo "DENIED ${denied:-}"
   echo "ENVNAMES $(env | cut -d= -f1 | LC_ALL=C sort | tr '\n' ' ')"
   env | grep '^GIT_CONFIG' | LC_ALL=C sort | sed 's/^/ENV /'
   echo "PROMPT $(printf '%s' "$prompt" | tr '\n' '~')"
@@ -775,7 +779,7 @@ section_driver() {
     assert "D1 [$be] the factory branch is on origin" test -n "$(git -C "$origin_dir" for-each-ref "refs/heads/$(git -C "$clone" rev-parse --abbrev-ref HEAD)")"
     assert "D1 [$be] state is done" test "$(state_of status)" = "done"
     assert "D1 [$be] local main did not move" test "$(git -C "$clone" rev-parse main)" = "$before"
-    refute "D18 [$be] no forbidden flag in any call" grep -Eq -- '--auto|--bare|--dangerously-skip-permissions|bypassPermissions' "$sd/calls.log"
+    refute "D18 [$be] no forbidden flag in any call" bash -c "sed -E -e '/^DENIED /d' -e 's/ --disallowedTools (\\\\ |[^ ])+//' '$sd/calls.log' | grep -Eq -- '--auto|--bare|--dangerously-skip-permissions|bypassPermissions'"
     refute "D18 [$be] no continue, session or resume flag" grep -Eq -- '^ARGV.*(--continue|--session|--resume)' "$sd/calls.log"
     if [ "$be" = claude ]; then
       id=$(basename "$(run_dir_of)")
@@ -786,6 +790,10 @@ section_driver() {
       refute "D17 no double slash or home path in a grant" grep -Eq "^ALLOWED .*(//|$hm/|/Users/)" "$sd/calls.log"
       refute "D17 a readonly grant has no mutating git command" grep -Eq '^ALLOWED Edit\(/.factory/.*(git (add|commit|rm|mv|restore)|mkdir|chmod)' "$sd/calls.log"
       refute "D17 no agent gets pull request creation" grep -Eq '^ALLOWED .*(gh pr|git push|git fetch|git switch)' "$sd/calls.log"
+      assert "D37 every claude phase passes --disallowedTools" test "$(grep -c '^ARGV.* --disallowedTools' "$sd/calls.log")" = "$(grep -c '^CALL ' "$sd/calls.log")"
+      assert "D37 the deny list holds the factory-layer denies" has "$(sed -n 's/^DENIED //p' "$sd/calls.log" | head -n 1)" 'Bash\(git config \*\),Bash\(git -c \*\).*Bash\(python\*\).*Bash\(rm -rf \*\)'
+      assert "D37 the deny list holds the AGENTS.md denies" has "$(sed -n 's/^DENIED //p' "$sd/calls.log" | head -n 1)" '^Bash\(gh pr merge \*\),Bash\(gh pr \*--auto\*\)'
+      assert "D37 the deny list is the same in every phase" test "$(sed -n 's/^DENIED //p' "$sd/calls.log" | sort -u | wc -l)" = 1
       assert "D17 the implementer grant is Edit and Write" has "$(grep -A2 'role=implementer' "$sd/calls.log" | grep '^ALLOWED' || true)" '^ALLOWED Edit,Write,'
     fi
   done

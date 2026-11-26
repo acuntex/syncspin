@@ -1,0 +1,15 @@
+gh pr merge *
+gh pr *--auto*
+git push * main*
+git push *:main*
+git push *refs/heads/main*
+git push *--force*
+git push -f *
+git push *--mirror*
+git push *--delete*
+git push --no-verify*
+git commit *--no-verify*
+git commit *--no-v*
+git commit -n*
+git commit * -n
+git commit * -n *
