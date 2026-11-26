@@ -110,6 +110,8 @@ mod sink;
 
 pub mod storage;
 
+#[cfg(feature = "color")]
+pub use client::ColorScheme;
 #[cfg(feature = "controller")]
 pub use client::RepeatMode;
 #[cfg(feature = "metadata")]

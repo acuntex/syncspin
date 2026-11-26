@@ -41,6 +41,15 @@ async fn next_event(stream: &mut EventStream) -> Event {
     }
 }
 
+/// The roles a headless build offers: controller and metadata, plus color where it is built.
+fn expected_roles() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut roles = vec!["controller@v1", "metadata@v1"];
+    #[cfg(feature = "color")]
+    roles.push("color@v1");
+    roles
+}
+
 #[tokio::test]
 async fn a_headless_hello_omits_the_player_role_and_its_support_object() {
     let mut server = FakeServer::start(headless_roles()).await.unwrap();
@@ -53,7 +62,7 @@ async fn a_headless_hello_omits_the_player_role_and_its_support_object() {
     let hello: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
         hello["payload"]["supported_roles"],
-        serde_json::json!(["controller@v1", "metadata@v1"]),
+        serde_json::json!(expected_roles()),
         "a client without a sink must not offer a role it cannot carry out"
     );
     assert!(

@@ -22,11 +22,11 @@ case "$mode" in
 esac
 
 # Sets of role features. An empty entry is `--no-default-features` alone.
-role_sets=("" "player" "controller" "metadata" "artwork" "player,controller" "player,metadata" "controller,metadata" "metadata,artwork")
+role_sets=("" "player" "controller" "metadata" "artwork" "color" "player,controller" "player,metadata" "controller,metadata" "metadata,artwork" "metadata,color" "artwork,color")
 
 # Sets that add an optional role to the default roles, so the tests that need a sink and the artwork
 # role together (`roles_artwork`) run.
-default_plus=("artwork")
+default_plus=("artwork" "color" "artwork,color")
 
 # Sets that combine the other features with no role or a single one. They are compiled and linted;
 # the headless advertisement path runs for `discovery,metadata`. `pairing-code` also forwards to

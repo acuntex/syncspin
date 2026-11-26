@@ -7,7 +7,8 @@
     feature = "player",
     feature = "controller",
     feature = "metadata",
-    feature = "artwork"
+    feature = "artwork",
+    feature = "color"
 )))]
 
 use syncspin_client::{connect_headless, ClientConfig, Identity};

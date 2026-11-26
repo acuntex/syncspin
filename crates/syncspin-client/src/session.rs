@@ -66,6 +66,8 @@ use syncspin_core::pairing::pake::TAG_LEN;
 
 #[cfg(feature = "player")]
 use crate::buffer::{BufferEstimator, PLAUSIBLE_US, WARMUP};
+#[cfg(feature = "color")]
+use crate::client::ColorScheme;
 #[cfg(feature = "player")]
 use crate::client::{check_reported_level, clamp_volume_with, StreamEndReason};
 use crate::client::{
@@ -88,8 +90,10 @@ use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_
 use crate::playout::{Dropped, OwnedFrame, PlayoutQueue, BUFFER_CAPACITY};
 #[cfg(feature = "artwork")]
 use crate::roles::artwork::{Artwork, Change};
-#[cfg(feature = "metadata")]
+#[cfg(any(feature = "metadata", feature = "color"))]
 use crate::roles::sched::Pending;
+#[cfg(feature = "color")]
+use crate::roles::COLOR_ROLE;
 #[cfg(feature = "controller")]
 use crate::roles::CONTROLLER_ROLE;
 #[cfg(feature = "metadata")]
@@ -777,6 +781,9 @@ pub(crate) struct Session<'a> {
     /// The scheduled metadata update, if one is waiting for its server timestamp.
     #[cfg(feature = "metadata")]
     track: Pending<Event>,
+    /// The scheduled color update, if one is waiting for its server timestamp.
+    #[cfg(feature = "color")]
+    color: Pending<ColorScheme>,
     /// The artwork role's images, schedule and transfer in flight.
     #[cfg(feature = "artwork")]
     artwork: Artwork,
@@ -999,6 +1006,8 @@ pub(crate) async fn attempt(
         track: Pending::new(),
         #[cfg(feature = "artwork")]
         artwork: Artwork::new(&config.artwork_channels, config.max_artwork_bytes),
+        #[cfg(feature = "color")]
+        color: Pending::new(),
         #[cfg(feature = "metadata")]
         server_clock,
         playback: PlaybackState::default(),
@@ -1132,9 +1141,9 @@ impl Session<'_> {
 
             // The control receiver outlives individual handles: dropping the last one disables the
             // branch instead of ending the session.
-            #[cfg(any(feature = "metadata", feature = "artwork"))]
+            #[cfg(any(feature = "metadata", feature = "artwork", feature = "color"))]
             let role_deadline = self.role_deadline();
-            #[cfg(not(any(feature = "metadata", feature = "artwork")))]
+            #[cfg(not(any(feature = "metadata", feature = "artwork", feature = "color")))]
             let role_deadline: Option<Instant> = None;
             let control = &mut self.control;
             #[cfg(feature = "player")]
@@ -1238,9 +1247,9 @@ impl Session<'_> {
                 // the three timers above are never armed.
                 #[cfg(not(feature = "player"))]
                 Wakeup::Playout | Wakeup::LateFlush | Wakeup::OutputDelayPoll => {}
-                #[cfg(any(feature = "metadata", feature = "artwork"))]
+                #[cfg(any(feature = "metadata", feature = "artwork", feature = "color"))]
                 Wakeup::RoleSchedule => self.fire_scheduled(),
-                #[cfg(not(any(feature = "metadata", feature = "artwork")))]
+                #[cfg(not(any(feature = "metadata", feature = "artwork", feature = "color")))]
                 Wakeup::RoleSchedule => {}
                 Wakeup::Clock => {
                     if self.rehandshake.is_some() {
@@ -1523,6 +1532,15 @@ impl Session<'_> {
                     // A pairing message that does not decode is a protocol error: the flow cannot
                     // continue without the field, and ignoring it would leave a half-open attempt.
                     return Err(error.into());
+                }
+                // `messaging.md` makes a value outside a fixed range or length limit in a
+                // recognised message a protocol error that closes the connection, but also says an
+                // inactive role's object is ignored with its values unvalidated. The role check
+                // therefore comes first: an out-of-range color closes only while the color role is
+                // active, and is ignored like any malformed control message otherwise.
+                #[cfg(feature = "color")]
+                if self.role_active(COLOR_ROLE) && color_out_of_range(text) {
+                    bail!("server/state carries a color component outside its 0-255 range");
                 }
                 eprintln!("ignoring a malformed control message: {error}");
                 Ok(())
@@ -3045,7 +3063,17 @@ impl Session<'_> {
             if role == ARTWORK_ROLE {
                 self.artwork_stream_end();
             }
-            #[cfg(not(any(feature = "controller", feature = "metadata", feature = "artwork")))]
+            #[cfg(feature = "color")]
+            if role == COLOR_ROLE {
+                self.color.clear();
+                self.emit(Event::ColorCleared);
+            }
+            #[cfg(not(any(
+                feature = "controller",
+                feature = "metadata",
+                feature = "artwork",
+                feature = "color"
+            )))]
             let _ = role;
         }
     }
@@ -3089,10 +3117,31 @@ impl Session<'_> {
         }
     }
 
+    /// Delivers a `color` object at its timestamp, through the same schedule as metadata.
+    #[cfg(feature = "color")]
+    fn offer_color(&mut self, color: syncspin_core::messages::Color) {
+        let local_now_us = now_us();
+        let scheme = ColorScheme {
+            timestamp_us: color.timestamp,
+            background_dark: color.background_dark,
+            background_light: color.background_light,
+            primary: color.primary,
+            accent: color.accent,
+            on_dark: color.on_dark,
+            on_light: color.on_light,
+        };
+        if let Some(scheme) = self
+            .color
+            .offer(color.timestamp, scheme, &self.clock, local_now_us)
+        {
+            self.emit(Event::Color(scheme));
+        }
+    }
+
     /// The local instant the next scheduled role state is due, from the current clock estimate.
     ///
     /// Recomputed on every loop iteration, because the filter resynchronises and may step.
-    #[cfg(any(feature = "metadata", feature = "artwork"))]
+    #[cfg(any(feature = "metadata", feature = "artwork", feature = "color"))]
     fn role_deadline(&self) -> Option<Instant> {
         let local_now_us = now_us();
         let now = Instant::now();
@@ -3108,16 +3157,28 @@ impl Session<'_> {
         .into_iter()
         .flatten()
         .min();
+        #[cfg(feature = "color")]
+        let deadline = [
+            deadline,
+            self.color.next_deadline(&self.clock, local_now_us, now),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         deadline
     }
 
     /// Delivers the scheduled role states whose moment has been reached.
-    #[cfg(any(feature = "metadata", feature = "artwork"))]
+    #[cfg(any(feature = "metadata", feature = "artwork", feature = "color"))]
     fn fire_scheduled(&mut self) {
         let local_now_us = now_us();
         #[cfg(feature = "metadata")]
         if let Some(event) = self.track.fire_due(&self.clock, local_now_us) {
             self.emit(event);
+        }
+        #[cfg(feature = "color")]
+        if let Some(scheme) = self.color.fire_due(&self.clock, local_now_us) {
+            self.emit(Event::Color(scheme));
         }
         #[cfg(feature = "artwork")]
         {
@@ -3134,7 +3195,7 @@ impl Session<'_> {
 
     /// Reports one `server/state` message for the roles this client has active.
     #[cfg_attr(
-        not(any(feature = "metadata", feature = "controller")),
+        not(any(feature = "metadata", feature = "controller", feature = "color")),
         allow(unused_variables)
     )]
     fn handle_state(&mut self, state: ServerState) {
@@ -3142,6 +3203,12 @@ impl Session<'_> {
         if self.role_active(METADATA_ROLE) {
             if let Some(metadata) = state.metadata {
                 self.offer_track(metadata);
+            }
+        }
+        #[cfg(feature = "color")]
+        if self.role_active(COLOR_ROLE) {
+            if let Some(color) = state.color {
+                self.offer_color(color);
             }
         }
         #[cfg(feature = "controller")]
@@ -3571,7 +3638,8 @@ impl Session<'_> {
         feature = "player",
         feature = "controller",
         feature = "metadata",
-        feature = "artwork"
+        feature = "artwork",
+        feature = "color"
     ))]
     fn role_active(&self, role: &str) -> bool {
         self.active_roles.iter().any(|active| active == role)
@@ -3615,6 +3683,10 @@ impl Session<'_> {
         }
         #[cfg(feature = "artwork")]
         if self.role_active(ARTWORK_ROLE) {
+            return true;
+        }
+        #[cfg(feature = "color")]
+        if self.role_active(COLOR_ROLE) {
             return true;
         }
         self.player_active()
@@ -4242,6 +4314,41 @@ fn affects_player(roles: Option<&[String]>) -> bool {
     names_role(roles, PLAYER_STREAM_ROLE, PLAYER_ROLE)
 }
 
+/// Whether a `server/state` text carries a `color` object with a triple that is not three
+/// integers or a component outside 0-255: the fixed range and length the color role defines.
+///
+/// Only that class counts. Other malformations (a wrong type, a missing timestamp) are not a range
+/// violation and stay ignored under the rule for malformed control messages.
+#[cfg(feature = "color")]
+fn color_out_of_range(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("server/state") {
+        return false;
+    }
+    let Some(color) = value.pointer("/payload/color").and_then(|c| c.as_object()) else {
+        return false;
+    };
+    [
+        "background_dark",
+        "background_light",
+        "primary",
+        "accent",
+        "on_dark",
+        "on_light",
+    ]
+    .iter()
+    .filter_map(|key| color.get(*key)?.as_array())
+    .any(|triple| {
+        triple.len() != 3
+            || triple.iter().any(|component| {
+                component.as_i64().is_some_and(|n| !(0..=255).contains(&n))
+                    || (component.as_u64().is_some() && component.as_i64().is_none())
+            })
+    })
+}
+
 /// Decodes the server's static public key from the `server_id` it announced.
 ///
 /// A re-handshake does not repeat `server/init`, so the key the responder needs comes from the
@@ -4840,6 +4947,8 @@ mod tests {
             track: Pending::new(),
             #[cfg(feature = "artwork")]
             artwork: Artwork::new(&config.artwork_channels, config.max_artwork_bytes),
+            #[cfg(feature = "color")]
+            color: Pending::new(),
             #[cfg(feature = "metadata")]
             server_clock,
             playback: PlaybackState::default(),
@@ -5869,5 +5978,32 @@ mod tests {
             "player@v1"
         ));
         assert!(affects_player(list(&["player@v1"]).as_deref()));
+    }
+
+    #[cfg(feature = "color")]
+    #[test]
+    fn only_a_range_or_length_violation_counts_as_an_out_of_range_color() {
+        let state =
+            |color: &str| format!(r#"{{"type":"server/state","payload":{{"color":{color}}}}}"#);
+        for bad in [
+            r#"{"timestamp":1,"primary":[256,0,0]}"#,
+            r#"{"timestamp":1,"accent":[0,-1,0]}"#,
+            r#"{"timestamp":1,"on_dark":[0,0]}"#,
+            r#"{"timestamp":1,"on_light":[0,0,0,0]}"#,
+            r#"{"timestamp":1,"primary":[18446744073709551615,0,0]}"#,
+        ] {
+            assert!(color_out_of_range(&state(bad)), "{bad}");
+        }
+        for fine in [
+            r#"{"timestamp":1,"primary":[255,0,0]}"#,
+            r#"{"timestamp":1,"primary":"red"}"#,
+            r#"{"primary":[1,2,3]}"#,
+            "null",
+        ] {
+            assert!(!color_out_of_range(&state(fine)), "{fine}");
+        }
+        assert!(!color_out_of_range(
+            r#"{"type":"group/update","payload":{}}"#
+        ));
     }
 }

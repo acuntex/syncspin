@@ -63,10 +63,16 @@ async fn a_headless_advertiser_serves_a_dialling_server_without_the_player_role(
         .expect("the client announces itself")
         .expect("a client/hello arrived");
     // The roles this build offers without a sink: the player is never among them.
-    #[cfg(feature = "controller")]
-    let expected = ["controller@v1", "metadata@v1"];
-    #[cfg(not(feature = "controller"))]
-    let expected = ["metadata@v1"];
+    let expected: Vec<&str> = [
+        #[cfg(feature = "controller")]
+        Some("controller@v1"),
+        Some("metadata@v1"),
+        #[cfg(feature = "color")]
+        Some("color@v1"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     assert_eq!(
         hello.supported_roles, expected,
         "a headless advertiser offers no player role"

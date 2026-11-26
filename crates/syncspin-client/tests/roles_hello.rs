@@ -103,6 +103,8 @@ fn expected_roles() -> Vec<&'static str> {
     roles.push("metadata@v1");
     #[cfg(feature = "artwork")]
     roles.push("artwork@v1");
+    #[cfg(feature = "color")]
+    roles.push("color@v1");
     roles
 }
 
@@ -117,7 +119,12 @@ async fn the_hello_lists_the_built_roles_in_order() {
     );
 }
 
-#[cfg(all(feature = "controller", feature = "metadata", not(feature = "artwork")))]
+#[cfg(all(
+    feature = "controller",
+    feature = "metadata",
+    not(feature = "artwork"),
+    not(feature = "color")
+))]
 #[test]
 fn the_default_set_is_player_controller_metadata() {
     assert_eq!(

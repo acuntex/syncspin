@@ -83,8 +83,8 @@ here rather than a preference.
   `syncspin-client` has role features: `player`, `controller` and `metadata` (on by default) and the
   tables `storage-file`, `pairing-code` (core/client/server), `discovery` and `mdns`
   (client/server). `artwork` is a role feature too (off by default: it holds images in memory and
-  advertises nothing until the host configures a channel); `color` does not exist yet, and
-  `visualizer` and `source` are not implemented. A set that turns a role off compiles other test files, so a change in the client
+  advertises nothing until the host configures a channel) and so is `color` (off by default); `visualizer`
+  and `source` are not implemented. A set that turns a role off compiles other test files, so a change in the client
   runs `scripts/check-roles.sh` as well. `storage-file` is off in
   `syncspin-client` but on in `player-pipe`, so a workspace build enables it through feature
   unification; `pairing-code`, `discovery` and `mdns` are off unless requested. `mdns-pair` has its

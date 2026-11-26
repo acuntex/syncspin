@@ -455,6 +455,15 @@ pub enum Event {
         /// The image, or `None` for a cleared channel.
         image: Option<crate::ArtworkImage>,
     },
+    /// The server's colors took effect.
+    ///
+    /// Delivered at the scheme's server timestamp, like `Event::Track`: a future-dated scheme is held
+    /// and replaced by a newer one, and a past or present one applies at once.
+    #[cfg(feature = "color")]
+    Color(ColorScheme),
+    /// The color state was dropped because the color role was removed.
+    #[cfg(feature = "color")]
+    ColorCleared,
     /// The server's view of playback state changed.
     State(PlaybackState),
     /// The server sent a `group_id` the spec does not allow, and the client accepted it.
@@ -644,6 +653,10 @@ impl fmt::Debug for Event {
                 .field("late_by", late_by)
                 .field("dropped", dropped)
                 .finish(),
+            #[cfg(feature = "color")]
+            Self::Color(scheme) => formatter.debug_tuple("Color").field(scheme).finish(),
+            #[cfg(feature = "color")]
+            Self::ColorCleared => formatter.write_str("ColorCleared"),
             #[cfg(feature = "artwork")]
             Self::Artwork { channel, image } => formatter
                 .debug_struct("Artwork")
@@ -784,6 +797,29 @@ impl TrackProgress {
         }
         Some(u64::try_from(calculated.max(0)).unwrap_or(u64::MAX))
     }
+}
+
+/// The colors the server derived from the audio, as `[R, G, B]` triples.
+///
+/// A color the server did not send is `None`.
+#[cfg(feature = "color")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ColorScheme {
+    /// Server clock time in microseconds at which the scheme takes effect.
+    pub timestamp_us: i64,
+    /// Background for dark mode.
+    pub background_dark: Option<[u8; 3]>,
+    /// Background for light mode.
+    pub background_light: Option<[u8; 3]>,
+    /// The dominant color.
+    pub primary: Option<[u8; 3]>,
+    /// A secondary or complementary color.
+    pub accent: Option<[u8; 3]>,
+    /// A light color for use on dark backgrounds.
+    pub on_dark: Option<[u8; 3]>,
+    /// A dark color for use on light backgrounds.
+    pub on_light: Option<[u8; 3]>,
 }
 
 /// Repeat mode of the group, as the controller commands name it.

@@ -5,7 +5,7 @@
 
 #[cfg(feature = "artwork")]
 pub(crate) mod artwork;
-#[cfg(any(feature = "metadata", feature = "artwork"))]
+#[cfg(any(feature = "metadata", feature = "artwork", feature = "color"))]
 pub(crate) mod sched;
 
 /// Versioned role identifier of the audio player.
@@ -19,6 +19,10 @@ pub(crate) const METADATA_ROLE: &str = "metadata@v1";
 /// Versioned role identifier of the artwork display.
 #[cfg(feature = "artwork")]
 pub(crate) const ARTWORK_ROLE: &str = "artwork@v1";
+
+/// Versioned role identifier of the color role.
+#[cfg(feature = "color")]
+pub(crate) const COLOR_ROLE: &str = "color@v1";
 
 /// Bare role name artwork uses in `stream/end`, `stream/clear` and binary routing.
 #[cfg(feature = "artwork")]
@@ -63,7 +67,8 @@ impl Offer {
 /// The player role is offered exactly with a sink, and only in a build with the `player` feature, so
 /// a headless client never advertises a role it cannot carry out. Controller and metadata are offered
 /// in the builds that have them; artwork in a build with the feature and at least one configured
-/// channel. The order is fixed: player, controller, metadata, artwork.
+/// channel, color in a build with the feature. The order is fixed: player, controller, metadata,
+/// artwork, color.
 #[cfg_attr(not(feature = "player"), allow(unused_variables))]
 pub(crate) fn supported_roles(offer: Offer) -> Vec<&'static str> {
     let roles: &[Option<&'static str>] = &[
@@ -75,6 +80,8 @@ pub(crate) fn supported_roles(offer: Offer) -> Vec<&'static str> {
         Some(METADATA_ROLE),
         #[cfg(feature = "artwork")]
         offer.artwork.then_some(ARTWORK_ROLE),
+        #[cfg(feature = "color")]
+        Some(COLOR_ROLE),
     ];
     roles.iter().flatten().copied().collect()
 }
@@ -122,7 +129,12 @@ mod tests {
         offer
     }
 
-    #[cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+    #[cfg(all(
+        feature = "player",
+        feature = "controller",
+        feature = "metadata",
+        not(feature = "color")
+    ))]
     #[test]
     fn a_sink_adds_the_player_role_first() {
         assert_eq!(
