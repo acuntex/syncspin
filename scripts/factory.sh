@@ -21,12 +21,22 @@
 #     --code-rounds N               lower the code review cap (3) to N
 #     --model-helper M              model for the reviewers and the pr-writer ($FACTORY_MODEL_HELPER)
 #     --model-main M                model for the planner and the implementer ($FACTORY_MODEL_MAIN)
+#     --variant-helper V            OpenCode reasoning variant for the helper roles ($FACTORY_VARIANT_HELPER)
+#     --variant-main V              OpenCode reasoning variant for the main roles ($FACTORY_VARIANT_MAIN)
+#     --opencode-attach URL         run every OpenCode phase against a running OpenCode server
+#                                   ($FACTORY_OPENCODE_ATTACH); http(s)://host[:port], nothing else. The
+#                                   server password travels only as $OPENCODE_SERVER_PASSWORD.
 #     --phase-timeout SECS          timeout of every phase (default 2700; implement and fix 7200)
+#
+# The variant and attach options apply to the OpenCode backend only; the Claude backend ignores them
+# with a warning.
 #
 # Exit codes: 0 done, 2 usage, 3 preflight, 10 owner decisions open, 11 plan review cap, 12 code
 # review cap, 13 sandbox violation, 14 bad commits, 15 final gate failed, 16 pull request text lint,
 # 20 phase failure (resumable). Environment: FACTORY_BACKEND, FACTORY_MODEL_HELPER, FACTORY_MODEL_MAIN,
-# FACTORY_PASS_ENV (names of variables to pass to the agent, for a model-provider key).
+# FACTORY_VARIANT_HELPER, FACTORY_VARIANT_MAIN, FACTORY_OPENCODE_ATTACH, FACTORY_PASS_ENV (names of
+# variables to pass to the agent, for a model-provider key), OPENCODE_SERVER_PASSWORD (passed to the
+# OpenCode phases only together with --opencode-attach).
 #
 # Test knobs: FACTORY_LIB_ONLY=1 (source the functions without running), FACTORY_SCRUB_USER and
 # FACTORY_SCRUB_HOST (override the names the personal-data scrub looks for).
@@ -362,7 +372,9 @@ log_head() {
   local max=$1 line count=0
   while IFS= read -r line && [ "$count" -lt "$max" ]; do
     [ -n "${line//[[:space:]]/}" ] || continue
-    if ! scrub <<<"$line" >/dev/null || grep -Eq '[A-Za-z0-9_-]{32,}|(^|[^A-Za-z0-9])(sk-|ghp_|gho_|github_pat_|xox)' <<<"$line"; then
+    if { [ -n "${OPENCODE_SERVER_PASSWORD:-}" ] && [[ "$line" == *"$OPENCODE_SERVER_PASSWORD"* ]]; } || { [ -n "${OPENCODE_SERVER_USERNAME:-}" ] && [[ "$line" == *"$OPENCODE_SERVER_USERNAME"* ]]; }; then
+      line='[line withheld: it holds personal data or a token]'
+    elif ! scrub <<<"$line" >/dev/null || grep -Eq '[A-Za-z0-9_-]{32,}|(^|[^A-Za-z0-9])(sk-|ghp_|gho_|github_pat_|xox)' <<<"$line"; then
       line='[line withheld: it holds personal data or a token]'
     fi
     printf '%s\n' "${line:0:200}"
@@ -452,6 +464,9 @@ plan_cap=$PLAN_CAP
 code_cap=$CODE_CAP
 model_helper=${FACTORY_MODEL_HELPER:-}
 model_main=${FACTORY_MODEL_MAIN:-}
+variant_helper=${FACTORY_VARIANT_HELPER:-}
+variant_main=${FACTORY_VARIANT_MAIN:-}
+opencode_attach=${FACTORY_OPENCODE_ATTACH:-}
 phase_timeout=""
 task_text=""
 task_file=""
@@ -472,6 +487,9 @@ while [ "$#" -gt 0 ]; do
     --code-rounds) need_value "$@"; code_cap=$2; shift 2 ;;
     --model-helper) need_value "$@"; model_helper=$2; shift 2 ;;
     --model-main) need_value "$@"; model_main=$2; shift 2 ;;
+    --variant-helper) need_value "$@"; variant_helper=$2; shift 2 ;;
+    --variant-main) need_value "$@"; variant_main=$2; shift 2 ;;
+    --opencode-attach) need_value "$@"; opencode_attach=$2; shift 2 ;;
     --phase-timeout) need_value "$@"; phase_timeout=$2; shift 2 ;;
     --task-file) need_value "$@"; task_file=$2; shift 2 ;;
     -h | --help) usage 0 ;;
@@ -491,6 +509,11 @@ if [ -n "$phase_timeout" ]; then
   [[ "$phase_timeout" =~ ^[0-9]+$ ]] && [ "$phase_timeout" -ge 1 ] || die_usage "--phase-timeout takes a number of seconds"
 fi
 case "$backend" in "" | opencode | claude) ;; *) die_usage "--backend takes opencode or claude" ;; esac
+# A variant reaches `opencode run --variant` as one argument: a conservative pattern keeps anything
+# else out of the command line. The attach URL has no user, path or query.
+[ -z "$variant_helper" ] || [[ "$variant_helper" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die_usage "--variant-helper takes lowercase letters, digits, dot, underscore and dash, starting with a letter or digit"
+[ -z "$variant_main" ] || [[ "$variant_main" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || die_usage "--variant-main takes lowercase letters, digits, dot, underscore and dash, starting with a letter or digit"
+[ -z "$opencode_attach" ] || [[ "$opencode_attach" =~ ^https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?/?$ ]] || die_usage "--opencode-attach takes http(s)://host[:port] with no user, path or query"
 if [ -n "$resume_id" ]; then
   [ -z "$task_text" ] && [ -z "$task_file" ] || die_usage "--resume takes no task"
 else
@@ -510,6 +533,13 @@ model_for() {
   case "$(role_class "$1")" in
     helper) printf '%s' "$model_helper" ;;
     *) printf '%s' "$model_main" ;;
+  esac
+}
+
+variant_for() {
+  case "$(role_class "$1")" in
+    helper) printf '%s' "$variant_helper" ;;
+    *) printf '%s' "$variant_main" ;;
   esac
 }
 
@@ -551,13 +581,17 @@ claude_denies() {
 
 # build_cmd <role> <access> <phase> <prompt> [artifact]: fills the global array `cmd`.
 build_cmd() {
-  local role=$1 access=$2 phase=$3 prompt=$4 artifact=${5:-} model
+  local role=$1 access=$2 phase=$3 prompt=$4 artifact=${5:-} model variant
   model=$(model_for "$role")
   cmd=()
   case "$backend" in
     opencode)
-      cmd=(opencode run --agent "factory-$role")
+      cmd=(opencode run)
+      if [ -n "$opencode_attach" ]; then cmd+=(--attach "$opencode_attach"); fi
+      cmd+=(--agent "factory-$role")
       if [ -n "$model" ]; then cmd+=(--model "$model"); fi
+      variant=$(variant_for "$role")
+      if [ -n "$variant" ]; then cmd+=(--variant "$variant"); fi
       cmd+=(--title "${run_id:-RUN_ID}:$phase" --dir "$PWD" "$prompt")
       ;;
     claude)
@@ -579,6 +613,16 @@ if [ -z "$backend" ]; then
   done
 fi
 
+# The variant and attach options are OpenCode flags; build_cmd only passes them to that backend.
+if [ "$backend" = claude ]; then
+  if [ -n "$variant_helper$variant_main" ]; then
+    printf 'factory: warning: --variant-main/--variant-helper apply to the OpenCode backend only; ignored for claude\n' >&2
+  fi
+  if [ -n "$opencode_attach" ]; then
+    printf 'factory: warning: --opencode-attach applies to the OpenCode backend only; ignored for claude\n' >&2
+  fi
+fi
+
 if [ "$dry_run" = 1 ]; then
   [ -n "$backend" ] || backend=opencode
   printf 'factory dry run: nothing is called, nothing is changed\n'
@@ -586,6 +630,10 @@ if [ "$dry_run" = 1 ]; then
   printf 'caps: plan review %s rounds, code review %s rounds\n' "$plan_cap" "$code_cap"
   printf 'phases: plan, plan-review, owner-gate, implement, code-review, final-gate, pr\n'
   printf 'stop after: %s%s\n' "$stop_after" "$( [ "$no_push" = 1 ] && printf ', no push' || true)"
+  if [ "$backend" = opencode ]; then
+    printf 'variants: main=%s helper=%s\n' "${variant_main:-(none)}" "${variant_helper:-(none)}"
+    printf 'opencode server: %s\n' "${opencode_attach:-(own, started per phase)}"
+  fi
   for entry in planner:readonly:plan plan-reviewer:readonly:plan-review implementer:code:implement code-reviewer:readonly:code-review pr-writer:readonly:pr; do
     IFS=: read -r r a p <<<"$entry"
     build_cmd "$r" "$a" "$p" "<prompt>"
@@ -874,7 +922,21 @@ run_phase() {
   done
   printf 'factory: phase %s (%s, round %s/%s)\n' "$name" "$role" "${P_ROUND:-0}" "${P_MAX:-0}"
   printf '== %s %s\n' "$name" "$(date -u +%H:%M:%S)" >>"$run_dir/logs/$name.log"
-  setsid timeout -k 30 "$secs" "${envargs[@]}" "${cmd[@]}" >>"$run_dir/logs/$name.log" 2>&1 &
+  if [ "$backend" = opencode ] && [ -n "$opencode_attach" ] && [ -n "${OPENCODE_SERVER_PASSWORD:-}${OPENCODE_SERVER_USERNAME:-}" ]; then
+    # The server credentials never go on a command line (the process list shows it): they travel
+    # through file descriptor 3 and a one-line shim that exports them inside the scrubbed environment.
+    # shellcheck disable=SC2016  # the shim is expanded by the inner bash, not here
+    setsid timeout -k 30 "$secs" "${envargs[@]}" bash -c '
+      IFS= read -r user <&3 || true
+      IFS= read -r pass <&3 || true
+      exec 3<&-
+      if [ -n "$user" ]; then export OPENCODE_SERVER_USERNAME=$user; fi
+      if [ -n "$pass" ]; then export OPENCODE_SERVER_PASSWORD=$pass; fi
+      unset user pass
+      exec "$@"' factory-attach "${cmd[@]}" 3< <(printf '%s\n%s\n' "${OPENCODE_SERVER_USERNAME:-}" "${OPENCODE_SERVER_PASSWORD:-}") >>"$run_dir/logs/$name.log" 2>&1 &
+  else
+    setsid timeout -k 30 "$secs" "${envargs[@]}" "${cmd[@]}" >>"$run_dir/logs/$name.log" 2>&1 &
+  fi
   child_pgid=$!
   wait "$child_pgid" || rc=$?
   # Reap grandchildren: TERM the group, poll, KILL only if something still answers.

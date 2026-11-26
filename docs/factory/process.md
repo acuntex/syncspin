@@ -198,6 +198,27 @@ user's own servers neither run in a factory run nor leave files in the tree. `--
 `--setting-sources` are not used. OpenCode has no equivalent switch and still loads the user's MCP
 servers.
 
+## OpenCode options: variant and attach
+
+- `--variant-main V` / `--variant-helper V` (`FACTORY_VARIANT_MAIN`, `FACTORY_VARIANT_HELPER`) add
+  `--variant V` to the OpenCode phases of the main roles (planner, implementer) and the helper roles
+  (reviewers, pull request writer). `V` must match `^[a-z0-9][a-z0-9._-]*$`; an empty value adds nothing. The
+  Claude backend has no such flag: the driver warns and ignores the option.
+- `--opencode-attach URL` (`FACTORY_OPENCODE_ATTACH`) adds `--attach URL` to every OpenCode phase, next
+  to the `--dir <repository root>` the driver always passes. `URL` must match
+  `^https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?/?$`: no user, path or query. The Claude backend warns and
+  ignores it. The server credentials `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME` are
+  passed to a phase only with `--opencode-attach`, only when set, and through a file descriptor and
+  an `exec` shim inside the scrubbed environment, never as an argument. A log line holding either
+  value is withheld from `handoff.md` and from stderr.
+- With an attached server the environment scrub and the MCP isolation of the driver do not apply: the
+  server has its own environment, user-level configuration, MCP servers and OpenCode version, and the
+  permission semantics are the server's. Interoperability of a client and a server of different OpenCode
+  generations is unverified. The snapshot checks still apply, because they look at the files. Each
+  phase is a new session. A server restart (for example after high memory use) ends the running
+  phase: exit 20, resumable. Plain-HTTP basic auth over a network is unencrypted. See the README for
+  the by-hand check and the recommended use.
+
 ## Hooks
 
 The hooks under `.githooks/` are driver-only. The driver exports `GIT_CONFIG_COUNT=1`,

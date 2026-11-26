@@ -61,7 +61,8 @@ scripts/factory.sh --backend opencode --no-push --stop-after review --task-file 
 scripts/factory.sh --dry-run --backend claude "anything"   # print the phases and command shapes, call nothing
 ```
 
-Options: `--resume ID`, `--stop-after plan|implement|review|pr`, `--no-push`, `--dry-run`,
+`--allow-protected`, `--plan-rounds N`, `--code-rounds N`, `--model-helper M`, `--model-main M`,
+`--variant-helper V`, `--variant-main V`, `--opencode-attach URL`,
 `--allow-protected`, `--plan-rounds N`, `--code-rounds N`, `--model-helper M`, `--model-main M`,
 `--phase-timeout SECS`. `FACTORY_PASS_ENV` names the variables to pass to the agent (for a model
 provider key); everything else is removed from its environment.
@@ -115,6 +116,47 @@ above; without a helper model the driver warns once and the reviewers use the se
 run makes one planner call, one to five plan reviews, one implementer call, one to three code reviews
 (plus fixes) and one pull request writer call. Phases time out after 45 minutes (implement and fix:
 two hours) unless `--phase-timeout` says otherwise.
+
+### Reasoning variant (OpenCode)
+
+`opencode run --variant` selects a provider-specific reasoning effort (for example `minimal`, `high` or
+`max`). Set `FACTORY_VARIANT_MAIN` (planner and implementer) and `FACTORY_VARIANT_HELPER` (reviewers and
+pull request writer), or `--variant-main V` and `--variant-helper V`. A variant is passed as
+`--variant V` to the OpenCode backend only, and only when set; it must match `^[a-z0-9][a-z0-9._-]*$`, so
+nothing else can reach the command line. The Claude backend ignores it with a one-line warning. The
+driver does not know which variants a model supports: an unsupported one fails in OpenCode. `--dry-run`
+prints the variants and the command shapes.
+
+### Running against a long-lived OpenCode server
+
+`FACTORY_OPENCODE_ATTACH` or `--opencode-attach URL` makes every OpenCode phase run as
+`opencode run --attach URL --dir <repository root> ...` instead of starting its own server, so the
+phases show up as sessions in that server and a run can be followed from its web UI. The URL must be
+`http://host[:port]` or `https://host[:port]`, for example `http://localhost:4096` or
+`http://127.0.0.1:4096`, with no user, path or query; anything else is a usage error. The Claude
+backend ignores the option with a warning. `--dry-run` prints the URL.
+
+Credentials: for a server with basic auth, export `OPENCODE_SERVER_PASSWORD` (and, if the server needs
+one, `OPENCODE_SERVER_USERNAME`) in the shell that starts the driver. The driver passes them to the
+OpenCode phases only when `--opencode-attach` is used and the variable is set. They are handed to the
+phase through a file descriptor, never on a command line (the process list would show them), and a
+log line that holds either value is withheld from `handoff.md` and from stderr. The phase logs under
+`.factory/runs/` are raw agent output and are not scrubbed.
+
+What changes, honestly:
+
+- The server runs in its own environment, with its own user-level configuration, MCP servers and
+  OpenCode version. The driver's environment scrub and its MCP isolation do not apply, and the
+  permission semantics are those of the server's version.
+- Attaching works only if the client and the server API versions interoperate. This is unverified: try
+  `opencode run --attach http://localhost:4096 --dir <absolute path> "say ok"` by hand once before a
+  real run. A server of another major generation may read the configuration format differently.
+- The snapshot checks still apply: they look at the files, not at the process. Each phase is a new
+  session, so the reviewers keep fresh context.
+- A long session can drive the server to high memory use, and a supervisor may restart it. That ends
+  the running phase: exit 20, resumable.
+- Plain-HTTP basic auth sends the password unencrypted. Use loopback, or a TLS-terminating proxy, for
+  anything beyond a trusted LAN. Recommended only for local, low-risk runs.
 
 ## Permissions
 
