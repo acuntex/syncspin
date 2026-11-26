@@ -64,6 +64,9 @@ jobs:
         run: |
           command -v shellcheck || { sudo apt-get update && sudo apt-get install -y shellcheck; }
           git ls-files -z '*.sh' '.githooks/*' | xargs -0 -r shellcheck
+      # The gate and hook tests: stub CLIs and a generated fixture workspace, no network, no model.
+      - name: factory tests
+        run: scripts/test-factory.sh
 
   test:
     name: test

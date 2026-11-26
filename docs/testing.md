@@ -149,6 +149,20 @@ What the suites do not cover:
 - external review. The CPace layer has draft vectors and hermetic tests, not a review
   ([`SECURITY.md`](../SECURITY.md), "The pairing PAKE").
 
+## The gate and the factory tests
+
+`scripts/gate.sh` runs what CI runs, in a fixed order, and prints a PASS, FAIL or SKIP line per step
+(logs in `target/gate/`). `--commit` is the per-commit check, the standard mode is what the CI lint,
+test, docs and arm jobs run, `--full` adds MSRV, `cargo deny`, `cargo package` and gitleaks, and
+`--list` prints the steps without running them. A step whose input is absent (a script, a package, an
+installed target) is skipped with its reason; `--require-all` turns every skip into a failure.
+Prettier is a local pre-commit hook, not a CI job, so the gate marks that step as local only.
+
+`scripts/test-factory.sh` tests the gate and the driver-only hooks under `.githooks/` without a
+network and without a model: the tools the factory could start are stubs on `PATH`, and one test
+builds a one-crate fixture workspace in a temporary directory and runs the real gate against it with
+real `cargo`. The `lint` job runs the script.
+
 ## MSRV
 
 The workspace declares `rust-version = "1.85"`, and `rust-toolchain.toml` pins the `stable` channel,

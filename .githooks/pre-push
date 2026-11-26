@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# Driver-only hook: only fast-forward pushes of branches other than main and master.
+#
+# Refused: any update of refs/heads/main or refs/heads/master, tag pushes, deletions and every
+# non-fast-forward update. The code factory activates the hook through GIT_CONFIG_* variables; it is
+# local and removable, so it is a guardrail and not a control.
+
+set -euo pipefail
+
+zero=0000000000000000000000000000000000000000
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main | refs/heads/master)
+      printf 'pre-push: refusing to update %s\n' "$remote_ref" >&2
+      exit 1
+      ;;
+  esac
+  case "$local_ref" in
+    refs/tags/*)
+      printf 'pre-push: refusing to push a tag (%s)\n' "$local_ref" >&2
+      exit 1
+      ;;
+  esac
+  case "$remote_ref" in
+    refs/tags/*)
+      printf 'pre-push: refusing to update a tag (%s)\n' "$remote_ref" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$local_sha" = "$zero" ]; then
+    printf 'pre-push: refusing to delete %s\n' "$remote_ref" >&2
+    exit 1
+  fi
+  if [ "$remote_sha" != "$zero" ] && ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+    printf 'pre-push: refusing a non-fast-forward update of %s\n' "$remote_ref" >&2
+    exit 1
+  fi
+done
