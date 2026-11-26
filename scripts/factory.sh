@@ -1,0 +1,1062 @@
+#!/usr/bin/env bash
+#
+# The code factory driver: plan, plan review, implement, code review, pull request, with the control
+# flow in this script and the thinking in the agents. It is the only OpenCode path and the unattended
+# path for Claude Code. The specification is docs/factory/process.md; the usage text is below.
+#
+#   scripts/factory.sh [options] "task text"
+#   scripts/factory.sh [options] --task-file FILE
+#   scripts/factory.sh --resume RUN_ID
+#
+#     --backend opencode|claude     default $FACTORY_BACKEND, else the first installed
+#     --resume ID                   continue a run stopped with exit 10 or exit 20
+#     --stop-after plan|implement|review|pr
+#                                   stop after the reviewed plan, the implement phase, the code review
+#                                   loop, or run everything (default). `plan` leaves the branch that
+#                                   preflight created in the local repository.
+#     --no-push                     do not push and do not open the pull request
+#     --dry-run                     print the phases and command shapes, call nothing
+#     --allow-protected             let the implementer change the protected paths (default off)
+#     --plan-rounds N               lower the plan review cap (4) to N
+#     --code-rounds N               lower the code review cap (3) to N
+#     --model-helper M              model for the reviewers and the pr-writer ($FACTORY_MODEL_HELPER)
+#     --model-main M                model for the planner and the implementer ($FACTORY_MODEL_MAIN)
+#     --phase-timeout SECS          timeout of every phase (default 2700; implement and fix 7200)
+#
+# Exit codes: 0 done, 2 usage, 3 preflight, 10 owner decisions open, 11 plan review cap, 12 code
+# review cap, 13 sandbox violation, 14 bad commits, 15 final gate failed, 16 pull request text lint,
+# 20 phase failure (resumable). Environment: FACTORY_BACKEND, FACTORY_MODEL_HELPER, FACTORY_MODEL_MAIN,
+# FACTORY_PASS_ENV (names of variables to pass to the agent, for a model-provider key).
+#
+# Test knobs: FACTORY_LIB_ONLY=1 (source the functions without running), FACTORY_SCRUB_USER and
+# FACTORY_SCRUB_HOST (override the names the personal-data scrub looks for).
+
+# shellcheck disable=SC2034  # the run state variables are read back through ${!name} in save_state
+# shellcheck disable=SC2209,SC1010,SC2100  # phase and step names (pr, done, review) are plain values
+set -euo pipefail
+# A literal `&` in a replacement must stay a literal `&` (bash 5.2 changed the default).
+shopt -u patsub_replacement 2>/dev/null || true
+
+PLAN_CAP=4
+CODE_CAP=3
+# Configuration the tools read at project level, and the files that decide what they may do.
+# `.claude/settings.local.json` and `CLAUDE.local.md` are gitignored, so git status never shows them;
+# take_snapshot hashes them separately (the `localcfg` component).
+PROTECTED=(.githooks scripts .opencode .claude opencode.json opencode.jsonc .mcp.json AGENTS.md CLAUDE.md .github)
+LOCAL_CONFIG=(.claude/settings.local.json CLAUDE.local.md)
+CONVENTIONAL='^(feat|fix|docs|test|refactor|perf|chore|build|ci|style|revert)(\([a-z0-9._-]+\))?!?: .+'
+GENERIC_NAMES=" root runner ubuntu user admin build home test dev github docker localhost "
+
+# ---------------------------------------------------------------------------------------------
+# Small helpers
+
+hash_stdin() {
+  sha256sum | cut -d' ' -f1
+}
+
+hash_file() {
+  if [ -e "$1" ] || [ -L "$1" ]; then hash_stdin <"$1"; else printf 'absent'; fi
+}
+
+# Verdict of a review file: APPROVED only when the last non-empty line, trailing spaces and carriage
+# returns stripped, is exactly `VERDICT: APPROVED`. Everything else counts as CHANGES.
+parse_verdict() {
+  local file=$1 last
+  if [ ! -s "$file" ]; then
+    printf 'CHANGES'
+    return 0
+  fi
+  last=$(grep -v '^[[:space:]]*$' "$file" | tail -n 1 | sed -e 's/[[:space:]]*$//' || true)
+  if [ "$last" = "VERDICT: APPROVED" ]; then printf 'APPROVED'; else printf 'CHANGES'; fi
+}
+
+# The lines of the `## Owner decisions` section of a plan, blank lines dropped.
+owner_section() {
+  awk '/^## Owner decisions[[:space:]]*$/ { f = 1; next } f && /^## / { exit } f' "$1" | tr -d '\r' | grep -v '^[[:space:]]*$' || true
+}
+
+owner_section_closed() {
+  [ "$(owner_section "$1")" = "None." ]
+}
+
+# A user or host name that already occurs as a whole word in the base tree is an ordinary word there
+# (a machine called `server` or `laptop`), not a leak: it is not scrubbed. Cached per name.
+SCRUB_KNOWN_WORDS=" "
+SCRUB_UNKNOWN_WORDS=" "
+word_in_base_tree() {
+  case "$SCRUB_KNOWN_WORDS" in *" $1 "*) return 0 ;; esac
+  case "$SCRUB_UNKNOWN_WORDS" in *" $1 "*) return 1 ;; esac
+  if git grep -qiwF -e "$1" "${base_sha:-HEAD}" -- 2>/dev/null; then
+    SCRUB_KNOWN_WORDS="$SCRUB_KNOWN_WORDS$1 "
+    return 0
+  fi
+  SCRUB_UNKNOWN_WORDS="$SCRUB_UNKNOWN_WORDS$1 "
+  return 1
+}
+
+# Personal-data scrub: reads text on stdin, prints what it found, returns 1 when anything matched.
+scrub() {
+  local text found=0 home user host word seg
+  text=$(cat)
+  home=${HOME:-}
+  seg=$(printf '%s' "$home" | tr -cd '/' | wc -c)
+  if [ "$seg" -ge 2 ] && grep -Fq -- "$home" <<<"$text"; then
+    printf 'the home directory path\n'
+    found=1
+  fi
+  user=${FACTORY_SCRUB_USER-$(id -un 2>/dev/null || true)}
+  host=${FACTORY_SCRUB_HOST-$(hostname -s 2>/dev/null || true)}
+  for word in $user $host; do
+    if [ "${#word}" -le 4 ]; then continue; fi
+    case "$GENERIC_NAMES" in *" $word "*) continue ;; esac
+    if word_in_base_tree "$word"; then continue; fi
+    if grep -qw -- "$word" <<<"$text"; then
+      printf 'the user or host name "%s"\n' "$word"
+      found=1
+    fi
+  done
+  if grep -Eo '/(home|Users)/[A-Za-z0-9._-]{3,}/' <<<"$text" | grep -Evq '^/(home|Users)/(you|user|alice|runner|name)/$'; then
+    printf 'a /home/<name>/ or /Users/<name>/ path\n'
+    found=1
+  fi
+  [ "$found" = 0 ]
+}
+
+slugify() {
+  local words slug
+  words=$(printf '%s' "$1" | tr '\n' ' ' | awk '{ for (i = 1; i <= 4 && i <= NF; i++) printf "%s ", $i }')
+  slug=$(printf '%s' "$words" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-*//' -e 's/-*$//' | cut -c1-30 | sed -e 's/-*$//')
+  printf '%s' "${slug:-task}"
+}
+
+shortid() {
+  od -An -N3 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+exit_name() {
+  case "$1" in
+    0) printf 'done' ;;
+    2) printf 'usage' ;;
+    3) printf 'preflight' ;;
+    10) printf 'owner decisions open' ;;
+    11) printf 'plan review cap' ;;
+    12) printf 'code review cap' ;;
+    13) printf 'sandbox violation' ;;
+    14) printf 'bad commits' ;;
+    15) printf 'final gate failed' ;;
+    16) printf 'pull request text lint' ;;
+    20) printf 'phase failure' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------------------------
+# Snapshot: what a phase must not change. Computed from refs, config, hooks, the worktree and the
+# protected set, and from nothing else. The worktree part is `git status` (a staged change shows as
+# `M ` against a clean baseline, so staging hides nothing) plus the content of every path it lists.
+
+snap_paths() {
+  local p
+  while IFS= read -r -d '' p; do
+    if [ -L "$p" ]; then
+      printf '%s link:%s\n' "$p" "$(readlink "$p")"
+    elif [ ! -e "$p" ]; then
+      printf '%s deleted\n' "$p"
+    elif [ -d "$p" ]; then
+      printf '%s repo:%s:%s\n' "$p" "$(git -C "$p" rev-parse HEAD 2>/dev/null || printf none)" \
+        "$(find "$p" -type f -printf '%P %s %m\n' 2>/dev/null | LC_ALL=C sort | hash_stdin)"
+    else
+      printf '%s %s %s\n' "$p" "$(git hash-object --no-filters -- "$p")" "$(stat -c %a -- "$p")"
+    fi
+  done
+}
+
+# take_snapshot [exclude-branch]: one `name value` line per component.
+take_snapshot() {
+  local exclude=${1:-} f
+  printf 'refs %s\n' "$(git for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags | hash_stdin)"
+  printf 'refs-code %s\n' "$(git for-each-ref --format='%(refname) %(objectname)' | grep -v '^refs/remotes/' | { if [ -n "$exclude" ]; then grep -v "^refs/heads/$exclude "; else cat; fi; } | hash_stdin)"
+  printf 'head %s\n' "$(git symbolic-ref -q HEAD || printf detached)"
+  printf 'tip %s\n' "$(git rev-parse -q --verify "refs/heads/${exclude:-__none__}" || printf none)"
+  printf 'config %s\n' "$({
+    git config --local --list
+    for f in config config.worktree info/attributes info/exclude; do
+      printf '%s %s\n' "$f" "$(hash_file "$(git rev-parse --git-path "$f")")"
+    done
+  } | hash_stdin)"
+  printf 'hooks %s\n' "$({
+    local hooks_dir
+    # Not `--git-path hooks`: that follows core.hooksPath, and the driver points it at .githooks.
+    hooks_dir=$(git rev-parse --git-dir)/hooks
+    if [ -d "$hooks_dir" ]; then
+      for f in "$hooks_dir"/*; do
+        [ -e "$f" ] || continue
+        case "$f" in *.sample) continue ;; esac
+        printf '%s %s\n' "$(basename "$f")" "$(hash_file "$f")"
+      done
+    fi
+  } | hash_stdin)"
+  printf 'worktree %s\n' "$({
+    git status --porcelain=v1 -z --untracked-files=all | tr '\0' '\n'
+    git ls-files -m -o --exclude-standard -z | snap_paths
+  } | hash_stdin)"
+  printf 'localcfg %s\n' "$(for f in "${LOCAL_CONFIG[@]}"; do printf '%s %s\n' "$f" "$(hash_file "$f")"; done | hash_stdin)"
+  printf 'taskdoc %s\n' "$(hash_file "${run_dir:+$run_dir/task.md}")"
+  printf 'plandoc %s\n' "$(hash_file "${run_dir:+$run_dir/plan.md}")"
+  printf 'protected %s\n' "$(git ls-files -z -- "${PROTECTED[@]}" | snap_paths | hash_stdin)"
+  if [ -L CLAUDE.md ] && [ "$(readlink CLAUDE.md)" = AGENTS.md ] && [[ "$(git ls-files -s CLAUDE.md)" == 120000* ]]; then
+    printf 'symlink ok\n'
+  else
+    printf 'symlink broken\n'
+  fi
+}
+
+# compare_snapshots <readonly|code> <before> <after> [names]: prints the names of changed components.
+compare_snapshots() {
+  local mode=$1 before=$2 after=$3 names=${4:-} name changed=1
+  if [ -n "$names" ]; then
+    :
+  elif [ "$mode" = readonly ]; then
+    names="refs head config hooks worktree protected symlink localcfg taskdoc plandoc"
+  else
+    names="refs-code head config hooks symlink localcfg taskdoc plandoc"
+  fi
+  for name in $names; do
+    # The planner legitimately rewrites the plan.
+    if [ "$name" = plandoc ] && [ "${snap_skip_plandoc:-0}" = 1 ]; then continue; fi
+    if [ "$(grep "^$name " "$before")" != "$(grep "^$name " "$after")" ]; then
+      printf '%s ' "$name"
+      changed=0
+    fi
+  done
+  [ "$changed" = 1 ]
+}
+
+# Commit checks over base..HEAD; prints each problem, returns 1 when there is one.
+check_commits() {
+  local base=$1 problems=0 commits h subject body added
+  commits=$(git rev-list --reverse "$base..HEAD")
+  if [ -z "$commits" ]; then
+    printf 'no commit above the base\n'
+    return 1
+  fi
+  for h in $commits; do
+    subject=$(git log -n1 --format=%s "$h")
+    body=$(git log -n1 --format=%B "$h")
+    if ! grep -Eq "$CONVENTIONAL" <<<"$subject"; then
+      printf 'commit %s: subject is not a Conventional Commits title\n' "${h:0:8}"
+      problems=1
+    fi
+    if grep -Eiq '^(Co-Authored-By:|.*Generated (with|by) )' <<<"$body"; then
+      printf 'commit %s: attribution line\n' "${h:0:8}"
+      problems=1
+    fi
+    if grep -Eq '#[0-9]+' <<<"$body"; then
+      printf 'commit %s: a #<number> reference\n' "${h:0:8}"
+      problems=1
+    fi
+    if ! what=$(scrub <<<"$body"); then
+      printf 'commit %s: personal data in the message (%s)\n' "${h:0:8}" "$(tr '\n' ';' <<<"$what")"
+      problems=1
+    fi
+  done
+  added=$(git diff --no-color -U0 "$base..HEAD" | grep '^+' | grep -v '^+++' || true)
+  if ! what=$(scrub <<<"$added"); then
+    printf 'personal data in added lines (%s)\n' "$(tr '\n' ';' <<<"$what")"
+    problems=1
+  fi
+  [ "$problems" = 0 ]
+}
+
+# Lint of the pull request text; prints each problem, returns 1 when there is one.
+lint_pr() {
+  local file=$1 title problems=0 what
+  title=$(head -n 1 "$file")
+  if ! grep -Eq "$CONVENTIONAL" <<<"$title" || [ "${#title}" -gt 72 ]; then
+    printf 'the title is not a Conventional Commits title of at most 72 characters\n'
+    problems=1
+  fi
+  if grep -Eq '#[0-9]+' "$file"; then
+    printf 'a #<number> reference (GitHub would link it to another pull request)\n'
+    problems=1
+  fi
+  if grep -Eiq '(Co-Authored-By:|Generated (with|by) )' "$file"; then
+    printf 'an attribution line\n'
+    problems=1
+  fi
+  if ! grep -Eiq '^#{1,6}[[:space:]]+Not verified[[:space:]]*$' "$file"; then
+    printf 'no "Not verified" heading\n'
+    problems=1
+  fi
+  if ! what=$(scrub <"$file"); then
+    printf 'personal data (%s)\n' "$(tr '\n' ';' <<<"$what")"
+    problems=1
+  fi
+  [ "$problems" = 0 ]
+}
+
+# Replace {{NAME}} placeholders in a template read from stdin. Values come from P_* variables.
+render() {
+  local s
+  s=$(cat)
+  s=${s//'{{TASK_FILE}}'/${P_TASK_FILE-}}
+  s=${s//'{{ARTIFACT}}'/${P_ARTIFACT-}}
+  s=${s//'{{PLAN}}'/${P_PLAN-}}
+  s=${s//'{{REVIEW}}'/${P_REVIEW-}}
+  s=${s//'{{DECISIONS}}'/${P_DECISIONS-}}
+  s=${s//'{{ROUND}}'/${P_ROUND-}}
+  s=${s//'{{MAX_ROUNDS}}'/${P_MAX-}}
+  s=${s//'{{BASE_SHA}}'/${P_BASE-}}
+  s=${s//'{{BRANCH}}'/${P_BRANCH-}}
+  s=${s//'{{RUN_DIR}}'/${P_RUN_DIR-}}
+  s=${s//'{{GATE_CMD}}'/${P_GATE-}}
+  s=${s//'{{RESUME_CONTEXT}}'/${P_RESUME-}}
+  printf '%s\n' "$s"
+}
+
+# truncate_text <bytes> <text>
+truncate_text() {
+  if [ "${#2}" -le "$1" ]; then
+    printf '%s' "$2"
+  else
+    printf '%s\n(truncated)' "${2:0:$1}"
+  fi
+}
+
+resume_context() {
+  if [ "$resuming" = 1 ]; then
+    # One argv element: keep it far below the kernel limit for a single argument.
+    printf 'A previous attempt was interrupted; inspect the tree and continue.\n\nGit status:\n%s\n\nCommits since the base:\n%s\n' \
+      "$(truncate_text 3000 "$(git status --porcelain)")" "$(truncate_text 3000 "$(git log --oneline "$base_sha..HEAD")")"
+  fi
+}
+
+if [ "${FACTORY_LIB_ONLY:-0}" = 1 ]; then
+  # shellcheck disable=SC2317  # reached when the file is sourced
+  return 0 2>/dev/null || exit 0
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Usage and options
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+ROOT=$PWD
+
+usage() {
+  awk '/^#   scripts\/factory.sh \[options\]/ { f = 1 } f { sub(/^# ?/, ""); print } /--phase-timeout/ { exit }' "${BASH_SOURCE[0]}" >&2
+  exit "${1:-2}"
+}
+
+die_usage() {
+  printf 'factory: %s\n' "$1" >&2
+  exit 2
+}
+
+die_preflight() {
+  printf 'factory: %s\n' "$1" >&2
+  exit 3
+}
+
+backend=${FACTORY_BACKEND:-}
+resume_id=""
+stop_after=pr
+no_push=0
+dry_run=0
+allow_protected=0
+plan_cap=$PLAN_CAP
+code_cap=$CODE_CAP
+model_helper=${FACTORY_MODEL_HELPER:-}
+model_main=${FACTORY_MODEL_MAIN:-}
+phase_timeout=""
+task_text=""
+task_file=""
+
+need_value() {
+  [ "$#" -ge 2 ] && [ -n "$2" ] || die_usage "$1 needs a value"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --backend) need_value "$@"; backend=$2; shift 2 ;;
+    --resume) need_value "$@"; resume_id=$2; shift 2 ;;
+    --stop-after) need_value "$@"; stop_after=$2; shift 2 ;;
+    --no-push) no_push=1; shift ;;
+    --dry-run) dry_run=1; shift ;;
+    --allow-protected) allow_protected=1; shift ;;
+    --plan-rounds) need_value "$@"; plan_cap=$2; shift 2 ;;
+    --code-rounds) need_value "$@"; code_cap=$2; shift 2 ;;
+    --model-helper) need_value "$@"; model_helper=$2; shift 2 ;;
+    --model-main) need_value "$@"; model_main=$2; shift 2 ;;
+    --phase-timeout) need_value "$@"; phase_timeout=$2; shift 2 ;;
+    --task-file) need_value "$@"; task_file=$2; shift 2 ;;
+    -h | --help) usage 0 ;;
+    --*) die_usage "unknown option $1" ;;
+    *)
+      [ -z "$task_text" ] || die_usage "more than one task text"
+      task_text=$1
+      shift
+      ;;
+  esac
+done
+
+case "$stop_after" in plan | implement | review | pr) ;; *) die_usage "--stop-after takes plan, implement, review or pr" ;; esac
+[[ "$plan_cap" =~ ^[0-9]+$ ]] && [ "$plan_cap" -ge 1 ] && [ "$plan_cap" -le "$PLAN_CAP" ] || die_usage "--plan-rounds takes 1 to $PLAN_CAP (the cap can only be lowered)"
+[[ "$code_cap" =~ ^[0-9]+$ ]] && [ "$code_cap" -ge 1 ] && [ "$code_cap" -le "$CODE_CAP" ] || die_usage "--code-rounds takes 1 to $CODE_CAP (the cap can only be lowered)"
+if [ -n "$phase_timeout" ]; then
+  [[ "$phase_timeout" =~ ^[0-9]+$ ]] && [ "$phase_timeout" -ge 1 ] || die_usage "--phase-timeout takes a number of seconds"
+fi
+case "$backend" in "" | opencode | claude) ;; *) die_usage "--backend takes opencode or claude" ;; esac
+if [ -n "$resume_id" ]; then
+  [ -z "$task_text" ] && [ -z "$task_file" ] || die_usage "--resume takes no task"
+else
+  [ -z "$task_text" ] || [ -z "$task_file" ] || die_usage "give a task text or --task-file, not both"
+  [ -n "$task_text" ] || [ -n "$task_file" ] || { usage 2; }
+  [ -z "$task_file" ] || [ -f "$task_file" ] || die_usage "no such task file: $task_file"
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Backends: the only place that knows a flag.
+
+role_class() {
+  sed -n 's/^model_class=//p' "docs/factory/meta/$1.conf"
+}
+
+model_for() {
+  case "$(role_class "$1")" in
+    helper) printf '%s' "$model_helper" ;;
+    *) printf '%s' "$model_main" ;;
+  esac
+}
+
+claude_tools() {
+  local access=$1 artifact=${2:-.factory/runs/${run_id:-RUN_ID}/<artifact>} list line f
+  local -a files=(common)
+  if [ "$access" = readonly ]; then
+    # Exactly the one file the phase writes, anchored at the repository root: state, snapshots and
+    # the other run files are not agent-writable.
+    list="Edit(/$artifact)"
+  else
+    list="Edit,Write"
+    files+=(code)
+  fi
+  # The orchestrator grant (fetch, branch creation, pull request commands) is never given to an
+  # agent: only the driver pushes and opens the pull request.
+  for f in "${files[@]}"; do
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] || continue
+      list="$list,$line"
+    done <"docs/factory/meta/claude-allow-$f.txt"
+  done
+  printf '%s' "$list"
+}
+
+# build_cmd <role> <access> <phase> <prompt> [artifact]: fills the global array `cmd`.
+build_cmd() {
+  local role=$1 access=$2 phase=$3 prompt=$4 artifact=${5:-} model
+  model=$(model_for "$role")
+  cmd=()
+  case "$backend" in
+    opencode)
+      cmd=(opencode run --agent "factory-$role")
+      if [ -n "$model" ]; then cmd+=(--model "$model"); fi
+      cmd+=(--title "${run_id:-RUN_ID}:$phase" --dir "$PWD" "$prompt")
+      ;;
+    claude)
+      cmd=(claude -p "$prompt" --agent "factory-$role")
+      if [ -n "$model" ]; then cmd+=(--model "$model"); fi
+      cmd+=(--permission-mode dontAsk --allowedTools "$(claude_tools "$access" "$artifact")" --no-session-persistence --output-format text)
+      ;;
+  esac
+}
+
+if [ -z "$backend" ]; then
+  for candidate in opencode claude; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      backend=$candidate
+      break
+    fi
+  done
+fi
+
+if [ "$dry_run" = 1 ]; then
+  [ -n "$backend" ] || backend=opencode
+  printf 'factory dry run: nothing is called, nothing is changed\n'
+  printf 'backend: %s\n' "$backend"
+  printf 'caps: plan review %s rounds, code review %s rounds\n' "$plan_cap" "$code_cap"
+  printf 'phases: plan, plan-review, owner-gate, implement, code-review, final-gate, pr\n'
+  printf 'stop after: %s%s\n' "$stop_after" "$( [ "$no_push" = 1 ] && printf ', no push' || true)"
+  for entry in planner:readonly:plan plan-reviewer:readonly:plan-review implementer:code:implement code-reviewer:readonly:code-review pr-writer:readonly:pr; do
+    IFS=: read -r r a p <<<"$entry"
+    build_cmd "$r" "$a" "$p" "<prompt>"
+    printf 'command (%s): ' "$p"
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+  done
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Run state
+
+run_id=""
+branch=""
+base_sha=""
+phase=preflight
+step=""
+plan_round=0
+code_round=0
+post_decision_review=0
+status=running
+exit_code=""
+stopped_at=""
+run_dir=""
+child_pgid=""
+resuming=0
+head_before=""
+main_before=""
+
+save_state() {
+  [ -n "$run_dir" ] || return 0
+  local k
+  {
+    for k in run_id backend branch base_sha phase step plan_round code_round post_decision_review status exit_code stopped_at; do
+      printf '%s=%s\n' "$k" "${!k}"
+    done
+  } >"$run_dir/state.tmp"
+  mv "$run_dir/state.tmp" "$run_dir/state"
+}
+
+load_state() {
+  local line key value
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^([a-z_]+)=(.*)$ ]] || continue
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    case "$key" in
+      run_id | backend | branch | base_sha | phase | step | plan_round | code_round | post_decision_review | status | exit_code | stopped_at)
+        printf -v "$key" '%s' "$value"
+        ;;
+    esac
+  done <"$run_dir/state"
+}
+
+last_review_file() {
+  local f newest=""
+  for f in "$run_dir"/review-*.md; do
+    [ -e "$f" ] || continue
+    if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest=$f; fi
+  done
+  printf '%s' "$newest"
+}
+
+write_handoff() {
+  local code=$1 reason=$2 review resume f
+  review=$(last_review_file)
+  if [ "$code" = 10 ] || [ "$code" = 20 ]; then
+    resume="scripts/factory.sh --resume $run_id"
+  else
+    resume="not resumable"
+  fi
+  {
+    printf '# Handoff\n\n'
+    printf 'Run: %s\n' "$run_id"
+    printf 'Branch: %s\n' "$branch"
+    printf 'Stopped at: %s, step %s\n' "$phase" "${step:-none}"
+    printf 'Exit code: %s (%s)\n\n' "$code" "$(exit_name "$code")"
+    printf 'Reason: %s\n\n' "$reason"
+    printf 'Artifacts:\n'
+    for f in "$run_dir"/*; do
+      [ -e "$f" ] && printf -- '- %s\n' "${f#"$ROOT"/}"
+    done
+    printf '\nOpen findings:\n'
+    if [ -n "$review" ]; then
+      printf '%s\n\n' "${review#"$ROOT"/}"
+      if grep -q '^## Blocker' "$review"; then
+        awk '/^## Blocker/ { f = 1; print; next } f && /^## / { exit } f' "$review"
+      else
+        cat "$review"
+      fi
+    else
+      printf 'none\n'
+    fi
+    if [ -s "$run_dir/protected-diff.txt" ]; then
+      printf '\nProtected paths changed (--allow-protected):\n'
+      sed -e 's/^/- /' "$run_dir/protected-diff.txt"
+    fi
+    printf '\nResume: %s\n' "$resume"
+  } >"$run_dir/handoff.md"
+}
+
+stop() {
+  local code=$1
+  shift
+  exit_code=$code
+  status=stopped
+  stopped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  save_state
+  write_handoff "$code" "$*"
+  printf 'factory: stopped, exit %s (%s): %s\n' "$code" "$(exit_name "$code")" "$*" >&2
+  printf 'factory: see %s/handoff.md\n' "${run_dir#"$ROOT"/}" >&2
+  exit "$code"
+}
+
+finish() {
+  phase=done
+  step=""
+  status=done
+  exit_code=0
+  stopped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  save_state
+  printf 'factory: done (%s)\n' "$*"
+  exit 0
+}
+
+kill_group() {
+  if [ -n "$child_pgid" ]; then
+    kill -TERM -- "-$child_pgid" 2>/dev/null || true
+    sleep 0.2
+    if kill -0 -- "-$child_pgid" 2>/dev/null; then
+      sleep 1
+      if kill -0 -- "-$child_pgid" 2>/dev/null; then kill -KILL -- "-$child_pgid" 2>/dev/null || true; fi
+    fi
+  fi
+}
+
+on_signal() {
+  trap '' INT TERM
+  kill_group
+  exit_code=20
+  status=stopped
+  stopped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  save_state
+  write_handoff 20 "interrupted by a signal; the agent process group was terminated"
+  exit 130
+}
+
+# ---------------------------------------------------------------------------------------------
+# Preflight and resume
+
+export_hooks() {
+  export GIT_CONFIG_COUNT=1
+  export GIT_CONFIG_KEY_0=core.hooksPath
+  export GIT_CONFIG_VALUE_0="$ROOT/.githooks"
+}
+
+rel() {
+  printf '%s' "${1#"$ROOT"/}"
+}
+
+need_tools() {
+  local t
+  for t in git setsid timeout sha256sum od; do
+    command -v "$t" >/dev/null 2>&1 || die_preflight "required tool not found: $t"
+  done
+  [ -n "$backend" ] || die_preflight "neither opencode nor claude is installed (install one, or set --backend)"
+  command -v "$backend" >/dev/null 2>&1 || die_preflight "backend not found: $backend (install it or choose the other with --backend)"
+  if [ "$no_push" = 0 ] && [ "$stop_after" = pr ]; then
+    command -v gh >/dev/null 2>&1 || die_preflight "gh not found (needed to open the pull request; install it or use --no-push)"
+  fi
+}
+
+snap_take_to() {
+  take_snapshot "$branch" >"$1"
+}
+
+if [ -z "$resume_id" ]; then
+  export_hooks
+  need_tools
+  git rev-parse --show-toplevel >/dev/null 2>&1 || die_preflight "not a git repository"
+  [ -z "$(git status --porcelain)" ] || die_preflight "the working tree is not clean; commit or stash first"
+  git remote get-url origin >/dev/null 2>&1 || die_preflight "no remote named origin"
+  git fetch -q origin main || die_preflight "git fetch origin main failed"
+  git rev-parse --verify -q refs/remotes/origin/main >/dev/null || die_preflight "origin/main does not exist"
+  if [ -n "$task_file" ]; then task_text=$(cat "$task_file"); fi
+  [ -n "$task_text" ] || die_preflight "the task is empty"
+  slug=$(slugify "$task_text")
+  sid=$(shortid)
+  branch="factory/$slug-$sid"
+  if git show-ref --verify -q "refs/heads/$branch"; then
+    sid=$(shortid)
+    branch="factory/$slug-$sid"
+    ! git show-ref --verify -q "refs/heads/$branch" || die_preflight "branch $branch exists"
+  fi
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-$sid"
+  run_dir="$ROOT/.factory/runs/$run_id"
+  mkdir -p "$run_dir/logs"
+  main_before=$(git rev-parse -q --verify refs/heads/main || true)
+  git switch -q -c "$branch" --no-track origin/main
+  base_sha=$(git rev-parse HEAD)
+  printf '%s\n' "$task_text" >"$run_dir/task.md"
+  if [ "$backend" = opencode ] && [ -z "$model_helper" ]; then
+    printf 'factory: warning: no helper model set (FACTORY_MODEL_HELPER); the reviewers run on the OpenCode default\n' >&2
+  fi
+  phase=plan
+  step=write
+  save_state
+  printf '%s\n' "$main_before" >"$run_dir/main-before"
+  snap_take_to "$run_dir/snap.base"
+  printf 'factory: run %s on branch %s (backend %s)\n' "$run_id" "$branch" "$backend"
+else
+  export_hooks
+  run_dir="$ROOT/.factory/runs/$resume_id"
+  [ -f "$run_dir/state" ] || die_usage "no such run: $resume_id"
+  load_state
+  if [ "$status" != stopped ] || { [ "$exit_code" != 10 ] && [ "$exit_code" != 20 ]; }; then
+    die_usage "run $resume_id cannot be resumed (status $status, exit code ${exit_code:-none}); see $(rel "$run_dir")/handoff.md"
+  fi
+  need_tools
+  if [ "$exit_code" = 10 ]; then
+    [ -s "$run_dir/decisions.md" ] || die_preflight "write the owner decisions to $(rel "$run_dir")/decisions.md first"
+  fi
+  git show-ref --verify -q "refs/heads/$branch" || die_preflight "the branch $branch is gone"
+  git switch -q "$branch" || die_preflight "cannot switch to $branch"
+  git merge-base --is-ancestor "$base_sha" HEAD || die_preflight "the base commit is not an ancestor of HEAD"
+  main_before=$(cat "$run_dir/main-before" 2>/dev/null || true)
+  status=running
+  exit_code=""
+  stopped_at=""
+  resuming=1
+  # An interrupted phase skipped its snapshot check: compare the baseline of the last verified
+  # phase with the present state before it is retaken. HEAD is left out (the resume switches to the
+  # branch). Only an interrupted implement or fix may legitimately move the branch tip, change
+  # protected files (the post-phase checks then judge them) and leave a dirty tree; after any other
+  # phase the tip, the protected files and the worktree must be as verified, or a readonly phase
+  # could commit or edit and have it accepted as the new baseline.
+  if [ -f "$run_dir/snap.base" ]; then
+    resume_names="refs-code config hooks symlink localcfg taskdoc"
+    case "$step" in
+      implement | fix) ;;
+      *) resume_names="$resume_names tip protected worktree" ;;
+    esac
+    snap_take_to "$run_dir/snap.now"
+    if changed=$(compare_snapshots code "$run_dir/snap.base" "$run_dir/snap.now" "$resume_names"); then :; else
+      stop 13 "the interrupted phase changed state it must not touch: ${changed}"
+    fi
+  fi
+  snap_take_to "$run_dir/snap.base"
+  save_state
+  printf 'factory: resuming run %s at %s, step %s\n' "$run_id" "$phase" "$step"
+fi
+
+trap on_signal INT TERM
+
+# ---------------------------------------------------------------------------------------------
+# Running one phase
+
+timeout_for() {
+  if [ -n "$phase_timeout" ]; then printf '%s' "$phase_timeout"; return; fi
+  case "$1" in implement | fix) printf '7200' ;; *) printf '2700' ;; esac
+}
+
+# run_phase <role> <access> <phase-name> <template> <artifact-path-or-empty> <timeout-kind>
+# Sets phase_rc and phase_timed_out. Template values come from the P_* variables.
+run_phase() {
+  local role=$1 access=$2 name=$3 template=$4 artifact=$5 tkind=$6 prompt secs rc=0 var
+  local -a envargs
+  P_ARTIFACT=$artifact
+  P_BASE=$base_sha
+  P_BRANCH=$branch
+  P_RUN_DIR=$(rel "$run_dir")
+  P_TASK_FILE=$(rel "$run_dir")/task.md
+  prompt=$(render <"docs/factory/phases/$template.md")
+  build_cmd "$role" "$access" "$name" "$prompt" "$artifact"
+  secs=$(timeout_for "$tkind")
+  envargs=(env -i)
+  for var in PATH HOME TERM LANG; do
+    if [ -n "${!var+x}" ]; then envargs+=("$var=${!var}"); fi
+  done
+  envargs+=("GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT" "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0" "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0")
+  envargs+=("FACTORY_RUN_DIR=$(rel "$run_dir")" "FACTORY_ARTIFACT=$artifact" "FACTORY_BASE_SHA=$base_sha")
+  for var in ${FACTORY_PASS_ENV:-}; do
+    if [ -n "${!var+x}" ]; then envargs+=("$var=${!var}"); fi
+  done
+  printf 'factory: phase %s (%s, round %s/%s)\n' "$name" "$role" "${P_ROUND:-0}" "${P_MAX:-0}"
+  printf '== %s %s\n' "$name" "$(date -u +%H:%M:%S)" >>"$run_dir/logs/$name.log"
+  setsid timeout -k 30 "$secs" "${envargs[@]}" "${cmd[@]}" >>"$run_dir/logs/$name.log" 2>&1 &
+  child_pgid=$!
+  wait "$child_pgid" || rc=$?
+  # Reap grandchildren: TERM the group, poll, KILL only if something still answers.
+  kill -TERM -- "-$child_pgid" 2>/dev/null || true
+  local waited=0
+  while kill -0 -- "-$child_pgid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  if kill -0 -- "-$child_pgid" 2>/dev/null; then kill -KILL -- "-$child_pgid" 2>/dev/null || true; fi
+  child_pgid=""
+  phase_rc=$rc
+  phase_timed_out=0
+  if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then phase_timed_out=1; fi
+}
+
+# Verify the snapshot after a phase and retake the baseline. readonly|code.
+verify_phase() {
+  local mode=$1 changed
+  case "$phase:$step" in
+    plan:write | plan-review:revise | owner-gate:revise) snap_skip_plandoc=1 ;;
+    *) snap_skip_plandoc=0 ;;
+  esac
+  take_snapshot "$branch" >"$run_dir/snap.now"
+  if changed=$(compare_snapshots "$mode" "$run_dir/snap.base" "$run_dir/snap.now"); then :; else
+    stop 13 "the $phase phase changed state it must not touch: ${changed}"
+  fi
+  if [ "$mode" = code ]; then
+    [ "$(git symbolic-ref -q HEAD)" = "refs/heads/$branch" ] || stop 13 "HEAD is no longer on $branch"
+    git merge-base --is-ancestor "$head_before" HEAD || stop 13 "the history of $branch was rewritten"
+    git diff --name-only "$base_sha..HEAD" -- "${PROTECTED[@]}" >"$run_dir/protected-diff.txt"
+    { git status --porcelain -- "${PROTECTED[@]}" | sed -e 's/^...//'; } >>"$run_dir/protected-diff.txt" || true
+    if [ -s "$run_dir/protected-diff.txt" ]; then
+      if [ "$allow_protected" = 0 ]; then
+        stop 13 "protected paths changed without --allow-protected: $(tr '\n' ' ' <"$run_dir/protected-diff.txt")"
+      fi
+    else
+      rm -f "$run_dir/protected-diff.txt"
+    fi
+  fi
+  take_snapshot "$branch" >"$run_dir/snap.base"
+}
+
+# Artifact phases: the backend must leave its artifact behind. Returns nothing; stops on failure.
+artifact_phase() {
+  local role=$1 name=$2 template=$3 artifact=$4
+  rm -f "${ROOT:?}/$artifact"
+  run_phase "$role" readonly "$name" "$template" "$artifact" "$name"
+  if [ "$phase_timed_out" = 1 ]; then stop 20 "the $name phase timed out"; fi
+  if [ ! -s "$ROOT/$artifact" ]; then
+    if [ "$backend" = claude ]; then
+      printf 'factory: artifact missing: the Edit(...) rule form may be wrong for this Claude Code version\n' >&2
+    fi
+    stop 20 "the $name phase ended (exit $phase_rc) without its artifact $artifact"
+  fi
+  verify_phase readonly
+}
+
+# Code phases (implement, fix): success criteria and post-phase checks.
+code_phase() {
+  local role=implementer name=$1 template=$2 progress
+  head_before=$(git rev-parse HEAD)
+  run_phase "$role" code "$name" "$template" "" "$name"
+  if [ "$phase_timed_out" = 1 ]; then stop 20 "the $name phase timed out"; fi
+  progress=$(git rev-list --count "$head_before..HEAD")
+  if [ "$phase_rc" != 0 ] && [ "$progress" = 0 ]; then
+    stop 20 "the backend exited with $phase_rc and made no commit"
+  fi
+  verify_phase code
+  if [ -e "$run_dir/blocked.md" ]; then
+    stop 14 "the implementer stopped and wrote blocked.md: $(head -c 400 "$run_dir/blocked.md" | tr '\n' ' ')"
+  fi
+  if [ "$phase_rc" = 0 ] && [ "$progress" = 0 ]; then
+    stop 14 "the $name phase exited cleanly but made no commit"
+  fi
+  local problems
+  if ! problems=$(check_commits "$base_sha"); then
+    stop 14 "commit checks failed: $(tr '\n' ';' <<<"$problems")"
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# The state machine: one unit of work per iteration. A stop records the unit, so a resume repeats it.
+
+plan_file=$(rel "$run_dir")/plan.md
+decisions_file=$(rel "$run_dir")/decisions.md
+
+while :; do
+  save_state
+  P_PLAN=$plan_file
+  P_DECISIONS=""
+  P_REVIEW=""
+  P_ROUND=""
+  P_MAX=""
+  P_GATE=""
+  P_RESUME=""
+  case "$phase:$step" in
+    plan:write)
+      P_RESUME=$(resume_context)
+      artifact_phase planner plan plan "$plan_file"
+      resuming=0
+      phase=plan-review
+      step=review
+      plan_round=1
+      ;;
+    plan-review:review)
+      P_ROUND=$plan_round
+      P_MAX=$plan_cap
+      review_file=$(rel "$run_dir")/review-plan-$plan_round.md
+      artifact_phase plan-reviewer plan-review plan-review "$review_file"
+      resuming=0
+      if [ "$(parse_verdict "$ROOT/$review_file")" = APPROVED ]; then
+        phase=owner-gate
+        step=check
+      elif [ "$plan_round" -lt "$plan_cap" ]; then
+        step=revise
+      else
+        stop 11 "the plan was not approved within $plan_cap review rounds"
+      fi
+      ;;
+    plan-review:revise)
+      P_ROUND=$plan_round
+      P_MAX=$plan_cap
+      P_REVIEW=$(rel "$run_dir")/review-plan-$plan_round.md
+      cp "$ROOT/$plan_file" "$run_dir/plan-before-revision-$plan_round.md"
+      before=$(hash_file "$ROOT/$plan_file")
+      run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
+      if [ "$phase_timed_out" = 1 ]; then stop 20 "the plan-revise phase timed out"; fi
+      if [ "$(hash_file "$ROOT/$plan_file")" = "$before" ]; then
+        if [ "$backend" = claude ]; then
+          printf 'factory: artifact missing: the Edit(...) rule form may be wrong for this Claude Code version\n' >&2
+        fi
+        stop 20 "the plan-revise phase ended (exit $phase_rc) without a revised plan"
+      fi
+      verify_phase readonly
+      resuming=0
+      plan_round=$((plan_round + 1))
+      step=review
+      ;;
+    owner-gate:check)
+      if owner_section_closed "$ROOT/$plan_file"; then
+        if [ "$stop_after" = plan ]; then finish "reviewed plan, stopped after plan"; fi
+        phase=implement
+        step=implement
+      else
+        step=revise
+        stop 10 "owner decisions are open; answer them in $decisions_file and run scripts/factory.sh --resume $run_id. Questions: $(owner_section "$ROOT/$plan_file" | tr '\n' ' ')"
+      fi
+      ;;
+    owner-gate:revise)
+      P_DECISIONS=$decisions_file
+      P_ROUND=$plan_round
+      P_MAX=$plan_cap
+      P_REVIEW=$(rel "$run_dir")/review-plan-$plan_round.md
+      before=$(hash_file "$ROOT/$plan_file")
+      run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
+      if [ "$phase_timed_out" = 1 ]; then stop 20 "the plan-revise phase timed out"; fi
+      if [ "$(hash_file "$ROOT/$plan_file")" = "$before" ]; then
+        stop 20 "the plan-revise phase ended (exit $phase_rc) without a revised plan"
+      fi
+      verify_phase readonly
+      resuming=0
+      step=post
+      ;;
+    owner-gate:post)
+      P_DECISIONS=$decisions_file
+      P_ROUND=$((plan_cap + 1))
+      P_MAX=$((plan_cap + 1))
+      artifact_phase plan-reviewer plan-review-post plan-review-post "$(rel "$run_dir")/review-plan-post.md"
+      resuming=0
+      post_decision_review=1
+      if [ "$(parse_verdict "$run_dir/review-plan-post.md")" != APPROVED ]; then
+        stop 11 "the post-decision review did not approve the plan"
+      fi
+      if [ "$stop_after" = plan ]; then finish "reviewed plan, stopped after plan"; fi
+      phase=implement
+      step=implement
+      ;;
+    implement:implement)
+      P_GATE="scripts/gate.sh --commit"
+      P_RESUME=$(resume_context)
+      code_phase implement implement
+      resuming=0
+      if [ "$stop_after" = implement ]; then finish "implemented, stopped after implement"; fi
+      phase=code-review
+      step=review
+      code_round=1
+      ;;
+    code-review:review)
+      P_ROUND=$code_round
+      P_MAX=$code_cap
+      P_GATE="scripts/gate.sh"
+      review_file=$(rel "$run_dir")/review-code-$code_round.md
+      artifact_phase code-reviewer code-review code-review "$review_file"
+      resuming=0
+      if [ "$(parse_verdict "$ROOT/$review_file")" = APPROVED ]; then
+        if [ "$stop_after" = review ]; then finish "reviewed, stopped after review"; fi
+        phase=final-gate
+        step=gate
+      elif [ "$code_round" -lt "$code_cap" ]; then
+        step=fix
+      else
+        stop 12 "the code was not approved within $code_cap review rounds"
+      fi
+      ;;
+    code-review:fix)
+      P_ROUND=$code_round
+      P_MAX=$code_cap
+      P_GATE="scripts/gate.sh --commit"
+      P_REVIEW=$(rel "$run_dir")/review-code-$code_round.md
+      P_RESUME=$(resume_context)
+      code_phase fix fix
+      resuming=0
+      code_round=$((code_round + 1))
+      step=review
+      ;;
+    final-gate:gate)
+      printf 'factory: final gate (scripts/gate.sh --full)\n'
+      gate_rc=0
+      timeout -k 30 "$(timeout_for implement)" scripts/gate.sh --full >"$run_dir/logs/final-gate.log" 2>&1 || gate_rc=$?
+      if [ "$gate_rc" = 124 ] || [ "$gate_rc" = 137 ]; then stop 20 "the final gate timed out"; fi
+      grep '^SKIP' "$run_dir/logs/final-gate.log" >"$run_dir/gate-skips.txt" || true
+      if [ "$gate_rc" != 0 ]; then
+        stop 15 "scripts/gate.sh --full failed (exit $gate_rc); no automatic fix is attempted; see $(rel "$run_dir")/logs/final-gate.log"
+      fi
+      phase=pr
+      step=pr-write
+      ;;
+    pr:pr-write)
+      P_RESUME=""
+      artifact_phase pr-writer pr pr "$(rel "$run_dir")/pr.md"
+      resuming=0
+      if ! problems=$(lint_pr "$run_dir/pr.md"); then
+        stop 16 "the pull request text failed its lint: $(tr '\n' ';' <<<"$problems")"
+      fi
+      pr_title=$(head -n 1 "$run_dir/pr.md")
+      tail -n +2 "$run_dir/pr.md" | sed -e '1{/^[[:space:]]*$/d}' >"$run_dir/pr-body.md"
+      if [ -s "$run_dir/protected-diff.txt" ]; then
+        {
+          printf '\n## Protected paths changed (--allow-protected)\n\n'
+          sed -e 's/^/- /' "$run_dir/protected-diff.txt"
+        } >>"$run_dir/pr-body.md"
+      fi
+      if [ "$no_push" = 1 ] || [ "$stop_after" != pr ]; then
+        finish "pull request text written to $(rel "$run_dir")/pr.md, not pushed"
+      fi
+      step=push
+      ;;
+    pr:push)
+      remote_head=$(git ls-remote origin "refs/heads/$branch" | cut -f1 || true)
+      if [ "$remote_head" = "$(git rev-parse HEAD)" ]; then
+        printf 'factory: %s is already on origin at HEAD, skipping the push\n' "$branch"
+      else
+        if ! git push -q -u origin "$branch" >>"$run_dir/logs/push.log" 2>&1; then
+          stop 20 "git push failed; see $(rel "$run_dir")/logs/push.log"
+        fi
+        # The push wrote the upstream into .git/config: the resume check must not see that as tampering.
+        take_snapshot "$branch" >"$run_dir/snap.base"
+      fi
+      step=pr-create
+      ;;
+    pr:pr-create)
+      pr_title=$(head -n 1 "$run_dir/pr.md")
+      existing=$(gh pr list --head "$branch" --json url --jq '.[0].url // empty' 2>>"$run_dir/logs/pr-create.log" || true)
+      if [ -n "$existing" ]; then
+        pr_url=$existing
+        printf 'factory: a pull request already exists\n'
+      else
+        if ! pr_url=$(gh pr create --base main --head "$branch" --title "$pr_title" --body-file "$run_dir/pr-body.md" 2>>"$run_dir/logs/pr-create.log"); then
+          stop 20 "gh pr create failed; see $(rel "$run_dir")/logs/pr-create.log"
+        fi
+      fi
+      [ "$(git rev-parse -q --verify refs/heads/main || true)" = "$main_before" ] || stop 13 "local main moved during the run"
+      # A commit of this branch reachable from fresh remote main means something pushed it there,
+      # whichever commit of the branch it was. A stale ref would hide that, so a failed fetch fails.
+      git fetch -q origin main || stop 20 "git fetch origin main failed; cannot check that main is untouched"
+      if [ "$(git rev-list --count refs/remotes/origin/main..HEAD)" != "$(git rev-list --count "$base_sha..HEAD")" ]; then
+        stop 13 "a commit of the branch is on remote main"
+      fi
+      printf '%s\n' "$pr_url" >"$run_dir/pr-url.txt"
+      finish "pull request: $pr_url"
+      ;;
+    *)
+      stop 3 "unknown state $phase:$step"
+      ;;
+  esac
+done
