@@ -329,6 +329,7 @@ status_all() {
     "$(printf '%s\n' "${fwd[@]}" | sed -n 's/^FACTORY_MODEL_MAIN=//p' | head -n 1 | grep . || printf 'default')" \
     "$(printf '%s\n' "${fwd[@]}" | sed -n 's/^FACTORY_MODEL_HELPER=//p' | head -n 1 | grep . || printf 'default')"
   if [ -n "$env_file" ]; then printf '  env file: set\n'; else printf '  env file: not set\n'; fi
+  printf '  task file: .factory/launch/task-%s-%s.md (a fresh name for a task text)\n' "$(date -u +%s)" "$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
   printf 'launches (newest first):\n'
   # shellcheck disable=SC2012  # names are checked against a pattern in the loop
   for meta in $(ls -1t .factory/launch/*.meta 2>/dev/null | head -n 5 || true); do

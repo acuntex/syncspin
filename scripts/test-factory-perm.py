@@ -88,8 +88,11 @@ def overlay(path):
             break
         if line == "permission:":
             in_perm = True
-        elif in_perm and re.fullmatch(r"  (edit|bash):", line):
+        elif in_perm and re.fullmatch(r"  (edit|bash|read):", line):
             tool = line.strip()[:-1]
+        elif in_perm and re.fullmatch(r'  question: "(allow|ask|deny)"', line):
+            tool = None
+            rules.append(("question", "*", line.split('"')[1]))
         elif in_perm and tool:
             m = re.fullmatch(r'    "(.*)": "(allow|ask|deny)"', line)
             if m:
@@ -353,6 +356,72 @@ check("v2 shape: every shell deny follows every shell allow", first_deny > last_
 check("v2 shape: readonly artifacts are editable", decide_v2(v2_readonly, "edit", ".factory/runs/x/plan.md") == "allow")
 check("v2 shape: readonly sources are not editable", decide_v2(v2_readonly, "edit", "src/lib.rs") == "deny")
 check("v2 shape: code sources are editable", decide_v2(v2_code, "edit", "src/lib.rs") == "allow")
+
+# The launcher agent: it may ask the owner (`question`), read run and launch files, write the launch
+# directory and run the launcher script, and nothing else. Every deny of the shared lists still follows
+# its one allow.
+launcher_path = repo + "/.opencode/agents/factory-launcher.md"
+launcher_overlay = overlay(launcher_path)
+launcher_rules = global_rules + launcher_overlay
+launcher_calls = [
+    "scripts/factory-launch.sh --task-file .factory/launch/task-1-ab12cd.md",
+    "scripts/factory-launch.sh --task-file .factory/launch/task-1-ab12cd.md --no-push --stop-after plan",
+    "scripts/factory-launch.sh --task-file .factory/launch/task-1-ab12cd.md --no-push --stop-after review --no-attach",
+    "scripts/factory-launch.sh --resume r1 --decisions-file .factory/launch/decisions-r1.md",
+    "scripts/factory-launch.sh --status",
+    "scripts/factory-launch.sh --status 20240102T100000Z-abc123",
+    "scripts/factory-launch.sh --stop deadbeef",
+]
+launcher_denied = (
+    denied_project + denied_factory + never + common + code_only + orchestrator_only
+    + ["scripts/factory.sh x", "scripts/gate.sh --commit", "scripts/factory-launch.sh.x y", "cargo test", "ls", "cat x"]
+)
+with open(repo + "/docs/factory/meta/launcher-allow.txt") as f:
+    launcher_allow_file = [e.strip()[5:-1] for e in f if e.strip().startswith("Bash(")]
+check("launcher: exactly one bash allow, the launcher script", launcher_allow_file == ["scripts/factory-launch.sh *"])
+got = [pat for tool, pat, act in launcher_overlay if tool == "bash" and act == "allow"]
+check("launcher: the allow rules mirror launcher-allow.txt", got == launcher_allow_file)
+got = [pat for tool, pat, act in launcher_overlay if tool == "bash" and act == "deny"]
+check("launcher: the deny rules are the two deny files", got == ["*"] + deny_project + deny_factory)
+bash_order = [(pat, act) for tool, pat, act in launcher_overlay if tool == "bash"]
+check("launcher: the baseline deny is the first bash rule", bash_order[0] == ("*", "deny"))
+check("launcher: one allow follows the baseline", bash_order[1] == ("scripts/factory-launch.sh *", "allow"))
+check("launcher: every other bash rule is a deny", all(act == "deny" for _, act in bash_order[2:]))
+for cmd in launcher_calls:
+    check("launcher allows: " + cmd, decide(launcher_rules, "bash", cmd) == "allow")
+    check("v2 launcher allows: " + cmd, decide_v2(to_v2(launcher_rules), "bash", cmd) == "allow")
+for cmd in launcher_denied:
+    check("launcher denies: " + cmd, decide(launcher_rules, "bash", cmd) == "deny")
+    check("v2 launcher denies: " + cmd, decide_v2(to_v2(launcher_rules), "bash", cmd) == "deny")
+check("launcher: question is allowed", decide(launcher_rules, "question", "*") == "allow")
+check("v2 launcher: question is allowed", decide_v2(to_v2(launcher_rules), "question", "*") == "allow")
+for name in roles:
+    check(name + ": question is not granted", decide(agent_rules[name], "question", "*") == "ask")
+check("project files: question is not granted", decide(global_rules, "question", "*") == "ask")
+launcher_edit_ok = [".factory/launch/task-1-ab12cd.md", ".factory/launch/decisions-r1.md"]
+launcher_edit_no = [
+    ".factory/runs/r1/decisions.md", ".factory/runs/r1/state", ".factory/launch", "crates/a/src/lib.rs",
+    "scripts/factory-launch.sh", ".opencode/agents/factory-launcher.md", "opencode.json", "AGENTS.md", ".githooks/pre-commit",
+]
+for path in launcher_edit_ok:
+    check("launcher may edit: " + path, decide(launcher_rules, "edit", path) == "allow")
+    check("v2 launcher may edit: " + path, decide_v2(to_v2(launcher_rules), "edit", path) == "allow")
+for path in launcher_edit_no:
+    check("launcher may not edit: " + path, decide(launcher_rules, "edit", path) == "deny")
+    check("v2 launcher may not edit: " + path, decide_v2(to_v2(launcher_rules), "edit", path) == "deny")
+launcher_read_ok = [
+    ".factory/runs/r1/plan.md", ".factory/runs/r1/handoff.md", ".factory/runs/r1/logs/plan.log",
+    ".factory/launch/decisions-r1.md", "/work/repo/.factory/runs/r1/plan.md",
+]
+launcher_read_no = ["crates/a/src/lib.rs", "AGENTS.md", "/etc/passwd", ".git/config", ".env", "opencode.json", "scripts/factory.sh"]
+for path in launcher_read_ok:
+    check("launcher may read: " + path, decide(launcher_rules, "read", path) == "allow")
+    check("v2 launcher may read: " + path, decide_v2(to_v2(launcher_rules), "read", path) == "allow")
+for path in launcher_read_no:
+    check("launcher may not read: " + path, decide(launcher_rules, "read", path) == "deny")
+    check("v2 launcher may not read: " + path, decide_v2(to_v2(launcher_rules), "read", path) == "deny")
+check("launcher: no ask rule", all(act != "ask" for _, _, act in launcher_overlay))
+check("no Claude counterpart of the launcher agent", not __import__("os").path.exists(repo + "/.claude/agents/factory-launcher.md"))
 
 for name, readonly in roles.items():
     if agent_json_dir:
