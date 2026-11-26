@@ -7,7 +7,7 @@
 #   scripts/test-factory.sh              all sections
 #   scripts/test-factory.sh gate hooks   only the named sections
 #
-# Sections: gate, fixture, hooks, sync, perm, driver, probes, static.
+# Sections: gate, fixture, hooks, sync, perm, driver, launch, probes, static.
 #
 # FACTORY_TEST_SKIP_CLI=1 skips every check that starts a real opencode or claude binary (they only
 # print configuration, never run a model, but a contributor may not want them started).
@@ -1708,6 +1708,358 @@ section_probes() {
     printf 'skip: opencode is not installed\n'
   fi
 }
+# The launcher (scripts/factory-launch.sh) in a fixture repository whose driver is a stub that records
+# what it was given, with stub `systemd-run` and `systemctl` on PATH; the fallback path runs the stub
+# driver detached with `setsid`. Secrets are dummy values built at runtime.
+section_launch() {
+  local lroot=$tmp/launch lbin=$tmp/launch-bin out rc i pw user f lid pid spid
+
+  pw=dummy-pw-
+  pw+=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+  user=dummy-user-
+  user+=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+
+  mkdir -p "$lroot/scripts" "$lbin"
+  new_repo "$lroot"
+  cp "$repo/scripts/factory-launch.sh" "$lroot/scripts/"
+  cat >"$lroot/scripts/factory.sh" <<'STUB'
+#!/usr/bin/env bash
+out=$PWD/.factory/launch
+{
+  printf 'ARGV'
+  printf ' [%s]' "$@"
+  printf '\n'
+  printf 'PWD=%s\n' "$PWD"
+  env | grep -E '^(FACTORY_|OPENCODE_)' | LC_ALL=C sort
+} >"$out/stub.out"
+touch "$out/stub.done"
+if [ -f "$out/stub.sleep" ]; then sleep 60; fi
+STUB
+  chmod +x "$lroot/scripts/factory.sh" "$lroot/scripts/factory-launch.sh"
+  cat >"$lbin/systemd-run" <<'STUB'
+#!/usr/bin/env bash
+{ printf 'systemd-run'; printf ' [%s]' "$@"; printf '\n'; } >>"${STUB_LOG:?}"
+exit "${STUB_SYSTEMD_RC:-0}"
+STUB
+  cat >"$lbin/systemctl" <<'STUB'
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >>"${STUB_LOG:?}"
+case "$*" in
+  *is-active*) exit "${STUB_ACTIVE_RC:-0}" ;;
+  *stop*) exit "${STUB_STOP_RC:-0}" ;;
+esac
+exit "${STUB_SYSTEMCTL_RC:-0}"
+STUB
+  chmod +x "$lbin/systemd-run" "$lbin/systemctl"
+  printf '/.factory/\n' >>"$lroot/.gitignore"
+  git -C "$lroot" add .gitignore scripts
+  git -C "$lroot" commit -q -m "chore: launcher fixture"
+
+  printf 'Add a small thing.\n' >"$lroot/task.md"
+  local envf=$tmp/launch.env
+  printf 'OPENCODE_SERVER_USERNAME=%s\nOPENCODE_SERVER_PASSWORD=%s\n' "$user" "$pw" >"$envf"
+  chmod 600 "$envf"
+
+  # launch [VAR=value...] -- args...: run the launcher in the fixture; sets l_out (stdout and stderr)
+  # and l_rc. The FACTORY_* variables of the test shell never leak in.
+  launch() {
+    local -a e=()
+    while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+      e+=("$1")
+      shift
+    done
+    shift
+    : >"$tmp/launch.log"
+    rm -f "$lroot/.factory/launch/stub.done" "$lroot/.factory/launch/stub.out"
+    l_rc=0
+    l_out=$(cd "$lroot" && env -u FACTORY_BACKEND -u FACTORY_MODEL_MAIN -u FACTORY_MODEL_HELPER -u FACTORY_VARIANT_MAIN -u FACTORY_VARIANT_HELPER -u FACTORY_OPENCODE_BIN -u FACTORY_OPENCODE_ATTACH -u FACTORY_PASS_ENV -u FACTORY_LAUNCH_ENVFILE -u FACTORY_LAUNCH_NO_SYSTEMD "${e[@]}" STUB_LOG="$tmp/launch.log" PATH="$lbin:$PATH" scripts/factory-launch.sh "$@" 2>&1) || l_rc=$?
+  }
+  wait_stub() {
+    for i in $(seq 1 100); do
+      [ -f "$lroot/.factory/launch/stub.done" ] && return 0
+      sleep 0.1
+    done
+    return 1
+  }
+  sdcalls() { grep -c '^systemd-run' "$tmp/launch.log" || true; }
+  # shellcheck disable=SC2329  # called through assert
+  has_line() { grep -Eq -- "$1" "$tmp/launch.log"; }
+  launch_id() { sed -n 's/^  launch:  //p' <<<"$l_out"; }
+
+  # L1: the systemd path.
+  launch -- --task-file task.md
+  assert "L1 a launch exits 0" test "$l_rc" = 0
+  assert "L1 one systemd-run call" test "$(sdcalls)" = 1
+  assert "L1 the unit is factory-<id>" has_line '^systemd-run \[--user\] \[--quiet\] \[--unit=factory-[a-z0-9]+\] \[--collect\] \[--working-directory='
+  assert "L1 the driver is run by absolute path after --" has_line '\[--\] \[/[^]]*/scripts/factory\.sh\] \[--task-file\] \[task\.md\]$'
+  refute "L1 no EnvironmentFile without an env file" has_line 'EnvironmentFile'
+  assert "L1 the summary names the unit and how to follow it" has "$l_out" 'journalctl --user -u factory-[a-z0-9]+ -f'
+  assert "L1 the summary names the run directory" has "$l_out" '\.factory/runs/'
+  assert "L1 the summary has a resume hint" has "$l_out" '--resume'
+  assert "L1 the summary names the stop command" has "$l_out" 'scripts/factory-launch\.sh --stop [0-9a-f]{8}'
+  assert "L1 the launch directory exists and is private" test "$(stat -c %a "$lroot/.factory/launch")" = 700
+  assert "L1 a private launch record is written" test "$(stat -c %a "$lroot/.factory/launch/$(launch_id).meta")" = 600
+  refute "L1 the task text is not in any argument" grep -q 'Add a small thing' "$tmp/launch.log"
+  assert "L1 the launch directory is ignored by git" git -C "$lroot" check-ignore -q .factory/launch/x
+
+  # L2: environment allowlist and value checks.
+  launch FACTORY_MODEL_MAIN=prov/model#high FACTORY_BACKEND=opencode FACTORY_OPENCODE_ATTACH=http://localhost:4096 FACTORY_VARIANT_HELPER=high FACTORY_PASS_ENV="KEY_A KEY_B" FACTORY_SECRET_THING=x OPENCODE_SERVER_PASSWORD="$pw" GH_TOKEN=x -- --task-file task.md
+  assert "L2 launch with the allowlisted variables exits 0" test "$l_rc" = 0
+  assert "L2 an allowlisted name is forwarded" has_line '\[--setenv=FACTORY_MODEL_MAIN=prov/model#high\]'
+  assert "L2 the attach URL is forwarded" has_line '\[--setenv=FACTORY_OPENCODE_ATTACH=http://localhost:4096\]'
+  assert "L2 FACTORY_PASS_ENV is forwarded whole" has_line '\[--setenv=FACTORY_PASS_ENV=KEY_A KEY_B\]'
+  refute "L2 another FACTORY_ name is not forwarded" has_line 'FACTORY_SECRET_THING'
+  refute "L2 GH_TOKEN is not forwarded" has_line 'GH_TOKEN'
+  refute "L2 the server password of the launcher environment is not forwarded" grep -q -- "$pw" "$tmp/launch.log"
+  refute "L2 the password is not in the output" grep -q -- "$pw" <<<"$l_out"
+  launch FACTORY_OPENCODE_ATTACH=http://localhost:4096 FACTORY_MODEL_MAIN=p/m -- --task-file task.md --no-attach
+  assert "L2 --no-attach exits 0" test "$l_rc" = 0
+  refute "L2 --no-attach drops the attach URL" has_line 'FACTORY_OPENCODE_ATTACH'
+  assert "L2 --no-attach keeps the other variables" has_line 'FACTORY_MODEL_MAIN=p/m'
+  refute "L2 --no-attach is not passed to the driver" has_line '\[--no-attach\]'
+  launch -- --task-file task.md --no-attach --opencode-attach http://localhost:4096
+  assert "L2 --no-attach with --opencode-attach is a usage error" test "$l_rc" = 2
+  # shellcheck disable=SC2016  # a literal $( in a bad value, never expanded
+  for f in 'FACTORY_MODEL_MAIN=a;b''FACTORY_MODEL_HELPER=$(x)' 'FACTORY_MODEL_MAIN=-x' 'FACTORY_VARIANT_MAIN=High' 'FACTORY_VARIANT_HELPER=a b' 'FACTORY_OPENCODE_ATTACH=http://u:p@h:1' 'FACTORY_OPENCODE_ATTACH=http://h/path' 'FACTORY_BACKEND=other' 'FACTORY_OPENCODE_BIN=a b' 'FACTORY_PASS_ENV=A;B' 'FACTORY_PASS_ENV=1A'; do
+    launch "$f" -- --task-file task.md
+    assert "L2 a bad value is a usage error: ${f%%=*}" test "$l_rc" = 2
+    assert "L2 a bad value starts nothing: ${f%%=*}" test "$(sdcalls)" = 0
+    refute "L2 the bad value is not echoed back: ${f%%=*}" grep -qF -- "${f#*=}" <<<"$l_out"
+  done
+
+  # L3: the credentials file.
+  launch -- --env-file "$envf" --task-file task.md
+  assert "L3 an env file exits 0" test "$l_rc" = 0
+  assert "L3 systemd loads it as EnvironmentFile" has_line "\\[-p\\] \\[EnvironmentFile=$envf\\]"
+  refute "L3 no credential value in the systemd-run call" grep -q -e "$pw" -e "$user" "$tmp/launch.log"
+  refute "L3 no credential value in the output" grep -q -e "$pw" -e "$user" <<<"$l_out"
+  refute "L3 no warning for a mode 600 file" has "$l_out" 'warning'
+  launch FACTORY_LAUNCH_ENVFILE="$envf" -- --task-file task.md
+  assert "L3 FACTORY_LAUNCH_ENVFILE names the file too" has_line "EnvironmentFile=$envf"
+  cp "$envf" "$tmp/launch-open.env"
+  chmod 644 "$tmp/launch-open.env"
+  launch -- --env-file "$tmp/launch-open.env" --task-file task.md
+  assert "L3 a group- or world-readable file still launches" test "$l_rc" = 0
+  assert "L3 a readable file warns on stderr" has "$l_out" 'warning: the env file is readable by group or others'
+  refute "L3 the warning holds no credential value" grep -q -e "$pw" -e "$user" <<<"$l_out"
+  launch -- --env-file "$tmp/no-such.env" --task-file task.md
+  assert "L3 a missing env file exits 3" test "$l_rc" = 3
+  assert "L3 a missing env file starts nothing" test "$(sdcalls)" = 0
+  launch -- --env-file "$tmp/bad name;.env" --task-file task.md
+  assert "L3 an env file path with odd characters is a usage error" test "$l_rc" = 2
+
+  # L4: the fallback with setsid. The detached shell sources the file; the driver sees the values.
+  launch FACTORY_LAUNCH_NO_SYSTEMD=1 FACTORY_MODEL_MAIN=prov/model -- --env-file "$envf" --task-file task.md --no-push --stop-after plan
+  assert "L4 the fallback exits 0" test "$l_rc" = 0
+  assert "L4 no systemd-run call" test "$(sdcalls)" = 0
+  assert "L4 the summary names the log" has "$l_out" '\.factory/launch/[0-9a-f]+\.log'
+  assert "L4 the detached driver finishes" wait_stub
+  assert "L4 the driver got the task as a file and the options" has "$(cat "$lroot/.factory/launch/stub.out")" '^ARGV \[--task-file\] \[task\.md\] \[--no-push\] \[--stop-after\] \[plan\]$'
+  assert "L4 the driver runs in the repository root" has "$(cat "$lroot/.factory/launch/stub.out")" "^PWD=$(cd "$lroot" && pwd -P)\$"
+  assert "L4 the driver got the credentials from the env file" has "$(cat "$lroot/.factory/launch/stub.out")" "^OPENCODE_SERVER_PASSWORD=$pw\$"
+  assert "L4 the driver got the allowlisted variable" has "$(cat "$lroot/.factory/launch/stub.out")" '^FACTORY_MODEL_MAIN=prov/model$'
+  refute "L4 no credential value in the output" grep -q -e "$pw" -e "$user" <<<"$l_out"
+  refute "L4 no credential value in any log or record" grep -rq -e "$pw" -e "$user" "$lroot/.factory/launch" --include='*.log' --include='*.meta'
+  assert "L4 the log is private" test -z "$(find "$lroot/.factory/launch" -name '*.log' -perm /077)"
+  launch FACTORY_LAUNCH_NO_SYSTEMD=1 OPENCODE_SERVER_PASSWORD="$pw" -- --task-file task.md
+  assert "L4 the fallback finishes" wait_stub
+  refute "L4 the launcher's own password is not handed on" grep -q '^OPENCODE_SERVER_PASSWORD=' "$lroot/.factory/launch/stub.out"
+  # A user manager that does not answer also selects the fallback.
+  launch STUB_SYSTEMCTL_RC=1 -- --task-file task.md
+  assert "L4 an unreachable user manager falls back" test "$l_rc" = 0 -a "$(sdcalls)" = 0
+  wait_stub || true
+  launch STUB_SYSTEMD_RC=1 -- --task-file task.md
+  assert "L4 a failing systemd-run exits 1" test "$l_rc" = 1
+
+  # L5: the task file.
+  ln -s task.md "$lroot/task-link.md"
+  : >"$lroot/empty.md"
+  head -c 300000 /dev/zero | tr '\0' 'x' >"$lroot/big.md"
+  launch -- --task-file nope.md
+  assert "L5 a missing task file is a usage error" test "$l_rc" = 2
+  launch -- --task-file task-link.md
+  assert "L5 a symlinked task file is refused" test "$l_rc" = 2
+  launch -- --task-file empty.md
+  assert "L5 an empty task file is refused" test "$l_rc" = 2
+  launch -- --task-file big.md
+  assert "L5 an oversize task file is refused" test "$l_rc" = 2
+  launch -- --task-file -x
+  assert "L5 a task path starting with a dash is refused" test "$l_rc" = 2
+  assert "L5 no task and no resume is a usage error" test "$l_rc" = 2
+  launch -- --task-file task.md --resume abc
+  assert "L5 a task together with --resume is a usage error" test "$l_rc" = 2
+  launch -- --task-file task.md --decisions-file task.md
+  assert "L5 --decisions-file without --resume is a usage error" test "$l_rc" = 2
+  assert "L5 none of these started a run" test "$(sdcalls)" = 0
+
+  # L6: resume and the decisions copy.
+  mkdir -p "$lroot/.factory/runs/run-1"
+  printf 'old\n' >"$lroot/.factory/runs/run-1/decisions.md"
+  printf 'Answer: yes.\n' >"$lroot/answer.md"
+  launch -- --resume run-1 --decisions-file answer.md --backend claude
+  assert "L6 resume exits 0" test "$l_rc" = 0
+  assert "L6 the driver is started with --resume and the options" has_line '\[--\] \[/[^]]*/scripts/factory\.sh\] \[--resume\] \[run-1\] \[--backend\] \[claude\]$'
+  assert "L6 the decisions were copied before the start" test "$(cat "$lroot/.factory/runs/run-1/decisions.md")" = 'Answer: yes.'
+  assert "L6 no stray temporary file is left" test -z "$(find "$lroot/.factory/runs/run-1" -name '.decisions.*')"
+  assert "L6 the summary names the run" has "$l_out" 'run:     run-1'
+  printf 'keep\n' >"$lroot/.factory/runs/run-1/decisions.md"
+  launch -- --resume run-1
+  assert "L6 resume without a decisions file leaves decisions.md alone" test "$l_rc" = 0 -a "$(cat "$lroot/.factory/runs/run-1/decisions.md")" = keep
+  for f in '../x' '.hidden' '..' 'a/b' '-x' 'a b' 'a;b'; do
+    launch -- --resume "$f"
+    assert "L6 a bad run id is a usage error: $f" test "$l_rc" = 2
+  done
+  launch -- --resume run-none
+  assert "L6 a missing run directory is a usage error" test "$l_rc" = 2
+  ln -s run-1 "$lroot/.factory/runs/run-link"
+  launch -- --resume run-link
+  assert "L6 a symlinked run directory is refused" test "$l_rc" = 2
+  ln -s answer.md "$lroot/answer-link.md"
+  launch -- --resume run-1 --decisions-file answer-link.md
+  assert "L6 a symlinked decisions file is refused" test "$l_rc" = 2
+  launch -- --resume run-1 --decisions-file big.md
+  assert "L6 an oversize decisions file is refused" test "$l_rc" = 2
+  launch -- --resume run-1 --decisions-file empty.md
+  assert "L6 an empty decisions file is refused" test "$l_rc" = 2
+  launch -- --resume run-1 --decisions-file .
+  assert "L6 a directory as decisions file is refused" test "$l_rc" = 2
+  assert "L6 a refused decisions file leaves decisions.md alone" test "$(cat "$lroot/.factory/runs/run-1/decisions.md")" = keep
+
+  # L7: the driver option allowlist.
+  launch -- --task-file task.md --backend opencode --opencode-attach http://127.0.0.1:4096 --opencode-bin /usr/bin/opencode --model-main p/m --model-helper p/m#low --variant-main high --variant-helper low --stop-after review --plan-rounds 2 --code-rounds 1 --phase-timeout 600 --no-push
+  assert "L7 every allowed option passes" test "$l_rc" = 0
+  assert "L7 the options reach the driver in order" has_line '\[--task-file\] \[task\.md\] \[--backend\] \[opencode\] \[--opencode-attach\] \[http://127\.0\.0\.1:4096\] \[--opencode-bin\] \[/usr/bin/opencode\] \[--model-main\] \[p/m\] \[--model-helper\] \[p/m#low\] \[--variant-main\] \[high\] \[--variant-helper\] \[low\] \[--stop-after\] \[review\] \[--plan-rounds\] \[2\] \[--code-rounds\] \[1\] \[--phase-timeout\] \[600\] \[--no-push\]$'
+  for f in '--allow-protected' '--dry-run' '--bogus' '--backend=claude' 'stray-word' '--plan-rounds 5' '--code-rounds 0' '--backend other' '--stop-after never' '--phase-timeout 0' '--phase-timeout x' '--variant-main Bad' '--opencode-attach http://h/p' '--opencode-bin -x' '--model-main a;b' '--model-helper' '--task-file'; do
+    # shellcheck disable=SC2086  # the option text is a word list on purpose
+    launch -- --task-file task.md $f
+    assert "L7 refused: $f" test "$l_rc" = 2
+    assert "L7 nothing started for: $f" test "$(sdcalls)" = 0
+  done
+
+  # L8: prerequisites.
+  local outside=$tmp/launch-outside
+  mkdir -p "$outside/scripts"
+  cp "$repo/scripts/factory-launch.sh" "$outside/scripts/"
+  : >"$outside/scripts/factory.sh"
+  rc=0
+  out=$(cd "$outside" && STUB_LOG="$tmp/launch.log" PATH="$lbin:$PATH" scripts/factory-launch.sh --task-file x 2>&1) || rc=$?
+  assert "L8 a directory that is not a git repository exits 3" test "$rc" = 3
+  mkdir -p "$lroot/sub/scripts"
+  cp "$repo/scripts/factory-launch.sh" "$lroot/sub/scripts/"
+  : >"$lroot/sub/scripts/factory.sh"
+  rc=0
+  out=$(cd "$lroot/sub" && STUB_LOG="$tmp/launch.log" PATH="$lbin:$PATH" scripts/factory-launch.sh --task-file x 2>&1) || rc=$?
+  assert "L8 a subdirectory of a repository is not a root: exit 3" test "$rc" = 3
+  rm -r "$lroot/sub"
+  mv "$lroot/scripts/factory.sh" "$lroot/scripts/factory.sh.off"
+  launch -- --task-file task.md
+  assert "L8 a missing scripts/factory.sh exits 3" test "$l_rc" = 3
+  mv "$lroot/scripts/factory.sh.off" "$lroot/scripts/factory.sh"
+  # shellcheck disable=SC2016  # the pattern names a shell variable literally
+  refute "L8 the launcher never reads the env file by itself" grep -Eq '(cat|source)[[:space:]]+"?\$env_file|<[[:space:]]*"?\$env_file' "$repo/scripts/factory-launch.sh"
+  refute "L8 the launcher never evals or builds a shell string" grep -Eq '(^|[[:space:]])(eval|bash -c "|sh -c ")' "$repo/scripts/factory-launch.sh"
+
+  # L9: --status. Dummy run states and logs with known times; no credential in any line.
+  local rid=20240102T100000Z-abc123 rdir
+  rdir=$lroot/.factory/runs/$rid
+  mkdir -p "$rdir/logs"
+  printf 'run_id=%s\nbackend=opencode\nbranch=factory/x-abc123\nbase_sha=0000\nphase=owner-gate\nstep=wait\nplan_round=2\ncode_round=0\nstatus=stopped\nexit_code=10\nstopped_at=2024-01-02T10:12:34Z\n' "$rid" >"$rdir/state"
+  printf '# Handoff\n\nReason: owner decisions are open\001 here\n' >"$rdir/handoff.md"
+  printf '== plan 10:00:00\nout\n' >"$rdir/logs/plan.log"
+  touch -d '2024-01-02 10:12:34 UTC' "$rdir/logs/plan.log"
+  printf '== implement 23:50:00\nout\n' >"$rdir/logs/implement.log"
+  touch -d '2024-01-03 00:10:05 UTC' "$rdir/logs/implement.log"
+  printf '== pr 09:00:00\n== pr 09:30:00\nout\n' >"$rdir/logs/pr.log"
+  touch -d '2024-01-03 11:00:01 UTC' "$rdir/logs/pr.log"
+  printf 'no header here\n' >"$rdir/logs/other.log"
+  launch FACTORY_OPENCODE_ATTACH=http://localhost:4096 FACTORY_MODEL_MAIN=p/m OPENCODE_SERVER_PASSWORD="$pw" -- --status "$rid"
+  assert "L9 --status RUN exits 0" test "$l_rc" = 0
+  assert "L9 the status line" has "$l_out" 'status:   stopped'
+  assert "L9 the phase and step" has "$l_out" 'phase:    owner-gate \(step wait\)'
+  assert "L9 the rounds" has "$l_out" 'rounds:   plan 2, code 0'
+  assert "L9 the exit code is named" has "$l_out" 'exit:     10 \(owner decisions open\)'
+  assert "L9 the reason is shown without control characters" has "$l_out" 'reason:   owner decisions are open here'
+  assert "L9 a short phase: 12m34s" has "$l_out" 'plan +started 10:00:00 UTC, last output 12m34s later'
+  assert "L9 a phase across midnight: 20m05s" has "$l_out" 'implement +started 23:50:00 UTC, last output 20m05s later'
+  assert "L9 the last header counts, and an hour shows as 1h30m01s" has "$l_out" 'pr +started 09:30:00 UTC, last output 1h30m01s later'
+  assert "L9 a log without a header is reported" has "$l_out" 'other +no start time in the log'
+  refute "L9 no credential in the status" grep -q -e "$pw" -e "$user" <<<"$l_out"
+  launch FACTORY_OPENCODE_ATTACH=http://localhost:4096 FACTORY_MODEL_MAIN=p/m FACTORY_LAUNCH_ENVFILE="$envf" OPENCODE_SERVER_PASSWORD="$pw" -- --status
+  assert "L9 --status exits 0" test "$l_rc" = 0
+  assert "L9 the configuration shows the server" has "$l_out" 'server:   http://localhost:4096'
+  assert "L9 the configuration shows the models" has "$l_out" 'models:   main p/m, helper default'
+  assert "L9 the configuration says an env file is set" has "$l_out" 'env file: set'
+  refute "L9 the configuration never shows the env file path" grep -qF -- "$envf" <<<"$l_out"
+  assert "L9 the run is listed" has "$l_out" "$rid  status stopped, phase owner-gate, exit 10"
+  refute "L9 no credential in the listing" grep -q -e "$pw" -e "$user" <<<"$l_out"
+  launch -- --status
+  assert "L9 without configuration the server is not set" has "$l_out" 'server:   not set'
+  assert "L9 without an env file it says so" has "$l_out" 'env file: not set'
+  for f in '../x' '-x' 'a/b' 'a;b'; do
+    launch -- --status "$f"
+    assert "L9 a bad run id is refused: $f" test "$l_rc" = 2
+  done
+  launch -- --status run-none
+  assert "L9 a missing run is a usage error" test "$l_rc" = 2
+  launch -- --status "$rid" --task-file task.md
+  assert "L9 --status takes no other option" test "$l_rc" = 2
+  mkdir -p "$lroot/.factory/runs/fresh"
+  launch -- --status fresh
+  assert "L9 a run without state says so" has "$l_out" 'no state file yet'
+  assert "L9 --status never started anything" test "$(sdcalls)" = 0
+
+  # L10: --stop, through systemd and through the fallback process group.
+  launch -- --task-file task.md
+  lid=$(launch_id)
+  launch -- --stop "$lid"
+  assert "L10 --stop exits 0" test "$l_rc" = 0
+  assert "L10 systemd stops the unit" grep -q "^systemctl --user stop factory-$lid$" "$tmp/launch.log"
+  launch -- --stop "factory-$lid"
+  assert "L10 the factory- prefix is accepted" test "$l_rc" = 0
+  launch STUB_STOP_RC=1 -- --stop "$lid"
+  assert "L10 a failing stop exits 1" test "$l_rc" = 1
+  for f in zz 'factory-xyz' '../x' '1234567' '123456789' 'ABCDEF01'; do
+    launch -- --stop "$f"
+    assert "L10 a bad launch id is refused: $f" test "$l_rc" = 2
+  done
+  launch -- --stop deadbeef
+  assert "L10 an unknown launch is refused" test "$l_rc" = 2
+  launch -- --stop
+  assert "L10 --stop needs an id" test "$l_rc" = 2
+  launch -- --stop "$lid" --no-push
+  assert "L10 --stop takes no other option" test "$l_rc" = 2
+  touch "$lroot/.factory/launch/stub.sleep"
+  launch FACTORY_LAUNCH_NO_SYSTEMD=1 -- --task-file task.md
+  lid=$(launch_id)
+  assert "L10 the long stub driver is running" wait_stub
+  pid=$(sed -n 's/^pid=//p' "$lroot/.factory/launch/$lid.meta")
+  assert "L10 the record holds the process id" test -n "$pid"
+  launch -- --status
+  assert "L10 --status lists the launch as running" has "$l_out" "$lid .*fallback  running"
+  launch -- --stop "$lid"
+  assert "L10 stopping the fallback exits 0" test "$l_rc" = 0
+  for i in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  refute "L10 the process group is gone" bash -c "kill -0 $pid 2>/dev/null"
+  launch -- --stop "$lid"
+  assert "L10 stopping a finished launch is not an error" test "$l_rc" = 0
+  assert "L10 and says so" has "$l_out" 'not running'
+  launch -- --status
+  assert "L10 --status lists it as finished" has "$l_out" "$lid .*fallback  finished"
+  # A recorded pid that is not the driver is never signalled.
+  sleep 60 &
+  # shellcheck disable=SC2031  # the background job above belongs to this shell
+  spid=$!
+  printf 'kind=task\nmode=fallback\npid=%s\nstarted=1\n' "$spid" >"$lroot/.factory/launch/aaaaaaaa.meta"
+  launch -- --stop aaaaaaaa
+  assert "L10 a pid that is not a run is left alone" has "$l_out" 'not running'
+  assert "L10 that process is still alive" kill -0 "$spid"
+  kill "$spid" 2>/dev/null || true
+  rm -f "$lroot/.factory/launch/stub.sleep"
+}
+
 # Permission tests: the two configuration files, the generated OpenCode agent overlays and, when
 # OpenCode is installed, the rules it resolves for each agent. The evaluator is
 # scripts/test-factory-perm.py (python3, standard library only).
@@ -1752,7 +2104,7 @@ section_static() {
   # Files that ship with the factory hold no credentials, no local paths and no personal names.
   # docs/factory, scripts/factory.sh and this script necessarily contain the patterns they look for.
   local files f hits="" user host word generic=" root runner ubuntu user admin build home test dev github docker localhost "
-  files=$(git -C "$repo" ls-files scripts/gate.sh scripts/factory-sync.sh scripts/test-factory-perm.py .githooks .opencode .claude opencode.json)
+  files=$(git -C "$repo" ls-files scripts/gate.sh scripts/factory-sync.sh scripts/factory-launch.sh scripts/test-factory-perm.py .githooks .opencode .claude opencode.json)
   user=$(id -un 2>/dev/null || true)
   host=$(hostname -s 2>/dev/null || true)
   for f in $files; do
@@ -1778,13 +2130,13 @@ section_static() {
 
 sections=("$@")
 if [ ${#sections[@]} -eq 0 ]; then
-  sections=(gate fixture hooks sync perm driver probes static)
+  sections=(gate fixture hooks sync perm driver launch probes static)
 fi
 for s in "${sections[@]}"; do
   case "$s" in
-    gate | fixture | hooks | sync | perm | driver | probes | static) "section_$s" ;;
+    gate | fixture | hooks | sync | perm | driver | launch | probes | static) "section_$s" ;;
     *)
-      printf 'usage: %s [gate] [fixture] [hooks] [sync] [perm] [driver] [probes] [static]\n' "$0" >&2
+      printf 'usage: %s [gate] [fixture] [hooks] [sync] [perm] [driver] [launch] [probes] [static]\n' "$0" >&2
       exit 2
       ;;
   esac
