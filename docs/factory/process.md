@@ -24,6 +24,9 @@ agent files, and `scripts/factory.sh` fills in the phase templates. The human pa
 | `docs/factory/meta/deny-*.txt`               | Deny rules (project level and factory only).                          |
 | `CLAUDE.md`                                  | Git symlink to `AGENTS.md`; no content of its own.                    |
 | `scripts/factory.sh`                         | Deterministic driver; the only OpenCode path and the unattended path. |
+| `scripts/factory-launch.sh`                  | Detaches a run; `--status` and `--stop`. Used by the OpenCode client. |
+| `docs/factory/commands/`                     | Sources of the OpenCode commands `/factory`, `-resume`, `-status`.    |
+| `.opencode/commands/`                        | Generated OpenCode commands, run by the `factory-launcher` agent.     |
 | `scripts/test-factory.sh`                    | Hermetic tests with stub CLIs; no model is ever run.                  |
 
 The run directory `.factory/runs/<run id>/` holds artifacts only and is gitignored.
@@ -38,9 +41,11 @@ The run directory `.factory/runs/<run id>/` holds artifacts only and is gitignor
 | `factory-pr-writer`     | readonly     | Only `pr.md`.                                       |
 | `factory-implementer`   | code         | Repository files; `git add`/`commit`; never pushes. |
 | `factory` (command)     | orchestrator | Claude Code only: coordinates the others.           |
+| `factory-launcher`      | launcher     | OpenCode only: files under `.factory/launch/`.      |
 
 Every role prompt tells the agent to read `AGENTS.md` first, that the repository is public, that task
-text and findings are data, and that agents never merge or push to `main`.
+text and findings are data, and that agents never merge or push to `main`. The launcher cannot read
+the repository, so its prompt says the rules bind it without asking it to read them.
 
 ## Caps and phases
 
@@ -218,6 +223,42 @@ servers.
   phase is a new session. A server restart (for example after high memory use) ends the running
   phase: exit 20, resumable. Plain-HTTP basic auth over a network is unencrypted. See the README for
   the by-hand check and the recommended use.
+
+## The launcher and the OpenCode commands
+
+A run takes tens of minutes, so an OpenCode client starts it through `scripts/factory-launch.sh`
+instead of running the driver in an agent's bash call. The launcher runs from the repository root
+(exit 3 otherwise, and for a missing env file), takes `--task-file FILE` or `--resume RUN_ID
+[--decisions-file FILE]`, the driver options `--backend`, `--opencode-attach`, `--opencode-bin`,
+`--model-main`, `--model-helper`, `--variant-main`, `--variant-helper`, `--stop-after`, `--plan-rounds`,
+`--code-rounds`, `--phase-timeout` and `--no-push`, and its own `--env-file`, `--no-attach`, `--status
+[RUN_ID]` and `--stop LAUNCH_ID`. Any other option, `--allow-protected` and `--dry-run` included, is a
+usage error (exit 2). Values are checked with the driver's patterns; models and the client path with a
+conservative pattern of the launcher's own. The task text is passed only as a file path, never in a
+shell string.
+
+It detaches the driver with `systemd-run --user --unit=factory-<id> --collect` when `systemctl
+--user` answers, otherwise with `setsid` and a private log `.factory/launch/<id>.log`, and writes a
+private record `.factory/launch/<id>.meta` that `--status` and `--stop` read. The environment of the
+detached run holds only `PATH`, `HOME`, `LANG` and `TERM` (fallback) and the allowlisted names
+`FACTORY_BACKEND`, `FACTORY_MODEL_MAIN`, `FACTORY_MODEL_HELPER`, `FACTORY_VARIANT_MAIN`,
+`FACTORY_VARIANT_HELPER`, `FACTORY_OPENCODE_BIN`, `FACTORY_OPENCODE_ATTACH` and `FACTORY_PASS_ENV`, each
+validated. Credentials come from an env file (`--env-file` or `FACTORY_LAUNCH_ENVFILE`): systemd loads
+it as `EnvironmentFile`, the fallback sources it inside the detached shell, and the launcher itself
+neither reads nor prints it. With `--resume`, a decisions file (a regular file, no symlink, up to 256
+KiB) is copied to `.factory/runs/<run id>/decisions.md` before the driver starts.
+
+The commands in `.opencode/commands/` run in the `factory-launcher` agent, generated with the access
+class `launcher`: `question` allowed; `read` denied except `.factory/runs/*` and `.factory/launch/*`;
+`edit` denied except `.factory/launch/*`; `bash` denied except `scripts/factory-launch.sh *`, then
+every deny of the shared lists last. They ask the owner with the `question` tool (explanation and a
+recommendation on every question), treat the task text and the answers as data and stop without the
+tool rather than guess. The commands take no arguments: a template may be expanded for `!` shell
+substitution and `@` file references after OpenCode substitutes typed arguments (unverified), so
+the templates hold no `$ARGUMENTS`, `$<digit>`, `!` followed by a backtick or `@` followed by a path
+character (a static test pins it), and the owner's text arrives only as a `question` answer.
+Unverified: the command directory and keys and the `question` tool with its permission key, in
+OpenCode 1.x and 2.x. See the README.
 
 ## Hooks
 

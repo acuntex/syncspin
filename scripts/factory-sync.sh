@@ -12,7 +12,11 @@
 # command and, as bash rules, the allows of the OpenCode agents) and docs/factory/meta/deny-{project,factory}.txt
 # (the deny rules; the project-level ones are also committed in opencode.json and .claude/settings.json).
 # Output: .opencode/agents/<name>.md and .claude/agents/<name>.md for every role that is not the
-# orchestrator, and .claude/commands/factory.md for the orchestrator. Never edit the output by hand.
+# orchestrator or the launcher, and .claude/commands/factory.md for the orchestrator. The launcher
+# (access class `launcher`) is an OpenCode agent only, with the bash allows of
+# docs/factory/meta/launcher-allow.txt; its commands come from docs/factory/commands/<name>.md (body)
+# and <name>.conf (description, agent) and land in .opencode/commands/<name>.md. Never edit the
+# output by hand.
 #
 # The generated frontmatter is block-style YAML with simple keys unquoted and pattern keys and string
 # values double-quoted, so prettier leaves it alone. Tool differences live only in emit_opencode,
@@ -51,7 +55,7 @@ read_conf() {
   [[ "$conf_name" =~ ^factory(-[a-z]+)*$ ]] || die "$file: bad name"
   [ -n "$conf_description" ] && [ "${#conf_description}" -le 100 ] || die "$file: description missing or longer than 100 characters"
   [[ "$conf_description" != *[\"\\]* ]] || die "$file: description must not contain a quote or backslash"
-  case "$conf_access" in readonly | code | orchestrator) ;; *) die "$file: bad access" ;; esac
+  case "$conf_access" in readonly | code | orchestrator | launcher) ;; *) die "$file: bad access" ;; esac
   case "$conf_model_class" in helper | main) ;; *) die "$file: bad model_class" ;; esac
   [[ "$conf_max_turns" =~ ^[0-9]+$ ]] || die "$file: bad max_turns"
 }
@@ -81,12 +85,27 @@ emit_opencode() {
   printf 'description: "%s"\n' "$conf_description"
   printf 'mode: "all"\n'
   printf 'permission:\n'
+  if [ "$conf_access" = launcher ]; then
+    # The launcher asks the owner questions and reads run files; the absolute form of each read path
+    # is allowed too, because the path form `read` is matched against is not verified.
+    printf '  question: "allow"\n'
+    printf '  read:\n'
+    printf '    "*": "deny"\n'
+    printf '    ".factory/runs/*": "allow"\n'
+    printf '    "*/.factory/runs/*": "allow"\n'
+    printf '    ".factory/launch/*": "allow"\n'
+    printf '    "*/.factory/launch/*": "allow"\n'
+  fi
   # Edit rules: deny everything, then allow the run directory (the last matching rule wins). The
-  # implementer may edit anywhere; the driver's snapshot check guards the protected paths.
+  # implementer may edit anywhere; the driver's snapshot check guards the protected paths. The
+  # launcher may write only its own launch directory.
   printf '  edit:\n'
   if [ "$conf_access" = readonly ]; then
     printf '    "*": "deny"\n'
     printf '    ".factory/runs/*": "allow"\n'
+  elif [ "$conf_access" = launcher ]; then
+    printf '    "*": "deny"\n'
+    printf '    ".factory/launch/*": "allow"\n'
   else
     printf '    "*": "allow"\n'
   fi
@@ -97,7 +116,11 @@ emit_opencode() {
   # and comes earlier in the resolved list, so these rules decide.
   printf '  bash:\n'
   printf '    "*": "deny"\n'
-  [ "$conf_access" = readonly ] || files+=("$src/meta/claude-allow-code.txt")
+  if [ "$conf_access" = launcher ]; then
+    files=("$src/meta/launcher-allow.txt")
+  elif [ "$conf_access" != readonly ]; then
+    files+=("$src/meta/claude-allow-code.txt")
+  fi
   while IFS= read -r cmd; do
     case "$seen" in *$'\n'"$cmd"$'\n'*) die "duplicate bash rule: $cmd" ;; esac
     seen+="$cmd"$'\n'
@@ -153,15 +176,51 @@ generate() {
     if [ "$conf_access" = orchestrator ]; then
       mkdir -p "$out/.claude/commands"
       emit_claude_command "$role" >"$out/.claude/commands/factory.md"
+    elif [ "$conf_access" = launcher ]; then
+      mkdir -p "$out/.opencode/agents"
+      emit_opencode "$role" >"$out/.opencode/agents/$conf_name.md"
     else
       mkdir -p "$out/.opencode/agents" "$out/.claude/agents"
       emit_opencode "$role" >"$out/.opencode/agents/$conf_name.md"
       emit_claude_agent "$role" >"$out/.claude/agents/$conf_name.md"
     fi
   done
+  for conf in "$src"/commands/*.md; do
+    [ -e "$conf" ] || continue
+    role=$(basename "$conf" .md)
+    [[ "$role" =~ ^factory(-[a-z]+)*$ ]] || die "$conf: bad command name"
+    mkdir -p "$out/.opencode/commands"
+    emit_opencode_command "$role" >"$out/.opencode/commands/$role.md"
+  done
 }
 
-generated_dirs=(.opencode/agents .claude/agents .claude/commands)
+# emit_opencode_command <name>: an OpenCode command that runs in the launcher agent. The body is the
+# source verbatim; it carries the one $ARGUMENTS placeholder itself.
+emit_opencode_command() {
+  local name=$1 conf=$src/commands/$1.conf line key value description="" agent=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    [[ "$line" =~ ^([a-z_]+)=(.*)$ ]] || die "$conf: malformed line"
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    case "$key" in
+      description) description=$value ;;
+      agent) agent=$value ;;
+      *) die "$conf: unknown key '$key'" ;;
+    esac
+  done <"$conf"
+  [ -n "$description" ] && [ "${#description}" -le 100 ] || die "$conf: description missing or longer than 100 characters"
+  [[ "$description" != *[\"\\]* ]] || die "$conf: description must not contain a quote or backslash"
+  grep -qx "name=$agent" "$src"/meta/*.conf || die "$conf: no agent named '$agent'"
+  printf -- '---\n'
+  printf 'description: "%s"\n' "$description"
+  printf 'agent: "%s"\n' "$agent"
+  printf -- '---\n'
+  printf '\n<!-- generated by scripts/factory-sync.sh from %s/commands/%s.md; edit the source -->\n\n' "$src" "$name"
+  cat "$src/commands/$name.md"
+}
+
+generated_dirs=(.opencode/agents .opencode/commands .claude/agents .claude/commands)
 
 mode=sync
 case "${1:-}" in
