@@ -22,8 +22,9 @@
 //!
 //! With `--revoke-after <secs>` the demo takes its approval back that long after it opened the
 //! stream, which is the operator action that removes the player role from a client that is
-//! playing. A client that leaves before the deadline is not revoked: the deadline is dropped with
-//! the connection.
+//! playing. The stream keeps running afterwards: the client goes on receiving audio while its role
+//! disappears, which is what the switch reproduces. A client that leaves before the deadline is
+//! not revoked: the deadline is dropped with the connection.
 //!
 //! Nothing here decodes, queues or reads a file. A real host replaces the tone with its own frames
 //! and keeps its identity in storage it owns.
@@ -235,6 +236,16 @@ per run, so every start is a new server. Status lines go to standard error.
     text
 }
 
+/// The instant a `--revoke-after` delay ends at.
+///
+/// The sum is checked: a delay this clock cannot reach is a command-line mistake, reported as one
+/// instead of panicking in the event loop.
+fn revoke_deadline(delay: Duration) -> Result<Instant> {
+    Instant::now().checked_add(delay).ok_or_else(|| {
+        anyhow!("--revoke-after {delay:?} is beyond the range this clock can express")
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = match parse_args(std::env::args().skip(1)) {
@@ -319,9 +330,10 @@ async fn run(options: Options) -> Result<()> {
                         stream = Some((writer, 0));
                         // The delay counts from here, not from the connection: the operator's
                         // stream is what the role loss has to interrupt.
-                        revoke_at = options
-                            .revoke_after
-                            .map(|delay| Instant::now() + delay);
+                        revoke_at = match options.revoke_after {
+                            Some(delay) => Some(revoke_deadline(delay)?),
+                            None => None,
+                        };
                         eprintln!("streaming a {TONE_HZ} Hz tone");
                     }
                 }
@@ -386,6 +398,7 @@ mod tests {
 
         assert_eq!(options.bind, DEFAULT_BIND);
         assert_eq!(options.name, DEFAULT_NAME);
+        assert_eq!(options.revoke_after, None);
         #[cfg(feature = "mdns")]
         assert!(!options.mdns);
     }
@@ -398,6 +411,16 @@ mod tests {
             options(&["--revoke-after=5"]).revoke_after,
             Some(Duration::from_secs(5))
         );
+    }
+
+    #[test]
+    fn an_unreachable_revoke_delay_is_reported_instead_of_panicking() {
+        assert!(revoke_deadline(Duration::from_secs(0)).is_ok());
+        let Err(error) = revoke_deadline(Duration::MAX) else {
+            panic!("a delay past the clock's range must be refused");
+        };
+        let text = format!("{error}");
+        assert!(text.contains("--revoke-after"), "got: {text}");
     }
 
     #[test]
