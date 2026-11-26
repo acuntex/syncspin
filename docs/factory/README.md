@@ -15,7 +15,7 @@ The specification (process, caps, exit codes, state files, protected paths, hook
   (`rustup target add armv7-unknown-linux-gnueabihf`) is optional: the gate skips that step without it
   and says so.
 - Claude Code: open every fresh clone once, interactively (`claude` in the clone), and accept the
-  workspace trust dialog. Without that, a headless run ignores the project allow rules and the
+  workspace trust dialog. Without that, a headless run ignores the project permission rules and the
   phases end without their artifacts (see Troubleshooting).
 - Claude Code: the driver passes `--strict-mcp-config` and no `--mcp-config`, so no MCP server is
   loaded in a factory run, including the ones from your user-level configuration. Tools from your
@@ -30,14 +30,14 @@ The specification (process, caps, exit codes, state files, protected paths, hook
 
 ## Starting a run
 
-|                       | OpenCode                                      | Claude Code                                                                  |
-| --------------------- | --------------------------------------------- | ---------------------------------------------------------------------------- |
-| Interactive           | not available (see below)                     | `/factory <task text>` in a session                                          |
-| Driver (unattended)   | `scripts/factory.sh --backend opencode "..."` | `scripts/factory.sh --backend claude "..."`                                  |
-| Agents                | `.opencode/agents/factory-*.md` (generated)   | `.claude/agents/factory-*.md` and `.claude/commands/factory.md`              |
-| Permissions           | `opencode.json`                               | `.claude/settings.json`                                                      |
-| Project rules         | reads `AGENTS.md` directly                    | reads `CLAUDE.md`, a symlink to `AGENTS.md`                                  |
-| Non-interactive slash | -                                             | `claude -p "/factory ..."` stops at the push request (not approved headless) |
+|                       | OpenCode                                                    | Claude Code                                                                  |
+| --------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Interactive           | not available (see below)                                   | `/factory <task text>` in a session                                          |
+| Driver (unattended)   | `scripts/factory.sh --backend opencode "..."`               | `scripts/factory.sh --backend claude "..."`                                  |
+| Agents                | `.opencode/agents/factory-*.md` (generated)                 | `.claude/agents/factory-*.md` and `.claude/commands/factory.md`              |
+| Permissions           | generated agents (`opencode.json`: `AGENTS.md` denies only) | driver flags (`.claude/settings.json`: `AGENTS.md` denies only)              |
+| Project rules         | reads `AGENTS.md` directly                                  | reads `CLAUDE.md`, a symlink to `AGENTS.md`                                  |
+| Non-interactive slash | -                                                           | `claude -p "/factory ..."` stops at the push request (not approved headless) |
 
 OpenCode has no `/factory` command: its subagents run in the background and report when idle, and
 there is no documented way to wait for one. The driver is the OpenCode path.
@@ -121,17 +121,39 @@ two hours) unless `--phase-timeout` says otherwise.
 Both tools get guardrails, not security boundaries; the vendors say so too. The real layers are the
 driver's snapshot verification, its own final gate, CI and the review of the protected-path diff.
 
-| Aspect                   | OpenCode (`opencode.json`, generated overlays)               | Claude Code (`.claude/settings.json`, per-phase grants)          |
-| ------------------------ | ------------------------------------------------------------ | ---------------------------------------------------------------- |
-| Rule shape               | Ordered map per tool; the last matching rule wins            | `allow`, `ask`, `deny`; deny wins                                |
-| Baseline                 | `bash "*": "ask"`, allows next, every deny last              | Nothing is allowed that is not listed; `dontAsk` denies the rest |
-| Readonly roles           | Edit denied except the run directory; deny-only bash overlay | Driver grants `Edit` on the one artifact file only               |
-| Implementer              | Global rules                                                 | Driver grants `Edit,Write` plus the common and code bash grants  |
-| Push                     | Denied; only the driver pushes                               | `ask` (denied under `dontAsk`); `main` and force forms denied    |
-| Knows the current branch | No; the pre-push hook and the driver do                      | No; the pre-push hook and the driver do                          |
+**Interactive sessions are not restricted by the factory.** The committed project files
+(`opencode.json`, `.claude/settings.json`) hold only what `AGENTS.md` states for every agent: no
+`gh pr merge`, no auto-merge (`gh pr *--auto*`), no push to `main` or force push, no `--no-verify`
+forms. Your own OpenCode `plan` and `build` agents and your own Claude Code sessions in this
+repository keep their normal behaviour for everything else. Every other restriction exists only in
+the factory layer:
 
-Headless behaviour of an `ask` rule in OpenCode is not documented: a hung phase ends by timeout, and
-the driver never uses `--auto`.
+| What                             | Where it lives                                                                                                          |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `AGENTS.md`-level denies         | `docs/factory/meta/deny-project.txt`, copied into `opencode.json`, `.claude/settings.json` and every factory agent      |
+| Factory-only denies              | `docs/factory/meta/deny-factory.txt`: in the generated OpenCode agents, and passed by the driver to Claude per phase    |
+| Allowed commands                 | `docs/factory/meta/claude-allow-*.txt`: OpenCode agents carry them as bash rules, the Claude driver as `--allowedTools` |
+| Edit rules of the readonly roles | The generated OpenCode agents; for Claude the driver's `Edit(<artifact>)` grant                                         |
+
+| Aspect                   | OpenCode (generated agents)                                          | Claude Code (driver flags)                                       |
+| ------------------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Rule shape               | Ordered map per tool; the last matching rule wins                    | `allow`, `deny`; deny wins                                       |
+| Baseline                 | `bash "*": "deny"`, allows of the access class next, every deny last | Nothing is allowed that is not listed; `dontAsk` denies the rest |
+| Readonly roles           | Edit denied except the run directory; no mutating bash allowed       | Driver grants `Edit` on the one artifact file only               |
+| Implementer              | Edit allowed; the common and code bash allows                        | Driver grants `Edit,Write` plus the common and code bash grants  |
+| Push                     | Denied; only the driver pushes                                       | Denied through `--disallowedTools`; only the driver pushes       |
+| Knows the current branch | No; the pre-push hook and the driver do                              | No; the pre-push hook and the driver do                          |
+
+The OpenCode baseline is `deny`, not `ask`: a headless run cannot answer a prompt, and a deny fails
+at once with a message the model can act on, while an `ask` would hang until the phase timeout. The
+interactive `/factory` command of Claude Code has no per-command deny list: it pre-approves the
+allow list, and the factory denies apply only to the driver's phases and to the OpenCode agents.
+
+**Redirection is not covered.** Command-prefix rules match the command text and cannot stop shell
+redirection: `cat x > y` matches `cat *`, and `sed`, `sort` or `uniq` can name an output file. The
+read-only guarantee for the planner and the reviewers therefore does not rest on the allow list. It
+rests on the driver's post-phase snapshot check (a changed file is exit 13) and on the artifact-only
+`Edit` grant. Do not read the allow list as a sandbox.
 
 ## Troubleshooting
 
