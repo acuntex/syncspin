@@ -64,3 +64,19 @@ attacker would want, and a public advisory is permanent. Redact them:
 This is a small project without a security team: reports are handled on a best-effort basis, with
 no response-time commitment and no bug bounty. You will get an answer that says whether the report
 is accepted, and a credit in the advisory if you want one.
+
+## Artwork images (client, `artwork` feature)
+
+The artwork role holds image bytes a server pushes, and the announced `total_size` is a number the
+server chooses. The client never sizes a buffer from it: a transfer announced as larger than
+`ClientConfig::max_artwork_bytes` (8 MiB by default) is followed in a discard mode that counts bytes
+and enforces the message sequence but buffers nothing, and bytes are appended only as they arrive.
+The client's own state is one transfer in flight plus one pending image per channel, so
+`5 * max_artwork_bytes`, about 40 MiB at the default, with buffer capacity up to about twice the
+length of what it holds (pending images are shrunk before they are stored); a host that shows small
+images lowers the limit. That figure does not cover events queued for the host: `Event::Artwork`
+owns its image and sits in an unbounded queue until read, so a host that reads slowly while a
+server keeps pushing images grows without a bound. A host must drain the event stream promptly.
+Artwork binary messages are checked for length, flags and sequence as the specification requires,
+and a violation closes the connection. The image bytes are handed to the host unparsed:
+decoding them is the host's job, and a host should treat them as untrusted input to its decoder.

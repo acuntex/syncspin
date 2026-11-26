@@ -53,6 +53,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: example manifests
         run: scripts/check-example-versions.sh
+      # Clippy for the role feature sets `--all-features` never builds, one run per
+      # set (see the script). The `test` job runs the matching tests and docs.
+      - name: cargo clippy (role feature sets)
+        run: scripts/check-roles.sh lint
 
   test:
     name: test
@@ -63,13 +67,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: cargo test
         run: cargo test --workspace --locked
-      # Feature unification matters here. `syncspin-client` has no default
-      # features, but `player-pipe` enables `storage-file` by default, so the
-      # workspace run above turns it on for the client and runs the file
-      # backend's tests. `pairing-code` is off everywhere unless requested.
-      # The second run adds the code flows; the third tests the library crates
-      # with their own defaults, which is what a consumer that enables nothing
-      # gets. All three are the `test` gate.
+      # Feature unification matters here. `syncspin-client` defaults to the
+      # `player`, `controller` and `metadata` roles, and `player-pipe` also
+      # enables `storage-file`, so the workspace run above turns it on for the
+      # client and runs the file backend's tests. `pairing-code` is off
+      # everywhere unless requested. The second run adds the code flows; the
+      # third tests the library crates with their own defaults, which is what a
+      # consumer that enables nothing gets. All three are the `test` gate.
       - name: cargo test (pairing features)
         run: cargo test --workspace --features pairing-code,storage-file --locked
       - name: cargo test (library defaults)
@@ -78,6 +82,10 @@ jobs:
       # above builds or tests it. The tests need no multicast socket.
       - name: cargo test (mdns-pair flow)
         run: cargo test -p mdns-pair --features mdns --locked
+      # The client's role features: tests, test builds and docs for every set the
+      # runs above never build (a set without a role compiles other test files).
+      - name: client role feature sets
+        run: scripts/check-roles.sh test
 
   msrv:
     name: msrv
@@ -125,6 +133,12 @@ jobs:
       # an ARM-only consumer must be able to build a server too.
       - name: cargo check (armv7)
         run: cargo check -p syncspin-core -p syncspin-client -p syncspin-server --all-features --target armv7-unknown-linux-gnueabihf --locked
+      # The client with its default roles is what an ARM consumer builds; the
+      # `--no-default-features` build is the smallest the role features allow.
+      - name: cargo check (armv7, client defaults)
+        run: cargo check -p syncspin-client --target armv7-unknown-linux-gnueabihf --locked
+      - name: cargo check (armv7, client without roles)
+        run: cargo check -p syncspin-client --no-default-features --target armv7-unknown-linux-gnueabihf --locked
 
   coverage:
     runs-on: ubuntu-26.04

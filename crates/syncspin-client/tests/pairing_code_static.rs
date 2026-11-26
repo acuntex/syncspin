@@ -8,7 +8,13 @@
 //! What the tests decide: the window gates every attempt, the flow takes one round, a failed
 //! `server_kc` aborts without a retry, the fifth failure closes the window, and the delivered key is
 //! a record under the server's id.
-#![cfg(feature = "pairing-code")]
+
+#![cfg(all(
+    feature = "pairing-code",
+    feature = "player",
+    feature = "controller",
+    feature = "metadata"
+))]
 
 #[path = "fake_server.rs"]
 mod fake_server;
@@ -138,6 +144,10 @@ fn config_for(endpoint: &str, storage: Option<Arc<dyn Storage>>) -> ClientConfig
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
         code_out_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     }
 }
 

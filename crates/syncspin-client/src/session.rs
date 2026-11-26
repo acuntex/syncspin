@@ -15,16 +15,22 @@ use std::collections::BTreeSet;
 use std::future::pending;
 #[cfg(feature = "pairing-code")]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+#[cfg(feature = "player")]
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+#[cfg(feature = "player")]
+use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
+#[cfg(feature = "metadata")]
+use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{Bytes, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -33,13 +39,18 @@ use syncspin_core::clock::{ClockFilter, TimeSample};
 use syncspin_core::framing::{
     encode_binary, Reassembler, BINARY_MESSAGE_ID_JSON, MAX_REASSEMBLED_LEN,
 };
+#[cfg(feature = "player")]
 use syncspin_core::messages::{
-    AudioChunkHeader, ClientCommand, ClientGoodbye, ClientHello, ClientInit, ClientPairFinalize,
-    ClientPairInit, ClientState, ClientTime, ControllerCommand, DeviceInfo, GroupUpdate, Incoming,
-    NoiseHandshake, PairAbort, PairingActivation, PairingPskMethod, PlayerState, PlayerSupport,
-    ServerActivate, ServerCommand, ServerState, ServerTime, StreamClear, StreamStart,
-    SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
-    PROTOCOL_VERSION,
+    AudioChunkHeader, PlayerState, PlayerSupport, ServerCommand, StreamClear, StreamStart,
+    SupportedFormat, AUDIO_CHUNK_ID,
+};
+#[cfg(feature = "controller")]
+use syncspin_core::messages::{ClientCommand, ControllerCommand};
+use syncspin_core::messages::{
+    ClientGoodbye, ClientHello, ClientInit, ClientPairFinalize, ClientPairInit, ClientState,
+    ClientTime, DeviceInfo, GroupUpdate, Incoming, NoiseHandshake, PairAbort, PairingActivation,
+    PairingPskMethod, ServerActivate, ServerState, ServerTime, SupportedPairMethods,
+    UnpairedAccess, NOISE_SUITE, PROTOCOL_VERSION,
 };
 #[cfg(feature = "pairing-code")]
 use syncspin_core::messages::{
@@ -53,22 +64,50 @@ use syncspin_core::noise::{
 #[cfg(feature = "pairing-code")]
 use syncspin_core::pairing::pake::TAG_LEN;
 
+#[cfg(feature = "player")]
 use crate::buffer::{BufferEstimator, PLAUSIBLE_US, WARMUP};
+#[cfg(feature = "color")]
+use crate::client::ColorScheme;
+#[cfg(feature = "player")]
+use crate::client::{check_reported_level, clamp_volume_with, StreamEndReason};
 use crate::client::{
-    check_reported_level, clamp_volume_with, ControlAction, ControlRequest, Event, GoodbyeReason,
-    PairingFailure, PairingRequiredReason, PlaybackState, StreamEndReason, NORMAL_PLAYBACK_SPEED,
+    ControlAction, ControlRequest, Event, GoodbyeReason, PairingFailure, PairingRequiredReason,
+    PlaybackState,
 };
+#[cfg(feature = "metadata")]
+use crate::client::{TrackProgress, NORMAL_PLAYBACK_SPEED};
+#[cfg(feature = "player")]
+use crate::config::AudioMode;
 #[cfg(feature = "pairing-code")]
 use crate::config::CodeFormat;
-use crate::config::{AudioMode, ClientConfig, PskCategory, StoredPsk};
+use crate::config::{ClientConfig, PskCategory, StoredPsk};
 #[cfg(feature = "pairing-code")]
 use crate::pairing::{
     pake_sid, TagOutcome, METHOD_DYNAMIC_PAIRING_CODE, METHOD_STATIC_PAIRING_CODE,
 };
 use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_PAIRING_PSK};
+#[cfg(feature = "player")]
 use crate::playout::{Dropped, OwnedFrame, PlayoutQueue, BUFFER_CAPACITY};
+#[cfg(feature = "artwork")]
+use crate::roles::artwork::{Artwork, Change};
+#[cfg(any(feature = "metadata", feature = "color"))]
+use crate::roles::sched::Pending;
+#[cfg(feature = "color")]
+use crate::roles::COLOR_ROLE;
+#[cfg(feature = "controller")]
+use crate::roles::CONTROLLER_ROLE;
+#[cfg(feature = "metadata")]
+use crate::roles::METADATA_ROLE;
+#[cfg(feature = "player")]
+use crate::roles::PLAYER_ROLE;
+use crate::roles::{role_changes, supported_roles, Offer};
+#[cfg(feature = "artwork")]
+use crate::roles::{ARTWORK_ROLE, ARTWORK_STREAM_ROLE};
+#[cfg(feature = "player")]
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 use crate::storage::persist_pairing;
+#[cfg(feature = "artwork")]
+use syncspin_core::messages::{ArtworkMessage, StreamStartArtwork};
 
 /// How long the Noise handshake may take, from `client/init` to the first `server/activate`.
 ///
@@ -115,24 +154,12 @@ const SYNC_BURST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Minimum spacing between consecutive sync bursts, so a long stream keeps tracking the clock.
 const RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Versioned role identifier of the audio player.
-const PLAYER_ROLE: &str = "player@v1";
 /// Bare role name used by `stream/end` and `stream/clear` (see `messaging.md`).
+#[cfg(feature = "player")]
 const PLAYER_STREAM_ROLE: &str = "player";
 
-/// Versioned role identifier of the now-playing metadata.
-const METADATA_ROLE: &str = "metadata@v1";
-
-/// Versioned role identifier of the group controller state.
-const CONTROLLER_ROLE: &str = "controller@v1";
-
-/// The roles this client advertises in `client/hello`.
-///
-/// The list is written here once, so the roles the client announces cannot drift apart from the
-/// roles its activation check admits: both read this constant.
-const SUPPORTED_ROLES: [&str; 3] = [PLAYER_ROLE, CONTROLLER_ROLE, METADATA_ROLE];
-
 /// Largest output delay reported to the server, in milliseconds.
+#[cfg(feature = "player")]
 const MAX_OUTPUT_DELAY_MS: u32 = 5_000;
 
 /// How long after an accepted `set_output_delay` the session reads the sink on its own.
@@ -140,6 +167,7 @@ const MAX_OUTPUT_DELAY_MS: u32 = 5_000;
 /// The host normally calls `ControlHandle::output_delay_applied` as soon as it applied the value.
 /// This bounded fallback keeps the server's view from going stale when it does not: the session
 /// reads the sink once, and reports only what the sink adopted by then.
+#[cfg(feature = "player")]
 const OUTPUT_DELAY_FALLBACK: Duration = Duration::from_millis(500);
 
 /// How far past its pre-port write time a frame may be before it is dropped instead of written.
@@ -147,18 +175,23 @@ const OUTPUT_DELAY_FALLBACK: Duration = Duration::from_millis(500);
 /// `roles/player/v1.md` calls for late chunks to be dropped so they cannot break the sync they
 /// were scheduled for. The window absorbs scheduling noise without letting an audibly late frame
 /// through.
+#[cfg(feature = "player")]
 const LATE_TOLERANCE: Duration = Duration::from_millis(10);
 
 /// Minimum spacing between two [`Event::LateAudio`] reports.
+#[cfg(feature = "player")]
 const LATE_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sample rate of the formats this client advertises, in hertz.
+#[cfg(feature = "player")]
 const SUPPORTED_SAMPLE_RATE: u32 = 48_000;
 
 /// Channel count of the formats this client advertises.
+#[cfg(feature = "player")]
 const SUPPORTED_CHANNELS: u8 = 2;
 
 /// Bit depth of the formats this client advertises.
+#[cfg(feature = "player")]
 const SUPPORTED_BIT_DEPTH: u8 = 16;
 
 /// Length of a canonical unpadded base64url key id.
@@ -189,15 +222,18 @@ const WINDOW_FAILURE_LIMIT: u8 = 5;
 const ROUND_LIMIT: u32 = 20;
 
 /// Player commands this client accepts from the server.
+#[cfg(feature = "player")]
 const PLAYER_COMMANDS: [&str; 2] = ["volume", "mute"];
 
 /// Command a host that can change its output delay opts in to advertising.
+#[cfg(feature = "player")]
 const OUTPUT_DELAY_COMMAND: &str = "set_output_delay";
 
 /// The player commands this configuration advertises.
 ///
 /// `set_output_delay` is present only when [`ClientConfig::output_delay_control`] is set: a host
 /// that cannot apply it must not claim it, and [`Session::handle_command`] ignores it otherwise.
+#[cfg(feature = "player")]
 fn supported_player_commands(config: &ClientConfig) -> Vec<String> {
     let mut commands: Vec<String> = PLAYER_COMMANDS
         .iter()
@@ -270,7 +306,10 @@ pub(crate) enum SocketMessage {
 impl Transport {
     /// Opens a plain WebSocket connection to `url`.
     pub(crate) async fn connect(url: &str) -> Result<Transport> {
-        let (socket, _response) = tokio_tungstenite::connect_async(url)
+        // Nagle's algorithm would hold a small write (a `client/time` request, a keepalive ping)
+        // behind an unacknowledged earlier one, which delays clock-sync round trips. Disabling it
+        // changes latency only, not the protocol.
+        let (socket, _response) = tokio_tungstenite::connect_async_with_config(url, None, true)
             .await
             .with_context(|| format!("failed to connect to the server at {url}"))?;
         Ok(Transport {
@@ -447,13 +486,16 @@ enum AdmittedMethod {
 
 /// State a connection keeps across attempts.
 pub(crate) struct Carried {
-    /// Audio output, moved into each session and returned when it ends.
-    pub(crate) sink: Box<dyn Sink>,
+    /// Audio output, moved into each session and returned when it ends; `None` for a headless
+    /// client, which has no audio output and does not take the player role.
+    #[cfg(feature = "player")]
+    pub(crate) sink: Option<Box<dyn Sink>>,
     /// Control requests, or `None` once every handle was dropped.
     pub(crate) control: Option<mpsc::UnboundedReceiver<ControlRequest>>,
     /// Level in force, in the protocol's 0-100 range.
     pub(crate) volume: u8,
     /// Mute state in force.
+    #[cfg(feature = "player")]
     pub(crate) muted: bool,
     /// Roles the last session had active.
     pub(crate) active_roles: Vec<String>,
@@ -471,6 +513,35 @@ pub(crate) struct Carried {
     /// [`ControlHandle::release_holdback`](crate::ControlHandle::release_holdback) resets it.
     #[cfg(feature = "pairing-code")]
     pub(crate) failed_rounds: Arc<AtomicU32>,
+}
+
+impl Carried {
+    /// Whether the connection has an audio sink: the player role is offered exactly then.
+    pub(crate) fn has_sink(&self) -> bool {
+        #[cfg(feature = "player")]
+        {
+            self.sink.is_some()
+        }
+        #[cfg(not(feature = "player"))]
+        {
+            false
+        }
+    }
+
+    /// Flushes the sink, if there is one, and returns what it failed with.
+    ///
+    /// The connection loops call this once a session ended, so nothing buffered for it can become
+    /// audible later. Without a sink, and without the `player` feature, there is nothing to flush.
+    pub(crate) fn flush_sink(&mut self) -> Option<anyhow::Error> {
+        #[cfg(feature = "player")]
+        {
+            self.sink.as_mut().and_then(|sink| sink.flush().err())
+        }
+        #[cfg(not(feature = "player"))]
+        {
+            None
+        }
+    }
 }
 
 /// How one connection attempt ended.
@@ -545,6 +616,8 @@ enum Wakeup {
     LateFlush,
     /// The fallback read of the sink after a `set_output_delay` is due.
     OutputDelayPoll,
+    /// A scheduled role state is due.
+    RoleSchedule,
     /// The clock deadline elapsed.
     Clock,
     /// The keepalive deadline elapsed: a ping is due, or the one on the wire timed out.
@@ -559,8 +632,12 @@ enum Wakeup {
 enum MessageKind {
     /// A control or state message: a JSON body under [`BINARY_MESSAGE_ID_JSON`].
     Control,
-    /// A player audio chunk under [`AUDIO_CHUNK_ID`].
+    /// A player audio chunk under `AUDIO_CHUNK_ID`.
+    #[cfg(feature = "player")]
     Audio,
+    /// An artwork image message, under an id from 8 to 11.
+    #[cfg(feature = "artwork")]
+    Artwork,
     /// A message id this revision does not implement.
     Unknown,
 }
@@ -570,13 +647,17 @@ impl MessageKind {
     fn of(id: u8) -> MessageKind {
         match id {
             BINARY_MESSAGE_ID_JSON => MessageKind::Control,
+            #[cfg(feature = "player")]
             AUDIO_CHUNK_ID => MessageKind::Audio,
+            #[cfg(feature = "artwork")]
+            id if ArtworkMessage::is_artwork_id(id) => MessageKind::Artwork,
             _ => MessageKind::Unknown,
         }
     }
 }
 
 /// Drops accumulated for the next [`Event::LateAudio`] report.
+#[cfg(feature = "player")]
 #[derive(Debug, Default)]
 struct LateAudioWindow {
     /// When the last report went out, or `None` before the first.
@@ -594,9 +675,12 @@ pub(crate) struct Session<'a> {
     transport: Transport,
     noise: NoiseTransport,
     config: &'a ClientConfig,
-    sink: Box<dyn Sink>,
+    /// Audio output, or `None` for a headless session.
+    #[cfg(feature = "player")]
+    sink: Option<Box<dyn Sink>>,
     events: &'a mpsc::UnboundedSender<Event>,
     /// Level shared with every control handle; the session is its only writer.
+    #[cfg(feature = "player")]
     reported_volume: &'a AtomicU8,
     clock: ClockFilter,
     reassembler: Reassembler,
@@ -610,27 +694,36 @@ pub(crate) struct Session<'a> {
     /// Together with a non-empty role set this is what makes an unpaired connection rely on
     /// unpaired access, which is the condition the spec gives for a `pairing_required` close.
     playback_declared: bool,
+    #[cfg(feature = "player")]
     stream: Option<AudioFormat>,
     /// When the current stream started, for the estimator's warmup, or `None` without one.
     ///
     /// An in-place `stream/start` keeps the value it already has: arrival delay is a property of
     /// the path, not of the format.
+    #[cfg(feature = "player")]
     stream_started: Option<Instant>,
     /// Frames waiting for their pre-port write time.
+    #[cfg(feature = "player")]
     queue: PlayoutQueue,
     /// When the playout branch next has work, the pre-port delay already subtracted, or `None`
     /// while the queue is empty.
+    #[cfg(feature = "player")]
     next_playout: Option<Instant>,
     /// Delay between [`Sink::write`] and the audio port, as the sink last reported it.
+    #[cfg(feature = "player")]
     pre_port_delay: Duration,
     /// Post-port delay the sink last reported; part of every mapped deadline.
+    #[cfg(feature = "player")]
     output_delay: Option<Duration>,
     /// `required_lead_time_ms` as the last `client/state` reported it.
+    #[cfg(feature = "player")]
     reported_lead_ms: Option<u32>,
     /// When the sink is read once after an accepted `set_output_delay`, in case the host never
     /// calls `ControlHandle::output_delay_applied`. `None` while no command is pending.
+    #[cfg(feature = "player")]
     output_delay_poll_at: Option<Instant>,
     /// Drops not yet reported through [`Event::LateAudio`].
+    #[cfg(feature = "player")]
     late_audio: LateAudioWindow,
     /// Remaining `client/time` messages of the current burst (0 = no burst running).
     sync_remaining: usize,
@@ -660,6 +753,7 @@ pub(crate) struct Session<'a> {
     /// Output level in force, in the protocol's 0-100 range.
     volume: u8,
     /// Mute state in force.
+    #[cfg(feature = "player")]
     muted: bool,
     /// Buffer duration in force, in milliseconds.
     ///
@@ -667,10 +761,13 @@ pub(crate) struct Session<'a> {
     /// configuration leaves the value to the session. Every `client/state` reports it; a pinned
     /// session leaves it alone, and an unpinned one replaces it with a value derived from arrival
     /// delay.
+    #[cfg(feature = "player")]
     min_buffer_ms: u32,
     /// Arrival-delay estimator behind [`Self::min_buffer_ms`] when the host did not pin it.
+    #[cfg(feature = "player")]
     estimator: BufferEstimator,
     /// Whether a sink call failed, which the host has to repair before another attempt.
+    #[cfg(feature = "player")]
     sink_failed: bool,
     /// Whether this connection already reported a non-canonical `group_id`.
     ///
@@ -679,7 +776,20 @@ pub(crate) struct Session<'a> {
     group_id_tolerance_reported: bool,
     /// Controller commands the server last advertised, or `None` before its first controller
     /// state.
+    #[cfg(feature = "controller")]
     controller_commands: Option<Vec<String>>,
+    /// The scheduled metadata update, if one is waiting for its server timestamp.
+    #[cfg(feature = "metadata")]
+    track: Pending<Event>,
+    /// The scheduled color update, if one is waiting for its server timestamp.
+    #[cfg(feature = "color")]
+    color: Pending<ColorScheme>,
+    /// The artwork role's images, schedule and transfer in flight.
+    #[cfg(feature = "artwork")]
+    artwork: Artwork,
+    /// Where the server-minus-local clock offset is published for the control handles.
+    #[cfg(feature = "metadata")]
+    server_clock: &'a watch::Sender<Option<i64>>,
     /// The state last reported to the host, merged from `group/update` and `server/state`.
     ///
     /// `group/update` supplies the group fields and `server/state` the controller ones, so either
@@ -746,7 +856,8 @@ pub(crate) async fn attempt(
     events: &mpsc::UnboundedSender<Event>,
     psks: &[StoredPsk],
     pairing_psk: Option<PairingPsk>,
-    reported_volume: &AtomicU8,
+    #[cfg(feature = "player")] reported_volume: &AtomicU8,
+    #[cfg(feature = "metadata")] server_clock: &watch::Sender<Option<i64>>,
     carried: Carried,
     shutdown: &mut oneshot::Receiver<GoodbyeReason>,
 ) -> Attempt {
@@ -774,6 +885,7 @@ pub(crate) async fn attempt(
                 &candidates,
                 &carried.active_roles,
                 &carried.unpaired_access,
+                Offer::new(carried.has_sink(), config),
             ),
         ) => result,
         // The host closed while the handshake was running. There is no session to say goodbye on
@@ -824,17 +936,25 @@ pub(crate) async fn attempt(
     let unpaired_access_snapshot = carried.unpaired_access.load(Ordering::Relaxed);
     // The estimator owns the initial value: the pin when the host set one, otherwise the value an
     // unpinned session starts at.
+    #[cfg(feature = "player")]
     let estimator = BufferEstimator::new(config.min_buffer_ms);
     // The trait has no change notification, so the values are snapshotted here and polled at the
     // points named on `Sink::pre_port_delay` and `Sink::output_delay`.
-    let pre_port_delay = carried.sink.pre_port_delay();
-    let output_delay = carried.sink.output_delay();
+    #[cfg(feature = "player")]
+    let pre_port_delay = carried
+        .sink
+        .as_ref()
+        .map_or(Duration::ZERO, |sink| sink.pre_port_delay());
+    #[cfg(feature = "player")]
+    let output_delay = carried.sink.as_ref().and_then(|sink| sink.output_delay());
     let mut session = Session {
         transport: ready.transport,
         noise: ready.noise,
         config,
+        #[cfg(feature = "player")]
         sink: carried.sink,
         events,
+        #[cfg(feature = "player")]
         reported_volume,
         clock: ClockFilter::new(),
         reassembler: Reassembler::new(MAX_REASSEMBLED_LEN),
@@ -842,14 +962,23 @@ pub(crate) async fn attempt(
         unpaired_access: carried.unpaired_access,
         unpaired_access_snapshot,
         playback_declared: false,
+        #[cfg(feature = "player")]
         stream: None,
+        #[cfg(feature = "player")]
         stream_started: None,
+        #[cfg(feature = "player")]
         queue: PlayoutQueue::new(BUFFER_CAPACITY, LATE_TOLERANCE),
+        #[cfg(feature = "player")]
         next_playout: None,
+        #[cfg(feature = "player")]
         pre_port_delay,
+        #[cfg(feature = "player")]
         output_delay,
+        #[cfg(feature = "player")]
         reported_lead_ms: None,
+        #[cfg(feature = "player")]
         output_delay_poll_at: None,
+        #[cfg(feature = "player")]
         late_audio: LateAudioWindow::default(),
         sync_remaining: 0,
         burst_deadline: None,
@@ -862,12 +991,25 @@ pub(crate) async fn attempt(
         control: carried.control,
         shutdown,
         volume: carried.volume,
+        #[cfg(feature = "player")]
         muted: carried.muted,
+        #[cfg(feature = "player")]
         min_buffer_ms: estimator.value(),
+        #[cfg(feature = "player")]
         estimator,
+        #[cfg(feature = "player")]
         sink_failed: false,
         group_id_tolerance_reported: false,
+        #[cfg(feature = "controller")]
         controller_commands: None,
+        #[cfg(feature = "metadata")]
+        track: Pending::new(),
+        #[cfg(feature = "artwork")]
+        artwork: Artwork::new(&config.artwork_channels, config.max_artwork_bytes),
+        #[cfg(feature = "color")]
+        color: Pending::new(),
+        #[cfg(feature = "metadata")]
+        server_clock,
         playback: PlaybackState::default(),
         server_id: ready.server_id.clone(),
         matched: ready.matched,
@@ -889,7 +1031,11 @@ pub(crate) async fn attempt(
         keepalive_ping: None,
         keepalive_nonce: 0,
     };
+    #[cfg(feature = "player")]
     session.publish_volume();
+    // A new connection starts without an estimate, and the previous one's offset is not valid for it.
+    #[cfg(feature = "metadata")]
+    session.server_clock.send_replace(None);
 
     session.emit(Event::Connected {
         server_id: ready.server_id,
@@ -902,7 +1048,7 @@ pub(crate) async fn attempt(
     // The handshake consumed the first activation; it is applied here, now that the session can
     // answer it. A pairing activation in it starts the attempt just as a later one does.
     let prepared = session.apply_activate(ready.activate).await;
-    if prepared.is_ok() && session.player_active() {
+    if prepared.is_ok() && session.needs_clock() {
         session.start_burst();
     }
 
@@ -913,7 +1059,12 @@ pub(crate) async fn attempt(
             Err(error) => Ending::Failed(error),
         },
     };
+    #[cfg(feature = "metadata")]
+    session.server_clock.send_replace(None);
+    #[cfg(feature = "player")]
     let sink_failed = session.sink_failed;
+    #[cfg(not(feature = "player"))]
+    let sink_failed = false;
     let carried = session.into_carried();
     Attempt {
         carried,
@@ -927,9 +1078,11 @@ impl Session<'_> {
     /// Returns the state the next attempt starts from.
     fn into_carried(self) -> Carried {
         Carried {
+            #[cfg(feature = "player")]
             sink: self.sink,
             control: self.control,
             volume: self.volume,
+            #[cfg(feature = "player")]
             muted: self.muted,
             active_roles: self.active_roles,
             unpaired_access: self.unpaired_access,
@@ -988,10 +1141,23 @@ impl Session<'_> {
 
             // The control receiver outlives individual handles: dropping the last one disables the
             // branch instead of ending the session.
+            #[cfg(any(feature = "metadata", feature = "artwork", feature = "color"))]
+            let role_deadline = self.role_deadline();
+            #[cfg(not(any(feature = "metadata", feature = "artwork", feature = "color")))]
+            let role_deadline: Option<Instant> = None;
             let control = &mut self.control;
-            let next_playout = self.next_playout;
-            let late_flush = self.late_audio.flush_at;
-            let output_delay_poll = self.output_delay_poll_at;
+            #[cfg(feature = "player")]
+            let (next_playout, late_flush, output_delay_poll) = (
+                self.next_playout,
+                self.late_audio.flush_at,
+                self.output_delay_poll_at,
+            );
+            #[cfg(not(feature = "player"))]
+            let (next_playout, late_flush, output_delay_poll): (
+                Option<Instant>,
+                Option<Instant>,
+                Option<Instant>,
+            ) = (None, None, None);
             let wakeup = tokio::select! {
                 biased;
                 request = async {
@@ -1025,6 +1191,14 @@ impl Session<'_> {
                         None => pending().await,
                     }
                 } => Wakeup::OutputDelayPoll,
+                // A scheduled role state is delivered before the next read for the same reason as
+                // playout: a chatty server must not hold it past its moment.
+                () = async {
+                    match role_deadline {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => pending().await,
+                    }
+                } => Wakeup::RoleSchedule,
                 message = self.transport.read() => Wakeup::Socket(message),
                 () = async {
                     match deadline {
@@ -1056,15 +1230,27 @@ impl Session<'_> {
                         // A socket that just delivered a burst may have kept a now-due frame
                         // waiting; the next loop iteration would catch it too, but draining here
                         // keeps the write off the socket's schedule.
+                        #[cfg(feature = "player")]
                         self.drain_playout()?;
                     }
                 },
+                #[cfg(feature = "player")]
                 Wakeup::Playout => self.drain_playout()?,
+                #[cfg(feature = "player")]
                 Wakeup::LateFlush => self.flush_late_audio(),
+                #[cfg(feature = "player")]
                 Wakeup::OutputDelayPoll => {
                     self.output_delay_poll_at = None;
                     self.poll_timing().await?;
                 }
+                // Without the player there is no queue, no late-audio window and no sink to poll:
+                // the three timers above are never armed.
+                #[cfg(not(feature = "player"))]
+                Wakeup::Playout | Wakeup::LateFlush | Wakeup::OutputDelayPoll => {}
+                #[cfg(any(feature = "metadata", feature = "artwork", feature = "color"))]
+                Wakeup::RoleSchedule => self.fire_scheduled(),
+                #[cfg(not(any(feature = "metadata", feature = "artwork", feature = "color")))]
+                Wakeup::RoleSchedule => {}
                 Wakeup::Clock => {
                     if self.rehandshake.is_some() {
                         // The server must send its activation under the new keys; staying silent
@@ -1138,7 +1324,7 @@ impl Session<'_> {
         if self.sync_remaining == 0
             && self.burst_deadline.is_none()
             && self.reply_deadline.is_none()
-            && self.player_active()
+            && self.needs_clock()
             && self.burst_due()
         {
             self.start_burst();
@@ -1231,22 +1417,29 @@ impl Session<'_> {
         self.burst_sent_us.clear();
         let pushed = if let Some(sample) = best_sample(&self.burst_samples) {
             self.clock.push(sample);
+            #[cfg(feature = "metadata")]
+            self.publish_server_clock();
             true
         } else {
             false
         };
         self.burst_samples.clear();
+        #[cfg(feature = "player")]
         if pushed {
             // A clock update moves every queued deadline; re-map before the timing poll, which
             // only re-maps when the sink's post-port delay changed.
             self.remap_playout();
         }
+        #[cfg(not(feature = "player"))]
+        let _ = pushed;
         if !self.state_sent && self.clock.sample_count() >= 1 && self.player_active() {
             self.send_client_state().await?;
         }
         // A burst is one of the poll points, whether or not it produced a report: the clock
         // moved and a changed timing has to re-map or re-arm from it.
-        self.poll_timing().await
+        #[cfg(feature = "player")]
+        self.poll_timing().await?;
+        Ok(())
     }
 
     /// Decrypts one transport message and dispatches the message it carries.
@@ -1258,6 +1451,7 @@ impl Session<'_> {
     async fn receive(&mut self, ciphertext: &[u8]) -> Result<()> {
         // Arrival belongs at the transport read, before decryption and parsing can add their own
         // time to the delay the estimator measures.
+        #[cfg(feature = "player")]
         let arrival_us = now_us();
         let plaintext = match self.noise.decrypt(ciphertext) {
             Ok(plaintext) => plaintext,
@@ -1282,8 +1476,11 @@ impl Session<'_> {
         // not decode is ignored, while a malformed audio chunk stays a protocol error.
         match MessageKind::of(id) {
             MessageKind::Control => self.handle_control_message(&body).await,
+            #[cfg(feature = "player")]
             MessageKind::Audio => self.handle_audio(&body, arrival_us).await,
             // A message id belongs to a role this client does not implement.
+            #[cfg(feature = "artwork")]
+            MessageKind::Artwork => self.handle_artwork(id, &body),
             MessageKind::Unknown => Ok(()),
         }
     }
@@ -1336,6 +1533,15 @@ impl Session<'_> {
                     // continue without the field, and ignoring it would leave a half-open attempt.
                     return Err(error.into());
                 }
+                // `messaging.md` makes a value outside a fixed range or length limit in a
+                // recognised message a protocol error that closes the connection, but also says an
+                // inactive role's object is ignored with its values unvalidated. The role check
+                // therefore comes first: an out-of-range color closes only while the color role is
+                // active, and is ignored like any malformed control message otherwise.
+                #[cfg(feature = "color")]
+                if self.role_active(COLOR_ROLE) && color_out_of_range(text) {
+                    bail!("server/state carries a color component outside its 0-255 range");
+                }
                 eprintln!("ignoring a malformed control message: {error}");
                 Ok(())
             }
@@ -1352,11 +1558,36 @@ impl Session<'_> {
                 Ok(())
             }
             Incoming::GroupUpdate(update) => self.handle_group_update(update),
+            #[cfg(feature = "player")]
             Incoming::ServerCommand(command) => self.handle_command(command).await,
-            Incoming::StreamStart(start) => self.handle_stream_start(start).await,
-            Incoming::StreamEnd(end) if !affects_player(end.roles.as_deref()) => Ok(()),
-            Incoming::StreamEnd(_) => self.stop_stream(StreamEndReason::End),
+            #[cfg(any(feature = "player", feature = "artwork"))]
+            Incoming::StreamStart(start) => {
+                // The artwork object is handled first and leaves the player path alone: a
+                // `stream/start` with only an artwork object does not touch an open player stream.
+                #[cfg(feature = "artwork")]
+                self.artwork_stream_start(start.artwork.as_ref());
+                #[cfg(feature = "player")]
+                return self.handle_stream_start(start).await;
+                #[cfg(not(feature = "player"))]
+                Ok(())
+            }
+            #[cfg(any(feature = "player", feature = "artwork"))]
+            Incoming::StreamEnd(end) => {
+                #[cfg(feature = "artwork")]
+                if names_role(end.roles.as_deref(), ARTWORK_STREAM_ROLE, ARTWORK_ROLE) {
+                    self.artwork_stream_end();
+                }
+                #[cfg(feature = "player")]
+                if affects_player(end.roles.as_deref()) {
+                    return self.stop_stream(StreamEndReason::End);
+                }
+                Ok(())
+            }
+            // A `stream/clear` without roles clears the player (and the visualizer), never artwork,
+            // and one that names artwork explicitly is ignored: artwork has no buffer to clear.
+            #[cfg(feature = "player")]
             Incoming::StreamClear(clear) if !affects_player(clear.roles.as_deref()) => Ok(()),
+            #[cfg(feature = "player")]
             Incoming::StreamClear(clear) => self.handle_stream_clear(clear),
             Incoming::ServerPairFinalize(_) => self.confirm_pairing(),
             Incoming::ServerUnpair(_) => self.handle_unpair().await,
@@ -1478,8 +1709,14 @@ impl Session<'_> {
             Ok(Some(activation)) => self.admitted_method(&activation).is_some(),
             Err(_) => true,
         };
-        if let Some(refusal) =
-            admit_activation(self.matched, unpaired_access, pairing_admissible, &activate).refusal()
+        if let Some(refusal) = admit_activation(
+            self.matched,
+            unpaired_access,
+            Offer::new(self.has_sink(), self.config),
+            pairing_admissible,
+            &activate,
+        )
+        .refusal()
         {
             return self.refuse_activation(refusal).await;
         }
@@ -1509,6 +1746,7 @@ impl Session<'_> {
         }
 
         let had_player = self.player_active();
+        let previous_roles = self.active_roles.clone();
         // The spec re-evaluates playback capability against the persisted roles instead of rejecting
         // a later activation for them: a connection that can no longer carry playback loses its
         // roles, and `had_player` above is what turns that loss into `StreamEnd` below.
@@ -1521,19 +1759,40 @@ impl Session<'_> {
             self.active_roles = roles;
         }
         let has_player = self.player_active();
+        let (added, removed) = role_changes(&previous_roles, &self.active_roles);
 
         if had_player && !has_player {
             // The player role is gone: nothing that is still buffered may become audible.
             self.state_sent = false;
             self.suspend_burst();
+            #[cfg(feature = "player")]
             self.stop_stream(StreamEndReason::RoleRemoved)?;
         } else if !had_player && has_player {
             // A re-added role reports itself again, from the existing estimate when there is one.
+            // The report is owed to the player even when a player-less one went out before.
+            self.state_sent = false;
             if self.clock.sample_count() >= 1 {
                 self.send_client_state().await?;
             } else {
                 self.start_burst();
             }
+        }
+
+        // The player's stream ended above, so its event precedes the other roles' clears.
+        self.reconcile_removed(&removed);
+        // A role that defines a state object must report it when it becomes active, and the server
+        // sends none of its data before. The first report of a connection goes out below.
+        #[cfg(feature = "artwork")]
+        if self.state_sent && added.iter().any(|role| role == ARTWORK_ROLE) {
+            self.send_client_state().await?;
+        }
+        #[cfg(not(feature = "artwork"))]
+        let _ = added;
+
+        // Only the player waits for the clock before its first `client/state`: a client that has
+        // roles but no player owes the initial report as soon as the activation names them.
+        if !self.state_sent && !self.active_roles.is_empty() && !self.player_active() {
+            self.send_client_state().await?;
         }
 
         if let Some(activation) = pairing {
@@ -2178,7 +2437,9 @@ impl Session<'_> {
         self.write_client_state().await?;
         // The state report is one of the poll points; after it, a changed timing sends the
         // state that reports the new value.
-        self.poll_timing().await
+        #[cfg(feature = "player")]
+        self.poll_timing().await?;
+        Ok(())
     }
 
     /// Sends one `client/state` message from the values in force.
@@ -2188,8 +2449,31 @@ impl Session<'_> {
     /// read could disagree with the cache and make `poll_timing` report a value twice.
     async fn write_client_state(&mut self) -> Result<()> {
         self.state_sent = true;
-        let pre_port_delay = self.sink.pre_port_delay();
-        let output_delay = self.sink.output_delay();
+        #[cfg(feature = "player")]
+        let player = self.player_state();
+        #[cfg(not(feature = "player"))]
+        let player = None;
+        #[cfg(feature = "artwork")]
+        let artwork =
+            self.role_active(ARTWORK_ROLE)
+                .then(|| syncspin_core::messages::ArtworkState {
+                    channels: self.artwork.state_channels(),
+                });
+        #[cfg(not(feature = "artwork"))]
+        let artwork = None;
+        let state = Incoming::ClientState(ClientState {
+            available: true,
+            player,
+            artwork,
+        });
+        self.send_json(&state).await
+    }
+
+    /// Reads the sink once, refreshes the timing caches and builds the `player` object, or `None`
+    /// when this session does not carry the player role.
+    #[cfg(feature = "player")]
+    fn player_state(&mut self) -> Option<PlayerState> {
+        let (pre_port_delay, output_delay) = self.sink_delays();
         let output_changed = output_delay != self.output_delay;
         self.pre_port_delay = pre_port_delay;
         self.output_delay = output_delay;
@@ -2202,10 +2486,9 @@ impl Session<'_> {
                 .map_or(MAX_OUTPUT_DELAY_MS, |delay| delay.min(MAX_OUTPUT_DELAY_MS))
         });
         let required_lead_time_ms = self.required_lead_ms(pre_port_delay);
-        self.reported_lead_ms = Some(required_lead_time_ms);
-        let state = Incoming::ClientState(ClientState {
-            available: true,
-            player: Some(PlayerState {
+        self.player_active().then(|| {
+            self.reported_lead_ms = Some(required_lead_time_ms);
+            PlayerState {
                 volume: Some(self.volume),
                 muted: Some(self.muted),
                 output_delay_ms,
@@ -2213,9 +2496,8 @@ impl Session<'_> {
                 min_buffer_ms: self.min_buffer_ms,
                 supported_commands: supported_player_commands(self.config),
                 format: None,
-            }),
-        });
-        self.send_json(&state).await
+            }
+        })
     }
 
     /// Opens the sink for a newly announced player stream.
@@ -2223,6 +2505,7 @@ impl Session<'_> {
     /// The queue is cleared with the flush, including for an in-place `stream/start` that only
     /// replaces the format: a frame queued for the previous announcement must not reach the sink
     /// after the new one opened it.
+    #[cfg(feature = "player")]
     async fn handle_stream_start(&mut self, start: StreamStart) -> Result<()> {
         if !self.player_active() {
             return Ok(());
@@ -2279,6 +2562,7 @@ impl Session<'_> {
     /// The chunk's payload is owned from here on, because a borrowed [`AudioFrame`] cannot outlive
     /// the message it was parsed from. The queue stores the raw server timestamp beside the local
     /// deadline, so a later `stream/clear` can cut by the stamp a clock update does not move.
+    #[cfg(feature = "player")]
     async fn handle_audio(&mut self, body: &[u8], arrival_us: i64) -> Result<()> {
         // The reassembler removed the message id, so the body parses in place.
         let (header, data) = AudioChunkHeader::parse_body(body)?;
@@ -2318,6 +2602,7 @@ impl Session<'_> {
     /// playing it would break the sync it was scheduled for, and the queue has nothing to gain from
     /// holding it. The queue's own `push` still guards against capacity overruns; those drops feed
     /// the same report.
+    #[cfg(feature = "player")]
     fn enqueue(&mut self, server_us: i64, due: Instant, frame: OwnedFrame) {
         // A subtraction that underflows has no honest write time: falling back to the port
         // deadline would delay the frame, so the conservative outcome is "now" instead.
@@ -2344,6 +2629,7 @@ impl Session<'_> {
     /// delay before its port deadline. Each frame is re-checked against the tolerance: the loop may
     /// have been held up by the socket or by a blocking sink, and a frame that is now too late is
     /// dropped rather than written. Its count and lateness join the same report as a late arrival.
+    #[cfg(feature = "player")]
     fn drain_playout(&mut self) -> Result<()> {
         let now = Instant::now();
         let cut = now.checked_add(self.pre_port_delay).unwrap_or(now);
@@ -2380,6 +2666,7 @@ impl Session<'_> {
     /// Called after every queue mutation and every pre-port change; `None` means the queue is empty
     /// and the branch waits without a deadline. A subtraction that underflows falls back to
     /// "now": the timer fires at once instead of waiting for the later port instant.
+    #[cfg(feature = "player")]
     fn arm_playout(&mut self) {
         self.next_playout = self.queue.next_due().map(|due| {
             due.checked_sub(self.pre_port_delay)
@@ -2394,6 +2681,7 @@ impl Session<'_> {
     /// reports zero lateness: those frames were not late, their queue was full. A window that fills
     /// without reaching the interval is flushed by the [`Wakeup::LateFlush`] timer, so its tail is
     /// not lost when no further frame is dropped.
+    #[cfg(feature = "player")]
     fn record_drops(&mut self, dropped: &[Dropped]) {
         if dropped.is_empty() {
             return;
@@ -2419,6 +2707,7 @@ impl Session<'_> {
     }
 
     /// Emits the pending late-audio window and restarts the reporting interval.
+    #[cfg(feature = "player")]
     fn emit_late_audio(&mut self) {
         self.emit(Event::LateAudio {
             late_by: self.late_audio.worst,
@@ -2431,6 +2720,7 @@ impl Session<'_> {
     }
 
     /// Emits a window that saw no further drop before the interval elapsed.
+    #[cfg(feature = "player")]
     fn flush_late_audio(&mut self) {
         if self.late_audio.dropped > 0 {
             self.emit_late_audio();
@@ -2446,6 +2736,7 @@ impl Session<'_> {
     /// start-from-empty burst is transmitted back-to-back and does not represent steady-state
     /// delay), when `send_ahead` carries one of the protocol's saturation values, before the clock
     /// estimate exists, and for a delay outside the plausibility bound.
+    #[cfg(feature = "player")]
     async fn record_arrival_delay(
         &mut self,
         header: &AudioChunkHeader,
@@ -2483,6 +2774,7 @@ impl Session<'_> {
     /// The event goes out before the flush, so a host can mute or stop its output while the
     /// client is still dropping the audio it buffered. A sink that fails to flush ends the
     /// session, like any other sink error.
+    #[cfg(feature = "player")]
     fn stop_stream(&mut self, reason: StreamEndReason) -> Result<()> {
         self.stream = None;
         self.stream_started = None;
@@ -2501,6 +2793,7 @@ impl Session<'_> {
     ///
     /// The event goes out before the sink call, so a host can restart its output and re-prime a
     /// decoder before the buffered audio is dropped.
+    #[cfg(feature = "player")]
     fn handle_stream_clear(&mut self, clear: StreamClear) -> Result<()> {
         self.emit(Event::StreamClear {
             from_timestamp: clear.from_timestamp,
@@ -2516,10 +2809,14 @@ impl Session<'_> {
     ///
     /// The queue goes first: a frame that is written between the sink's flush and the queue's clear
     /// would already be audible after the flush.
+    #[cfg(feature = "player")]
     fn flush_sink(&mut self) -> Result<()> {
         self.queue.clear();
         self.arm_playout();
-        match self.sink.flush() {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        match sink.flush() {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.sink_failed = true;
@@ -2533,11 +2830,15 @@ impl Session<'_> {
     /// The queue is cut by the raw server timestamp, because a clock update moves local deadlines
     /// but not the stamps a `stream/clear` names. The sink receives the mapped deadline for the
     /// same stamp, with the post-port delay subtracted, so both sides cut at the same audio.
+    #[cfg(feature = "player")]
     fn discard_sink(&mut self, server_us: i64) -> Result<()> {
         self.queue.discard_from(server_us);
         self.arm_playout();
         let due = self.playout_deadline(server_us);
-        match self.sink.discard_from(due) {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        match sink.discard_from(due) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.sink_failed = true;
@@ -2547,8 +2848,12 @@ impl Session<'_> {
     }
 
     /// Opens the sink for a stream, recording a failure the caller has to treat as fatal.
+    #[cfg(feature = "player")]
     fn open_sink(&mut self, format: AudioFormat) -> Result<()> {
-        match self.sink.open(format) {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        match sink.open(format) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.sink_failed = true;
@@ -2558,8 +2863,12 @@ impl Session<'_> {
     }
 
     /// Writes one frame, recording a failure the caller has to treat as fatal.
+    #[cfg(feature = "player")]
     fn write_sink(&mut self, frame: AudioFrame<'_>, due: Instant) -> Result<()> {
-        match self.sink.write(frame, due) {
+        let Some(sink) = self.sink.as_mut() else {
+            return Ok(());
+        };
+        match sink.write(frame, due) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.sink_failed = true;
@@ -2575,6 +2884,7 @@ impl Session<'_> {
     /// The result is **not** clamped, so a deadline that already passed stays in the past and a
     /// caller can tell a late frame from one that is merely due. `None` means no clock estimate is
     /// ready, or that the mapping overflowed the instant range.
+    #[cfg(feature = "player")]
     fn mapped_deadline(&self, server_us: i64) -> Option<Instant> {
         map_deadline(&self.clock, self.output_delay, server_us)
     }
@@ -2585,6 +2895,7 @@ impl Session<'_> {
     /// already passed and when the mapping overflows, it is [`Instant::now`], so a sink can compare
     /// it with its own clock. The scheduler never uses the clamp - lateness is judged from the
     /// unclamped [`Self::mapped_deadline`], because a clamped value is always "not early".
+    #[cfg(feature = "player")]
     fn playout_deadline(&self, server_us: i64) -> Instant {
         let now = Instant::now();
         match self.mapped_deadline(server_us) {
@@ -2598,6 +2909,7 @@ impl Session<'_> {
     /// Deadlines are a function of the stamp, the clock estimate and the sink's reported post-port
     /// delay, so both a new clock sample and a changed delay move every frame that is waiting. The
     /// stored stamps are unchanged, which is what lets a later clear still cut by them.
+    #[cfg(feature = "player")]
     fn remap_playout(&mut self) {
         let clock = &self.clock;
         let output_delay = self.output_delay;
@@ -2624,9 +2936,9 @@ impl Session<'_> {
     /// owns the caches and reads the sink once, so the value that is stored, re-mapped and reported
     /// is the same. Before the first state report exists, no state is sent here: the initial report
     /// that follows the clock estimate carries the new values anyway.
+    #[cfg(feature = "player")]
     async fn poll_timing(&mut self) -> Result<()> {
-        let pre_port_delay = self.sink.pre_port_delay();
-        let output_delay = self.sink.output_delay();
+        let (pre_port_delay, output_delay) = self.sink_delays();
         let lead = self.required_lead_ms(pre_port_delay);
         let lead_changed = self
             .reported_lead_ms
@@ -2654,36 +2966,252 @@ impl Session<'_> {
     /// `roles/player/v1.md` makes the audio backend buffer a floor for `required_lead_time_ms`, and
     /// the sink's pre-port delay is that backend. The host's configured value is a start-up floor,
     /// not a ceiling, so the larger of the two is reported.
+    #[cfg(feature = "player")]
     fn required_lead_ms(&self, pre_port_delay: Duration) -> u32 {
         let pre_port_ms = u32::try_from(pre_port_delay.as_millis()).unwrap_or(u32::MAX);
         self.config.required_lead_time_ms.max(pre_port_ms)
     }
 
+    /// Handles the artwork object of a `stream/start`.
+    ///
+    /// An object for an inactive role is ignored, and so is one that does not match the channels this
+    /// client declared: the specification requires the match, so a mismatch is the server's mistake
+    /// and the client keeps its state.
+    #[cfg(feature = "artwork")]
+    fn artwork_stream_start(&mut self, start: Option<&StreamStartArtwork>) {
+        let Some(start) = start else {
+            return;
+        };
+        if !self.role_active(ARTWORK_ROLE) {
+            return;
+        }
+        if !self.artwork.stream_start(&start.channels) {
+            eprintln!("ignoring an artwork stream/start that does not match the declared channels");
+        }
+    }
+
+    /// Ends the artwork stream: every channel is cleared and reported.
+    #[cfg(feature = "artwork")]
+    fn artwork_stream_end(&mut self) {
+        let changes = self.artwork.stream_end();
+        self.emit_artwork(changes);
+    }
+
+    /// Reports what the artwork machine says changed.
+    #[cfg(feature = "artwork")]
+    fn emit_artwork(&self, changes: Vec<Change>) {
+        for change in changes {
+            self.emit(match change {
+                Change::Show(channel, image) => Event::Artwork {
+                    channel,
+                    image: Some(image),
+                },
+                Change::Clear(channel) => Event::Artwork {
+                    channel,
+                    image: None,
+                },
+            });
+        }
+    }
+
+    /// Handles one binary artwork message.
+    ///
+    /// The message-level checks run whenever this build has the role, whether or not it is active:
+    /// the specification keeps a recognised id recognised, so a malformed message closes the
+    /// connection either way. Well-formed data outside an active artwork stream is discarded with no
+    /// state change.
+    #[cfg(feature = "artwork")]
+    fn handle_artwork(&mut self, id: u8, body: &[u8]) -> Result<()> {
+        let mut message = Vec::with_capacity(body.len() + 1);
+        message.push(id);
+        message.extend_from_slice(body);
+        let parsed = ArtworkMessage::parse(&message)?;
+        if !self.role_active(ARTWORK_ROLE) || !self.artwork.stream_active() {
+            return Ok(());
+        }
+        let changes = self.artwork.handle(parsed, &self.clock, now_us())?;
+        self.emit_artwork(changes);
+        Ok(())
+    }
+
+    /// Drops the state of every role that is no longer active.
+    ///
+    /// Role removal happens through an explicit new set, through the implicit clear when an
+    /// activation that omits `active_roles` leaves the connection unable to carry playback, and
+    /// through a version replacement, so the caller passes the diff of the sets rather than the
+    /// activation. The player is handled by the caller, which also ends its stream. Group fields of
+    /// [`PlaybackState`] belong to `group/update`, not to a role, and are kept.
+    fn reconcile_removed(&mut self, removed: &[String]) {
+        for role in removed {
+            #[cfg(feature = "controller")]
+            if role == CONTROLLER_ROLE {
+                self.controller_commands = None;
+                self.playback.supported_commands = Vec::new();
+                self.playback.volume = None;
+                self.playback.muted = None;
+                self.playback.seek_max_ms = None;
+                self.playback.repeat = None;
+                self.playback.shuffle = None;
+                self.emit(Event::State(self.playback.clone()));
+            }
+            #[cfg(feature = "metadata")]
+            if role == METADATA_ROLE {
+                self.track.clear();
+                self.emit(Event::TrackCleared);
+            }
+            #[cfg(feature = "artwork")]
+            if role == ARTWORK_ROLE {
+                self.artwork_stream_end();
+            }
+            #[cfg(feature = "color")]
+            if role == COLOR_ROLE {
+                self.color.clear();
+                self.emit(Event::ColorCleared);
+            }
+            #[cfg(not(any(
+                feature = "controller",
+                feature = "metadata",
+                feature = "artwork",
+                feature = "color"
+            )))]
+            let _ = role;
+        }
+    }
+
+    /// Turns a `metadata` object into a [`Event::Track`] and delivers it at its timestamp.
+    ///
+    /// A state whose timestamp is past or present, or that arrives with no clock estimate, is
+    /// emitted at once and discards a held update; a future one is held and replaces the previous
+    /// one. An absent progress object maps to [`TrackProgress::default`], the position cleared at
+    /// normal speed.
+    #[cfg(feature = "metadata")]
+    fn offer_track(&mut self, metadata: syncspin_core::messages::Metadata) {
+        let local_now_us = now_us();
+        let timestamp_us = metadata
+            .timestamp
+            .unwrap_or_else(|| self.clock.now_us(local_now_us).unwrap_or(local_now_us));
+        let progress = match metadata.progress {
+            Some(progress) => TrackProgress {
+                position_ms: progress.track_progress,
+                duration_ms: progress.track_duration,
+                speed_permille: progress.playback_speed.unwrap_or(NORMAL_PLAYBACK_SPEED),
+            },
+            None => TrackProgress::default(),
+        };
+        let event = Event::Track {
+            title: metadata.title.unwrap_or_default(),
+            artist: metadata.artist.unwrap_or_default(),
+            album: metadata.album.unwrap_or_default(),
+            album_artist: metadata.album_artist.unwrap_or_default(),
+            artwork_url: metadata.artwork_url.unwrap_or_default(),
+            year: metadata.year,
+            track: metadata.track,
+            timestamp_us,
+            progress,
+        };
+        if let Some(event) = self
+            .track
+            .offer(timestamp_us, event, &self.clock, local_now_us)
+        {
+            self.emit(event);
+        }
+    }
+
+    /// Delivers a `color` object at its timestamp, through the same schedule as metadata.
+    #[cfg(feature = "color")]
+    fn offer_color(&mut self, color: syncspin_core::messages::Color) {
+        let local_now_us = now_us();
+        let scheme = ColorScheme {
+            timestamp_us: color.timestamp,
+            background_dark: color.background_dark,
+            background_light: color.background_light,
+            primary: color.primary,
+            accent: color.accent,
+            on_dark: color.on_dark,
+            on_light: color.on_light,
+        };
+        if let Some(scheme) = self
+            .color
+            .offer(color.timestamp, scheme, &self.clock, local_now_us)
+        {
+            self.emit(Event::Color(scheme));
+        }
+    }
+
+    /// The local instant the next scheduled role state is due, from the current clock estimate.
+    ///
+    /// Recomputed on every loop iteration, because the filter resynchronises and may step.
+    #[cfg(any(feature = "metadata", feature = "artwork", feature = "color"))]
+    fn role_deadline(&self) -> Option<Instant> {
+        let local_now_us = now_us();
+        let now = Instant::now();
+        #[cfg(feature = "metadata")]
+        let deadline = self.track.next_deadline(&self.clock, local_now_us, now);
+        #[cfg(not(feature = "metadata"))]
+        let deadline: Option<Instant> = None;
+        #[cfg(feature = "artwork")]
+        let deadline = [
+            deadline,
+            self.artwork.next_deadline(&self.clock, local_now_us, now),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        #[cfg(feature = "color")]
+        let deadline = [
+            deadline,
+            self.color.next_deadline(&self.clock, local_now_us, now),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        deadline
+    }
+
+    /// Delivers the scheduled role states whose moment has been reached.
+    #[cfg(any(feature = "metadata", feature = "artwork", feature = "color"))]
+    fn fire_scheduled(&mut self) {
+        let local_now_us = now_us();
+        #[cfg(feature = "metadata")]
+        if let Some(event) = self.track.fire_due(&self.clock, local_now_us) {
+            self.emit(event);
+        }
+        #[cfg(feature = "color")]
+        if let Some(scheme) = self.color.fire_due(&self.clock, local_now_us) {
+            self.emit(Event::Color(scheme));
+        }
+        #[cfg(feature = "artwork")]
+        {
+            let changes = self.artwork.fire_due(&self.clock, local_now_us);
+            self.emit_artwork(changes);
+        }
+    }
+
+    /// Publishes the clock offset for [`ControlHandle::server_time_us`](crate::ControlHandle).
+    #[cfg(feature = "metadata")]
+    fn publish_server_clock(&self) {
+        self.server_clock.send_replace(self.clock.offset_us());
+    }
+
     /// Reports one `server/state` message for the roles this client has active.
+    #[cfg_attr(
+        not(any(feature = "metadata", feature = "controller", feature = "color")),
+        allow(unused_variables)
+    )]
     fn handle_state(&mut self, state: ServerState) {
+        #[cfg(feature = "metadata")]
         if self.role_active(METADATA_ROLE) {
             if let Some(metadata) = state.metadata {
-                let (progress_ms, duration_ms, playback_speed) = match metadata.progress {
-                    Some(progress) => (
-                        progress.track_progress,
-                        progress.track_duration,
-                        progress.playback_speed.unwrap_or(NORMAL_PLAYBACK_SPEED),
-                    ),
-                    // Without a progress object the track is at its start, at normal speed.
-                    None => (None, None, NORMAL_PLAYBACK_SPEED),
-                };
-                self.emit(Event::Track {
-                    title: metadata.title.unwrap_or_default(),
-                    artist: metadata.artist.unwrap_or_default(),
-                    album: metadata.album.unwrap_or_default(),
-                    album_artist: metadata.album_artist.unwrap_or_default(),
-                    artwork_url: metadata.artwork_url.unwrap_or_default(),
-                    progress_ms,
-                    duration_ms,
-                    playback_speed,
-                });
+                self.offer_track(metadata);
             }
         }
+        #[cfg(feature = "color")]
+        if self.role_active(COLOR_ROLE) {
+            if let Some(color) = state.color {
+                self.offer_color(color);
+            }
+        }
+        #[cfg(feature = "controller")]
         if self.role_active(CONTROLLER_ROLE) {
             if let Some(controller) = state.controller {
                 self.controller_commands = Some(controller.supported_commands.clone());
@@ -2691,6 +3219,8 @@ impl Session<'_> {
                 self.playback.volume = controller.volume;
                 self.playback.muted = controller.muted;
                 self.playback.seek_max_ms = controller.seek_max_ms;
+                self.playback.repeat = controller.repeat;
+                self.playback.shuffle = controller.shuffle;
                 self.emit(Event::State(self.playback.clone()));
             }
         }
@@ -2743,6 +3273,7 @@ impl Session<'_> {
     /// number, and the following `client/state` reports the applied one. A mute request changes
     /// only the mute field, so it never looks like a request for volume zero; its event repeats
     /// the level in force for both numbers.
+    #[cfg(feature = "player")]
     async fn handle_command(&mut self, command: ServerCommand) -> Result<()> {
         if !self.player_active() {
             return Ok(());
@@ -2816,23 +3347,48 @@ impl Session<'_> {
         }
 
         let result = match action {
+            #[cfg(feature = "controller")]
             ControlAction::Transport(command) => self
                 .send_transport_command(command)
                 .await
                 .map(|()| self.volume),
+            #[cfg(feature = "controller")]
             ControlAction::Seek(position_ms) => self
                 .send_controller_command("seek", Some(position_ms), None)
                 .await
                 .map(|()| self.volume),
+            #[cfg(feature = "controller")]
+            ControlAction::GroupVolume(level) => self
+                .send_command(ControllerCommand {
+                    command: "volume".to_owned(),
+                    volume: Some(level),
+                    ..ControllerCommand::default()
+                })
+                .await
+                .map(|()| self.volume),
+            #[cfg(feature = "controller")]
+            ControlAction::GroupMute(muted) => self
+                .send_command(ControllerCommand {
+                    command: "mute".to_owned(),
+                    mute: Some(muted),
+                    ..ControllerCommand::default()
+                })
+                .await
+                .map(|()| self.volume),
+            #[cfg(feature = "controller")]
             ControlAction::SeekRelative(offset_ms) => self
                 .send_controller_command("seek_relative", None, Some(offset_ms))
                 .await
                 .map(|()| self.volume),
+            #[cfg(feature = "player")]
             ControlAction::Volume(level) => self.apply_volume(level).await,
+            #[cfg(feature = "player")]
             ControlAction::ReportVolume(level) => {
                 self.apply_report_volume(level).await.map(|()| self.volume)
             }
+            #[cfg(feature = "player")]
             ControlAction::Mute(muted) => self.apply_mute(muted).await.map(|()| self.volume),
+            #[cfg(feature = "player")]
             ControlAction::OutputDelayApplied => {
                 // Reads the sink once and reports only when its timing differs from the cache.
                 self.output_delay_poll_at = None;
@@ -2877,7 +3433,9 @@ impl Session<'_> {
             bail!("the connection is switching keys and cannot send yet");
         }
         match action {
+            #[cfg(feature = "controller")]
             ControlAction::Transport(command) => self.check_controller_command(command),
+            #[cfg(feature = "controller")]
             ControlAction::Seek(position_ms) => {
                 self.check_controller_command("seek")?;
                 let Some(max) = self.playback.seek_max_ms else {
@@ -2891,7 +3449,20 @@ impl Session<'_> {
                 }
                 Ok(())
             }
+            #[cfg(feature = "controller")]
             ControlAction::SeekRelative(_) => self.check_controller_command("seek_relative"),
+            #[cfg(feature = "controller")]
+            ControlAction::GroupVolume(level) => {
+                if *level > 100 {
+                    bail!(
+                        "the group volume {level} is outside the 0-100 range the protocol defines"
+                    );
+                }
+                self.check_controller_command("volume")
+            }
+            #[cfg(feature = "controller")]
+            ControlAction::GroupMute(_) => self.check_controller_command("mute"),
+            #[cfg(feature = "player")]
             ControlAction::Volume(_)
             | ControlAction::Mute(_)
             | ControlAction::OutputDelayApplied => {
@@ -2900,6 +3471,7 @@ impl Session<'_> {
                 }
                 Ok(())
             }
+            #[cfg(feature = "player")]
             ControlAction::ReportVolume(level) => {
                 // The handle refuses an out-of-range level before it queues the request; the
                 // check stays here so a refused value can never reach `client/state`.
@@ -2925,6 +3497,7 @@ impl Session<'_> {
     /// The role comes first, so a client without it never depends on the advertised set, and the
     /// window before the first controller state stays open: nothing is known yet, so a command is
     /// allowed.
+    #[cfg(feature = "controller")]
     fn check_controller_command(&self, command: &str) -> Result<()> {
         if !self.role_active(CONTROLLER_ROLE) {
             bail!("the server did not activate {CONTROLLER_ROLE}");
@@ -2938,6 +3511,7 @@ impl Session<'_> {
     }
 
     /// Sends one controller command as a `client/command` envelope.
+    #[cfg(feature = "controller")]
     async fn send_transport_command(&mut self, command: &'static str) -> Result<()> {
         self.send_controller_command(command, None, None).await
     }
@@ -2946,24 +3520,33 @@ impl Session<'_> {
     ///
     /// `position_ms` belongs to `seek` and `offset_ms` to `seek_relative`; every other command
     /// carries neither, so the envelope names no parameter the command does not have.
+    #[cfg(feature = "controller")]
     async fn send_controller_command(
         &mut self,
         command: &'static str,
         position_ms: Option<u64>,
         offset_ms: Option<i64>,
     ) -> Result<()> {
+        self.send_command(ControllerCommand {
+            command: command.to_owned(),
+            position_ms,
+            offset_ms,
+            ..ControllerCommand::default()
+        })
+        .await
+    }
+
+    /// Sends one complete controller command; only the fields that belong to it are set.
+    #[cfg(feature = "controller")]
+    async fn send_command(&mut self, command: ControllerCommand) -> Result<()> {
         let message = Incoming::ClientCommand(ClientCommand {
-            controller: Some(ControllerCommand {
-                command: command.to_owned(),
-                position_ms,
-                offset_ms,
-                ..ControllerCommand::default()
-            }),
+            controller: Some(command),
         });
         self.send_json(&message).await
     }
 
     /// Applies a level the host asked for, reports it and returns what reached the output.
+    #[cfg(feature = "player")]
     async fn apply_volume(&mut self, level: u8) -> Result<u8> {
         self.record_volume(clamp_volume_with(
             self.config.volume_policy,
@@ -2981,12 +3564,14 @@ impl Session<'_> {
     /// view matches what is audible. The protocol's range still applies, but
     /// [`check_reported_level`] refuses an out-of-range value before this runs, so nothing
     /// impossible can be recorded or written.
+    #[cfg(feature = "player")]
     async fn apply_report_volume(&mut self, level: u8) -> Result<()> {
         self.record_volume(level);
         self.report_state().await
     }
 
     /// Applies a mute state the host asked for, leaving the level untouched.
+    #[cfg(feature = "player")]
     async fn apply_mute(&mut self, muted: bool) -> Result<()> {
         self.muted = muted;
         self.report_state().await
@@ -3022,12 +3607,14 @@ impl Session<'_> {
     }
 
     /// Records the level in force and publishes it to the control handles.
+    #[cfg(feature = "player")]
     fn record_volume(&mut self, level: u8) {
         self.volume = level;
         self.publish_volume();
     }
 
     /// Publishes the level in force to the control handles.
+    #[cfg(feature = "player")]
     fn publish_volume(&self) {
         self.reported_volume.store(self.volume, Ordering::Relaxed);
     }
@@ -3037,6 +3624,7 @@ impl Session<'_> {
     /// The player may not send its initial state before its first clock measurement, so a change
     /// that arrives earlier is recorded and the burst that is already running carries it; once the
     /// initial report exists every change goes out immediately.
+    #[cfg(feature = "player")]
     async fn report_state(&mut self) -> Result<()> {
         if self.state_sent {
             self.send_client_state().await
@@ -3046,13 +3634,72 @@ impl Session<'_> {
     }
 
     /// Whether a versioned role is active for this connection.
+    #[cfg(any(
+        feature = "player",
+        feature = "controller",
+        feature = "metadata",
+        feature = "artwork",
+        feature = "color"
+    ))]
     fn role_active(&self, role: &str) -> bool {
         self.active_roles.iter().any(|active| active == role)
     }
 
     /// Whether the server activated the player role for this connection.
+    ///
+    /// A headless session has no sink and never takes the role, so the sink is part of the answer
+    /// even though the admission check already refuses an activation of the role without one.
     fn player_active(&self) -> bool {
-        self.role_active(PLAYER_ROLE)
+        #[cfg(feature = "player")]
+        {
+            self.sink.is_some() && self.role_active(PLAYER_ROLE)
+        }
+        #[cfg(not(feature = "player"))]
+        {
+            false
+        }
+    }
+
+    /// Whether this session has an audio sink, which is what the player role is offered for.
+    fn has_sink(&self) -> bool {
+        #[cfg(feature = "player")]
+        {
+            self.sink.is_some()
+        }
+        #[cfg(not(feature = "player"))]
+        {
+            false
+        }
+    }
+
+    /// Whether a role that needs the clock estimate is active.
+    ///
+    /// The player needs it to schedule audio, and metadata needs it to deliver a state at its
+    /// server timestamp. A session with neither runs no clock bursts.
+    fn needs_clock(&self) -> bool {
+        #[cfg(feature = "metadata")]
+        if self.role_active(METADATA_ROLE) {
+            return true;
+        }
+        #[cfg(feature = "artwork")]
+        if self.role_active(ARTWORK_ROLE) {
+            return true;
+        }
+        #[cfg(feature = "color")]
+        if self.role_active(COLOR_ROLE) {
+            return true;
+        }
+        self.player_active()
+    }
+
+    /// The delays the sink reports: before the audio port, and after it. A session without a
+    /// sink has neither.
+    #[cfg(feature = "player")]
+    fn sink_delays(&self) -> (Duration, Option<Duration>) {
+        match self.sink.as_deref() {
+            Some(sink) => (sink.pre_port_delay(), sink.output_delay()),
+            None => (Duration::ZERO, None),
+        }
     }
 
     /// Queues one event for the caller.
@@ -3126,6 +3773,7 @@ async fn handshake(
     candidates: &Candidates,
     previous_roles: &[String],
     unpaired_access: &AtomicBool,
+    offer: Offer,
 ) -> Result<Ready, HandshakeError> {
     // 1. client/init. Its exact bytes are the first half of the Noise prologue.
     let client_init = Incoming::ClientInit(ClientInit {
@@ -3205,7 +3853,7 @@ async fn handshake(
     }
 
     // 6. client/hello.
-    let hello = client_hello(config, unpaired_access);
+    let hello = client_hello(config, unpaired_access, offer);
     let ciphertext = encrypt_json(&mut noise, &hello)?;
     transport.send_binary(ciphertext).await?;
 
@@ -3257,6 +3905,7 @@ pub(crate) async fn reject_concurrent(
     pairing_psk: Option<PairingPsk>,
     previous_roles: &[String],
     unpaired_access: &AtomicBool,
+    offer: Offer,
 ) -> Result<()> {
     let candidates = Candidates::load(config.storage.as_deref(), &[], pairing_psk)?;
     let mut ready = match handshake(
@@ -3265,6 +3914,7 @@ pub(crate) async fn reject_concurrent(
         &candidates,
         previous_roles,
         unpaired_access,
+        offer,
     )
     .await
     {
@@ -3294,12 +3944,28 @@ pub(crate) async fn reject_concurrent(
 /// Builds the `client/hello` the client announces itself with.
 ///
 /// The unpaired-access value is read here, from the atomic the whole connection shares: the hello
-/// is what advertises the value a host may have changed while no session was live.
-fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool) -> Incoming {
-    let codec = match config.audio_mode {
-        AudioMode::Decode => "pcm",
-        AudioMode::Passthrough => "flac",
-    };
+/// is what advertises the value a host may have changed while no session was live. `sink` says
+/// whether the client has an audio output: the player role and its support object are announced
+/// exactly then.
+fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool, offer: Offer) -> Incoming {
+    #[cfg(feature = "player")]
+    let player_support = offer.sink.then(|| {
+        let codec = match config.audio_mode {
+            AudioMode::Decode => "pcm",
+            AudioMode::Passthrough => "flac",
+        };
+        PlayerSupport {
+            supported_formats: vec![SupportedFormat {
+                codec: codec.to_owned(),
+                channels: SUPPORTED_CHANNELS,
+                sample_rate: SUPPORTED_SAMPLE_RATE,
+                bit_depth: SUPPORTED_BIT_DEPTH,
+            }],
+            buffer_capacity: BUFFER_CAPACITY,
+        }
+    });
+    #[cfg(not(feature = "player"))]
+    let player_support = None;
     Incoming::ClientHello(ClientHello {
         name: config.player_name.clone(),
         device_info: config.device_info.as_ref().map(|info| DeviceInfo {
@@ -3308,19 +3974,11 @@ fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool) -> Incoming
             software_version: info.software_version.clone(),
             mac_address: info.mac_address.clone(),
         }),
-        supported_roles: SUPPORTED_ROLES
-            .iter()
-            .map(|role| (*role).to_owned())
+        supported_roles: supported_roles(offer)
+            .into_iter()
+            .map(str::to_owned)
             .collect(),
-        player_support: Some(PlayerSupport {
-            supported_formats: vec![SupportedFormat {
-                codec: codec.to_owned(),
-                channels: SUPPORTED_CHANNELS,
-                sample_rate: SUPPORTED_SAMPLE_RATE,
-                bit_depth: SUPPORTED_BIT_DEPTH,
-            }],
-            buffer_capacity: BUFFER_CAPACITY,
-        }),
+        player_support,
         supported_pair_methods: pair_methods(config),
         unpaired_access: UnpairedAccess {
             enabled: unpaired_access.load(Ordering::Relaxed),
@@ -3565,6 +4223,7 @@ pub(crate) fn playback_capable_for(
 fn activation_admissible(
     matched: MatchedPsk,
     unpaired_access: bool,
+    offer: Offer,
     activate: &ServerActivate,
 ) -> bool {
     let paired = is_paired(matched);
@@ -3573,10 +4232,8 @@ fn activation_admissible(
         return false;
     }
     let roles = activate.active_roles.as_deref().unwrap_or_default();
-    if !roles
-        .iter()
-        .all(|role| SUPPORTED_ROLES.contains(&role.as_str()))
-    {
+    let supported = supported_roles(offer);
+    if !roles.iter().all(|role| supported.contains(&role.as_str())) {
         return false;
     }
     roles.is_empty() || playback_capable_for(matched, unpaired_access, &activate.activities)
@@ -3597,10 +4254,11 @@ fn activation_admissible(
 pub(crate) fn admit_activation(
     matched: MatchedPsk,
     unpaired_access: bool,
+    offer: Offer,
     pairing_admissible: bool,
     activate: &ServerActivate,
 ) -> Admitted {
-    if activation_admissible(matched, unpaired_access, activate) {
+    if activation_admissible(matched, unpaired_access, offer, activate) {
         return Admitted::Admissible;
     }
     // Rule 1: unpaired access is off, and turning it on would have admitted this activation -
@@ -3608,7 +4266,7 @@ pub(crate) fn admit_activation(
     if !unpaired_access
         && !is_paired(matched)
         && pairing_admissible
-        && activation_admissible(matched, true, activate)
+        && activation_admissible(matched, true, offer, activate)
     {
         return Admitted::PairingRequired;
     }
@@ -3636,19 +4294,59 @@ fn admits_pairing(activate: &ServerActivate) -> Result<Option<PairingActivation>
     Ok(Some(activation))
 }
 
-/// Whether a `stream/end` or `stream/clear` role list affects the player stream.
+/// Whether a `stream/end` or `stream/clear` role list names a role.
 ///
-/// An absent list means every role. Otherwise it has to name the player: `messaging.md` lists the
-/// role names in this message as bare `'player'`, `'artwork'` and `'visualizer'`, while
-/// `server/activate` uses the versioned `player@v1` form. Both spellings are accepted so a server
-/// that reuses the versioned identifier is not silently ignored.
-fn affects_player(roles: Option<&[String]>) -> bool {
+/// An absent list means every role. Otherwise it has to name `family`: `messaging.md` lists the
+/// role names in these messages as bare `'player'`, `'artwork'` and `'visualizer'`, while
+/// `server/activate` uses the versioned form (`player@v1`). Both spellings are accepted for every
+/// family so a server that reuses the versioned identifier is not silently ignored.
+#[cfg(any(feature = "player", feature = "artwork"))]
+fn names_role(roles: Option<&[String]>, family: &str, versioned: &str) -> bool {
     match roles {
         None => true,
-        Some(roles) => roles
-            .iter()
-            .any(|role| role == PLAYER_STREAM_ROLE || role == PLAYER_ROLE),
+        Some(roles) => roles.iter().any(|role| role == family || role == versioned),
     }
+}
+
+/// Whether a `stream/end` or `stream/clear` role list affects the player stream.
+#[cfg(feature = "player")]
+fn affects_player(roles: Option<&[String]>) -> bool {
+    names_role(roles, PLAYER_STREAM_ROLE, PLAYER_ROLE)
+}
+
+/// Whether a `server/state` text carries a `color` object with a triple that is not three
+/// integers or a component outside 0-255: the fixed range and length the color role defines.
+///
+/// Only that class counts. Other malformations (a wrong type, a missing timestamp) are not a range
+/// violation and stay ignored under the rule for malformed control messages.
+#[cfg(feature = "color")]
+fn color_out_of_range(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("server/state") {
+        return false;
+    }
+    let Some(color) = value.pointer("/payload/color").and_then(|c| c.as_object()) else {
+        return false;
+    };
+    [
+        "background_dark",
+        "background_light",
+        "primary",
+        "accent",
+        "on_dark",
+        "on_light",
+    ]
+    .iter()
+    .filter_map(|key| color.get(*key)?.as_array())
+    .any(|triple| {
+        triple.len() != 3
+            || triple.iter().any(|component| {
+                component.as_i64().is_some_and(|n| !(0..=255).contains(&n))
+                    || (component.as_u64().is_some() && component.as_i64().is_none())
+            })
+    })
 }
 
 /// Decodes the server's static public key from the `server_id` it announced.
@@ -3833,6 +4531,7 @@ fn max_error_us(sample: &TimeSample) -> i128 {
 /// The post-port delay is subtracted before the delta is applied, so it is compensated exactly
 /// once. The result is unclamped: a deadline in the past is a past [`Instant`], and `None` covers
 /// both "no estimate yet" and an overflow of the instant range.
+#[cfg(feature = "player")]
 fn map_deadline(
     clock: &ClockFilter,
     output_delay: Option<Duration>,
@@ -3854,14 +4553,14 @@ fn map_deadline(
 }
 
 /// Current wall clock in microseconds since the Unix epoch, the domain of server timestamps.
-fn now_us() -> i64 {
+pub(crate) fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_micros() as i64)
         .unwrap_or(0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "player", feature = "controller", feature = "metadata"))]
 mod tests {
     use super::*;
     #[cfg(feature = "pairing-code")]
@@ -4162,6 +4861,10 @@ mod tests {
             code_formats: Vec::new(),
             #[cfg(feature = "pairing-code")]
             code_out_channels: Vec::new(),
+            #[cfg(feature = "artwork")]
+            artwork_channels: Vec::new(),
+            #[cfg(feature = "artwork")]
+            max_artwork_bytes: crate::DEFAULT_MAX_ARTWORK_BYTES,
         }
     }
 
@@ -4182,12 +4885,17 @@ mod tests {
         control: Option<mpsc::UnboundedReceiver<ControlRequest>>,
     ) -> Session<'a> {
         let estimator = BufferEstimator::new(config.min_buffer_ms);
+        #[cfg(feature = "metadata")]
+        let server_clock: &'a watch::Sender<Option<i64>> =
+            Box::leak(Box::new(watch::channel(None).0));
         Session {
             transport,
             noise,
             config,
-            sink: Box::new(NullSink),
+            #[cfg(feature = "player")]
+            sink: Some(Box::new(NullSink)),
             events,
+            #[cfg(feature = "player")]
             reported_volume,
             clock: ClockFilter::new(),
             reassembler: Reassembler::new(MAX_REASSEMBLED_LEN),
@@ -4195,14 +4903,23 @@ mod tests {
             unpaired_access: Arc::new(AtomicBool::new(config.unpaired_access)),
             unpaired_access_snapshot: config.unpaired_access,
             playback_declared: false,
+            #[cfg(feature = "player")]
             stream: None,
+            #[cfg(feature = "player")]
             stream_started: None,
+            #[cfg(feature = "player")]
             queue: PlayoutQueue::new(BUFFER_CAPACITY, LATE_TOLERANCE),
+            #[cfg(feature = "player")]
             next_playout: None,
+            #[cfg(feature = "player")]
             pre_port_delay: Duration::ZERO,
+            #[cfg(feature = "player")]
             output_delay: None,
+            #[cfg(feature = "player")]
             reported_lead_ms: None,
+            #[cfg(feature = "player")]
             output_delay_poll_at: None,
+            #[cfg(feature = "player")]
             late_audio: LateAudioWindow::default(),
             sync_remaining: 0,
             burst_deadline: None,
@@ -4215,12 +4932,25 @@ mod tests {
             control,
             shutdown: idle_shutdown(),
             volume: 50,
+            #[cfg(feature = "player")]
             muted: false,
+            #[cfg(feature = "player")]
             min_buffer_ms: estimator.value(),
+            #[cfg(feature = "player")]
             estimator,
+            #[cfg(feature = "player")]
             sink_failed: false,
             group_id_tolerance_reported: false,
+            #[cfg(feature = "controller")]
             controller_commands: None,
+            #[cfg(feature = "metadata")]
+            track: Pending::new(),
+            #[cfg(feature = "artwork")]
+            artwork: Artwork::new(&config.artwork_channels, config.max_artwork_bytes),
+            #[cfg(feature = "color")]
+            color: Pending::new(),
+            #[cfg(feature = "metadata")]
+            server_clock,
             playback: PlaybackState::default(),
             server_id: SERVER_ID.to_owned(),
             matched: MatchedPsk::Sentinel,
@@ -4524,7 +5254,7 @@ mod tests {
         );
         for unpaired_access in [true, false] {
             assert_eq!(
-                admit_activation(LONG_TERM, unpaired_access, true, &activate),
+                admit_activation(LONG_TERM, unpaired_access, Offer::SINK, true, &activate),
                 Admitted::Admissible
             );
         }
@@ -4533,7 +5263,13 @@ mod tests {
     #[test]
     fn a_paired_session_may_not_declare_the_pairing_activity() {
         assert_eq!(
-            admit_activation(LONG_TERM, true, true, &activation(&["pairing"], None)),
+            admit_activation(
+                LONG_TERM,
+                true,
+                Offer::SINK,
+                true,
+                &activation(&["pairing"], None)
+            ),
             Admitted::Unauthorized,
             "a connection keyed by a long-term PSK has nothing left to pair"
         );
@@ -4545,6 +5281,7 @@ mod tests {
             admit_activation(
                 LONG_TERM,
                 true,
+                Offer::SINK,
                 true,
                 &activation(&["playback", "kiosk"], None)
             ),
@@ -4558,6 +5295,7 @@ mod tests {
             admit_activation(
                 LONG_TERM,
                 true,
+                Offer::SINK,
                 true,
                 &activation(&["playback", "playback"], None)
             ),
@@ -4572,7 +5310,7 @@ mod tests {
         for matched in [MatchedPsk::Sentinel, MatchedPsk::PairingPsk, LONG_TERM] {
             for unpaired_access in [true, false] {
                 assert_eq!(
-                    admit_activation(matched, unpaired_access, true, &activate),
+                    admit_activation(matched, unpaired_access, Offer::SINK, true, &activate),
                     Admitted::Admissible,
                     "{matched:?} with unpaired access {unpaired_access}"
                 );
@@ -4586,6 +5324,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
+                Offer::SINK,
                 true,
                 &activation(&["pairing"], None)
             ),
@@ -4600,6 +5339,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
+                Offer::SINK,
                 true,
                 &activation(&["playback"], Some(&["player@v1"]))
             ),
@@ -4613,6 +5353,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
+                Offer::SINK,
                 true,
                 &activation(&[], Some(&["player@v1"]))
             ),
@@ -4627,6 +5368,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
+                Offer::SINK,
                 true,
                 &activation(&["playback"], Some(&["source@v1"]))
             ),
@@ -4641,6 +5383,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::PairingPsk,
                 false,
+                Offer::SINK,
                 true,
                 &activation(&["playback"], Some(&["player@v1"]))
             ),
@@ -4662,12 +5405,12 @@ mod tests {
             }),
         };
         assert_eq!(
-            admit_activation(MatchedPsk::Sentinel, false, true, &activate),
+            admit_activation(MatchedPsk::Sentinel, false, Offer::SINK, true, &activate),
             Admitted::PairingRequired,
             "with the method assumed acceptable, enabling unpaired access admits the activation"
         );
         assert_eq!(
-            admit_activation(MatchedPsk::Sentinel, false, false, &activate),
+            admit_activation(MatchedPsk::Sentinel, false, Offer::SINK, false, &activate),
             Admitted::Unauthorized,
             "the wrong method keeps the activation refused whatever the setting"
         );
@@ -4679,6 +5422,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 true,
+                Offer::SINK,
                 true,
                 &activation(&[], Some(&["player@v1"]))
             ),
@@ -4692,6 +5436,7 @@ mod tests {
             admit_activation(
                 LONG_TERM,
                 false,
+                Offer::SINK,
                 true,
                 &activation(&[], Some(&["player@v1"]))
             ),
@@ -5210,5 +5955,55 @@ mod tests {
             1,
             "one request yields at most one sample even if the peer echoes it twice"
         );
+    }
+
+    #[test]
+    fn a_role_list_names_a_role_bare_or_versioned() {
+        let list = |roles: &[&str]| Some(roles.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>());
+        assert!(
+            names_role(None, "player", "player@v1"),
+            "no list means every role"
+        );
+        for roles in [list(&["player"]), list(&["artwork", "player@v1"])] {
+            assert!(names_role(roles.as_deref(), "player", "player@v1"));
+        }
+        assert!(!names_role(
+            list(&["artwork"]).as_deref(),
+            "player",
+            "player@v1"
+        ));
+        assert!(!names_role(
+            list(&["artwork@v1"]).as_deref(),
+            "player",
+            "player@v1"
+        ));
+        assert!(affects_player(list(&["player@v1"]).as_deref()));
+    }
+
+    #[cfg(feature = "color")]
+    #[test]
+    fn only_a_range_or_length_violation_counts_as_an_out_of_range_color() {
+        let state =
+            |color: &str| format!(r#"{{"type":"server/state","payload":{{"color":{color}}}}}"#);
+        for bad in [
+            r#"{"timestamp":1,"primary":[256,0,0]}"#,
+            r#"{"timestamp":1,"accent":[0,-1,0]}"#,
+            r#"{"timestamp":1,"on_dark":[0,0]}"#,
+            r#"{"timestamp":1,"on_light":[0,0,0,0]}"#,
+            r#"{"timestamp":1,"primary":[18446744073709551615,0,0]}"#,
+        ] {
+            assert!(color_out_of_range(&state(bad)), "{bad}");
+        }
+        for fine in [
+            r#"{"timestamp":1,"primary":[255,0,0]}"#,
+            r#"{"timestamp":1,"primary":"red"}"#,
+            r#"{"primary":[1,2,3]}"#,
+            "null",
+        ] {
+            assert!(!color_out_of_range(&state(fine)), "{fine}");
+        }
+        assert!(!color_out_of_range(
+            r#"{"type":"group/update","payload":{}}"#
+        ));
     }
 }

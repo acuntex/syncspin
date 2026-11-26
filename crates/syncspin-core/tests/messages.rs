@@ -6,15 +6,16 @@ use syncspin_core::framing::{
     FRAGMENT_FLAG_LAST, MAX_PLAINTEXT_LEN, MAX_REASSEMBLED_LEN,
 };
 use syncspin_core::messages::{
-    AudioChunkHeader, ClientCommand, ClientGoodbye, ClientHello, ClientInit, ClientPairAuth,
-    ClientPairConfirm, ClientPairFinalize, ClientPairInit, ClientPairPending, ClientPairRetry,
-    ClientState, ClientTime, ControllerCommand, DecodeError, DeviceInfo, DynamicPairingCodeMethod,
-    GroupUpdate, Incoming, NoiseHandshake, PairAbort, PairingPskMethod, PlayerState, PlayerSupport,
-    ServerActivate, ServerCommand, ServerError, ServerHello, ServerInit, ServerPairAuth,
-    ServerPairConfirm, ServerPairFinalize, ServerPairInit, ServerState, ServerTime, ServerUnpair,
-    StaticPairingCodeMethod, StreamClear, StreamEnd, StreamStart, StreamStartPlayer,
-    SupportedFormat, SupportedPairMethods, UnpairedAccess, AUDIO_CHUNK_ID, NOISE_SUITE,
-    PROTOCOL_VERSION,
+    ArtworkChannelState, ArtworkMessage, ArtworkState, AudioChunkHeader, ClientCommand,
+    ClientGoodbye, ClientHello, ClientInit, ClientPairAuth, ClientPairConfirm, ClientPairFinalize,
+    ClientPairInit, ClientPairPending, ClientPairRetry, ClientState, ClientTime, ControllerCommand,
+    DecodeError, DeviceInfo, DynamicPairingCodeMethod, GroupUpdate, Incoming, NoiseHandshake,
+    PairAbort, PairingPskMethod, PlayerState, PlayerSupport, ServerActivate, ServerCommand,
+    ServerError, ServerHello, ServerInit, ServerPairAuth, ServerPairConfirm, ServerPairFinalize,
+    ServerPairInit, ServerState, ServerTime, ServerUnpair, StaticPairingCodeMethod, StreamClear,
+    StreamEnd, StreamStart, StreamStartArtwork, StreamStartPlayer, SupportedFormat,
+    SupportedPairMethods, UnpairedAccess, ARTWORK_ID_BASE, AUDIO_CHUNK_ID, MAX_ARTWORK_MESSAGE_LEN,
+    NOISE_SUITE, PROTOCOL_VERSION,
 };
 
 /// A payload whose first bytes differ, so a reassembled message is easy to verify.
@@ -296,6 +297,7 @@ fn server_activate_and_player_state_roundtrip() {
             supported_commands: vec!["volume".to_owned(), "mute".to_owned()],
             format: None,
         }),
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&Incoming::ClientState(state.clone())).unwrap();
@@ -1013,6 +1015,7 @@ fn stream_start_and_audio_chunk_header_roundtrip() {
             bit_depth: 16,
             codec_header: Some("ZkxhQwAAACAA".to_owned()),
         }),
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&Incoming::StreamStart(start.clone())).unwrap();
@@ -1223,6 +1226,7 @@ fn parse_accepts_every_message_this_revision_implements() {
         Incoming::ClientState(ClientState {
             available: true,
             player: None,
+            ..Default::default()
         }),
         Incoming::ServerState(ServerState::default()),
         Incoming::ServerCommand(ServerCommand::default()),
@@ -1766,5 +1770,216 @@ fn a_body_shorter_than_the_header_is_truncated_and_names_the_message_length() {
             format!("audio chunk truncated: {} bytes", len + 1),
             "unexpected error for body length {len}"
         );
+    }
+}
+
+#[test]
+fn the_artwork_object_of_client_state_has_positional_channels_with_holes() {
+    let state = ClientState {
+        available: true,
+        artwork: Some(ArtworkState {
+            channels: vec![
+                ArtworkChannelState {
+                    source: "album".to_owned(),
+                    format: Some("jpeg".to_owned()),
+                    width: Some(300),
+                    height: Some(300),
+                },
+                ArtworkChannelState::none(),
+                ArtworkChannelState {
+                    source: "artist".to_owned(),
+                    format: Some("png".to_owned()),
+                    width: Some(64),
+                    height: Some(32),
+                },
+            ],
+        }),
+        ..ClientState::default()
+    };
+    let json = serde_json::to_value(Incoming::ClientState(state.clone())).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "type": "client/state",
+            "payload": {
+                "available": true,
+                "artwork": {"channels": [
+                    {"source": "album", "format": "jpeg", "width": 300, "height": 300},
+                    {"source": "none"},
+                    {"source": "artist", "format": "png", "width": 64, "height": 32},
+                ]},
+            },
+        }),
+        "a none channel carries only its source and a client without the role has no object"
+    );
+    assert_eq!(
+        Incoming::parse(&json.to_string()).unwrap(),
+        Some(Incoming::ClientState(state))
+    );
+    let bare = serde_json::to_value(ClientState::default()).unwrap();
+    assert_eq!(bare, serde_json::json!({"available": false}));
+}
+
+#[test]
+fn the_artwork_object_of_stream_start_roundtrips_and_is_omitted_when_absent() {
+    let start = StreamStart {
+        server_transmitted: 7,
+        player: None,
+        artwork: Some(StreamStartArtwork {
+            channels: vec![ArtworkChannelState {
+                source: "album".to_owned(),
+                format: Some("png".to_owned()),
+                width: Some(10),
+                height: Some(20),
+            }],
+        }),
+    };
+    let json = serde_json::to_value(Incoming::StreamStart(start.clone())).unwrap();
+    assert_eq!(
+        json["payload"]["artwork"]["channels"][0]["format"],
+        serde_json::json!("png")
+    );
+    assert!(json["payload"].get("player").is_none());
+    assert_eq!(
+        Incoming::parse(&json.to_string()).unwrap(),
+        Some(Incoming::StreamStart(start))
+    );
+    let plain = serde_json::to_value(StreamStart::default()).unwrap();
+    assert!(plain.get("artwork").is_none());
+}
+
+#[test]
+fn the_color_object_of_server_state_parses_and_omits_absent_colors() {
+    let text = r#"{"type":"server/state","payload":{"color":{"timestamp":-5,
+        "background_dark":[0,0,0],"primary":[255,128,1]}}}"#;
+    let Some(Incoming::ServerState(state)) = Incoming::parse(text).unwrap() else {
+        panic!("expected server/state");
+    };
+    let color = state.color.clone().expect("the color object is present");
+    assert_eq!(color.timestamp, -5);
+    assert_eq!(color.background_dark, Some([0, 0, 0]));
+    assert_eq!(color.primary, Some([255, 128, 1]));
+    assert_eq!(color.accent, None);
+    let again = serde_json::to_value(Incoming::ServerState(state)).unwrap();
+    assert_eq!(
+        again["payload"]["color"],
+        serde_json::json!({"timestamp": -5, "background_dark": [0,0,0], "primary": [255,128,1]})
+    );
+}
+
+#[test]
+fn a_color_component_outside_0_to_255_fails_to_parse() {
+    for bad in [
+        r#"{"timestamp":1,"primary":[256,0,0]}"#,
+        r#"{"timestamp":1,"accent":[0,-1,0]}"#,
+        r#"{"timestamp":1,"on_dark":[0,0]}"#,
+        r#"{"timestamp":1,"on_light":[0,0,0,0]}"#,
+    ] {
+        let text = format!(r#"{{"type":"server/state","payload":{{"color":{bad}}}}}"#);
+        assert!(
+            Incoming::parse(&text).is_err(),
+            "{bad} must not yield a color"
+        );
+    }
+}
+
+#[test]
+fn a_null_role_object_parses_as_absent() {
+    let text =
+        r#"{"type":"server/state","payload":{"controller":null,"metadata":null,"color":null}}"#;
+    let Some(Incoming::ServerState(state)) = Incoming::parse(text).unwrap() else {
+        panic!("expected server/state");
+    };
+    assert_eq!(state, ServerState::default());
+}
+
+#[test]
+fn artwork_messages_roundtrip_on_every_channel() {
+    for channel in 0..4u8 {
+        let announce = ArtworkMessage::Announce {
+            channel,
+            timestamp_us: -42,
+            total_size: 70_000,
+        };
+        let bytes = announce.encode();
+        assert_eq!(bytes.len(), 14);
+        assert_eq!(bytes[0], ARTWORK_ID_BASE + channel);
+        assert_eq!(bytes[1], 0b10);
+        assert_eq!(ArtworkMessage::parse(&bytes).unwrap(), announce);
+
+        let part = ArtworkMessage::Part {
+            channel,
+            data: &[1, 2, 3],
+        };
+        let bytes = part.encode();
+        assert_eq!(bytes, vec![ARTWORK_ID_BASE + channel, 0, 1, 2, 3]);
+        assert_eq!(ArtworkMessage::parse(&bytes).unwrap(), part);
+
+        let cancel = ArtworkMessage::Cancel { channel };
+        let bytes = cancel.encode();
+        assert_eq!(bytes, vec![ARTWORK_ID_BASE + channel, 1]);
+        assert_eq!(ArtworkMessage::parse(&bytes).unwrap(), cancel);
+    }
+}
+
+#[test]
+fn an_empty_part_is_a_valid_part() {
+    let bytes = [8u8, 0];
+    assert_eq!(
+        ArtworkMessage::parse(&bytes).unwrap(),
+        ArtworkMessage::Part {
+            channel: 0,
+            data: &[]
+        }
+    );
+}
+
+#[test]
+fn malformed_artwork_messages_are_rejected() {
+    let announce = ArtworkMessage::Announce {
+        channel: 0,
+        timestamp_us: 1,
+        total_size: 1,
+    }
+    .encode();
+    let mut long_announce = announce.clone();
+    long_announce.push(0);
+    let mut reserved = vec![8u8, 0b100];
+    reserved.extend_from_slice(&[0; 4]);
+    let oversize = {
+        let mut m = vec![8u8, 0];
+        m.resize(MAX_ARTWORK_MESSAGE_LEN + 1, 0);
+        m
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", vec![]),
+        ("id byte only", vec![8]),
+        ("not an artwork id", vec![7, 0]),
+        ("id above the range", vec![12, 0]),
+        ("short announce", announce[..13].to_vec()),
+        ("long announce", long_announce),
+        ("long cancel", vec![8, 1, 0]),
+        ("reserved bit", reserved),
+        ("cancel and announce", vec![8, 0b11]),
+        ("oversize", oversize),
+    ];
+    for (name, bytes) in cases {
+        assert!(
+            ArtworkMessage::parse(&bytes).is_err(),
+            "{name} must be rejected"
+        );
+    }
+    let mut at_cap = vec![8u8, 0];
+    at_cap.resize(MAX_ARTWORK_MESSAGE_LEN, 0);
+    assert!(
+        ArtworkMessage::parse(&at_cap).is_ok(),
+        "the cap itself fits"
+    );
+}
+
+#[test]
+fn only_ids_8_to_11_are_artwork_ids() {
+    for id in 0..=255u8 {
+        assert_eq!(ArtworkMessage::is_artwork_id(id), (8..=11).contains(&id));
     }
 }

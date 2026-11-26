@@ -3,6 +3,8 @@
 //! Every test binds one loopback port and runs the hermetic fake server from `fake_server.rs`; no
 //! audio device and no other host is involved.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 
@@ -69,6 +71,10 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
         code_out_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     }
 }
 
@@ -168,6 +174,7 @@ fn controller_state(commands: &[&str]) -> String {
             shuffle: None,
             seek_max_ms: None,
         }),
+        ..Default::default()
     }))
     .expect("the state must encode")
 }

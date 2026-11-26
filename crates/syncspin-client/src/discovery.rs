@@ -275,7 +275,7 @@ async fn walk(
 /// a server can find the endpoint, and the whole server-initiated mode rests on that.
 ///
 /// A client that advertises must not dial a server itself (`connection.md`, _Server Initiated
-/// Connections_). This crate enforces that: [`connect`](crate::connect) refuses a configuration
+/// Connections_). This crate enforces that: `connect` refuses a configuration
 /// that advertises.
 pub trait Discovery: Send + Sync {
     /// Publishes `service` until its service type is withdrawn.
@@ -298,7 +298,7 @@ pub trait Discovery: Send + Sync {
 /// Returns the servers `discovery` currently reports.
 ///
 /// This is the browsing half of the client-initiated mode: the caller picks one
-/// [`DiscoveredServer::endpoint`] and passes it to [`connect`](crate::connect). Browsing is a
+/// [`DiscoveredServer::endpoint`] and passes it to `connect`. Browsing is a
 /// client-initiated act, so a host that browses must not advertise at the same time; a
 /// configuration with [`ClientConfig::inbound`](crate::ClientConfig) set cannot dial at all.
 ///
@@ -309,8 +309,10 @@ pub fn discover_servers(discovery: &dyn Discovery) -> Result<Vec<DiscoveredServe
     discovery.browse(SERVER_SERVICE_TYPE)
 }
 
+#[cfg(all(feature = "discovery", feature = "player"))]
+pub use inbound::advertise;
 #[cfg(feature = "discovery")]
-pub use inbound::{advertise, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT};
+pub use inbound::{advertise_headless, Inbound, DEFAULT_INBOUND_ADDR, DEFAULT_INBOUND_PORT};
 
 #[cfg(feature = "mdns")]
 mod mdns;
@@ -322,13 +324,17 @@ pub use mdns::MdnsDiscovery;
 mod inbound {
     use std::fmt;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicBool, AtomicU8};
+    use std::sync::atomic::AtomicBool;
+    #[cfg(feature = "player")]
+    use std::sync::atomic::AtomicU8;
     use std::sync::Arc;
     use std::time::Duration;
 
     use anyhow::{anyhow, Context, Result};
     use syncspin_core::pairing::token::encode_v0;
     use tokio::net::{TcpListener, TcpStream};
+    #[cfg(feature = "metadata")]
+    use tokio::sync::watch;
     use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinSet;
     use tokio_tungstenite::accept_hdr_async;
@@ -344,7 +350,9 @@ mod inbound {
     };
     use crate::config::ClientConfig;
     use crate::pairing::{load_or_draw_pairing_psk, PairingPsk};
+    use crate::roles::ensure_roles;
     use crate::session::{self, Carried, Transport};
+    #[cfg(feature = "player")]
     use crate::sink::Sink;
     use crate::Discovery;
 
@@ -367,10 +375,10 @@ mod inbound {
 
     /// The server-initiated half of the connection mode.
     ///
-    /// Setting [`ClientConfig::inbound`] puts the client in this mode: [`advertise`] publishes
+    /// Setting [`ClientConfig::inbound`] puts the client in this mode: `advertise` publishes
     /// [`CLIENT_SERVICE_TYPE`](super::CLIENT_SERVICE_TYPE) with the bound port, the configured path
     /// and the player name, and then accepts the servers that connect. A manual
-    /// [`connect`](crate::connect) is refused while this is set, because `connection.md` lets a
+    /// `connect` is refused while this is set, because `connection.md` lets a
     /// client use one of the two methods at a time.
     #[derive(Clone)]
     pub struct Inbound {
@@ -433,10 +441,43 @@ mod inbound {
     ///
     /// Pairing records come from [`ClientConfig::storage`]; this revision has no advertising
     /// counterpart to [`connect_with_psks`](crate::connect_with_psks).
+    #[cfg(feature = "player")]
     pub async fn advertise(
         config: ClientConfig,
         sink: Box<dyn Sink>,
     ) -> Result<(ClientHandle, EventStream)> {
+        advertise_with(config, Some(sink)).await
+    }
+
+    /// Advertises this client without an audio output and serves the servers that connect to it.
+    ///
+    /// The headless counterpart of `advertise`: the same listener, advertisement and admission
+    /// rules, but the client has no audio sink and does not offer the `player@v1` role.
+    ///
+    /// # Errors
+    /// Same as `advertise`.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime, because the listener is spawned.
+    pub async fn advertise_headless(config: ClientConfig) -> Result<(ClientHandle, EventStream)> {
+        advertise_with(
+            config,
+            #[cfg(feature = "player")]
+            None,
+        )
+        .await
+    }
+
+    /// Shared body of [`advertise`] and [`advertise_headless`].
+    async fn advertise_with(
+        config: ClientConfig,
+        #[cfg(feature = "player")] sink: Option<Box<dyn Sink>>,
+    ) -> Result<(ClientHandle, EventStream)> {
+        #[cfg(feature = "player")]
+        let has_sink = sink.is_some();
+        #[cfg(not(feature = "player"))]
+        let has_sink = false;
+        ensure_roles(crate::roles::Offer::new(has_sink, &config))?;
         let inbound = config.inbound.clone().ok_or_else(|| {
             anyhow!(
                 "this configuration has no ClientConfig::inbound, so there is nothing to \
@@ -476,16 +517,21 @@ mod inbound {
         let (events, receiver) = mpsc::unbounded_channel();
         let (commands, control) = mpsc::unbounded_channel();
         let (shutdown, shutdown_rx) = oneshot::channel();
+        #[cfg(feature = "player")]
         let reported_volume = Arc::new(AtomicU8::new(config.volume));
+        #[cfg(feature = "metadata")]
+        let (server_clock, server_clock_rx) = watch::channel(None::<i64>);
         // The dynamic flow's round counter belongs to the process, not to a connection: it starts
         // clean here and is carried across every inbound session.
         #[cfg(feature = "pairing-code")]
         let failed_rounds = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         let carried = Carried {
+            #[cfg(feature = "player")]
             sink,
             control: Some(control),
             volume: config.volume,
+            #[cfg(feature = "player")]
             muted: config.muted,
             active_roles: Vec::new(),
             unpaired_access: Arc::new(AtomicBool::new(config.unpaired_access)),
@@ -501,7 +547,10 @@ mod inbound {
             pairing,
             carried,
             events,
+            #[cfg(feature = "player")]
             Arc::clone(&reported_volume),
+            #[cfg(feature = "metadata")]
+            server_clock,
             shutdown_rx,
         ));
 
@@ -509,7 +558,10 @@ mod inbound {
             task: Some(task),
             control: ControlHandle {
                 commands,
+                #[cfg(feature = "player")]
                 volume: reported_volume,
+                #[cfg(feature = "metadata")]
+                server_clock: server_clock_rx,
                 pairing_token,
             },
             shutdown: Some(shutdown),
@@ -527,7 +579,8 @@ mod inbound {
         pairing: Option<PairingPsk>,
         carried: Carried,
         events: mpsc::UnboundedSender<Event>,
-        reported_volume: Arc<AtomicU8>,
+        #[cfg(feature = "player")] reported_volume: Arc<AtomicU8>,
+        #[cfg(feature = "metadata")] server_clock: watch::Sender<Option<i64>>,
         mut shutdown: oneshot::Receiver<GoodbyeReason>,
     ) -> Result<()> {
         let outcome = accept_loop(
@@ -537,7 +590,10 @@ mod inbound {
             pairing,
             carried,
             &events,
+            #[cfg(feature = "player")]
             &reported_volume,
+            #[cfg(feature = "metadata")]
+            &server_clock,
             &mut shutdown,
         )
         .await;
@@ -562,7 +618,8 @@ mod inbound {
         pairing: Option<PairingPsk>,
         mut carried: Carried,
         events: &mpsc::UnboundedSender<Event>,
-        reported_volume: &AtomicU8,
+        #[cfg(feature = "player")] reported_volume: &AtomicU8,
+        #[cfg(feature = "metadata")] server_clock: &watch::Sender<Option<i64>>,
         shutdown: &mut oneshot::Receiver<GoodbyeReason>,
     ) -> Result<()> {
         loop {
@@ -589,6 +646,7 @@ mod inbound {
             // The rejection task runs while the admitted session owns the carried state, so it
             // gets the shared unpaired-access value as a handle of its own.
             let unpaired_access = Arc::clone(&carried.unpaired_access);
+            let offer = crate::roles::Offer::new(carried.has_sink(), config);
             let mut rejections = JoinSet::new();
             let mut attempt = Box::pin(session::attempt(
                 transport,
@@ -596,7 +654,10 @@ mod inbound {
                 events,
                 &[],
                 pairing,
+                #[cfg(feature = "player")]
                 reported_volume,
+                #[cfg(feature = "metadata")]
+                server_clock,
                 carried,
                 shutdown,
             ));
@@ -614,6 +675,7 @@ mod inbound {
                             path.to_owned(),
                             pairing,
                             Arc::clone(&unpaired_access),
+                            offer,
                         ));
                     }
                     joined = rejections.join_next(), if !rejections.is_empty() => {
@@ -630,7 +692,7 @@ mod inbound {
 
             // Nothing buffered for the session that ended may become audible later; the flush runs
             // before the host hears about the drop. A deliberate close is not a drop.
-            let flush_error = carried.sink.flush().err().map(|error| {
+            let flush_error = carried.flush_sink().map(|error| {
                 error.context("the audio sink rejected a flush after the connection ended")
             });
             if matches!(&attempt.ending, session::Ending::Shutdown) {
@@ -673,13 +735,14 @@ mod inbound {
         path: String,
         pairing: Option<PairingPsk>,
         unpaired_access: Arc<AtomicBool>,
+        offer: crate::roles::Offer,
     ) {
         let Ok(Some(transport)) = upgrade(stream, &path).await else {
             return;
         };
         let _ = tokio::time::timeout(
             REJECT_TIMEOUT,
-            session::reject_concurrent(transport, &config, pairing, &[], &unpaired_access),
+            session::reject_concurrent(transport, &config, pairing, &[], &unpaired_access, offer),
         )
         .await;
     }
@@ -768,6 +831,8 @@ mod inbound {
             *error.status_mut() = StatusCode::NOT_FOUND;
             Err(error)
         };
+        // As for the dialled socket: small writes must not wait behind an unacknowledged one.
+        let _ = stream.set_nodelay(true);
         match accept_hdr_async(stream, callback).await {
             Ok(socket) => Ok(Some(Transport::accept(socket))),
             // The two answers above: the peer was told why and the socket is closed.

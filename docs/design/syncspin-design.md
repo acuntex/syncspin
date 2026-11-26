@@ -18,7 +18,7 @@ works today" and "What does not work yet", and
 handshake at either end, roles, the three pairing methods with their storage, the listener and its
 approval gate, one group with one stream, and discovery in both directions. So the pairing flows,
 the server half and bidirectional discovery below describe shipped code, not a plan. Still missing
-are several groups per server, role versions beyond `@v1`, the `artwork`, `visualizer`, `color` and
+are several groups per server, role versions beyond `@v1`, the `visualizer` and
 `source` roles, the `flac`, `opus` and `wss` features, and a persisted last-playback server; those are
 listed with their reasons in [`docs/spec-deviations.md`](../spec-deviations.md).
 
@@ -174,7 +174,9 @@ impl Client {
 }
 ```
 
-Decisions: events as an async stream (no callback trait), reconnect/backoff and volume reporting
+Decisions: a client may run without a `Sink` (`connect_headless`): it then offers no `player@v1`,
+reports no player state and takes part in the other roles only; events as an async stream (no
+callback trait), reconnect/backoff and volume reporting
 inside the crate, `Sink` receives audio frames (decoded or pass-through) when their write time
 arrives and writes them on call, pushback via blocking `write` on its own task. The crate owns the
 time filter, the playout queue and therefore the schedule: each frame's server timestamp becomes a

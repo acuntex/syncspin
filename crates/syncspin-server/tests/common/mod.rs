@@ -182,6 +182,7 @@ pub fn player_state_with_timing(
             supported_commands: vec!["volume".to_owned(), "mute".to_owned()],
             format: None,
         }),
+        ..Default::default()
     })
 }
 

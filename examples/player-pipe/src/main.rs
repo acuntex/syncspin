@@ -226,6 +226,14 @@ async fn run(options: Options) -> Result<()> {
         config.code_out_channels = Vec::new();
     }
 
+    #[cfg(feature = "artwork")]
+    {
+        config.artwork_channels = options.artwork.iter().copied().map(Some).collect();
+        if let Some(max) = options.artwork_max_bytes {
+            config.max_artwork_bytes = max;
+        }
+    }
+
     // The client owns the reconnect loop: a dropped session is reported on the stream and retried
     // with the same sink and identity, so this example only prints what it sees. The advertise mode
     // has no server address; the inbound listener it binds is what a server dials.
@@ -282,15 +290,43 @@ async fn run(options: Options) -> Result<()> {
                         "stream: {} {} Hz, {} channels, {}-bit",
                         format.codec, format.sample_rate, format.channels, format.bit_depth
                     ),
-                    Event::Track { title, artist, .. } => {
+                    Event::Track { title, artist, timestamp_us, progress, .. } => {
                         let label = match (artist.as_str(), title.as_str()) {
                             ("", "") => "(none)".to_owned(),
                             ("", title) => title.to_owned(),
                             (artist, "") => artist.to_owned(),
                             (artist, title) => format!("{artist} - {title}"),
                         };
-                        eprintln!("track: {label}");
+                        // The position is extrapolated to the server's clock now, when there is
+                        // an estimate; otherwise it is the position at the state's timestamp.
+                        let position =
+                            progress.position_ms_at(timestamp_us, handle.control().server_time_us());
+                        match position {
+                            Some(ms) => eprintln!("track: {label} at {ms} ms"),
+                            None => eprintln!("track: {label}"),
+                        }
                     }
+                    Event::TrackCleared => eprintln!("track cleared"),
+                    #[cfg(feature = "artwork")]
+                    Event::Artwork { channel, image } => match image {
+                        Some(image) => {
+                            eprintln!(
+                                "artwork channel={channel} bytes={} format={:?}",
+                                image.data.len(),
+                                image.format
+                            );
+                            if let Some(dir) = &options.artwork_dir {
+                                if let Err(error) = save_artwork(dir, channel, &image) {
+                                    eprintln!("artwork not saved: {error:#}");
+                                }
+                            }
+                        }
+                        None => eprintln!("artwork channel={channel} cleared"),
+                    },
+                    #[cfg(feature = "color")]
+                    Event::Color(scheme) => eprintln!("color {scheme:?}"),
+                    #[cfg(feature = "color")]
+                    Event::ColorCleared => eprintln!("color cleared"),
                     Event::Volume {
                         requested,
                         applied,
@@ -446,6 +482,15 @@ struct Options {
     /// File that holds the pairing PSK and records.
     #[cfg(feature = "storage-file")]
     pairing_store: PathBuf,
+    /// Artwork channels to ask for, in channel order (at most four).
+    #[cfg(feature = "artwork")]
+    artwork: Vec<syncspin_client::ArtworkChannel>,
+    /// Largest artwork image to keep, in bytes; the client's default when unset.
+    #[cfg(feature = "artwork")]
+    artwork_max_bytes: Option<usize>,
+    /// Directory the images are written to, as `channelN.<ext>`.
+    #[cfg(feature = "artwork")]
+    artwork_dir: Option<PathBuf>,
     /// Static pairing code, shared with the server.
     #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
     static_code: Option<String>,
@@ -495,6 +540,12 @@ where
     let mut static_code: Option<String> = None;
     #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
     let mut open_window = false;
+    #[cfg(feature = "artwork")]
+    let mut artwork = Vec::new();
+    #[cfg(feature = "artwork")]
+    let mut artwork_max_bytes = None;
+    #[cfg(feature = "artwork")]
+    let mut artwork_dir = None;
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         let (flag, inline) = split_flag(&argument);
@@ -504,6 +555,30 @@ where
             "--name" => name = take_value(flag, inline, &mut args)?,
             "--identity" => identity = PathBuf::from(take_value(flag, inline, &mut args)?),
             "--pairing-required" => pairing_required = true,
+            #[cfg(feature = "artwork")]
+            "--artwork" => {
+                artwork.push(parse_artwork(&take_value(flag, inline, &mut args)?)?);
+                if artwork.len() > 4 {
+                    bail!("--artwork may be given at most four times, one per channel");
+                }
+            }
+            #[cfg(feature = "artwork")]
+            "--artwork-max-bytes" => {
+                let value = take_value(flag, inline, &mut args)?;
+                artwork_max_bytes = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| anyhow!("--artwork-max-bytes must be a number of bytes"))?,
+                );
+            }
+            #[cfg(feature = "artwork")]
+            "--artwork-dir" => {
+                artwork_dir = Some(PathBuf::from(take_value(flag, inline, &mut args)?))
+            }
+            #[cfg(not(feature = "artwork"))]
+            "--artwork" | "--artwork-max-bytes" | "--artwork-dir" => bail!(
+                "artwork needs the artwork feature: rebuild with --features artwork"
+            ),
             #[cfg(feature = "discovery")]
             "--advertise" => advertise = true,
             #[cfg(feature = "discovery")]
@@ -621,11 +696,68 @@ where
         discover,
         #[cfg(feature = "storage-file")]
         pairing_store,
+        #[cfg(feature = "artwork")]
+        artwork,
+        #[cfg(feature = "artwork")]
+        artwork_max_bytes,
+        #[cfg(feature = "artwork")]
+        artwork_dir,
         #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
         static_code,
         #[cfg(all(feature = "pairing-code", feature = "storage-file"))]
         open_window,
     }))
+}
+
+/// Parses one `--artwork` value: `[album|artist]:WxH:jpeg|png`.
+#[cfg(feature = "artwork")]
+fn parse_artwork(spec: &str) -> Result<syncspin_client::ArtworkChannel> {
+    use syncspin_client::{ArtworkChannel, ArtworkSource, ImageFormat};
+    let shape = "--artwork takes [album|artist]:WxH:jpeg|png, for example album:300x300:jpeg";
+    let parts: Vec<&str> = spec.split(':').collect();
+    let [source, size, format] = parts[..] else {
+        bail!("{shape}");
+    };
+    let source = match source {
+        "album" => ArtworkSource::Album,
+        "artist" => ArtworkSource::Artist,
+        _ => bail!("{shape}"),
+    };
+    let format = match format {
+        "jpeg" => ImageFormat::Jpeg,
+        "png" => ImageFormat::Png,
+        _ => bail!("{shape}"),
+    };
+    let (width, height) = size.split_once('x').ok_or_else(|| anyhow!("{shape}"))?;
+    let (width, height): (u32, u32) = (
+        width.parse().map_err(|_| anyhow!("{shape}"))?,
+        height.parse().map_err(|_| anyhow!("{shape}"))?,
+    );
+    if width == 0 || height == 0 {
+        bail!("--artwork sizes must not be zero");
+    }
+    Ok(ArtworkChannel {
+        source,
+        format,
+        width,
+        height,
+    })
+}
+
+/// Writes an artwork image to `dir/channelN.<ext>` by writing a temporary file and renaming it, so
+/// a reader never sees a half-written image.
+#[cfg(feature = "artwork")]
+fn save_artwork(dir: &Path, channel: u8, image: &syncspin_client::ArtworkImage) -> Result<()> {
+    let extension = match image.format {
+        syncspin_client::ImageFormat::Jpeg => "jpg",
+        syncspin_client::ImageFormat::Png => "png",
+    };
+    let temporary = dir.join(format!(".channel{channel}.tmp"));
+    fs::write(&temporary, &image.data)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    let target = dir.join(format!("channel{channel}.{extension}"));
+    fs::rename(&temporary, &target)
+        .with_context(|| format!("failed to replace {}", target.display()))
 }
 
 /// Rejects a static code that is not exactly the eight decimal digits the protocol defines.
@@ -776,6 +908,16 @@ Options:
                               (needs --open-window)
       --open-window           Open a pairing window on every connection
                               (needs --static-code)
+",
+    );
+    #[cfg(feature = "artwork")]
+    text.push_str(
+        "
+      --artwork <spec>        Ask for an artwork channel, [album|artist]:WxH:jpeg|png,
+                              for example album:300x300:jpeg; repeat for up to
+                              four channels, in channel order
+      --artwork-max-bytes <n> Largest image to keep, in bytes [default: 8 MiB]
+      --artwork-dir <dir>     Write each image to <dir>/channelN.<jpg|png>
 ",
     );
     text.push_str(
@@ -1199,5 +1341,58 @@ mod tests {
             format!("{error}").contains("unsupported URL scheme"),
             "the error should name the scheme, got: {error}"
         );
+    }
+
+    #[cfg(feature = "artwork")]
+    #[test]
+    fn an_artwork_spec_names_source_size_and_format() {
+        let channel = parse_artwork("artist:64x32:png").unwrap();
+        assert_eq!((channel.width, channel.height), (64, 32));
+        for bad in [
+            "album",
+            "album:10x10",
+            "x:10x10:png",
+            "album:0x10:png",
+            "album:10x10:gif",
+        ] {
+            assert!(parse_artwork(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[cfg(feature = "artwork")]
+    #[test]
+    fn at_most_four_artwork_channels_are_accepted() {
+        let mut args = vec!["--server", "host"];
+        for _ in 0..5 {
+            args.extend(["--artwork", "album:8x8:png"]);
+        }
+        assert!(parse(&args).is_err());
+        let options = options(&[
+            "--server",
+            "host",
+            "--artwork",
+            "album:8x8:png",
+            "--artwork-max-bytes",
+            "99",
+        ]);
+        assert_eq!(
+            (options.artwork.len(), options.artwork_max_bytes),
+            (1, Some(99))
+        );
+    }
+
+    #[cfg(feature = "artwork")]
+    #[test]
+    fn an_image_is_saved_atomically_under_its_channel_name() {
+        let dir = std::env::temp_dir().join(format!("player-pipe-artwork-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let image = syncspin_client::ArtworkImage {
+            format: syncspin_client::ImageFormat::Jpeg,
+            data: vec![1, 2, 3],
+        };
+        save_artwork(&dir, 2, &image).unwrap();
+        assert_eq!(fs::read(dir.join("channel2.jpg")).unwrap(), vec![1, 2, 3]);
+        assert!(!dir.join(".channel2.tmp").exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

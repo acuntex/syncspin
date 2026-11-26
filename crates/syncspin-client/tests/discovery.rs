@@ -5,7 +5,12 @@
 //! the loopback interface. The listener binds `127.0.0.1:0`, which makes the port ephemeral and the
 //! advertisement carry whatever was bound.
 
-#![cfg(feature = "discovery")]
+#![cfg(all(
+    feature = "discovery",
+    feature = "player",
+    feature = "controller",
+    feature = "metadata"
+))]
 
 #[path = "fake_server.rs"]
 mod fake_server;

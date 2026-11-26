@@ -291,6 +291,9 @@ pub enum Observation {
     HandshakeMessage2Rejected(String),
     /// The client closed before sending Noise message 2.
     ClosedBeforeMessage2,
+    /// The text of the `client/hello` message exactly as the client sent it, delivered just before
+    /// the typed [`Observation::ClientHello`] so a test can check keys the typed form drops.
+    ClientHelloText(String),
     /// The client announced itself.
     ClientHello(Box<ClientHello>),
     /// The client reported its state.
@@ -704,6 +707,17 @@ impl FakeServer {
         }
     }
 
+    /// Waits until the client announces itself and returns the message text as sent.
+    pub async fn wait_for_client_hello_text(&mut self) -> Option<String> {
+        loop {
+            match self.observation().await {
+                Some(Observation::ClientHelloText(text)) => return Some(text),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
     /// Waits until the client announces itself.
     pub async fn wait_for_client_hello(&mut self) -> Option<ClientHello> {
         loop {
@@ -918,6 +932,8 @@ async fn serve(
             .context("the client never connected")?;
         // The same socket type as the dialling harness: the transport inside is plain either way,
         // and one alias keeps every helper usable for both directions.
+        // Small writes (an answer to `client/time`, a ping) must not wait behind an unacknowledged one.
+        let _ = tcp.set_nodelay(true);
         let socket = accept_async(MaybeTlsStream::Plain(tcp))
             .await
             .context("the WebSocket upgrade failed")?;
@@ -1132,6 +1148,7 @@ async fn serve_connection(
 
     // 6. client/hello.
     let hello = read_encrypted_json(&mut socket, &mut noise).await?;
+    let _ = observations.send(Observation::ClientHelloText(hello.clone()));
     match Incoming::parse(&hello)? {
         Some(Incoming::ClientHello(hello)) => {
             let _ = observations.send(Observation::ClientHello(Box::new(hello)));
@@ -1232,6 +1249,7 @@ async fn serve_connection(
                             bit_depth,
                             codec_header,
                         }),
+                        ..Default::default()
                     }),
                 )
                 .await?;
@@ -1361,6 +1379,7 @@ async fn serve_connection(
                             ..Metadata::default()
                         }),
                         controller: None,
+                        ..Default::default()
                     }),
                 )
                 .await?;
@@ -1933,6 +1952,7 @@ async fn rehandshake(
                     ..Metadata::default()
                 }),
                 controller: None,
+                ..Default::default()
             }),
         )
         .await?;

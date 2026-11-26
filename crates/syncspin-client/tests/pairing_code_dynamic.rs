@@ -10,7 +10,13 @@
 //! the host, the commitment is opened by the revealed nonce, a failed `server_kc` retries with the
 //! same code and the same deadline, the twentieth round aborts, and the round limit holds the next
 //! attempt back until it is released.
-#![cfg(feature = "pairing-code")]
+
+#![cfg(all(
+    feature = "pairing-code",
+    feature = "player",
+    feature = "controller",
+    feature = "metadata"
+))]
 
 #[path = "fake_server.rs"]
 mod fake_server;
@@ -136,6 +142,10 @@ fn config_for(
         pairing_pending_text: None,
         code_formats: formats,
         code_out_channels: vec![CodeOutChannel::Display],
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     }
 }
 

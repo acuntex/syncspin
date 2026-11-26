@@ -8,6 +8,8 @@
 //! Everything runs against the hermetic fake server in `fake_server.rs`: one loopback port, the
 //! Noise initiator played with `snow`, no audio device.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 
@@ -173,6 +175,10 @@ fn config_for(server: &FakeServer, storage: Option<Arc<dyn Storage>>) -> ClientC
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
         code_out_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     }
 }
 

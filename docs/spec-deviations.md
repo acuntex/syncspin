@@ -4,6 +4,14 @@
 place where this library knowingly departs from it is listed here, with the spec section it
 concerns, the reason for the departure and what closing the gap requires.
 
+The specification text was read at `Sendspin/spec` commit `2cfe19725e26087801985e1d47b31c437bb39099`
+(the head when the role-feature series was written); re-check the role files against the current
+head before relying on a quoted rule.
+
+The long-term goal is to reduce these deviations over time. One is accepted only as a small
+tolerance that improves stability or compatibility with existing systems such as Music Assistant;
+every other one is debt to pay down, and a new entry has to give that justification.
+
 A deviation is only acceptable when it is in this file and, where the behaviour is observable,
 pinned by a test. "Not implemented yet" entries are staged work, not a claim that the deviation is
 harmless.
@@ -15,7 +23,6 @@ harmless.
 | 1   | Server-initiated connections: last-playback server not persisted       | [`connection.md` — Establishing a Connection](https://github.com/Sendspin/spec/blob/main/connection.md#establishing-a-connection)                                                                                                                                      | Open, no last-playback record      |
 | 4   | Code pairing is behind a feature (server MUST)                         | [`pairing.md` — PAKE](https://github.com/Sendspin/spec/blob/main/pairing.md#pake)                                                                                                                                                                                      | Accepted, `pairing-code`           |
 | 6   | Approval is not persisted across restarts                              | [`pairing.md` — Unpaired Access](https://github.com/Sendspin/spec/blob/main/pairing.md#unpaired-access)                                                                                                                                                                | Open, server lifetime              |
-| 7   | Scheduled metadata applied immediately                                 | [`messaging.md` — `server/state`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-serverstate)                                                                                                                                                  | Stage 1b                           |
 | 8   | In-place format change flushes queued audio                            | [`messaging.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamstart); [`roles/player/v1.md` — `stream/start`](https://github.com/Sendspin/spec/blob/main/roles/player/v1.md#server--client-streamstart-player-object) | Stage 1b                           |
 | 10  | A stream-clear reaches the sink buffer only through `discard_from`     | [`messaging.md` — `stream/clear`](https://github.com/Sendspin/spec/blob/main/messaging.md#server--client-streamclear)                                                                                                                                                  | Accepted, `Sink::discard_from`     |
 | 11  | Playout deadlines begin after three clock bursts                       | [`messaging.md` — Clock Synchronization](https://github.com/Sendspin/spec/blob/main/messaging.md#clock-synchronization)                                                                                                                                                | Documented                         |
@@ -132,26 +139,6 @@ reset - while the SHOULD waits for a store the host owns.
 **Removing it:** add an approval store the host supplies (or a flag on `PairingStore`) keyed by
 `client_id`, write on `approve`, remove on `revoke_approval`, `unpair` and a completed pairing, and
 test that a fresh server reads the approval back.
-
-## 7. Scheduled metadata applied immediately
-
-**Spec:** `messaging.md`, `server/state` → `metadata.timestamp`. The field is the server time at
-which the metadata becomes valid; a client that buffers audio ahead of playout should schedule the
-change rather than apply it on arrival.
-
-**What we do:** `handle_state` emits `Event::Track` as soon as the message is decoded, so the
-timestamp is ignored. A title or artwork overlay can be ahead of the audible position by the buffer
-depth: the `min_buffer_ms` the client asks for - 250 ms until it has enough arrival-delay samples to
-derive one, then the upper tail of the measured distribution - plus whatever the sink buffers.
-
-**Why:** scheduling needs a per-role event queue with a timer tied to the clock filter, which the
-session does not have yet; the extracted consumer treated metadata as immediate. Applying it late
-also needs a rule for a change that is superseded before it becomes valid, which belongs with that
-queue.
-
-**Removing it:** give metadata its own scheduled queue, compare `timestamp` with `clock.now_us`,
-and emit at the mapped deadline. Test a future timestamp, a past one, and a change superseded before
-it becomes valid.
 
 ## 8. In-place format change flushes queued audio
 
@@ -278,7 +265,8 @@ accept, so the observable outcome is the same, but the client has broken the MUS
 `seek_relative` shares that window: an offset needs no range, so nothing has to be known first.
 Absolute `seek` is the deliberate exception - it additionally requires the seekable range from the
 same controller state, and with no range known yet it is refused before the first controller state
-rather than sent unvalidated.
+rather than sent unvalidated. When the controller role is removed the recorded set is dropped and the
+window opens again (`roles_removal_headless`).
 
 **Why:** a host may offer a play button before the first `server/state` arrives - it has no other
 source of truth - and refusing there would make the button dead for an unbounded time. The window
@@ -307,7 +295,10 @@ stays active across a reconnect even when the server omits the field: the new se
 `unpaired_access` off that reconnects into an activation whose activity set has no `playback` is not
 playback-capable, so the carried roles are cleared and no state or burst follows. Roles the client
 has no `client/state` object for - `metadata@v1` and `controller@v1` - are kept in the set but
-produce no state of their own.
+produce no state of their own; a role that is later removed from the set (explicitly, by the implicit
+clear above, or by a version replacement) has its state dropped and reported as `Event::TrackCleared`
+or a reset `Event::State`. The new session starts with empty role state, so a reconnect reports no
+clear for the roles the previous session had.
 `an_activation_without_roles_keeps_the_roles_of_the_previous_connection` pins the player case, and
 covers only the setting-on case: the second connection's first activation carries no roles while
 `unpaired_access` is on, and the client still reports its player state.

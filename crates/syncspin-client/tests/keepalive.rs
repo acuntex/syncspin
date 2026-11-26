@@ -11,6 +11,8 @@
 //! (the runtime advances to the next timer instead). Each silence assertion states the virtual
 //! interval it measured, so a session that pinged early cannot pass by accident.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 
@@ -79,6 +81,10 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
         code_out_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     }
 }
 

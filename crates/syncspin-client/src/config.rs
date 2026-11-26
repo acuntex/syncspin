@@ -111,15 +111,15 @@ pub enum AudioMode {
     /// Play raw samples.
     ///
     /// The session advertises PCM only, so the server delivers raw samples and the sink receives
-    /// [`AudioFrame::Pcm`](crate::AudioFrame::Pcm). An encoded stream would need a decoder this
+    /// `AudioFrame::Pcm`. An encoded stream would need a decoder this
     /// build does not carry, so the session rejects one instead of handing encoded bytes to a
     /// sink that expects samples.
     Decode,
     /// Forward encoded frames.
     ///
     /// The session advertises the encoded formats it can forward and the sink receives
-    /// [`AudioFrame::Encoded`](crate::AudioFrame::Encoded). A PCM stream still arrives as
-    /// [`AudioFrame::Pcm`](crate::AudioFrame::Pcm), because there is nothing to decode.
+    /// `AudioFrame::Encoded`. A PCM stream still arrives as
+    /// `AudioFrame::Pcm`, because there is nothing to decode.
     Passthrough,
 }
 
@@ -287,13 +287,13 @@ pub struct ClientConfig {
     ///
     /// Off by default. A host that can change the delay after its audio port (external speakers,
     /// an amplifier, a soundbar) opts in: the client then advertises the command, reports
-    /// [`Event::OutputDelay`](crate::Event::OutputDelay) for a command it accepts, and the host
+    /// `Event::OutputDelay` for a command it accepts, and the host
     /// applies the value to its sink and persists it. A host that cannot apply the command must
     /// leave this off, because `roles/player/v1.md` lets a client advertise only what it applies.
     ///
     /// The command is an instruction to the host, not a value the session applies itself: the sink
     /// remains the authority for `output_delay_ms`. Once the host applied the value it calls
-    /// [`ControlHandle::output_delay_applied`](crate::ControlHandle::output_delay_applied), and the
+    /// `ControlHandle::output_delay_applied`, and the
     /// session reads the sink, re-maps queued deadlines and reports it. A host that never calls it
     /// is still reported: the session reads the sink once, half a second after the command, and
     /// sends a `client/state` if the sink adopted a new value by then. A host that applies the
@@ -334,7 +334,7 @@ pub struct ClientConfig {
     /// Limits applied to every volume request.
     ///
     /// The session applies the policy to a command from the server and to a level the host sets
-    /// through [`ControlHandle::set_volume`](crate::ControlHandle::set_volume); the value it
+    /// through `ControlHandle::set_volume`; the value it
     /// reports back is always the applied one. [`VolumePolicy::default`] keeps the fixed rule of
     /// earlier releases.
     pub volume_policy: VolumePolicy,
@@ -424,14 +424,78 @@ pub struct ClientConfig {
     /// The server-initiated half of the connection mode, or `None` for client-initiated
     /// connections.
     ///
-    /// Setting it makes [`advertise`](crate::advertise) publish `_sendspin._tcp` and accept the
-    /// servers that connect, and makes a manual [`connect`](crate::connect) fail: `connection.md`
+    /// Setting it makes `advertise` publish `_sendspin._tcp` and accept the
+    /// servers that connect, and makes a manual `connect` fail: `connection.md`
     /// lets a client use one of the two methods at a time, never both. [`Inbound::new`] fills the
     /// listen address and the path with the values the spec recommends.
     ///
     /// [`Inbound::new`]: crate::Inbound::new
     #[cfg(feature = "discovery")]
     pub inbound: Option<crate::Inbound>,
+    /// The artwork channels this client wants, by channel number (at most 4).
+    ///
+    /// `Some` is a configured channel, `None` a hole the wire reports as `source: "none"`. An empty
+    /// list means the client does not offer the artwork role at all, so a server never activates
+    /// it. A channel with a zero width or height is refused when the client starts: the
+    /// specification only says images arrive at exactly the declared size, so a zero size is a local
+    /// policy (input validation, pinned by `artwork_channels_are_validated`). A list is trimmed after
+    /// its last configured channel on the wire.
+    ///
+    /// Memory: the client itself holds at most one pending image per channel besides the transfer in
+    /// flight, so its own state is bounded by `5 * max_artwork_bytes`, about 40 MiB at the default,
+    /// and a buffer's capacity can reach about twice its length (pending images are shrunk). The
+    /// figure excludes the events queued for the host: an `Event::Artwork` owns its image and waits
+    /// in an unbounded queue until the host reads it, so a host that reads slowly while the server
+    /// keeps pushing images grows without a bound. Drain the event stream promptly.
+    #[cfg(feature = "artwork")]
+    pub artwork_channels: Vec<Option<ArtworkChannel>>,
+    /// The largest artwork image, in bytes, the client keeps; [`DEFAULT_MAX_ARTWORK_BYTES`] by
+    /// default.
+    ///
+    /// The specification lets a client discard an image above a limit it chooses, so this is a
+    /// choice, not a deviation. An image announced as larger is discarded: its parts are still counted so the sequence rules
+    /// hold, but nothing is buffered and no event is reported. A host that shows only small images
+    /// lowers it to bound memory.
+    #[cfg(feature = "artwork")]
+    pub max_artwork_bytes: usize,
+}
+
+/// Default for [`ClientConfig::max_artwork_bytes`]: 8 MiB.
+#[cfg(feature = "artwork")]
+pub const DEFAULT_MAX_ARTWORK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Which artwork a channel shows.
+#[cfg(feature = "artwork")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkSource {
+    /// The album or release artwork.
+    Album,
+    /// The artist artwork.
+    Artist,
+}
+
+/// The encoding of an artwork image.
+#[cfg(feature = "artwork")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFormat {
+    /// JPEG.
+    Jpeg,
+    /// PNG.
+    Png,
+}
+
+/// One artwork channel the client asks the server to deliver.
+#[cfg(feature = "artwork")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtworkChannel {
+    /// What the channel shows.
+    pub source: ArtworkSource,
+    /// The encoding of the delivered images.
+    pub format: ImageFormat,
+    /// Width in pixels of every delivered image.
+    pub width: u32,
+    /// Height in pixels of every delivered image.
+    pub height: u32,
 }
 
 impl fmt::Debug for ClientConfig {
@@ -539,7 +603,27 @@ impl ClientConfig {
             // The client-initiated mode is the default: nothing is advertised and nothing listens.
             #[cfg(feature = "discovery")]
             inbound: None,
+            #[cfg(feature = "artwork")]
+            artwork_channels: Vec::new(),
+            #[cfg(feature = "artwork")]
+            max_artwork_bytes: DEFAULT_MAX_ARTWORK_BYTES,
         }
+    }
+
+    /// Sets the artwork channels; see [`ClientConfig::artwork_channels`].
+    #[cfg(feature = "artwork")]
+    #[must_use]
+    pub fn with_artwork_channels(mut self, channels: Vec<Option<ArtworkChannel>>) -> Self {
+        self.artwork_channels = channels;
+        self
+    }
+
+    /// Sets the artwork size limit; see [`ClientConfig::max_artwork_bytes`].
+    #[cfg(feature = "artwork")]
+    #[must_use]
+    pub fn with_max_artwork_bytes(mut self, bytes: usize) -> Self {
+        self.max_artwork_bytes = bytes;
+        self
     }
 
     /// Rejects a configuration that would put invalid fields on the wire.
@@ -557,6 +641,24 @@ impl ClientConfig {
     /// check belongs to [`validate`](ClientConfig::validate) alone and the inbound listener
     /// validates without it.
     pub(crate) fn validate_common(&self) -> Result<()> {
+        #[cfg(feature = "artwork")]
+        {
+            if self.artwork_channels.len() > 4 {
+                bail!(
+                    "ClientConfig::artwork_channels has {} entries, more than the 4 channels the \
+                     protocol has",
+                    self.artwork_channels.len()
+                );
+            }
+            if self
+                .artwork_channels
+                .iter()
+                .flatten()
+                .any(|channel| channel.width == 0 || channel.height == 0)
+            {
+                bail!("ClientConfig::artwork_channels has a channel with a zero width or height");
+            }
+        }
         if self.player_name.trim().is_empty() {
             bail!("ClientConfig::player_name must not be empty");
         }
@@ -689,6 +791,10 @@ mod tests {
             code_formats: Vec::new(),
             #[cfg(feature = "pairing-code")]
             code_out_channels: Vec::new(),
+            #[cfg(feature = "artwork")]
+            artwork_channels: Vec::new(),
+            #[cfg(feature = "artwork")]
+            max_artwork_bytes: crate::DEFAULT_MAX_ARTWORK_BYTES,
         }
     }
 
@@ -1033,5 +1139,33 @@ mod tests {
             !text.contains("12345678"),
             "the code must never appear in a debug format: {text}"
         );
+    }
+
+    #[cfg(feature = "artwork")]
+    #[test]
+    fn artwork_channels_are_validated() {
+        let channel = ArtworkChannel {
+            source: ArtworkSource::Album,
+            format: ImageFormat::Png,
+            width: 8,
+            height: 8,
+        };
+        let mut config = valid();
+        config.artwork_channels = vec![Some(channel), None, Some(channel), None];
+        config
+            .validate()
+            .expect("four channels with holes are valid");
+        config.artwork_channels.push(Some(channel));
+        assert!(config.validate().is_err(), "more than four channels");
+        config.artwork_channels = vec![Some(ArtworkChannel {
+            width: 0,
+            ..channel
+        })];
+        assert!(config.validate().is_err(), "a zero width");
+        config.artwork_channels = vec![Some(ArtworkChannel {
+            height: 0,
+            ..channel
+        })];
+        assert!(config.validate().is_err(), "a zero height");
     }
 }

@@ -85,6 +85,7 @@ code flow.
 
 The examples are meant to be read. `player-pipe/src/main.rs` holds the event loop, the identity
 handling and the pairing token, and `player-pipe/src/pipe_sink.rs` the `Sink` implementation.
+With `--features artwork` and `--features color`, `player-pipe` takes `--artwork <album|artist>:WxH:<jpeg|png>` (repeatable, up to four), `--artwork-max-bytes` and `--artwork-dir`, and prints `artwork` and `color` status lines.
 `server-demo/src/main.rs` holds the approval gate, the event loop and the push data plane.
 `mdns-pair/src/main.rs` runs a whole discovery, approval and stream pass in one process, and exits
 on the format and the byte count; run it with `cargo run -p mdns-pair --features mdns`.
@@ -137,8 +138,10 @@ The stream lifecycle is visible on the event stream: `Event::StreamStart` announ
 `Event::StreamEnd` reports a pause or a removed player role, and `Event::StreamClear` reports a seek
 with its timestamp. The end and clear events arrive before the client discards or flushes buffered
 audio, so a host can mute, stop or restart its output first; a reconnect flush produces no stream
-event. `Event::Track` carries the now-playing metadata with the position, the duration and the
-playback speed in per-mille, where `1000` is normal speed.
+event. `Event::Track` carries the now-playing metadata - with the year, track number, the server timestamp
+and a `TrackProgress` of position, duration and speed in per-mille, where `1000` is normal speed -
+delivered at that timestamp: a future-dated state is held and replaced by a newer one, and
+`ControlHandle::server_time_us` with `TrackProgress::position_ms_at` extrapolates the position.
 
 Playout is scheduled in the client. Each audio frame is mapped from its server timestamp through the
 clock estimate, queued in deadline order and written one `pre_port_delay` before its port deadline,
@@ -258,8 +261,10 @@ it found and passes one URL to `connect`, which the spec leaves implementation-d
   the content and writes the frames; the crate owns the connection, clock, group and wire.
 - **Several groups.** One group per server. An unavailable member stays in it and simply receives no
   audio; there is no solo group and no `switch` command cycle.
-- **Roles.** Only `player@v1`, `controller@v1` and `metadata@v1`. There are no other role versions
-  and no `artwork`, `visualizer`, `color` or `source` role.
+- **Roles.** `player@v1`, `controller@v1` and `metadata@v1`, `artwork@v1` and `color@v1` in a client
+  built with the `artwork` and `color` features. There are no other role versions and no
+  `visualizer` or `source` role. Artwork channels are configured when the client starts; there is no call to change them on a
+  live connection, and the server crate does not serve artwork.
 - **Discovery persistence.** Both crates browse and advertise, but the client does not persist the
   server it last admitted with `playback`, and the server keeps operator approval for its lifetime
   only. A restart asks the operator again.
@@ -309,8 +314,39 @@ while let Some(event) = events.next().await {
 }
 ```
 
-`handle.control()` returns the play/pause/skip, seek, volume and mute controls; dropping the handle
+`handle.control()` returns the play/pause/skip/stop, seek, repeat, shuffle, group switch, group volume and group mute controls and the player's own volume and mute; dropping the handle
 or the event stream ends the connection.
+
+A host with no audio output - a remote control, a display or a bridge - connects headless. The
+client then has no `Sink`: it does not advertise or take `player@v1`, reports no player state and
+starts its clock and its first `client/state` as soon as the server activates a role.
+`connect_headless`, `connect_headless_with_psks` and, with the `discovery` feature,
+`advertise_headless` are the entry points; a server that activates `player@v1` on such a client gets
+`client/goodbye` reason `unauthorized`, as for any role the client did not offer. The player fields
+of `ClientConfig` are ignored.
+
+```rust
+let (handle, mut events) = Client::connect_headless(config).await?;
+while let Some(event) = events.next().await {
+    // Track, State, Disconnected, ...
+}
+```
+
+The client crate has cargo features for the roles it takes part in:
+
+| Feature      | Default | What it compiles in                                                                  |
+| ------------ | ------- | ------------------------------------------------------------------------------------ |
+| `player`     | on      | `Sink`, the playout queue, `connect`, the volume and mute controls and stream events |
+| `controller` | on      | the transport and seek controls and the group's controller state                     |
+| `metadata`   | on      | the now-playing track                                                                |
+| `artwork`    | off     | artwork images for the channels the host configures (`ClientConfig::artwork_channels`) |
+| `color`      | off     | the colors the server derives from the audio, delivered at their timestamp           |
+
+A consumer with `default-features = false` gets none of them and has to name the roles it wants; a
+build with no role at all has nothing to offer, so `connect_headless` and `advertise_headless` return
+an error instead of connecting. The other features, `storage-file`, `pairing-code`, `discovery` and
+`mdns`, are off by default. `scripts/check-roles.sh` builds, tests and lints the client for the sets
+that turn a role off.
 
 ## Integrating a server
 

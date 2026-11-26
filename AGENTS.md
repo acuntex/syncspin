@@ -40,7 +40,12 @@ cargo check -p syncspin-core -p syncspin-client --all-features \
   --target armv7-unknown-linux-gnueabihf --locked       # the ARM guard, as CI runs it
 cargo check -p syncspin-server --all-features \
   --target armv7-unknown-linux-gnueabihf --locked       # the same guard for the server, run it too
-cargo zigbuild --target armv7-unknown-linux-gnueabihf  # once the player/controller features land
+cargo check -p syncspin-client \
+  --target armv7-unknown-linux-gnueabihf --locked       # the client with its default roles
+cargo check -p syncspin-client --no-default-features \
+  --target armv7-unknown-linux-gnueabihf --locked       # and with no role feature at all
+scripts/check-roles.sh                                 # every role feature set: tests, docs, clippy
+cargo zigbuild --target armv7-unknown-linux-gnueabihf  # once a dependency needs a C toolchain
 cargo deny check                                       # licences, advisories, sources
 scripts/coverage.sh                                    # coverage, all features, advisory
 ```
@@ -73,10 +78,14 @@ here rather than a preference.
   There is no plaintext fallback and no downgrade - not behind a flag, not in a test.
 - **Never log key material or pairing records.** No static keys, no PSKs, no pairing blobs, no
   Noise handshake hashes - not at `trace`, not in `Debug` output, not in error strings.
-- **When the role feature flags land, the defaults stay `player`, `controller`, `metadata`.**
-  `artwork`, `visualizer`, `color` and `source` stay off unless a caller opts in. The role features
-  do not exist yet: the only tables today are `storage-file` (client), `pairing-code`
-  (core/client/server), `discovery` (client) and `mdns` (client/server). `storage-file` is off in
+- **The role feature defaults stay `player`, `controller`, `metadata`.**
+  `artwork`, `visualizer`, `color` and `source` stay off unless a caller opts in, and only
+  `syncspin-client` has role features: `player`, `controller` and `metadata` (on by default) and the
+  tables `storage-file`, `pairing-code` (core/client/server), `discovery` and `mdns`
+  (client/server). `artwork` is a role feature too (off by default: it holds images in memory and
+  advertises nothing until the host configures a channel) and so is `color` (off by default); `visualizer`
+  and `source` are not implemented. A set that turns a role off compiles other test files, so a change in the client
+  runs `scripts/check-roles.sh` as well. `storage-file` is off in
   `syncspin-client` but on in `player-pipe`, so a workspace build enables it through feature
   unification; `pairing-code`, `discovery` and `mdns` are off unless requested. `mdns-pair` has its
   own `mdns` feature, which forwards to the client and server ones and is off by default: the flow
@@ -85,6 +94,10 @@ here rather than a preference.
   `msrv` CI job is the gate.
 - **Names and licence are fixed:** crates `syncspin-core`, `syncspin-client` and `syncspin-server`;
   licence `MIT OR Apache-2.0`. Renames break downstream consumers and the published crates.
+- **The goal is fewer spec deviations over time.** A deviation is accepted only as a small
+  tolerance that improves stability or compatibility with existing systems such as Music Assistant.
+  Every other deviation is debt to pay down, and a change must not add one when conforming is
+  feasible. A new entry in `docs/spec-deviations.md` carries that justification.
 - **Spec deviations are documented** in `docs/spec-deviations.md` and covered by a test. Where
   Music Assistant and the spec disagree, the spec wins.
 - **A capability claim is checked against the tree, not against memory.** The documents have drifted

@@ -1548,6 +1548,15 @@ async fn a_playing_group_declares_the_playback_activity() -> Result<()> {
         "the roles of the initial activation stay in force"
     );
 
+    // The stream has to be announced before it can be ended: wait for the `stream/start`, so the
+    // pause below does not race the server's handling of the client's state report.
+    loop {
+        match client.next_received().await? {
+            Received::Json(message) if matches!(*message, Incoming::StreamStart(_)) => break,
+            _ => continue,
+        }
+    }
+
     // Dropping the activity needs the stream to end first, and it does.
     server.pause();
     let mut ended = false;

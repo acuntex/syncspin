@@ -5,6 +5,8 @@
 //! PSK and the record a pairing produces in an in-memory [`Storage`], which is the only thing that
 //! makes the Pairing PSK method available at all.
 
+#![cfg(all(feature = "player", feature = "controller", feature = "metadata"))]
+
 #[path = "fake_server.rs"]
 mod fake_server;
 
@@ -274,6 +276,10 @@ fn config_for(server: &FakeServer, storage: Option<Arc<dyn Storage>>) -> ClientC
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
         code_out_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     }
 }
 
@@ -1022,7 +1028,8 @@ async fn a_pairing_after_a_rehandshake_uses_index_one() {
                 assert_eq!(reason, PairingFailure::MethodNotSupported);
                 break;
             }
-            Event::StreamEnd { .. } => continue,
+            // The activation drops every role, so the role states are reported cleared too.
+            Event::StreamEnd { .. } | Event::TrackCleared | Event::State(_) => continue,
             other => panic!("expected PairingFailed, got {other:?}"),
         }
     }
