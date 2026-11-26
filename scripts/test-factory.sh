@@ -517,7 +517,7 @@ section_sync() {
 
 
 # ---------------------------------------------------------------------------
-# Driver tests (cases D1 to D29). The driver runs in a clone of a fake origin whose main branch is a
+# Driver tests (cases D1 to D36). The driver runs in a clone of a fake origin whose main branch is a
 # copy of the files the factory needs. There are two origins: one whose gate is a stub that only
 # stamps the tree (the default), and one whose gate is the real scripts/gate.sh (the real-gate cases).
 # The agent CLIs are stubs on PATH: they write canned artifacts and log their argv and environment.
@@ -779,6 +779,8 @@ section_driver() {
     refute "D18 [$be] no continue, session or resume flag" grep -Eq -- '^ARGV.*(--continue|--session|--resume)' "$sd/calls.log"
     if [ "$be" = claude ]; then
       id=$(basename "$(run_dir_of)")
+      assert "D35 every claude phase passes --strict-mcp-config" test "$(grep -c '^ARGV.* --strict-mcp-config' "$sd/calls.log")" = "$(grep -c '^CALL ' "$sd/calls.log")"
+      refute "D35 no claude phase passes --mcp-config" grep -Eq '^ARGV.* --mcp-config' "$sd/calls.log"
       assert "D17 the readonly grant starts with the run-directory Edit rule" test "$(sed -n 's/^ALLOWED //p' "$sd/calls.log" | head -n 1 | cut -d, -f1)" = "Edit(/.factory/runs/$id/plan.md)"
       refute "D17 no Write rule in a readonly grant" grep -q '^ALLOWED Edit(/.factory/runs/.*Write(' "$sd/calls.log"
       refute "D17 no double slash or home path in a grant" grep -Eq "^ALLOWED .*(//|$hm/|/Users/)" "$sd/calls.log"
@@ -1010,6 +1012,8 @@ HOOK
   assert "D13 it names the caps" has "$drv_out" 'plan review 4 rounds, code review 3 rounds'
   assert "D13 it names the phases" has "$drv_out" 'phases: plan, plan-review, owner-gate, implement, code-review, final-gate, pr'
   assert "D13 it shows the claude command shape" has "$drv_out" 'claude -p .*--permission-mode dontAsk .*--allowedTools'
+  assert "D13 it shows the strict MCP flag for claude" has "$drv_out" '--strict-mcp-config'
+  refute "D13 it passes no --mcp-config" has "$drv_out" '--mcp-config'
   drive --dry-run --backend opencode "t"
   assert "D13 it shows the opencode command shape" has "$drv_out" 'opencode run --agent factory-planner'
   assert "D13 it called nothing" test ! -s "$sd/calls.log"
@@ -1158,6 +1162,95 @@ HOOK
   : >"$sd/noop-plan"
   drive --backend opencode "t"
   refute "D25 no claude hint for opencode" has "$drv_out" 'rule form may be wrong'
+
+  # D36: a phase that ends without its artifact names its cause in handoff.md. The stub prints the
+  # log lines of each known case (with ANSI codes, the home directory, a second home-style path, a
+  # very long line and filler); the driver must classify, cut and scrub them.
+  local esc cause_case cause_line cause_sum cause_fix long_line handoff n
+  esc=$(printf '\033')
+  long_line="longline$(printf ' abcdefghij%.0s' $(seq 1 30))"
+  for cause_case in login trust limit unknown; do
+    case "$cause_case" in
+      login)
+        cause_line="${esc}[31mNot logged in${esc}[0m - Please run /login"
+        cause_sum='not logged in'
+        cause_fix='log in once'
+        ;;
+      trust)
+        cause_line="${esc}[1mWarning:${esc}[0m this workspace has not been trusted"
+        cause_sum='workspace not trusted'
+        cause_fix='accept the workspace trust dialog'
+        ;;
+      limit)
+        cause_line="API Error: 429 rate_limit_error"
+        cause_sum='rate or usage limit'
+        cause_fix='wait until the limit resets or switch backend'
+        ;;
+      unknown)
+        cause_line="${esc}[2Ksomething odd happened"
+        cause_sum='no known cause in the log'
+        cause_fix='read logs/plan.log'
+        ;;
+    esac
+    new_case stub
+    {
+      printf '%s\n' "$cause_line" "cwd=$HOME/work" "other=$hm/$rp/work" "$long_line"
+      for n in $(seq 1 14); do printf 'filler %s\n' "$n"; done
+    } >"$sd/loglines"
+    # shellcheck disable=SC2016  # the hook expands STUB_DIR inside the stub
+    printf 'cat "$STUB_DIR/loglines"\nhandled=1\n' >"$sd/hook-plan.sh"
+    printf '1\n' >"$sd/exit-plan"
+    drive --backend claude "t"
+    handoff=$(cat "$(run_dir_of)/handoff.md")
+    assert "D36 [$cause_case] exits 20, resumable" test "$drv_rc" = 20
+    assert "D36 [$cause_case] handoff.md has a cause section" has "$handoff" '^## Cause$'
+    assert "D36 [$cause_case] the cause is named" has "$handoff" "$cause_sum"
+    assert "D36 [$cause_case] the fix is named" has "$handoff" "$cause_fix"
+    assert "D36 [$cause_case] the first log lines are quoted" has "$handoff" 'filler 8'
+    refute "D36 [$cause_case] at most 12 log lines are quoted" has "$handoff" 'filler 9'
+    refute "D36 [$cause_case] no ANSI escape in handoff.md" grep -q "$esc" "$(run_dir_of)/handoff.md"
+    refute "D36 [$cause_case] no home directory in handoff.md" has "$handoff" "$HOME"
+    refute "D36 [$cause_case] no home-style path in handoff.md" has "$handoff" "$hm/$rp"
+    refute "D36 [$cause_case] no quoted line is longer than 200 characters" test -n "$(awk 'length > 204' "$(run_dir_of)/handoff.md")"
+    assert "D36 [$cause_case] the long line is cut, not dropped" has "$handoff" 'longline abcdefghij'
+    assert "D36 [$cause_case] the driver prints one cause line" has "$drv_out" 'factory: (cause: |artifact missing: )'
+    if [ "$cause_case" = unknown ]; then
+      assert "D36 [unknown] the rule-form hint is the fallback" has "$handoff" 'rule form may be wrong'
+    else
+      refute "D36 [$cause_case] no rule-form hint when the cause is known" has "$handoff$drv_out" 'rule form may be wrong'
+    fi
+  done
+  # An unknown cause on OpenCode never shows the Claude rule-form hint.
+  new_case stub
+  # shellcheck disable=SC2016  # the hook expands STUB_DIR inside the stub
+  printf 'cat "$STUB_DIR/loglines"\nhandled=1\n' >"$sd/hook-plan.sh"
+  printf 'nothing known here\n' >"$sd/loglines"
+  drive --backend opencode "t"
+  assert "D36 [opencode] exits 20" test "$drv_rc" = 20
+  refute "D36 [opencode] no rule-form hint" has "$(cat "$(run_dir_of)/handoff.md")$drv_out" 'rule form may be wrong'
+  assert "D36 [opencode] the log is quoted" has "$(cat "$(run_dir_of)/handoff.md")" 'nothing known here'
+
+  # D36 tokens and prose: a token-like string is withheld, and a login URL or the word login in prose
+  # is not "not logged in". The tokens are built from pieces so no secret-looking literal is stored.
+  local tok_a tok_b
+  tok_a="gh"
+  tok_a+="p_$(printf 'A1b2%.0s' $(seq 1 10))"
+  tok_b=$(printf 'Zq9%.0s' $(seq 1 12))
+  new_case stub
+  printf '%s\n' "visit https://example.invalid/login to sign in" "please login again later" "token=$tok_a" "key $tok_b" "plain line kept" >"$sd/loglines"
+  # shellcheck disable=SC2016  # the hook expands STUB_DIR inside the stub
+  printf 'cat "$STUB_DIR/loglines"\nhandled=1\n' >"$sd/hook-plan.sh"
+  drive --backend claude "t"
+  handoff=$(cat "$(run_dir_of)/handoff.md")
+  assert "D36 [token] exits 20" test "$drv_rc" = 20
+  refute "D36 [token] the prefixed token is not in handoff.md" has "$handoff" "${tok_a:0:12}"
+  refute "D36 [token] the long token is not in handoff.md" has "$handoff" "${tok_b:0:12}"
+  refute "D36 [token] the token is not on stderr" has "$drv_out" "${tok_b:0:12}"
+  assert "D36 [token] the lines are withheld" has "$handoff" 'line withheld'
+  assert "D36 [token] ordinary lines are kept" has "$handoff" 'plain line kept'
+  assert "D36 [login prose] a login URL is quoted" has "$handoff" 'example.invalid/login'
+  refute "D36 [login prose] a login URL or the word login is not 'not logged in'" has "$handoff" 'not logged in'
+  assert "D36 [login prose] the cause stays unknown" has "$handoff" 'no known cause in the log'
 
   # D26: the personal-data scrub.
   # shellcheck disable=SC2329  # called through assert and refute
@@ -1375,7 +1468,7 @@ section_probes() {
   fi
   if command -v claude >/dev/null 2>&1; then
     help=$(claude --help 2>&1 || true)
-    for flag in -p --agent --model --permission-mode --allowedTools --no-session-persistence --output-format; do
+    for flag in -p --agent --model --permission-mode --allowedTools --strict-mcp-config --no-session-persistence --output-format; do
       assert "probe: claude lists $flag" has "$help" "(^|[^A-Za-z-])$flag([^A-Za-z-]|$)"
     done
   else

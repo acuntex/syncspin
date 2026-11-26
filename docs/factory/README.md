@@ -10,9 +10,18 @@ The specification (process, caps, exit codes, state files, protected paths, hook
 
 ## Prerequisites
 
-- `opencode` and/or `claude` installed and logged in, `git` 2.31 or newer, `gh` logged in,
-  `shellcheck`. The ARMv7 target (`rustup target add armv7-unknown-linux-gnueabihf`) is optional: the
-  gate skips that step without it and says so.
+- `opencode` and/or `claude` installed, `git` 2.31 or newer, `gh`, `shellcheck`. Every tool you use
+  must be logged in: the agent CLIs (log in once, interactively) and `gh`. The ARMv7 target
+  (`rustup target add armv7-unknown-linux-gnueabihf`) is optional: the gate skips that step without it
+  and says so.
+- Claude Code: open every fresh clone once, interactively (`claude` in the clone), and accept the
+  workspace trust dialog. Without that, a headless run ignores the project allow rules and the
+  phases end without their artifacts (see Troubleshooting).
+- Claude Code: the driver passes `--strict-mcp-config` and no `--mcp-config`, so no MCP server is
+  loaded in a factory run, including the ones from your user-level configuration. Tools from your
+  personal setup do not run inside a run, and they cannot create files that trip the snapshot
+  check. The driver does not use `--bare` (it would also skip hooks and agents) and does not restrict
+  `--setting-sources`.
 - For unattended runs, a throwaway clone or container and a scoped, non-admin credential (push to
   feature branches and pull request creation only). The agent process keeps `HOME`, so
   `~/.config/gh`, `~/.ssh` and git credential helpers stay reachable, and anything run through
@@ -124,8 +133,26 @@ driver's snapshot verification, its own final gate, CI and the review of the pro
 Headless behaviour of an `ask` rule in OpenCode is not documented: a hung phase ends by timeout, and
 the driver never uses `--auto`.
 
+## Troubleshooting
+
+When a phase exits non-zero or ends without its artifact, the driver stays on exit 20 (resumable),
+prints one `factory: cause: ...` line and adds a `## Cause` section to `handoff.md` with the first 12 non-blank
+lines of `logs/<phase>.log` (ANSI codes removed, lines with personal data withheld). Fix the cause,
+then run `scripts/factory.sh --resume <run id>`.
+
+| Cause in handoff.md       | What the log said                                 | Fix                                                                   |
+| ------------------------- | ------------------------------------------------- | --------------------------------------------------------------------- |
+| not logged in             | `Not logged in`, `run /login`                     | Log in once: run the tool interactively (Claude Code: `/login`).      |
+| workspace not trusted     | `has not been trusted`, `trust dialog`            | Run `claude` in the clone once and accept the workspace trust dialog. |
+| rate or usage limit       | `rate_limit`, `usage limit`, `spend limit`, `429` | Wait until the limit resets, or switch backend with `--backend`.      |
+| no known cause in the log | none of the above                                 | Read the log. On Claude Code the `Edit(...)` rule form may be wrong.  |
+
 ## Known limits
 
+- The OpenCode backend has no documented switch to ignore the user's own configuration (`opencode run`
+  has no such flag), so it still loads your MCP servers. If one of them creates files in the working
+  tree, the driver's snapshot check can trip (exit 13). Use a throwaway clone and, if it happens,
+  remove the server from your user-level OpenCode configuration for the run.
 - Pattern rules match command text. Wrappers and other shells (`bash -c`, an absolute path) can get
   around them; the allow list is the control, the deny list adds clarity.
 - `cargo` and `scripts/*` are allowed, so a build script or a test can run arbitrary code with the

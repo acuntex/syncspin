@@ -95,7 +95,11 @@ owner-gate implement code-review final-gate pr done`. `step` names the unit of w
 
 `handoff.md` is written on every stop with a fixed layout: `# Handoff`, `Run:`, `Branch:`,
 `Stopped at:`, `Exit code:`, `Reason:`, `Artifacts:`, `Open findings:` and `Resume:` (the exact
-command, or `not resumable`).
+command, or `not resumable`). When a phase exits non-zero or ends without its artifact, a `## Cause`
+section follows `Reason:`: the classification of `logs/<phase>.log` (not logged in, workspace not
+trusted, rate or usage limit, or no known cause), the fix, and the first 12 non-blank lines of the log, each cut
+at 200 characters, with ANSI codes removed and lines that hold personal data withheld. The driver
+prints the same cause as one line to stderr; the exit code stays 20.
 
 Run directory files: `task.md plan.md review-plan-N.md review-plan-post.md decisions.md
 review-code-N.md pr.md blocked.md handoff.md state logs/<phase>.log`. Logs can hold paths and model
@@ -138,6 +142,14 @@ read-only set (`docs/factory/meta/claude-allow-common.txt`), the implementer als
 commands (`claude-allow-code.txt`), and nobody but the driver or the interactive command gets
 fetch, branch creation or `gh pr create` (`claude-allow-orchestrator.txt`). `.claude/settings.json`
 allows only the common set, because `dontAsk` honours project allow rules in every phase.
+
+The Claude command shape is `claude -p <prompt> --agent factory-<role> [--model M] --permission-mode
+dontAsk --allowedTools <grant> --strict-mcp-config --no-session-persistence --output-format text`.
+`--strict-mcp-config` without `--mcp-config` loads no MCP server at all, so the user's own servers
+neither run in a factory run nor leave files in the tree. `--bare` and `--setting-sources` are not
+used. The project allow rules apply only in a workspace the user has trusted once (an interactive
+`claude` in the clone); without that, a headless phase ignores them. OpenCode has no equivalent
+switch and still loads the user's MCP servers.
 
 ## Hooks
 

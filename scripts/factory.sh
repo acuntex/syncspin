@@ -331,6 +331,91 @@ resume_context() {
   fi
 }
 
+# The log of the last invocation of a phase, ANSI escape sequences removed.
+phase_log_text() {
+  local file=$1 esc bel
+  esc=$(printf '\033')
+  bel=$(printf '\007')
+  [ -f "$file" ] || return 0
+  awk '/^== / { n = 0; delete a; next } { a[++n] = $0 } END { for (i = 1; i <= n; i++) print a[i] }' "$file" |
+    LC_ALL=C sed -e "s#${esc}\\[[0-9;?]*[ -/]*[@-~]##g" -e "s#${esc}\\][^${bel}]*${bel}##g" -e 's/\r$//' || true
+}
+
+# classify_log: reads the cleaned log on stdin, prints one of login, trust, limit, unknown.
+classify_log() {
+  local text
+  text=$(cat)
+  if grep -Eiq 'Not logged in|run /login|Please run /login' <<<"$text"; then
+    printf 'login'
+  elif grep -Eiq 'has not been trusted|trust dialog' <<<"$text"; then
+    printf 'trust'
+  elif grep -Eiq 'rate_limit|usage limit|spend limit|(^|[^0-9])429([^0-9]|$)' <<<"$text"; then
+    printf 'limit'
+  else
+    printf 'unknown'
+  fi
+}
+
+# log_head <lines>: the first lines of the cleaned log on stdin, each cut at 200 characters. A line
+# that holds personal data (see scrub) is replaced, not shortened, so nothing of it is kept.
+log_head() {
+  local max=$1 line count=0
+  while IFS= read -r line && [ "$count" -lt "$max" ]; do
+    [ -n "${line//[[:space:]]/}" ] || continue
+    if ! scrub <<<"$line" >/dev/null || grep -Eq '[A-Za-z0-9_-]{32,}|(^|[^A-Za-z0-9])(sk-|ghp_|gho_|github_pat_|xox)' <<<"$line"; then
+      line='[line withheld: it holds personal data or a token]'
+    fi
+    printf '%s\n' "${line:0:200}"
+    count=$((count + 1))
+  done
+}
+
+cause_md=""
+
+# diagnose <phase-name> <artifact-missing 0|1>: sets cause_md for handoff.md and prints one line to
+# stderr. Called only when a phase is about to stop the run; the exit code is the caller's business.
+diagnose() {
+  local name=$1 missing=$2 kind text fix summary head_lines line
+  text=$(phase_log_text "$run_dir/logs/$name.log")
+  kind=$(classify_log <<<"$text")
+  case "$kind" in
+    login)
+      summary="not logged in"
+      fix="log in once (run the backend interactively and sign in; Claude Code: /login), then resume"
+      ;;
+    trust)
+      summary="workspace not trusted"
+      fix="open claude in this clone once and accept the workspace trust dialog, then resume"
+      ;;
+    limit)
+      summary="rate or usage limit"
+      fix="wait until the limit resets or switch backend (--backend), then resume"
+      ;;
+    *)
+      summary="no known cause in the log"
+      fix="read logs/$name.log"
+      if [ "$backend" = claude ] && [ "$missing" = 1 ]; then
+        fix="$fix; the Edit(...) rule form may be wrong for this Claude Code version"
+      fi
+      ;;
+  esac
+  head_lines=$(log_head 12 <<<"$text")
+  cause_md=$(
+    printf '## Cause\n\n%s. Fix: %s.\n\n' "$summary" "$fix"
+    printf 'First lines of logs/%s.log:\n\n' "$name"
+    if [ -n "$head_lines" ]; then
+      while IFS= read -r line; do printf '    %s\n' "$line"; done <<<"$head_lines"
+    else
+      printf '    (the log is empty)\n'
+    fi
+  )
+  if [ "$kind" = unknown ] && [ "$backend" = claude ] && [ "$missing" = 1 ]; then
+    printf 'factory: artifact missing: the Edit(...) rule form may be wrong for this Claude Code version\n' >&2
+  else
+    printf 'factory: cause: %s; %s\n' "$summary" "$fix" >&2
+  fi
+}
+
 if [ "${FACTORY_LIB_ONLY:-0}" = 1 ]; then
   # shellcheck disable=SC2317  # reached when the file is sourced
   return 0 2>/dev/null || exit 0
@@ -464,7 +549,9 @@ build_cmd() {
     claude)
       cmd=(claude -p "$prompt" --agent "factory-$role")
       if [ -n "$model" ]; then cmd+=(--model "$model"); fi
-      cmd+=(--permission-mode dontAsk --allowedTools "$(claude_tools "$access" "$artifact")" --no-session-persistence --output-format text)
+      # --strict-mcp-config without --mcp-config: no MCP server is loaded, so nothing from the user's
+      # own configuration runs inside a factory run or creates files the snapshot would flag.
+      cmd+=(--permission-mode dontAsk --allowedTools "$(claude_tools "$access" "$artifact")" --strict-mcp-config --no-session-persistence --output-format text)
       ;;
   esac
 }
@@ -564,6 +651,7 @@ write_handoff() {
     printf 'Stopped at: %s, step %s\n' "$phase" "${step:-none}"
     printf 'Exit code: %s (%s)\n\n' "$code" "$(exit_name "$code")"
     printf 'Reason: %s\n\n' "$reason"
+    if [ -n "$cause_md" ]; then printf '%s\n\n' "$cause_md"; fi
     printf 'Artifacts:\n'
     for f in "$run_dir"/*; do
       [ -e "$f" ] && printf -- '- %s\n' "${f#"$ROOT"/}"
@@ -823,9 +911,7 @@ artifact_phase() {
   run_phase "$role" readonly "$name" "$template" "$artifact" "$name"
   if [ "$phase_timed_out" = 1 ]; then stop 20 "the $name phase timed out"; fi
   if [ ! -s "$ROOT/$artifact" ]; then
-    if [ "$backend" = claude ]; then
-      printf 'factory: artifact missing: the Edit(...) rule form may be wrong for this Claude Code version\n' >&2
-    fi
+    diagnose "$name" 1
     stop 20 "the $name phase ended (exit $phase_rc) without its artifact $artifact"
   fi
   verify_phase readonly
@@ -839,6 +925,7 @@ code_phase() {
   if [ "$phase_timed_out" = 1 ]; then stop 20 "the $name phase timed out"; fi
   progress=$(git rev-list --count "$head_before..HEAD")
   if [ "$phase_rc" != 0 ] && [ "$progress" = 0 ]; then
+    diagnose "$name" 0
     stop 20 "the backend exited with $phase_rc and made no commit"
   fi
   verify_phase code
@@ -902,9 +989,7 @@ while :; do
       run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
       if [ "$phase_timed_out" = 1 ]; then stop 20 "the plan-revise phase timed out"; fi
       if [ "$(hash_file "$ROOT/$plan_file")" = "$before" ]; then
-        if [ "$backend" = claude ]; then
-          printf 'factory: artifact missing: the Edit(...) rule form may be wrong for this Claude Code version\n' >&2
-        fi
+        diagnose plan-revise 1
         stop 20 "the plan-revise phase ended (exit $phase_rc) without a revised plan"
       fi
       verify_phase readonly
@@ -931,6 +1016,7 @@ while :; do
       run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
       if [ "$phase_timed_out" = 1 ]; then stop 20 "the plan-revise phase timed out"; fi
       if [ "$(hash_file "$ROOT/$plan_file")" = "$before" ]; then
+        diagnose plan-revise 1
         stop 20 "the plan-revise phase ended (exit $phase_rc) without a revised plan"
       fi
       verify_phase readonly
