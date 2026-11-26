@@ -19,3 +19,33 @@ curl *
 wget *
 sudo *
 rm -rf *
+find* -exec*
+find* -execdir*
+find* -ok*
+find* -delete*
+find* -fprint*
+find* -fls*
+git branch* -d*
+git branch* -D*
+git branch* -m*
+git branch* -M*
+git branch* -c*
+git branch* -C*
+git branch* -f*
+git branch* -u*
+git branch* --delete*
+git branch* --move*
+git branch* --copy*
+git branch* --force*
+git branch* --set-upstream*
+git branch* --unset-upstream*
+git branch* --edit-description*
+git grep* -O*
+git grep* --open-files-in-pager*
+sed* -i*
+sed* --in-place*
+sort* -o*
+sort* --output*
+sort* --compress-program*
+tree* -o*
+file* -C*

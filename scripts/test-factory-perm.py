@@ -146,6 +146,12 @@ denied_factory = [
     "wget http://x", "sudo true", "git -c a=b status", "git -C . status", "rm -rf x", "python3 x",
     "git diff --output=x", "git log --output=x", "git show HEAD --output=x", "git push origin factory/x",
     "git reset --hard x", "gh repo view", "gh workflow run x", "gh release list", "gh auth status",
+    "find . -exec rm {} ;", "find . -name x -exec rm {} +", "find . -execdir rm {} ;", "find . -delete",
+    "find . -ok rm {} ;", "find . -fprint out", "git branch -D x", "git branch -d x", "git branch -m a b",
+    "git branch -M a b", "git branch -c a b", "git branch -C a b", "git branch --delete x",
+    "git branch --move a b", "git branch --copy a b", "git branch --set-upstream-to=x", "git branch -u x",
+    "git branch x -D", "git branch --force x", "git grep -O x", "sed -n -i p x", "sed -i s/a/b/ x",
+    "sort -o out in", "sort --output=out in", "tree -o out",
 ]
 for cmd in denied_factory:
     check("project opencode does not deny: " + cmd, decide(global_rules, "bash", cmd) != "deny")
@@ -169,6 +175,12 @@ def list_decide(entries, text):
 common = [
     "cargo test", "scripts/gate.sh --commit", "ls x", "rg x", "grep x y", "wc -l x", "diff a b",
     "git status", "git diff", "git log", "git show HEAD", "git write-tree",
+    "cat x", "head -n 5 x", "tail -n 5 x", "find . -name x", "stat x", "file x", "tree -L 2", "sort x",
+    "uniq x", "cut -d: -f1 x", "tr a b", "basename x", "dirname x", "realpath x", "pwd", "which x",
+    "sed -n 1,5p x", "git branch", "git branch -a", "git branch --list x", "git branch --show-current",
+    "git branch -vv", "git branch --contains x", "git branch --merged", "git stash list",
+    "git describe --tags", "git ls-tree HEAD", "git cat-file -p HEAD", "git blame x", "git shortlog -sn",
+    "git grep x", "git tag -l", "git remote -v", "git worktree list",
 ]
 # Commands that change the tree: the implementer only.
 code_only = ["git add x", "git commit -m x", "git rm x", "git mv a b", "git restore x", "mkdir x", "chmod +x x"]
