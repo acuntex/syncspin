@@ -32,15 +32,17 @@ The specification (process, caps, exit codes, state files, protected paths, hook
 
 |                       | OpenCode                                                    | Claude Code                                                                  |
 | --------------------- | ----------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Interactive           | no `/factory` command; follow and steer (see below)         | `/factory <task text>` in a session                                          |
+| Interactive           | `/factory`, `/factory-resume`, `/factory-status`; see below | `/factory <task text>` in a session                                          |
 | Driver (unattended)   | `scripts/factory.sh --backend opencode "..."`               | `scripts/factory.sh --backend claude "..."`                                  |
-| Agents                | `.opencode/agents/factory-*.md` (generated)                 | `.claude/agents/factory-*.md` and `.claude/commands/factory.md`              |
+| Agents                | `.opencode/agents/factory-*.md`, `.opencode/commands/`      | `.claude/agents/factory-*.md` and `.claude/commands/factory.md`              |
 | Permissions           | generated agents (`opencode.json`: `AGENTS.md` denies only) | driver flags (`.claude/settings.json`: `AGENTS.md` denies only)              |
 | Project rules         | reads `AGENTS.md` directly                                  | reads `CLAUDE.md`, a symlink to `AGENTS.md`                                  |
 | Non-interactive slash | -                                                           | `claude -p "/factory ..."` stops at the push request (not approved headless) |
 
-OpenCode has no `/factory` command: its subagents run in the background and report when idle, and
-there is no documented way to wait for one. The driver is the OpenCode path. A run can still be
+OpenCode has no `/factory` command that runs the phases inside the session: its subagents run in the
+background and report when idle, and there is no documented way to wait for one. The driver is the
+OpenCode path. The OpenCode commands described under "Starting from an OpenCode client" only start,
+resume and follow the driver. A run can still be
 followed and steered interactively: with `--opencode-attach URL` every phase is a session on that
 server, visible in its interface, and a person there can answer a permission prompt instead of the
 phase waiting for its timeout. Attached 2.x sessions are not archived, so they show in the server's
@@ -162,6 +164,118 @@ What changes, honestly:
 - Plain-HTTP basic auth sends the password unencrypted. Use loopback, or a TLS-terminating proxy, for
   anything beyond a trusted LAN. Recommended only for local, low-risk runs.
 
+## Starting from an OpenCode client
+
+An OpenCode client (the mobile app, a web client, a desktop client or the terminal interface) can talk
+to a long-running OpenCode server on the machine that holds the clone, and start and follow a run from
+there. A run takes tens of minutes, which must not hang an agent's bash tool call, so the commands go
+through `scripts/factory-launch.sh`. It checks its arguments, then detaches `scripts/factory.sh` as a
+systemd user unit `factory-<id>` (when `systemctl --user` answers) or with `setsid` and a log file
+under `.factory/launch/`, and returns a short summary at once.
+
+| Command                    | What it does                                                                     |
+| -------------------------- | -------------------------------------------------------------------------------- |
+| `/factory <task text>`     | Asks how far to go and where to run, writes the task file, starts a detached run |
+| `/factory-resume <run id>` | Reads why the run stopped, asks the open owner decisions, resumes the run        |
+| `/factory-status [run id]` | Summarises the configuration, the launches and a run, and offers the next step   |
+
+The commands run in the generated `factory-launcher` agent (`.opencode/agents/factory-launcher.md`).
+Its rules: bash denied except `scripts/factory-launch.sh *`, every shared deny last; `edit` only under
+`.factory/launch/`; `read` only under `.factory/runs/` and `.factory/launch/`; `question` allowed.
+Everything is generated from `docs/factory/commands/`, `roles/launcher.md` and `meta/launcher*`. The
+commands exist for OpenCode only: Claude Code has its own `/factory`.
+
+### What you are asked
+
+Every question comes from the OpenCode `question` tool: a header, the question, two to four options,
+each with a one-sentence explanation of its consequence, and a free-text answer. The recommended option
+comes first and says `(Recommended)`. The agent asks in the language you wrote in.
+
+- `/factory`: one call with the task (only if you gave none), how far to go and, if a server is
+  configured, where to run. A second call confirms the exact, secret-free command. The confirmation
+  cannot share the first call, because the command depends on the first answers.
+  - Plan only (recommended for a first run: cheap, no code is written): `--no-push --stop-after plan`.
+  - Through code review, without pushing: `--no-push --stop-after review`.
+  - Through a pull request: `--stop-after pr` (the driver pushes the factory branch and opens it).
+  - Attached to the configured server (recommended, the run is visible and steerable there): no
+    argument. A private server of its own: `--no-attach`.
+- `/factory-resume <run id>`: for exit 10 the agent reads the `## Owner decisions` section of `plan.md`
+  and asks each decision with concrete options, what each means and its own recommendation, labelled
+  `(My recommendation)` with the reason. Your answers are written to
+  `.factory/launch/decisions-<run id>.md`, which the launcher copies to the run's `decisions.md`
+  before the driver resumes. For exit 20 it explains the cause and offers resume, the log tail or
+  nothing. For exits 11 to 16 the run is not resumable: it explains and offers the handoff, a log
+  tail or nothing.
+- `/factory-status`: a summary (phase, step, rounds, exit code, phase durations from the logs) and one
+  question offering what fits: stop a running launch, resume, or nothing.
+
+The task text and your answers are data: the prompts say so, and the agent runs nothing but the
+launcher. If the `question` tool is not available (a headless run), the agent says so, uses the
+recommended defaults of the non-destructive choices and, for an owner decision, prints the open
+questions and stops.
+
+### Configuring the server
+
+The launcher passes the driver options only from a fixed list (`--backend`, `--opencode-attach`,
+`--opencode-bin`, `--model-main`, `--model-helper`, `--variant-main`, `--variant-helper`,
+`--stop-after`, `--plan-rounds`, `--code-rounds`, `--phase-timeout`, `--no-push`, and its own
+`--no-attach`); `--allow-protected` and `--dry-run` are not on it. The task text never reaches a command
+line. The defaults come from the environment of the server process, which the launcher forwards (after
+the driver's own value checks) for exactly these names: `FACTORY_BACKEND`, `FACTORY_MODEL_MAIN`,
+`FACTORY_MODEL_HELPER`, `FACTORY_VARIANT_MAIN`, `FACTORY_VARIANT_HELPER`, `FACTORY_OPENCODE_BIN`,
+`FACTORY_OPENCODE_ATTACH` and `FACTORY_PASS_ENV`. Nothing else leaves the server's environment.
+
+```sh
+# in the environment of the process that serves the OpenCode client
+FACTORY_BACKEND=opencode
+FACTORY_MODEL_MAIN=provider/model
+FACTORY_MODEL_HELPER=provider/model
+FACTORY_OPENCODE_ATTACH=http://127.0.0.1:4096
+FACTORY_LAUNCH_ENVFILE=/path/to/launch.env
+```
+
+Credentials for an attached server go in a file, named by `FACTORY_LAUNCH_ENVFILE` or `--env-file`,
+with `OPENCODE_SERVER_USERNAME` and `OPENCODE_SERVER_PASSWORD` (and any provider key named in
+`FACTORY_PASS_ENV`) as `NAME=value` lines. Keep it mode 600: the launcher warns on stderr when group
+or others can read it and refuses a missing file. It never reads the file and never prints it:
+systemd loads it for the unit (`EnvironmentFile`), or the detached shell sources it in the fallback.
+
+### What you see
+
+After the questions the agent reports the launcher's summary: the launch id, `journalctl --user -u
+factory-<id> -f` (or the log path), `scripts/factory-launch.sh --status`, `scripts/factory-launch.sh
+--stop <launch id>`, and where the run directory appears (`.factory/runs/`). With an attached server,
+every phase is also a session in that server. `--status` lists the five newest launches and runs;
+phase durations are the last log header (`== <phase> HH:MM:SS`, UTC) against the log's last write.
+`--stop` ends the systemd unit or the fallback process group; an agent phase of the fallback may run
+on until its own timeout.
+
+### Limits
+
+- Anyone who can use the server's interface can start agents on that machine, with the credentials of
+  the user the server runs as. The launcher agent is restricted, but the user's own agents on the
+  same server are not.
+- A command template is expanded by OpenCode before the agent sees it. OpenCode runs shell
+  substitutions and attaches `@` file references that appear in it, and the task text is part of the
+  template: text typed after `/factory` can reach them outside the agent's permissions. This is
+  unverified; assume it, and read the command as a convenience for the owner, not as a boundary.
+- Plain-HTTP basic auth sends the password unencrypted off loopback.
+- The detached run uses the owner's credentials (`gh`, `ssh`, git helpers) like any driver run. Use a
+  throwaway clone and a scoped, non-admin token for anything beyond local, low-risk runs.
+- The bash rule `scripts/factory-launch.sh *` matches command text; it relies on OpenCode checking
+  each part of a compound command. Unverified for both generations.
+- The `read` rules also allow the absolute form of the two directories, because the path form
+  `read` is matched against is not verified.
+- Unverified until tried by hand, in both generations: that OpenCode finds commands in
+  `.opencode/commands/` (the 1.x layout here uses `.opencode/agents/`; the current documentation names
+  `commands/`, and `command/` as the older spelling), that the `description` and `agent` keys and the
+  `$ARGUMENTS` placeholder work as the documentation says in 1.x and in 2.x, that the `question` tool
+  exists in the generation you run and under the `question` permission key, that a client shows it
+  (the documentation says it needs one that supports the interactive form), and what it does in a
+  headless `opencode run`.
+- The launcher needs `setsid`, `git` and `od`; it exits 3 when the directory it runs in is not a
+  repository root with `scripts/factory.sh`, or an env file is missing, and 2 on a usage error.
+
 ## Permissions
 
 Both tools get guardrails, not security boundaries; the vendors say so too. The real layers are the
@@ -253,8 +367,10 @@ directly. Always edit `AGENTS.md`, never the link.
 
 ## Generated files
 
-`scripts/factory-sync.sh` writes `.opencode/agents/`, `.claude/agents/` and
-`.claude/commands/factory.md` from `roles/`, `meta/` and `meta/claude-allow-*.txt`. `--check` (run by the
+`scripts/factory-sync.sh` writes `.opencode/agents/`, `.opencode/commands/`, `.claude/agents/` and
+`.claude/commands/factory.md` from `roles/`, `commands/`, `meta/` and `meta/claude-allow-*.txt` (the
+launcher agent from `roles/launcher.md` and `meta/launcher-allow.txt`, the OpenCode commands from
+`commands/`). `--check` (run by the
 `lint` job) fails when a generated file differs from its source. Edit the source, run the script,
 commit both.
 
@@ -270,7 +386,10 @@ versions used and the result of each of these checks:
   path form and the rule order on OpenCode 1.x);
 - the Claude Code `/factory` command waits for its foreground subagents;
 - Claude Code follows the `CLAUDE.md` symlink (ask it to quote one rule from `AGENTS.md`);
-- what OpenCode does headless when a rule says `ask`.
+- what OpenCode does headless when a rule says `ask`;
+- the OpenCode commands: `.opencode/commands/` is found, `/factory` starts a detached run, the
+  `question` tool is shown by the client and by `opencode run`, and the `factory-launcher` read and
+  edit path forms match (1.x and 2.x).
 
 ## Manual cleanup
 
@@ -281,6 +400,7 @@ the pull request on GitHub.
 ## Not included
 
 Deferred on purpose: rewriting history with `--force-with-lease`, a `--worktree` mode, a
-`--verify-each` mode, an OpenCode `/factory` command, a CI check that compares the permission files
+`--verify-each` mode, an OpenCode `/factory` command that runs the phases inside the session (the
+launcher commands only start the driver), a CI check that compares the permission files
 with the CI jobs, and changes to the contributor guide or the pull request template beyond the
 required-check count.
