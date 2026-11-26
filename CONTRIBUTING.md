@@ -62,7 +62,8 @@ are configured in [`.pre-commit-config.yaml`](.pre-commit-config.yaml); install 
 
 ## The gates
 
-`main` is protected. A pull request merges only when all seven checks are green:
+`main` is protected. A pull request merges only when all eleven checks are green: the seven below
+and the four `mutants` shards (`mutants (0)` to `mutants (3)`).
 
 | Check     | What it proves                                                                                                                                                |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -80,10 +81,9 @@ sit around 96.7, and the server crate that arrived in 0.2 sits near 85, which is
 number down. Making them required would gate pull requests on numbers that move with a refactor,
 not with a defect.
 
-`mutants` is a third job that is not in the required set, and it is not a number either. It runs
-weekly over `syncspin-core` and `cargo-mutants` exits non-zero as soon as one mutant survives, so a
-red run is a test gap or an exemption to add - it stays red until one of the two happens. Read it as
-a work list, not as a gate: the result arrives weekly, not on a pull request. A surviving mutant
+`mutants` runs over `syncspin-core` on every pull request, weekly and on demand, in four shards, and
+all four are required. `cargo-mutants` exits non-zero as soon as one mutant survives, so a red shard
+is a test gap or an exemption to add - it stays red until one of the two happens. A surviving mutant
 that cannot be killed because the mutation does not change behaviour needs an explicit exemption -
 a skip in the code or an exclusion in the cargo-mutants configuration - and the reason recorded
 next to it.

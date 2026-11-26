@@ -8,3 +8,4 @@ Usage is in the [README](../README.md). These are the documents behind it.
 | [Spec deviations](spec-deviations.md)        | Every known departure from the Sendspin specification, why it exists and what closing it takes. |
 | [Testing](testing.md)                        | The hermetic suites, the MSRV and ARMv7 checks, and the manual run against a real server.       |
 | [CPace review](cpace-review.md)              | What the pairing PAKE implements, what pins it, and what an external reviewer should attack.    |
+| [Code factory](factory/README.md)            | The OpenCode and Claude Code process from task to reviewed pull request, and how to run it.     |

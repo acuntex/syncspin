@@ -4,26 +4,26 @@ This page is the tool-neutral specification of the factory: the process, the cap
 the state files and the protected paths. It is the source of truth for the role prompts in `roles/`,
 the phase prompts in `phases/` and the generated agent files for OpenCode and Claude Code.
 
-Components that do not exist yet in the commit that introduces this page are marked "(introduced in
-commit N of the factory series)". Nothing in this directory is executed; the scripts that read it
-arrive in later commits.
+Nothing in this directory is executed directly: `scripts/factory-sync.sh` turns the role sources into
+agent files, and `scripts/factory.sh` fills in the phase templates. The human page is
+[`README.md`](README.md).
 
 ## Components
 
-| Component                                               | Role                                                                  |
-| ------------------------------------------------------- | --------------------------------------------------------------------- |
-| `docs/factory/roles/*.md`                               | Role system prompts (source of truth).                                |
-| `docs/factory/phases/*.md`                              | Per-phase user-prompt templates, filled in by the driver.             |
-| `docs/factory/meta/*.conf`                              | Per-role metadata: name, description, access class, model class.      |
-| `scripts/gate.sh` (commit 3)                            | Tool-independent gate: `--commit`, standard, `--full`, `--list`.      |
-| `.githooks/pre-commit`, `.githooks/pre-push` (commit 3) | Driver-only hooks, activated through environment variables.           |
-| `scripts/factory-sync.sh` (commit 4)                    | Generates the agent files for both tools from the sources; `--check`. |
-| `.opencode/agents/`, `.claude/agents/` (commit 4)       | Generated agent files. Never edit them by hand.                       |
-| `.claude/commands/factory.md` (commit 4)                | Generated interactive `/factory` command (Claude Code only).          |
-| `opencode.json`, `.claude/settings.json` (commit 5)     | Project permissions for the two tools.                                |
-| `CLAUDE.md` (commit 5)                                  | Git symlink to `AGENTS.md`; no content of its own.                    |
-| `scripts/factory.sh` (commit 6)                         | Deterministic driver; the only OpenCode path and the unattended path. |
-| `scripts/test-factory.sh` (commit 3, grows)             | Hermetic tests with stub CLIs; no model is ever run.                  |
+| Component                                    | Role                                                                  |
+| -------------------------------------------- | --------------------------------------------------------------------- |
+| `docs/factory/roles/*.md`                    | Role system prompts (source of truth).                                |
+| `docs/factory/phases/*.md`                   | Per-phase user-prompt templates, filled in by the driver.             |
+| `docs/factory/meta/*.conf`                   | Per-role metadata: name, description, access class, model class.      |
+| `scripts/gate.sh`                            | Tool-independent gate: `--commit`, standard, `--full`, `--list`.      |
+| `.githooks/pre-commit`, `.githooks/pre-push` | Driver-only hooks, activated through environment variables.           |
+| `scripts/factory-sync.sh`                    | Generates the agent files for both tools from the sources; `--check`. |
+| `.opencode/agents/`, `.claude/agents/`       | Generated agent files. Never edit them by hand.                       |
+| `.claude/commands/factory.md`                | Generated interactive `/factory` command (Claude Code only).          |
+| `opencode.json`, `.claude/settings.json`     | Project permissions for the two tools.                                |
+| `CLAUDE.md`                                  | Git symlink to `AGENTS.md`; no content of its own.                    |
+| `scripts/factory.sh`                         | Deterministic driver; the only OpenCode path and the unattended path. |
+| `scripts/test-factory.sh`                    | Hermetic tests with stub CLIs; no model is ever run.                  |
 
 The run directory `.factory/runs/<run id>/` holds artifacts only and is gitignored.
 
@@ -104,11 +104,14 @@ provider output: never attach them to a public issue.
 ## Protected paths and the snapshot
 
 The protected set is `.githooks/`, `scripts/`, `.opencode/`, `.claude/`, `opencode.json`,
-`AGENTS.md`, `.github/` and the `CLAUDE.md` symlink. The driver (commit 6) hashes it, together with
+`opencode.jsonc`, `.mcp.json`, `AGENTS.md`, `.github/` and the `CLAUDE.md` symlink. The driver hashes it, together with
 refs, git config, hooks and the worktree status, before and after every phase. A readonly phase must
 leave all of it unchanged; an implement phase may only advance the factory branch and must not touch
-the protected set unless the run was started with `--allow-protected`. A violation is exit 13. The
-gitignored `.claude/settings.local.json` is excluded from the hash.
+the protected set unless the run was started with `--allow-protected`. A violation is exit 13. Files
+the tools read but git ignores (`.claude/settings.local.json`, `CLAUDE.local.md`) are hashed too, in
+every phase: they must not appear or change, because local settings outrank the committed ones and
+`dontAsk` honours their allow rules. The run's `task.md` is hashed in every phase and `plan.md` in
+every phase except the planner's.
 
 The snapshot is a post-hoc state check, not a sandbox: `cargo` and `scripts/*` are allowed, so an agent
 can run arbitrary code. See "Limits".
@@ -128,8 +131,13 @@ agent rules after the global ones and the last matching rule wins, so a repeated
 override the global allows for `git diff`, `rg` and `grep` and hang a headless reviewer.
 
 Claude Code readonly phases get a per-phase `--allowedTools` grant: the only file-edit grant is
-`Edit(/.factory/runs/<run id>/**)`. The driver launches Claude with the repository root as working
-directory, which is what anchors that path.
+`Edit(/.factory/runs/<run id>/<artifact file>)`: the one file the phase writes, so `state`, the
+snapshots and the other run files are not agent-writable. The driver launches Claude with the repository root as working
+directory, which is what anchors that path. The bash grants are split: every role gets the common,
+read-only set (`docs/factory/meta/claude-allow-common.txt`), the implementer also the mutating git
+commands (`claude-allow-code.txt`), and nobody but the driver or the interactive command gets
+fetch, branch creation or `gh pr create` (`claude-allow-orchestrator.txt`). `.claude/settings.json`
+allows only the common set, because `dontAsk` honours project allow rules in every phase.
 
 ## Hooks
 
