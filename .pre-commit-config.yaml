@@ -24,6 +24,14 @@ repos:
         files: \.(rs|toml)$
         pass_filenames: false
 
+      # Shell scripts are linted with the system `shellcheck`; CI installs it in the `lint` job.
+      # The pattern also covers extension-less hook scripts under `.githooks/`.
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        files: \.sh$|^\.githooks/
+
       # Prettier is not vendored: the version is pinned here so formatting
       # cannot drift between machines. Markdown is included because `docs/`,
       # `AGENTS.md` and `README.md` are kept prettier-clean; the hook checks
