@@ -142,6 +142,10 @@ fn config_for(
         pairing_pending_text: None,
         code_formats: formats,
         code_out_channels: vec![CodeOutChannel::Display],
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     }
 }
 

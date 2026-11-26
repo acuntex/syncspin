@@ -86,6 +86,8 @@ use crate::pairing::{
 use crate::pairing::{Candidates, MatchedPsk, PairingAttempt, PairingPsk, METHOD_PAIRING_PSK};
 #[cfg(feature = "player")]
 use crate::playout::{Dropped, OwnedFrame, PlayoutQueue, BUFFER_CAPACITY};
+#[cfg(feature = "artwork")]
+use crate::roles::artwork::{Artwork, Change};
 #[cfg(feature = "metadata")]
 use crate::roles::sched::Pending;
 #[cfg(feature = "controller")]
@@ -94,10 +96,14 @@ use crate::roles::CONTROLLER_ROLE;
 use crate::roles::METADATA_ROLE;
 #[cfg(feature = "player")]
 use crate::roles::PLAYER_ROLE;
-use crate::roles::{role_changes, supported_roles};
+use crate::roles::{role_changes, supported_roles, Offer};
+#[cfg(feature = "artwork")]
+use crate::roles::{ARTWORK_ROLE, ARTWORK_STREAM_ROLE};
 #[cfg(feature = "player")]
 use crate::sink::{AudioFormat, AudioFrame, Codec, Sink};
 use crate::storage::persist_pairing;
+#[cfg(feature = "artwork")]
+use syncspin_core::messages::{ArtworkMessage, StreamStartArtwork};
 
 /// How long the Noise handshake may take, from `client/init` to the first `server/activate`.
 ///
@@ -625,6 +631,9 @@ enum MessageKind {
     /// A player audio chunk under `AUDIO_CHUNK_ID`.
     #[cfg(feature = "player")]
     Audio,
+    /// An artwork image message, under an id from 8 to 11.
+    #[cfg(feature = "artwork")]
+    Artwork,
     /// A message id this revision does not implement.
     Unknown,
 }
@@ -636,6 +645,8 @@ impl MessageKind {
             BINARY_MESSAGE_ID_JSON => MessageKind::Control,
             #[cfg(feature = "player")]
             AUDIO_CHUNK_ID => MessageKind::Audio,
+            #[cfg(feature = "artwork")]
+            id if ArtworkMessage::is_artwork_id(id) => MessageKind::Artwork,
             _ => MessageKind::Unknown,
         }
     }
@@ -766,6 +777,9 @@ pub(crate) struct Session<'a> {
     /// The scheduled metadata update, if one is waiting for its server timestamp.
     #[cfg(feature = "metadata")]
     track: Pending<Event>,
+    /// The artwork role's images, schedule and transfer in flight.
+    #[cfg(feature = "artwork")]
+    artwork: Artwork,
     /// Where the server-minus-local clock offset is published for the control handles.
     #[cfg(feature = "metadata")]
     server_clock: &'a watch::Sender<Option<i64>>,
@@ -864,7 +878,7 @@ pub(crate) async fn attempt(
                 &candidates,
                 &carried.active_roles,
                 &carried.unpaired_access,
-                carried.has_sink(),
+                Offer::new(carried.has_sink(), config),
             ),
         ) => result,
         // The host closed while the handshake was running. There is no session to say goodbye on
@@ -983,6 +997,8 @@ pub(crate) async fn attempt(
         controller_commands: None,
         #[cfg(feature = "metadata")]
         track: Pending::new(),
+        #[cfg(feature = "artwork")]
+        artwork: Artwork::new(&config.artwork_channels, config.max_artwork_bytes),
         #[cfg(feature = "metadata")]
         server_clock,
         playback: PlaybackState::default(),
@@ -1116,9 +1132,9 @@ impl Session<'_> {
 
             // The control receiver outlives individual handles: dropping the last one disables the
             // branch instead of ending the session.
-            #[cfg(feature = "metadata")]
+            #[cfg(any(feature = "metadata", feature = "artwork"))]
             let role_deadline = self.role_deadline();
-            #[cfg(not(feature = "metadata"))]
+            #[cfg(not(any(feature = "metadata", feature = "artwork")))]
             let role_deadline: Option<Instant> = None;
             let control = &mut self.control;
             #[cfg(feature = "player")]
@@ -1222,9 +1238,9 @@ impl Session<'_> {
                 // the three timers above are never armed.
                 #[cfg(not(feature = "player"))]
                 Wakeup::Playout | Wakeup::LateFlush | Wakeup::OutputDelayPoll => {}
-                #[cfg(feature = "metadata")]
+                #[cfg(any(feature = "metadata", feature = "artwork"))]
                 Wakeup::RoleSchedule => self.fire_scheduled(),
-                #[cfg(not(feature = "metadata"))]
+                #[cfg(not(any(feature = "metadata", feature = "artwork")))]
                 Wakeup::RoleSchedule => {}
                 Wakeup::Clock => {
                     if self.rehandshake.is_some() {
@@ -1454,6 +1470,8 @@ impl Session<'_> {
             #[cfg(feature = "player")]
             MessageKind::Audio => self.handle_audio(&body, arrival_us).await,
             // A message id belongs to a role this client does not implement.
+            #[cfg(feature = "artwork")]
+            MessageKind::Artwork => self.handle_artwork(id, &body),
             MessageKind::Unknown => Ok(()),
         }
     }
@@ -1524,12 +1542,31 @@ impl Session<'_> {
             Incoming::GroupUpdate(update) => self.handle_group_update(update),
             #[cfg(feature = "player")]
             Incoming::ServerCommand(command) => self.handle_command(command).await,
-            #[cfg(feature = "player")]
-            Incoming::StreamStart(start) => self.handle_stream_start(start).await,
-            #[cfg(feature = "player")]
-            Incoming::StreamEnd(end) if !affects_player(end.roles.as_deref()) => Ok(()),
-            #[cfg(feature = "player")]
-            Incoming::StreamEnd(_) => self.stop_stream(StreamEndReason::End),
+            #[cfg(any(feature = "player", feature = "artwork"))]
+            Incoming::StreamStart(start) => {
+                // The artwork object is handled first and leaves the player path alone: a
+                // `stream/start` with only an artwork object does not touch an open player stream.
+                #[cfg(feature = "artwork")]
+                self.artwork_stream_start(start.artwork.as_ref());
+                #[cfg(feature = "player")]
+                return self.handle_stream_start(start).await;
+                #[cfg(not(feature = "player"))]
+                Ok(())
+            }
+            #[cfg(any(feature = "player", feature = "artwork"))]
+            Incoming::StreamEnd(end) => {
+                #[cfg(feature = "artwork")]
+                if names_role(end.roles.as_deref(), ARTWORK_STREAM_ROLE, ARTWORK_ROLE) {
+                    self.artwork_stream_end();
+                }
+                #[cfg(feature = "player")]
+                if affects_player(end.roles.as_deref()) {
+                    return self.stop_stream(StreamEndReason::End);
+                }
+                Ok(())
+            }
+            // A `stream/clear` without roles clears the player (and the visualizer), never artwork,
+            // and one that names artwork explicitly is ignored: artwork has no buffer to clear.
             #[cfg(feature = "player")]
             Incoming::StreamClear(clear) if !affects_player(clear.roles.as_deref()) => Ok(()),
             #[cfg(feature = "player")]
@@ -1657,7 +1694,7 @@ impl Session<'_> {
         if let Some(refusal) = admit_activation(
             self.matched,
             unpaired_access,
-            self.has_sink(),
+            Offer::new(self.has_sink(), self.config),
             pairing_admissible,
             &activate,
         )
@@ -1704,7 +1741,7 @@ impl Session<'_> {
             self.active_roles = roles;
         }
         let has_player = self.player_active();
-        let (_added, removed) = role_changes(&previous_roles, &self.active_roles);
+        let (added, removed) = role_changes(&previous_roles, &self.active_roles);
 
         if had_player && !has_player {
             // The player role is gone: nothing that is still buffered may become audible.
@@ -1725,6 +1762,14 @@ impl Session<'_> {
 
         // The player's stream ended above, so its event precedes the other roles' clears.
         self.reconcile_removed(&removed);
+        // A role that defines a state object must report it when it becomes active, and the server
+        // sends none of its data before. The first report of a connection goes out below.
+        #[cfg(feature = "artwork")]
+        if self.state_sent && added.iter().any(|role| role == ARTWORK_ROLE) {
+            self.send_client_state().await?;
+        }
+        #[cfg(not(feature = "artwork"))]
+        let _ = added;
 
         // Only the player waits for the clock before its first `client/state`: a client that has
         // roles but no player owes the initial report as soon as the activation names them.
@@ -2390,10 +2435,18 @@ impl Session<'_> {
         let player = self.player_state();
         #[cfg(not(feature = "player"))]
         let player = None;
+        #[cfg(feature = "artwork")]
+        let artwork =
+            self.role_active(ARTWORK_ROLE)
+                .then(|| syncspin_core::messages::ArtworkState {
+                    channels: self.artwork.state_channels(),
+                });
+        #[cfg(not(feature = "artwork"))]
+        let artwork = None;
         let state = Incoming::ClientState(ClientState {
             available: true,
             player,
-            artwork: None,
+            artwork,
         });
         self.send_json(&state).await
     }
@@ -2901,6 +2954,68 @@ impl Session<'_> {
         self.config.required_lead_time_ms.max(pre_port_ms)
     }
 
+    /// Handles the artwork object of a `stream/start`.
+    ///
+    /// An object for an inactive role is ignored, and so is one that does not match the channels this
+    /// client declared: the specification requires the match, so a mismatch is the server's mistake
+    /// and the client keeps its state.
+    #[cfg(feature = "artwork")]
+    fn artwork_stream_start(&mut self, start: Option<&StreamStartArtwork>) {
+        let Some(start) = start else {
+            return;
+        };
+        if !self.role_active(ARTWORK_ROLE) {
+            return;
+        }
+        if !self.artwork.stream_start(&start.channels) {
+            eprintln!("ignoring an artwork stream/start that does not match the declared channels");
+        }
+    }
+
+    /// Ends the artwork stream: every channel is cleared and reported.
+    #[cfg(feature = "artwork")]
+    fn artwork_stream_end(&mut self) {
+        let changes = self.artwork.stream_end();
+        self.emit_artwork(changes);
+    }
+
+    /// Reports what the artwork machine says changed.
+    #[cfg(feature = "artwork")]
+    fn emit_artwork(&self, changes: Vec<Change>) {
+        for change in changes {
+            self.emit(match change {
+                Change::Show(channel, image) => Event::Artwork {
+                    channel,
+                    image: Some(image),
+                },
+                Change::Clear(channel) => Event::Artwork {
+                    channel,
+                    image: None,
+                },
+            });
+        }
+    }
+
+    /// Handles one binary artwork message.
+    ///
+    /// The message-level checks run whenever this build has the role, whether or not it is active:
+    /// the specification keeps a recognised id recognised, so a malformed message closes the
+    /// connection either way. Well-formed data outside an active artwork stream is discarded with no
+    /// state change.
+    #[cfg(feature = "artwork")]
+    fn handle_artwork(&mut self, id: u8, body: &[u8]) -> Result<()> {
+        let mut message = Vec::with_capacity(body.len() + 1);
+        message.push(id);
+        message.extend_from_slice(body);
+        let parsed = ArtworkMessage::parse(&message)?;
+        if !self.role_active(ARTWORK_ROLE) || !self.artwork.stream_active() {
+            return Ok(());
+        }
+        let changes = self.artwork.handle(parsed, &self.clock, now_us())?;
+        self.emit_artwork(changes);
+        Ok(())
+    }
+
     /// Drops the state of every role that is no longer active.
     ///
     /// Role removal happens through an explicit new set, through the implicit clear when an
@@ -2926,7 +3041,11 @@ impl Session<'_> {
                 self.track.clear();
                 self.emit(Event::TrackCleared);
             }
-            #[cfg(not(any(feature = "controller", feature = "metadata")))]
+            #[cfg(feature = "artwork")]
+            if role == ARTWORK_ROLE {
+                self.artwork_stream_end();
+            }
+            #[cfg(not(any(feature = "controller", feature = "metadata", feature = "artwork")))]
             let _ = role;
         }
     }
@@ -2973,17 +3092,37 @@ impl Session<'_> {
     /// The local instant the next scheduled role state is due, from the current clock estimate.
     ///
     /// Recomputed on every loop iteration, because the filter resynchronises and may step.
-    #[cfg(feature = "metadata")]
+    #[cfg(any(feature = "metadata", feature = "artwork"))]
     fn role_deadline(&self) -> Option<Instant> {
-        self.track
-            .next_deadline(&self.clock, now_us(), Instant::now())
+        let local_now_us = now_us();
+        let now = Instant::now();
+        #[cfg(feature = "metadata")]
+        let deadline = self.track.next_deadline(&self.clock, local_now_us, now);
+        #[cfg(not(feature = "metadata"))]
+        let deadline: Option<Instant> = None;
+        #[cfg(feature = "artwork")]
+        let deadline = [
+            deadline,
+            self.artwork.next_deadline(&self.clock, local_now_us, now),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        deadline
     }
 
     /// Delivers the scheduled role states whose moment has been reached.
-    #[cfg(feature = "metadata")]
+    #[cfg(any(feature = "metadata", feature = "artwork"))]
     fn fire_scheduled(&mut self) {
-        if let Some(event) = self.track.fire_due(&self.clock, now_us()) {
+        let local_now_us = now_us();
+        #[cfg(feature = "metadata")]
+        if let Some(event) = self.track.fire_due(&self.clock, local_now_us) {
             self.emit(event);
+        }
+        #[cfg(feature = "artwork")]
+        {
+            let changes = self.artwork.fire_due(&self.clock, local_now_us);
+            self.emit_artwork(changes);
         }
     }
 
@@ -3428,7 +3567,12 @@ impl Session<'_> {
     }
 
     /// Whether a versioned role is active for this connection.
-    #[cfg(any(feature = "player", feature = "controller", feature = "metadata"))]
+    #[cfg(any(
+        feature = "player",
+        feature = "controller",
+        feature = "metadata",
+        feature = "artwork"
+    ))]
     fn role_active(&self, role: &str) -> bool {
         self.active_roles.iter().any(|active| active == role)
     }
@@ -3467,6 +3611,10 @@ impl Session<'_> {
     fn needs_clock(&self) -> bool {
         #[cfg(feature = "metadata")]
         if self.role_active(METADATA_ROLE) {
+            return true;
+        }
+        #[cfg(feature = "artwork")]
+        if self.role_active(ARTWORK_ROLE) {
             return true;
         }
         self.player_active()
@@ -3553,7 +3701,7 @@ async fn handshake(
     candidates: &Candidates,
     previous_roles: &[String],
     unpaired_access: &AtomicBool,
-    sink: bool,
+    offer: Offer,
 ) -> Result<Ready, HandshakeError> {
     // 1. client/init. Its exact bytes are the first half of the Noise prologue.
     let client_init = Incoming::ClientInit(ClientInit {
@@ -3633,7 +3781,7 @@ async fn handshake(
     }
 
     // 6. client/hello.
-    let hello = client_hello(config, unpaired_access, sink);
+    let hello = client_hello(config, unpaired_access, offer);
     let ciphertext = encrypt_json(&mut noise, &hello)?;
     transport.send_binary(ciphertext).await?;
 
@@ -3685,7 +3833,7 @@ pub(crate) async fn reject_concurrent(
     pairing_psk: Option<PairingPsk>,
     previous_roles: &[String],
     unpaired_access: &AtomicBool,
-    sink: bool,
+    offer: Offer,
 ) -> Result<()> {
     let candidates = Candidates::load(config.storage.as_deref(), &[], pairing_psk)?;
     let mut ready = match handshake(
@@ -3694,7 +3842,7 @@ pub(crate) async fn reject_concurrent(
         &candidates,
         previous_roles,
         unpaired_access,
-        sink,
+        offer,
     )
     .await
     {
@@ -3727,9 +3875,9 @@ pub(crate) async fn reject_concurrent(
 /// is what advertises the value a host may have changed while no session was live. `sink` says
 /// whether the client has an audio output: the player role and its support object are announced
 /// exactly then.
-fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool, sink: bool) -> Incoming {
+fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool, offer: Offer) -> Incoming {
     #[cfg(feature = "player")]
-    let player_support = sink.then(|| {
+    let player_support = offer.sink.then(|| {
         let codec = match config.audio_mode {
             AudioMode::Decode => "pcm",
             AudioMode::Passthrough => "flac",
@@ -3754,7 +3902,7 @@ fn client_hello(config: &ClientConfig, unpaired_access: &AtomicBool, sink: bool)
             software_version: info.software_version.clone(),
             mac_address: info.mac_address.clone(),
         }),
-        supported_roles: supported_roles(sink)
+        supported_roles: supported_roles(offer)
             .into_iter()
             .map(str::to_owned)
             .collect(),
@@ -4003,7 +4151,7 @@ pub(crate) fn playback_capable_for(
 fn activation_admissible(
     matched: MatchedPsk,
     unpaired_access: bool,
-    sink: bool,
+    offer: Offer,
     activate: &ServerActivate,
 ) -> bool {
     let paired = is_paired(matched);
@@ -4012,7 +4160,7 @@ fn activation_admissible(
         return false;
     }
     let roles = activate.active_roles.as_deref().unwrap_or_default();
-    let supported = supported_roles(sink);
+    let supported = supported_roles(offer);
     if !roles.iter().all(|role| supported.contains(&role.as_str())) {
         return false;
     }
@@ -4034,11 +4182,11 @@ fn activation_admissible(
 pub(crate) fn admit_activation(
     matched: MatchedPsk,
     unpaired_access: bool,
-    sink: bool,
+    offer: Offer,
     pairing_admissible: bool,
     activate: &ServerActivate,
 ) -> Admitted {
-    if activation_admissible(matched, unpaired_access, sink, activate) {
+    if activation_admissible(matched, unpaired_access, offer, activate) {
         return Admitted::Admissible;
     }
     // Rule 1: unpaired access is off, and turning it on would have admitted this activation -
@@ -4046,7 +4194,7 @@ pub(crate) fn admit_activation(
     if !unpaired_access
         && !is_paired(matched)
         && pairing_admissible
-        && activation_admissible(matched, true, sink, activate)
+        && activation_admissible(matched, true, offer, activate)
     {
         return Admitted::PairingRequired;
     }
@@ -4080,7 +4228,7 @@ fn admits_pairing(activate: &ServerActivate) -> Result<Option<PairingActivation>
 /// role names in these messages as bare `'player'`, `'artwork'` and `'visualizer'`, while
 /// `server/activate` uses the versioned form (`player@v1`). Both spellings are accepted for every
 /// family so a server that reuses the versioned identifier is not silently ignored.
-#[cfg(feature = "player")]
+#[cfg(any(feature = "player", feature = "artwork"))]
 fn names_role(roles: Option<&[String]>, family: &str, versioned: &str) -> bool {
     match roles {
         None => true,
@@ -4606,6 +4754,10 @@ mod tests {
             code_formats: Vec::new(),
             #[cfg(feature = "pairing-code")]
             code_out_channels: Vec::new(),
+            #[cfg(feature = "artwork")]
+            artwork_channels: Vec::new(),
+            #[cfg(feature = "artwork")]
+            max_artwork_bytes: crate::DEFAULT_MAX_ARTWORK_BYTES,
         }
     }
 
@@ -4686,6 +4838,8 @@ mod tests {
             controller_commands: None,
             #[cfg(feature = "metadata")]
             track: Pending::new(),
+            #[cfg(feature = "artwork")]
+            artwork: Artwork::new(&config.artwork_channels, config.max_artwork_bytes),
             #[cfg(feature = "metadata")]
             server_clock,
             playback: PlaybackState::default(),
@@ -4991,7 +5145,7 @@ mod tests {
         );
         for unpaired_access in [true, false] {
             assert_eq!(
-                admit_activation(LONG_TERM, unpaired_access, true, true, &activate),
+                admit_activation(LONG_TERM, unpaired_access, Offer::SINK, true, &activate),
                 Admitted::Admissible
             );
         }
@@ -5000,7 +5154,13 @@ mod tests {
     #[test]
     fn a_paired_session_may_not_declare_the_pairing_activity() {
         assert_eq!(
-            admit_activation(LONG_TERM, true, true, true, &activation(&["pairing"], None)),
+            admit_activation(
+                LONG_TERM,
+                true,
+                Offer::SINK,
+                true,
+                &activation(&["pairing"], None)
+            ),
             Admitted::Unauthorized,
             "a connection keyed by a long-term PSK has nothing left to pair"
         );
@@ -5012,7 +5172,7 @@ mod tests {
             admit_activation(
                 LONG_TERM,
                 true,
-                true,
+                Offer::SINK,
                 true,
                 &activation(&["playback", "kiosk"], None)
             ),
@@ -5026,7 +5186,7 @@ mod tests {
             admit_activation(
                 LONG_TERM,
                 true,
-                true,
+                Offer::SINK,
                 true,
                 &activation(&["playback", "playback"], None)
             ),
@@ -5041,7 +5201,7 @@ mod tests {
         for matched in [MatchedPsk::Sentinel, MatchedPsk::PairingPsk, LONG_TERM] {
             for unpaired_access in [true, false] {
                 assert_eq!(
-                    admit_activation(matched, unpaired_access, true, true, &activate),
+                    admit_activation(matched, unpaired_access, Offer::SINK, true, &activate),
                     Admitted::Admissible,
                     "{matched:?} with unpaired access {unpaired_access}"
                 );
@@ -5055,7 +5215,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
-                true,
+                Offer::SINK,
                 true,
                 &activation(&["pairing"], None)
             ),
@@ -5070,7 +5230,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
-                true,
+                Offer::SINK,
                 true,
                 &activation(&["playback"], Some(&["player@v1"]))
             ),
@@ -5084,7 +5244,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
-                true,
+                Offer::SINK,
                 true,
                 &activation(&[], Some(&["player@v1"]))
             ),
@@ -5099,7 +5259,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 false,
-                true,
+                Offer::SINK,
                 true,
                 &activation(&["playback"], Some(&["source@v1"]))
             ),
@@ -5114,7 +5274,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::PairingPsk,
                 false,
-                true,
+                Offer::SINK,
                 true,
                 &activation(&["playback"], Some(&["player@v1"]))
             ),
@@ -5136,12 +5296,12 @@ mod tests {
             }),
         };
         assert_eq!(
-            admit_activation(MatchedPsk::Sentinel, false, true, true, &activate),
+            admit_activation(MatchedPsk::Sentinel, false, Offer::SINK, true, &activate),
             Admitted::PairingRequired,
             "with the method assumed acceptable, enabling unpaired access admits the activation"
         );
         assert_eq!(
-            admit_activation(MatchedPsk::Sentinel, false, true, false, &activate),
+            admit_activation(MatchedPsk::Sentinel, false, Offer::SINK, false, &activate),
             Admitted::Unauthorized,
             "the wrong method keeps the activation refused whatever the setting"
         );
@@ -5153,7 +5313,7 @@ mod tests {
             admit_activation(
                 MatchedPsk::Sentinel,
                 true,
-                true,
+                Offer::SINK,
                 true,
                 &activation(&[], Some(&["player@v1"]))
             ),
@@ -5167,7 +5327,7 @@ mod tests {
             admit_activation(
                 LONG_TERM,
                 false,
-                true,
+                Offer::SINK,
                 true,
                 &activation(&[], Some(&["player@v1"]))
             ),

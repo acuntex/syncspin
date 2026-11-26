@@ -22,7 +22,11 @@ case "$mode" in
 esac
 
 # Sets of role features. An empty entry is `--no-default-features` alone.
-role_sets=("" "player" "controller" "metadata" "player,controller" "player,metadata" "controller,metadata")
+role_sets=("" "player" "controller" "metadata" "artwork" "player,controller" "player,metadata" "controller,metadata" "metadata,artwork")
+
+# Sets that add an optional role to the default roles, so the tests that need a sink and the artwork
+# role together (`roles_artwork`) run.
+default_plus=("artwork")
 
 # Sets that combine the other features with no role or a single one. They are compiled and linted;
 # the headless advertisement path runs for `discovery,metadata`. `pairing-code` also forwards to
@@ -51,6 +55,12 @@ run_test() {
   RUSTDOCFLAGS="-D warnings" step cargo doc -p syncspin-client --no-deps $(flags "$set") --locked
 }
 
+run_default_plus() {
+  local set="$1"
+  step cargo test -p syncspin-client --features "$set" --locked
+  RUSTDOCFLAGS="-D warnings" step cargo doc -p syncspin-client --no-deps --features "$set" --locked
+}
+
 run_check() {
   local set="$1"
   # shellcheck disable=SC2046
@@ -65,12 +75,16 @@ run_lint() {
 
 if [ "$mode" != lint ]; then
   for set in "${role_sets[@]}"; do run_test "$set"; done
+  for set in "${default_plus[@]}"; do run_default_plus "$set"; done
   for set in "${build_sets[@]}"; do run_check "$set"; done
   for set in "${test_sets[@]}"; do run_test "$set"; done
 fi
 
 if [ "$mode" != test ]; then
   for set in "${role_sets[@]}" "${build_sets[@]}" "${test_sets[@]}"; do run_lint "$set"; done
+  for set in "${default_plus[@]}"; do
+    step cargo clippy -p syncspin-client --all-targets --features "$set" --locked -- -D warnings
+  done
 fi
 
 printf '\ncheck-roles: all sets passed\n'

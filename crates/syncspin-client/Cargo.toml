@@ -22,6 +22,9 @@ default = ["player", "controller", "metadata"]
 player = []
 controller = []
 metadata = []
+# Artwork images the server pushes for the channels the host configures, off by default: it holds
+# images in memory, bounded by `ClientConfig::max_artwork_bytes`.
+artwork = []
 # The optional JSON file backend for pairing records. Off by default so a build that does not ask
 # for it does no file I/O: records belong to the host, which implements `Storage` itself.
 storage-file = []

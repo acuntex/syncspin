@@ -442,6 +442,19 @@ pub enum Event {
     /// saying that whatever track the host displays no longer has a source.
     #[cfg(feature = "metadata")]
     TrackCleared,
+    /// An artwork channel shows a new image, or no image any more.
+    ///
+    /// `image` is `None` when the channel was cleared: the server sent an empty image, the artwork
+    /// stream ended, or the role was removed. Delivered at the image's server timestamp, like
+    /// `Event::Track`. The bytes are the encoded image exactly as the server sent them; `Debug`
+    /// prints only the format and the length.
+    #[cfg(feature = "artwork")]
+    Artwork {
+        /// Channel number, 0-3.
+        channel: u8,
+        /// The image, or `None` for a cleared channel.
+        image: Option<crate::ArtworkImage>,
+    },
     /// The server's view of playback state changed.
     State(PlaybackState),
     /// The server sent a `group_id` the spec does not allow, and the client accepted it.
@@ -630,6 +643,12 @@ impl fmt::Debug for Event {
                 .debug_struct("LateAudio")
                 .field("late_by", late_by)
                 .field("dropped", dropped)
+                .finish(),
+            #[cfg(feature = "artwork")]
+            Self::Artwork { channel, image } => formatter
+                .debug_struct("Artwork")
+                .field("channel", channel)
+                .field("image", image)
                 .finish(),
             #[cfg(feature = "metadata")]
             Self::TrackCleared => formatter.write_str("TrackCleared"),
@@ -1479,7 +1498,7 @@ async fn start(
     let has_sink = sink.is_some();
     #[cfg(not(feature = "player"))]
     let has_sink = false;
-    ensure_roles(has_sink)?;
+    ensure_roles(crate::roles::Offer::new(has_sink, &config))?;
     // connection.md, _Server Initiated Connections_: "Clients MUST NOT manually connect to servers
     // while advertising `_sendspin._tcp`." A client uses one of the two methods at a time, so a
     // configuration that advertises is refused here rather than connected on the side.
@@ -2050,6 +2069,10 @@ mod tests {
                 code_formats: Vec::new(),
                 #[cfg(feature = "pairing-code")]
                 code_out_channels: Vec::new(),
+                #[cfg(feature = "artwork")]
+                artwork_channels: Vec::new(),
+                #[cfg(feature = "artwork")]
+                max_artwork_bytes: crate::DEFAULT_MAX_ARTWORK_BYTES,
             },
             psks: Vec::new(),
             pairing: None,

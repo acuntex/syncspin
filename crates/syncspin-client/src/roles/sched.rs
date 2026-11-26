@@ -1,6 +1,6 @@
 //! Scheduling of role state that carries a server timestamp.
 //!
-//! Metadata (and later artwork and color) arrives stamped with the server time at which it takes
+//! Metadata and artwork arrive stamped with the server time at which it takes
 //! effect. A stamp in the past or present applies at once; a stamp in the future is held until its
 //! moment, and a newer one replaces the held one instead of queueing behind it. The held value keeps
 //! the **server** timestamp, never a local deadline: the clock filter resynchronises every few

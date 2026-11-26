@@ -260,8 +260,10 @@ it found and passes one URL to `connect`, which the spec leaves implementation-d
   the content and writes the frames; the crate owns the connection, clock, group and wire.
 - **Several groups.** One group per server. An unavailable member stays in it and simply receives no
   audio; there is no solo group and no `switch` command cycle.
-- **Roles.** Only `player@v1`, `controller@v1` and `metadata@v1`. There are no other role versions
-  and no `artwork`, `visualizer`, `color` or `source` role.
+- **Roles.** `player@v1`, `controller@v1` and `metadata@v1`, and `artwork@v1` in a client built with
+  the `artwork` feature. There are no other role versions and no `visualizer`, `color` or `source`
+  role. Artwork channels are configured when the client starts; there is no call to change them on a
+  live connection, and the server crate does not serve artwork.
 - **Discovery persistence.** Both crates browse and advertise, but the client does not persist the
   server it last admitted with `playback`, and the server keeps operator approval for its lifetime
   only. A restart asks the operator again.
@@ -336,6 +338,7 @@ The client crate has cargo features for the roles it takes part in:
 | `player`     | on      | `Sink`, the playout queue, `connect`, the volume and mute controls and stream events |
 | `controller` | on      | the transport and seek controls and the group's controller state                     |
 | `metadata`   | on      | the now-playing track                                                                |
+| `artwork`    | off     | artwork images for the channels the host configures (`ClientConfig::artwork_channels`) |
 
 A consumer with `default-features = false` gets none of them and has to name the roles it wants; a
 build with no role at all has nothing to offer, so `connect_headless` and `advertise_headless` return

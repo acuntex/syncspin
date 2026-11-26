@@ -122,6 +122,8 @@ pub use client::{
 };
 #[cfg(feature = "player")]
 pub use client::{connect, connect_with_psks};
+#[cfg(feature = "artwork")]
+pub use config::{ArtworkChannel, ArtworkSource, ImageFormat, DEFAULT_MAX_ARTWORK_BYTES};
 pub use config::{
     AudioMode, ClientConfig, DeviceInfo, PskCategory, StoredPsk, VolumePolicy, DEFAULT_MAX_BACKOFF,
     MAX_PLAYER_NAME_LEN,
@@ -141,6 +143,8 @@ pub use discovery::{
     discover_reachable_endpoint, discover_servers, reachable_endpoint, DiscoveredServer, Discovery,
     ServiceAdvertisement, CLIENT_SERVICE_TYPE, DEFAULT_SENDSPIN_PATH, SERVER_SERVICE_TYPE,
 };
+#[cfg(feature = "artwork")]
+pub use roles::artwork::ArtworkImage;
 #[cfg(feature = "player")]
 pub use sink::{AudioFormat, AudioFrame, Codec, Sink};
 

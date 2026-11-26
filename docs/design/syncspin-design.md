@@ -18,7 +18,7 @@ works today" and "What does not work yet", and
 handshake at either end, roles, the three pairing methods with their storage, the listener and its
 approval gate, one group with one stream, and discovery in both directions. So the pairing flows,
 the server half and bidirectional discovery below describe shipped code, not a plan. Still missing
-are several groups per server, role versions beyond `@v1`, the `artwork`, `visualizer`, `color` and
+are several groups per server, role versions beyond `@v1`, the `visualizer`, `color` and
 `source` roles, the `flac`, `opus` and `wss` features, and a persisted last-playback server; those are
 listed with their reasons in [`docs/spec-deviations.md`](../spec-deviations.md).
 

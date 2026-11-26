@@ -64,13 +64,27 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
         code_out_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     }
 }
 
 /// Connects a sink client and returns the `client/hello` text it sent.
 async fn hello_text() -> String {
     let mut server = FakeServer::start(ServerOptions::default()).await.unwrap();
-    let (_handle, _events) = connect(config_for(&server), Box::new(NullSink))
+    // Zero configured channels means the artwork role is not advertised, so a build with the
+    // feature configures one.
+    let config = config_for(&server);
+    #[cfg(feature = "artwork")]
+    let config = config.with_artwork_channels(vec![Some(syncspin_client::ArtworkChannel {
+        source: syncspin_client::ArtworkSource::Album,
+        format: syncspin_client::ImageFormat::Png,
+        width: 64,
+        height: 64,
+    })]);
+    let (_handle, _events) = connect(config, Box::new(NullSink))
         .await
         .expect("the configuration is valid");
     tokio::time::timeout(Duration::from_secs(8), server.wait_for_client_hello_text())
@@ -87,6 +101,8 @@ fn expected_roles() -> Vec<&'static str> {
     roles.push("controller@v1");
     #[cfg(feature = "metadata")]
     roles.push("metadata@v1");
+    #[cfg(feature = "artwork")]
+    roles.push("artwork@v1");
     roles
 }
 
@@ -101,7 +117,7 @@ async fn the_hello_lists_the_built_roles_in_order() {
     );
 }
 
-#[cfg(all(feature = "controller", feature = "metadata"))]
+#[cfg(all(feature = "controller", feature = "metadata", not(feature = "artwork")))]
 #[test]
 fn the_default_set_is_player_controller_metadata() {
     assert_eq!(

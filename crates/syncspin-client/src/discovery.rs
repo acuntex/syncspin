@@ -477,7 +477,7 @@ mod inbound {
         let has_sink = sink.is_some();
         #[cfg(not(feature = "player"))]
         let has_sink = false;
-        ensure_roles(has_sink)?;
+        ensure_roles(crate::roles::Offer::new(has_sink, &config))?;
         let inbound = config.inbound.clone().ok_or_else(|| {
             anyhow!(
                 "this configuration has no ClientConfig::inbound, so there is nothing to \
@@ -646,7 +646,7 @@ mod inbound {
             // The rejection task runs while the admitted session owns the carried state, so it
             // gets the shared unpaired-access value as a handle of its own.
             let unpaired_access = Arc::clone(&carried.unpaired_access);
-            let has_sink = carried.has_sink();
+            let offer = crate::roles::Offer::new(carried.has_sink(), config);
             let mut rejections = JoinSet::new();
             let mut attempt = Box::pin(session::attempt(
                 transport,
@@ -675,7 +675,7 @@ mod inbound {
                             path.to_owned(),
                             pairing,
                             Arc::clone(&unpaired_access),
-                            has_sink,
+                            offer,
                         ));
                     }
                     joined = rejections.join_next(), if !rejections.is_empty() => {
@@ -735,21 +735,14 @@ mod inbound {
         path: String,
         pairing: Option<PairingPsk>,
         unpaired_access: Arc<AtomicBool>,
-        has_sink: bool,
+        offer: crate::roles::Offer,
     ) {
         let Ok(Some(transport)) = upgrade(stream, &path).await else {
             return;
         };
         let _ = tokio::time::timeout(
             REJECT_TIMEOUT,
-            session::reject_concurrent(
-                transport,
-                &config,
-                pairing,
-                &[],
-                &unpaired_access,
-                has_sink,
-            ),
+            session::reject_concurrent(transport, &config, pairing, &[], &unpaired_access, offer),
         )
         .await;
     }

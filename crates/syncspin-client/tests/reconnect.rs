@@ -136,6 +136,10 @@ fn config_for(server: &FakeServer) -> ClientConfig {
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
         code_out_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     }
 }
 
@@ -316,6 +320,10 @@ async fn an_unreachable_server_is_an_event_and_not_an_error() {
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
         code_out_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(recordings.clone())))
         .await
@@ -596,6 +604,10 @@ async fn the_retry_delay_is_awaited_before_the_next_attempt() {
         code_formats: Vec::new(),
         #[cfg(feature = "pairing-code")]
         code_out_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        artwork_channels: Vec::new(),
+        #[cfg(feature = "artwork")]
+        max_artwork_bytes: syncspin_client::DEFAULT_MAX_ARTWORK_BYTES,
     };
     let (handle, mut events) = connect(config, Box::new(RecordingSink::new(Recordings::default())))
         .await

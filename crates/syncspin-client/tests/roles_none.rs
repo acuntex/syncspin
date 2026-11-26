@@ -3,7 +3,12 @@
 //! `--all-features` never compiles this file, so the per-feature matrix in
 //! `scripts/check-roles.sh` is what runs it.
 
-#![cfg(not(any(feature = "player", feature = "controller", feature = "metadata")))]
+#![cfg(not(any(
+    feature = "player",
+    feature = "controller",
+    feature = "metadata",
+    feature = "artwork"
+)))]
 
 use syncspin_client::{connect_headless, ClientConfig, Identity};
 
