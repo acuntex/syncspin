@@ -94,6 +94,10 @@ here rather than a preference.
   `msrv` CI job is the gate.
 - **Names and licence are fixed:** crates `syncspin-core`, `syncspin-client` and `syncspin-server`;
   licence `MIT OR Apache-2.0`. Renames break downstream consumers and the published crates.
+- **The goal is fewer spec deviations over time.** A deviation is accepted only as a small
+  tolerance that improves stability or compatibility with existing systems such as Music Assistant.
+  Every other deviation is debt to pay down, and a change must not add one when conforming is
+  feasible. A new entry in `docs/spec-deviations.md` carries that justification.
 - **Spec deviations are documented** in `docs/spec-deviations.md` and covered by a test. Where
   Music Assistant and the spec disagree, the spec wins.
 - **A capability claim is checked against the tree, not against memory.** The documents have drifted

@@ -8,6 +8,10 @@ The specification text was read at `Sendspin/spec` commit `2cfe19725e26087801985
 (the head when the role-feature series was written); re-check the role files against the current
 head before relying on a quoted rule.
 
+The long-term goal is to reduce these deviations over time. One is accepted only as a small
+tolerance that improves stability or compatibility with existing systems such as Music Assistant;
+every other one is debt to pay down, and a new entry has to give that justification.
+
 A deviation is only acceptable when it is in this file and, where the behaviour is observable,
 pinned by a test. "Not implemented yet" entries are staged work, not a claim that the deviation is
 harmless.
