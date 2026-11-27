@@ -7,7 +7,7 @@
 #   scripts/test-factory.sh              all sections
 #   scripts/test-factory.sh gate hooks   only the named sections
 #
-# Sections: gate, fixture, hooks, sync, perm, driver, launch, probes, static.
+# Sections: gate, fixture, hooks, sync, perm, driver, launch, timed, probes, static.
 #
 # FACTORY_TEST_SKIP_CLI=1 skips every check that starts a real opencode or claude binary (they only
 # print configuration, never run a model, but a contributor may not want them started).
@@ -19,6 +19,12 @@
 # real pre-commit stamp check.
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE
 unset GATE_ROOT GATE_PRETTIER GATE_PRETTIER_CMD
+# The same child inherits the run's own defaults (models, variants, client, attach URL, credentials):
+# every test sets what it needs, so none of them may leak in from the environment that started the
+# suite.
+unset FACTORY_BACKEND FACTORY_MODEL_MAIN FACTORY_MODEL_HELPER FACTORY_VARIANT_MAIN \
+  FACTORY_VARIANT_HELPER FACTORY_OPENCODE_BIN FACTORY_OPENCODE_ATTACH FACTORY_PASS_ENV \
+  FACTORY_LAUNCH_ENVFILE OPENCODE_SERVER_USERNAME OPENCODE_SERVER_PASSWORD
 
 set -euo pipefail
 
@@ -96,7 +102,28 @@ case "$*" in
 esac
 exit 0
 STUB
-  chmod +x "$bin/cargo" "$bin/rustup"
+  # The deny step's command is `cargo deny check` (the stub cargo runs it); this stub makes the
+  # "cargo-deny is installed" probe deterministic, so only the policy file decides the skip.
+  cat >"$bin/cargo-deny" <<'STUB'
+#!/usr/bin/env bash
+printf 'cargo-deny %s\n' "$*" >>"${STUB_LOG:?}"
+exit 0
+STUB
+  chmod +x "$bin/cargo" "$bin/rustup" "$bin/cargo-deny"
+}
+
+# gate_branch <repo> <path>...: point refs/remotes/origin/main at the current tip, then add the given
+# paths and commit them, so the branch change set of the fixture is exactly those paths. No network.
+gate_branch() {
+  local root=$1 p
+  shift
+  git -C "$root" update-ref refs/remotes/origin/main "$(git -C "$root" rev-parse HEAD)"
+  for p in "$@"; do
+    mkdir -p "$root/$(dirname "$p")"
+    printf 'x\n' >>"$root/$p"
+  done
+  git -C "$root" add -A
+  git -C "$root" commit -q -m "chore: change $*"
 }
 
 stub_script() {
@@ -159,19 +186,29 @@ section_gate() {
   assert "G3 --list shows the step command" has "$gate_out" 'cargo fmt --all -- --check'
   assert "G3 --list wrote no log" test ! -e "$root/target/gate"
 
-  # G4: --commit selects steps by staged paths.
+  # G4: --commit selects steps by the staged paths; an empty index is unknown.
   root=$tmp/g4
   new_repo "$root"
   run_gate "$root" --list --commit
-  assert "G4 nothing staged selects no factory tests" hasnt "$gate_out" '^factory-tests '
-  assert "G4 nothing staged selects no deny" hasnt "$gate_out" '^deny '
+  assert "G4 an empty index is unknown" has "$gate_out" '^paths: unknown \(every step of this mode\)$'
+  assert "G4 an empty index selects no factory tests" has "$gate_out" '^factory-tests '
+  assert "G4 an empty index selects the generator check" has "$gate_out" '^factory-sync '
+  assert "G4 an empty index selects doc-default" has "$gate_out" '^doc-default '
+  for step in fmt clippy example-versions test doc-default shellcheck factory-sync factory-tests prettier deny msrv; do
+    assert "G4 an empty index selects $step" has "$gate_out" "^$step "
+  done
+  for step in roles test-pairing test-lib-defaults test-mdns doc-all arm package secrets; do
+    assert "G4 an empty index does not select $step" hasnt "$gate_out" "^$step "
+  done
   mkdir -p "$root/scripts"
   printf '#!/usr/bin/env bash\n' >"$root/scripts/x.sh"
   git -C "$root" add scripts/x.sh
   run_gate "$root" --list --commit
   assert "G4 staged scripts select factory tests" has "$gate_out" '^factory-tests '
   assert "G4 staged scripts select the generator check" has "$gate_out" '^factory-sync '
+  assert "G4 staged scripts select shellcheck" has "$gate_out" '^shellcheck '
   assert "G4 staged scripts do not select deny" hasnt "$gate_out" '^deny '
+  assert "G4 staged scripts select no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
   git -C "$root" reset -q
   printf 'x\n' >"$root/Cargo.lock"
   git -C "$root" add Cargo.lock
@@ -186,6 +223,252 @@ section_gate() {
   assert "G4 --full lists msrv" has "$gate_out" '^msrv '
   assert "G4 --full lists package" has "$gate_out" '^package '
   assert "G4 --full lists secrets" has "$gate_out" '^secrets '
+
+  # G11: a docs-only branch change set selects no cargo or docs step, but keeps prettier; with
+  # `docs/factory` in the set the factory steps stay.
+  root=$tmp/g11
+  new_repo "$root"
+  gate_branch "$root" docs/notes.md
+  run_gate "$root" --list
+  assert "G11 the docs change set is named" has "$gate_out" '^paths: 1 changed \(branch since origin/main\)$'
+  for step in fmt clippy example-versions test test-pairing test-lib-defaults test-mdns doc-default doc-all arm; do
+    assert "G11 a docs-only change selects no $step" hasnt "$gate_out" "^$step "
+  done
+  assert "G11 a docs-only change keeps prettier" has "$gate_out" '^prettier '
+  gate_branch "$root" docs/factory/notes.md
+  run_gate "$root" --list
+  assert "G11 a factory docs change keeps the generator check" has "$gate_out" '^factory-sync '
+  assert "G11 a factory docs change keeps the factory tests" has "$gate_out" '^factory-tests '
+  assert "G11 a factory docs change selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+
+  # G12: a .gitignore-only change set keeps the factory steps (it can hide files from the generator).
+  root=$tmp/g12
+  new_repo "$root"
+  gate_branch "$root" .gitignore
+  run_gate "$root" --list
+  assert "G12 a .gitignore change keeps the generator check" has "$gate_out" '^factory-sync '
+  assert "G12 a .gitignore change keeps the factory tests" has "$gate_out" '^factory-tests '
+  assert "G12 a .gitignore change selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+
+  # G13: a *.sh-only change set keeps shellcheck and nothing cargo.
+  root=$tmp/g13
+  new_repo "$root"
+  gate_branch "$root" tool.sh
+  run_gate "$root" --list
+  assert "G13 a shell change keeps shellcheck" has "$gate_out" '^shellcheck '
+  for step in fmt clippy example-versions roles test test-pairing test-lib-defaults test-mdns doc-default doc-all arm; do
+    assert "G13 a shell change selects no $step" hasnt "$gate_out" "^$step "
+  done
+
+  # G14: a Rust path selects the cargo steps of the mode.
+  root=$tmp/g14
+  new_repo "$root"
+  mkdir -p "$root/crates/syncspin-client/src"
+  printf 'pub fn x() {}\n' >"$root/crates/syncspin-client/src/lib.rs"
+  git -C "$root" add -A
+  run_gate "$root" --list --commit
+  for step in fmt clippy example-versions test doc-default; do
+    assert "G14 a staged Rust file selects $step" has "$gate_out" "^$step "
+  done
+  assert "G14 a staged Rust file selects no deny" hasnt "$gate_out" '^deny '
+  assert "G14 a staged Rust file selects no msrv" hasnt "$gate_out" '^msrv '
+  gate_branch "$root" crates/syncspin-client/src/main.rs
+  run_gate "$root" --list
+  for step in fmt clippy example-versions roles test test-pairing test-lib-defaults test-mdns doc-default doc-all arm; do
+    assert "G14 a Rust branch change selects $step" has "$gate_out" "^$step "
+  done
+  run_gate "$root" --list --full
+  for step in msrv deny package; do
+    assert "G14 --full on a Rust change selects $step" has "$gate_out" "^$step "
+  done
+
+  # G15: an undeterminable change set selects every step of the mode.
+  root=$tmp/g15
+  new_repo "$root"
+  run_gate "$root" --list
+  assert "G15 a missing origin/main is unknown" has "$gate_out" '^paths: unknown \(every step of this mode\)$'
+  for step in fmt clippy example-versions roles test test-pairing test-lib-defaults test-mdns doc-default doc-all arm shellcheck factory-sync factory-tests prettier; do
+    assert "G15 a missing origin/main selects $step" has "$gate_out" "^$step "
+  done
+  for step in msrv deny package secrets; do
+    assert "G15 standard mode does not select $step" hasnt "$gate_out" "^$step "
+  done
+  gate_branch "$root" notes.txt
+  run_gate "$root" --list
+  assert "G15 a known change set of a non-code file is named" has "$gate_out" '^paths: 1 changed \(branch since origin/main\)$'
+  assert "G15 a non-code change selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+  printf 'pub fn x() {}\n' >"$root/experiment.rs"
+  run_gate "$root" --list
+  assert "G15 an untracked Rust file is in the change set" has "$gate_out" '^paths: 2 changed \(branch since origin/main\)$'
+  assert "G15 an untracked Rust file selects the cargo steps" has "$gate_out" '^fmt '
+  root=$tmp/g15c
+  new_repo "$root"
+  printf 'x\n' >"$root/notes.txt"
+  git -C "$root" add notes.txt
+  run_gate "$root" --list --commit
+  assert "G15 the staged change set is named" has "$gate_out" '^paths: 1 changed \(commit index\)$'
+  assert "G15 a staged text file selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+
+  # G16: --list always prints the change-set line.
+  root=$tmp/g16
+  new_repo "$root"
+  printf 'x\n' >"$root/notes.txt"
+  git -C "$root" add notes.txt
+  run_gate "$root" --list --commit
+  assert "G16 --commit names the commit index" has "$gate_out" '^paths: 1 changed \(commit index\)$'
+  assert "G16 --commit --list prints the step table" has "$gate_out" '^prettier +LOCAL ONLY'
+  run_gate "$root" --list
+  assert "G16 standard names the branch" has "$gate_out" '^paths: .* \((branch since origin/main|every step of this mode)\)$'
+
+  # G17: the deny step skips without its policy file and never fetches the advisory database.
+  root=$tmp/g17
+  new_repo "$root"
+  : >"$tmp/stub.log"
+  run_gate "$root" --commit
+  assert "G17 a missing deny.toml is skipped with its reason" has "$gate_out" '^SKIP +deny +deny.toml not present$'
+  refute "G17 the absent policy never runs cargo deny" grep -q '^deny check' "$tmp/stub.log"
+  printf '# policy\n' >"$root/deny.toml"
+  printf 'x\n' >"$root/Cargo.toml"
+  git -C "$root" add deny.toml Cargo.toml
+  : >"$tmp/stub.log"
+  run_gate "$root" --commit
+  assert "G17 a present policy runs the deny step" has "$gate_out" '^PASS +deny '
+  assert "G17 the deny step calls cargo deny check" grep -q '^deny check$' "$tmp/stub.log"
+
+  # G18: a rename is two paths, and the old one still selects its steps. Without --no-renames the
+  # deletion side is invisible, so a renamed script keeps only prettier.
+  root=$tmp/g18
+  new_repo "$root"
+  mkdir -p "$root/scripts"
+  printf '#!/usr/bin/env bash\n' >"$root/scripts/x.sh"
+  git -C "$root" add scripts/x.sh
+  git -C "$root" commit -q -m "chore: add a script"
+  mkdir -p "$root/docs"
+  git -C "$root" mv scripts/x.sh docs/x.md
+  run_gate "$root" --list --commit
+  assert "G18 a staged script rename names both sides" has "$gate_out" '^paths: 2 changed \(commit index\)$'
+  assert "G18 a renamed script keeps shellcheck" has "$gate_out" '^shellcheck '
+  assert "G18 a renamed script keeps the factory steps" has "$gate_out" '^factory-sync '
+  root=$tmp/g18b
+  new_repo "$root"
+  mkdir -p "$root/crates/x/src"
+  printf 'pub fn x() {}\n' >"$root/crates/x/src/lib.rs"
+  git -C "$root" add crates/x/src/lib.rs
+  git -C "$root" commit -q -m "chore: add a Rust file"
+  git -C "$root" mv crates/x/src/lib.rs notes.md
+  run_gate "$root" --list --commit
+  assert "G18 a staged code rename names both sides" has "$gate_out" '^paths: 2 changed \(commit index\)$'
+  assert "G18 a renamed code file keeps the cargo steps" has "$gate_out" '^fmt '
+
+  # G19: a path outside every class leaves the set unknown, so every step of the mode is selected.
+  root=$tmp/g19
+  new_repo "$root"
+  printf 'all:\n' >"$root/Makefile"
+  git -C "$root" add Makefile
+  run_gate "$root" --list --commit
+  assert "G19 an unlisted path is unknown" has "$gate_out" '^paths: unknown \(every step of this mode\)$'
+  for step in fmt clippy test doc-default shellcheck factory-sync factory-tests deny msrv; do
+    assert "G19 an unlisted path selects $step" has "$gate_out" "^$step "
+  done
+
+  # G20: .github and .mcp.json are factory paths: a known set that keeps the generator and the tests.
+  root=$tmp/g20
+  new_repo "$root"
+  mkdir -p "$root/.github/workflows"
+  printf 'name: x\n' >"$root/.github/workflows/ci.yml"
+  git -C "$root" add .github/workflows/ci.yml
+  run_gate "$root" --list --commit
+  assert "G20 a workflow change is known" has "$gate_out" '^paths: 1 changed \(commit index\)$'
+  assert "G20 a workflow change keeps the generator check" has "$gate_out" '^factory-sync '
+  assert "G20 a workflow change keeps the factory tests" has "$gate_out" '^factory-tests '
+  assert "G20 a workflow change selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+  git -C "$root" reset -q
+  printf '{}\n' >"$root/.mcp.json"
+  git -C "$root" add .mcp.json
+  run_gate "$root" --list --commit
+  assert "G20 .mcp.json keeps the factory steps" has "$gate_out" '^factory-sync '
+
+  # G21: --since selects the per-commit steps for the committed range, and a bogus ref is unknown.
+  root=$tmp/g21
+  new_repo "$root"
+  gate_branch "$root" docs/notes.md
+  run_gate "$root" --since HEAD~1 --list
+  assert "G21 --since names its range" has "$gate_out" '^paths: 1 changed \(range since HEAD~1\)$'
+  assert "G21 a docs range keeps prettier" has "$gate_out" '^prettier '
+  assert "G21 a docs range selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+  gate_branch "$root" crates/syncspin-client/src/lib.rs
+  run_gate "$root" --since HEAD~1 --list
+  for step in fmt clippy example-versions test doc-default; do
+    assert "G21 a Rust range selects $step" has "$gate_out" "^$step "
+  done
+  for step in roles test-pairing test-lib-defaults test-mdns doc-all arm deny msrv package secrets; do
+    assert "G21 a Rust range selects no $step" hasnt "$gate_out" "^$step "
+  done
+  run_gate "$root" --since 0000000000000000000000000000000000000000 --list
+  assert "G21 an unreadable range is unknown" has "$gate_out" '^paths: unknown \(every step of this mode\)$'
+  run_gate "$root" --since HEAD~1 --commit --list
+  assert "G21 --since and --commit are mutually exclusive" test "$gate_rc" = 2
+  run_gate "$root" --since "" --list
+  assert "G21 an empty --since is a usage error" test "$gate_rc" = 2
+  run_gate "$root" --since= --list
+  assert "G21 an empty --since= is a usage error" test "$gate_rc" = 2
+
+  # G22: a deny.toml that was tracked and is now deleted is a failure, not an absent input.
+  root=$tmp/g22
+  new_repo "$root"
+  printf '# policy\n' >"$root/deny.toml"
+  printf 'x\n' >"$root/Cargo.toml"
+  git -C "$root" add deny.toml Cargo.toml
+  git -C "$root" commit -q -m "chore: add a policy"
+  git -C "$root" rm -q deny.toml
+  printf 'y\n' >"$root/Cargo.toml"
+  git -C "$root" add Cargo.toml
+  run_gate "$root" --commit
+  assert "G22 a deleted deny.toml fails the gate" test "$gate_rc" = 1
+  assert "G22 the failure names the deletion" has "$gate_out" '^FAIL +deny +deny.toml was deleted$'
+
+  # A pure deny.toml deletion has no Cargo manifest in the change set: the policy change itself
+  # selects the step, so --commit and the standard mode both fail instead of skipping it.
+  root=$tmp/g22b
+  new_repo "$root"
+  printf '# policy\n' >"$root/deny.toml"
+  git -C "$root" add deny.toml
+  git -C "$root" commit -q -m "chore: add a policy"
+  git -C "$root" update-ref refs/remotes/origin/main "$(git -C "$root" rev-parse HEAD)"
+  git -C "$root" rm -q deny.toml
+  run_gate "$root" --commit
+  assert "G22 a pure deny deletion fails the commit gate" test "$gate_rc" = 1
+  assert "G22 the commit failure names the deletion" has "$gate_out" '^FAIL +deny +deny.toml was deleted$'
+  run_gate "$root" --list
+  assert "G22 the standard change set is known" has "$gate_out" '^paths: 1 changed \(branch since origin/main\)$'
+  assert "G22 the standard mode selects deny for a changed policy" has "$gate_out" '^deny '
+  run_gate "$root"
+  assert "G22 the standard gate fails on the deleted policy" test "$gate_rc" = 1
+  assert "G22 the standard failure names the deletion" has "$gate_out" '^FAIL +deny +deny.toml was deleted$'
+
+  # G23: a tracked script that was deleted fails its step instead of turning it into a SKIP; neither
+  # change set holds a Cargo manifest, so only the script paths decide the selection.
+  root=$tmp/g23
+  new_repo "$root"
+  mkdir -p "$root/scripts"
+  printf '#!/usr/bin/env bash\n' >"$root/scripts/test-factory.sh"
+  git -C "$root" add scripts/test-factory.sh
+  git -C "$root" commit -q -m "chore: add the factory tests"
+  git -C "$root" rm -q scripts/test-factory.sh
+  run_gate "$root" --commit
+  assert "G23 a deleted factory test script fails the gate" test "$gate_rc" = 1
+  assert "G23 the failure names the deleted script" has "$gate_out" '^FAIL +factory-tests +scripts/test-factory\.sh was deleted$'
+  assert "G23 a never-tracked script is still a skip" has "$gate_out" '^SKIP +factory-sync +not present$'
+  root=$tmp/g23b
+  new_repo "$root"
+  mkdir -p "$root/scripts"
+  printf '#!/usr/bin/env bash\n' >"$root/scripts/factory-sync.sh"
+  git -C "$root" add scripts/factory-sync.sh
+  git -C "$root" commit -q -m "chore: add the generator"
+  git -C "$root" rm -q scripts/factory-sync.sh
+  run_gate "$root" --commit
+  assert "G23 a deleted generator script fails the gate" test "$gate_rc" = 1
+  assert "G23 the failure names the deleted generator" has "$gate_out" '^FAIL +factory-sync +scripts/factory-sync\.sh was deleted$'
 
   # G5: a script-backed step with an absent script is SKIP not present, and runs once it exists.
   root=$tmp/g5
@@ -281,6 +564,12 @@ name = "fx"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+# The msrv step's command names these two features; an unknown change set selects it, so the fixture
+# must declare them or that command would be an error.
+[features]
+pairing-code = []
+storage-file = []
 TOML
   cat >"$root/crates/fx/src/lib.rs" <<'RS'
 //! A fixture crate for the gate test.
@@ -324,9 +613,14 @@ section_fixture() {
   assert "fixture --commit PASS fmt" has "$out" '^PASS +fmt '
   assert "fixture --commit PASS clippy" has "$out" '^PASS +clippy '
   assert "fixture --commit PASS test" has "$out" '^PASS +test '
+  assert "fixture --commit PASS doc-default" has "$out" '^PASS +doc-default '
   assert "fixture --commit SKIP example-versions" has "$out" '^SKIP +example-versions +not present'
   assert "fixture --commit SKIP prettier" has "$out" '^SKIP +prettier +disabled'
   assert "fixture --commit SKIP shellcheck" has "$out" '^SKIP +shellcheck +no shell files'
+  assert "fixture --commit SKIP factory-sync" has "$out" '^SKIP +factory-sync +not present'
+  assert "fixture --commit SKIP factory-tests" has "$out" '^SKIP +factory-tests +not present'
+  assert "fixture --commit SKIP deny" has "$out" '^SKIP +deny +deny.toml not present'
+  assert "fixture --commit reports msrv" has "$out" '^(PASS|SKIP) +msrv '
   assert "fixture worktree is clean after --commit" test -z "$(git -C "$root" status --porcelain)"
 
   rc=0
@@ -394,6 +688,77 @@ section_hooks() {
   refute "H2 a tag push is refused" hook_push origin refs/tags/v-test
   assert "H2 the remote branch survived" git -C "$remote" show-ref --verify --quiet refs/heads/factory/x
   refute "H2 the remote has no main" git -C "$remote" show-ref --verify --quiet refs/heads/main
+}
+
+# Timed wrapper (scripts/timed.sh): the only timed form a factory agent may use. The command's exit
+# code passes through, a hit limit is 124/137, the limit itself is validated, and only the factory's
+# deterministic commands are accepted.
+section_timed() {
+  local rc out start end c
+  mkdir -p "$tmp/timed-bin"
+  cat >"$tmp/timed-bin/cargo" <<'STUB'
+#!/usr/bin/env bash
+if [ -n "${STUB_SLEEP:-}" ]; then exec sleep "$STUB_SLEEP"; fi
+exit "${STUB_RC:-0}"
+STUB
+  chmod +x "$tmp/timed-bin/cargo"
+
+  # T1: the command's own exit code.
+  rc=0
+  (cd "$repo" && PATH="$tmp/timed-bin:$PATH" scripts/timed.sh 5 -- cargo test) || rc=$?
+  assert "T1 a quick command exits 0" test "$rc" = 0
+  rc=0
+  (cd "$repo" && STUB_RC=7 PATH="$tmp/timed-bin:$PATH" scripts/timed.sh 5 -- cargo test) || rc=$?
+  assert "T1 the command's own exit code passes through" test "$rc" = 7
+
+  # T2: the limit ends a slow command early.
+  start=$(date +%s)
+  rc=0
+  (cd "$repo" && STUB_SLEEP=5 PATH="$tmp/timed-bin:$PATH" scripts/timed.sh 1 -- cargo test) || rc=$?
+  end=$(date +%s)
+  assert "T2 a command over its limit exits 124" test "$rc" = 124
+  assert "T2 the limit ends the command before it finishes" test "$((end - start))" -lt 5
+
+  # T3: every malformed call is a usage error with the usage line.
+  for c in '5 true' 'x -- true' '0 -- true' '7201 -- true' '5 --'; do
+    rc=0
+    # shellcheck disable=SC2086  # the case is a word list on purpose
+    out=$(cd "$repo" && scripts/timed.sh $c 2>&1) || rc=$?
+    assert "T3 '$c' is a usage error" test "$rc" = 2
+    assert "T3 '$c' prints the usage line" has "$out" '^usage: .*SECONDS -- command'
+  done
+
+  # T4: 7200 is the largest allowed limit (the longest phase budget).
+  rc=0
+  (cd "$repo" && PATH="$tmp/timed-bin:$PATH" scripts/timed.sh 7200 -- cargo test) || rc=$?
+  assert "T4 7200 seconds is accepted" test "$rc" = 0
+
+  # T5: the wrapper refuses a command outside its allowlist before it runs, so `scripts/*` cannot
+  # carry a denied command (a push, a --no-verify commit, a merge, rm) past the permission layer.
+  for c in 'git push origin main' 'git commit --no-verify -m x' 'gh pr merge 1' 'rm x' \
+    'bash -c true' 'timeout 1 true' './scripts/gate.sh --list' '/usr/bin/cargo test' 'scripts/nope.sh' \
+    'scripts/factory-sync.sh' 'scripts/factory-sync.sh --write' 'scripts/factory-sync.sh --check extra'; do
+    rc=0
+    # shellcheck disable=SC2086  # the case is a word list on purpose
+    out=$(cd "$repo" && PATH="$tmp/timed-bin:$PATH" scripts/timed.sh 1 -- $c 2>&1) || rc=$?
+    assert "T5 '$c' is refused" test "$rc" = 2
+    assert "T5 '$c' names the refusal" has "$out" 'refused: .* is not an allowed timed command'
+    assert "T5 '$c' prints the usage line" has "$out" '^usage: '
+  done
+  # The allowlist still accepts the two commands the templates name.
+  rc=0
+  (cd "$repo" && PATH="$tmp/timed-bin:$PATH" scripts/timed.sh 5 -- cargo test) || rc=$?
+  assert "T5 cargo is allowed" test "$rc" = 0
+  rc=0
+  (cd "$repo" && scripts/timed.sh 5 -- scripts/gate.sh --list >/dev/null) || rc=$?
+  assert "T5 scripts/gate.sh is allowed" test "$rc" = 0
+  # factory-sync is read-only through the wrapper: --check and --list are accepted, a write is not.
+  rc=0
+  (cd "$repo" && scripts/timed.sh 5 -- scripts/factory-sync.sh --check >/dev/null) || rc=$?
+  assert "T5 scripts/factory-sync.sh --check is allowed" test "$rc" = 0
+  rc=0
+  (cd "$repo" && scripts/timed.sh 5 -- scripts/factory-sync.sh --list >/dev/null) || rc=$?
+  assert "T5 scripts/factory-sync.sh --list is allowed" test "$rc" = 0
 }
 
 # The prettier command the tests may use, or nothing: an explicit FACTORY_TEST_PRETTIER_CMD, a
@@ -486,6 +851,48 @@ section_sync() {
     assert "sync: $(basename "$f") (opencode) bash rules start with the deny baseline" test "$(grep -A1 '^  bash:$' "$f" | tail -n 1)" = '    "*": "deny"'
     refute "sync: $(basename "$f") (opencode) has no ask rule" grep -q '": "ask"' "$f"
     assert "sync: $(basename "$f") (opencode) orders baseline, allows, denies" has "$(sed -n '/^  bash:$/,/^---$/p' "$f" | grep -o '": "\(allow\|deny\)"' | tr -d '\n')" '^": "deny"(": "allow")+(": "deny")+$'
+    assert "sync: $(basename "$f") (opencode) denies the task tool exactly once" test "$(grep -c '^  task: "deny"$' "$f")" = 1
+    refute "sync: $(basename "$f") (opencode) never allows or asks the task tool" grep -Eq '^  task: "(allow|ask)"' "$f"
+  done
+  assert "sync: the launcher role names the exact call form" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'exactly the form each command template names'
+  assert "sync: the launcher role says it cannot start a subagent" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'cannot start a subagent'
+  # The light templates. Phase templates are not generated, so they are checked directly.
+  local light_plan=$repo/docs/factory/phases/plan-light.md light_review=$repo/docs/factory/phases/code-review-light.md plan_headings light_headings
+  for h in '## Goal' '## Constraints' '## Files' '## Commit breakdown' '## Test plan' '## Docs to update' '## Notes' '## Risks' '## Owner decisions'; do
+    assert "sync: plan-light.md names $h" grep -qF -- "$h" "$light_plan"
+  done
+  assert "sync: plan-light.md plans one commit" grep -q 'one commit' "$light_plan"
+  # The light template and the planner's heading list must agree heading by heading, `## Notes`
+  # included, so a short plan has the same shape as a full one.
+  # The backticks are literal Markdown markers in the heading lists, not commands.
+  # shellcheck disable=SC2016
+  plan_headings=$(awk '/exactly these headings/ { f = 1 } f && /^3\. / { exit } f' "$repo/docs/factory/roles/planner.md" |
+    grep -o '`## [^`]*`' | tr -d '`' | tr '\n' ' ')
+  # shellcheck disable=SC2016
+  light_headings=$(awk '/exactly these headings/ { f = 1 } f && /^$/ { exit } f' "$light_plan" |
+    grep -o '`## [^`]*`' | tr -d '`' | tr '\n' ' ')
+  assert "sync: plan-light.md headings match the planner's list" test "$plan_headings" = "$light_headings"
+  # shellcheck disable=SC2016  # a literal backtick in the template text
+  assert "sync: code-review-light.md names the observed section" grep -qF -- '`## Observed`' "$light_review"
+  assert "sync: code-review-light.md runs the gate through the wrapper" grep -qF -- 'scripts/timed.sh 600 -- {{GATE_CMD}}' "$light_review"
+  assert "sync: code-review-light.md names the verdict" grep -q 'VERDICT: APPROVED' "$light_review"
+  # Every reviewer and the implementer keeps its commands in the foreground, and every gate runs
+  # through the only timed form an agent may use. The plan review has no gate at all.
+  for role in plan-reviewer code-reviewer implementer; do
+    assert "sync: $role has a discipline section" grep -q '^## Discipline$' "$repo/docs/factory/roles/$role.md"
+    assert "sync: $role never waits for a command" grep -q 'never end a turn' "$repo/docs/factory/roles/$role.md"
+  done
+  for t in implement fix code-review code-review-light; do
+    # shellcheck disable=SC2016  # the literal placeholder, not a shell expansion
+    assert "sync: $t runs the gate through the wrapper" grep -Eq 'scripts/timed\.sh [0-9]+ -- \{\{GATE_CMD\}\}' "$repo/docs/factory/phases/$t.md"
+  done
+  refute "sync: plan-review.md has no gate" grep -qF -- '{{GATE_CMD}}' "$repo/docs/factory/phases/plan-review.md"
+  # The planner reproduces an unexplained failure once before calling it external; the words are
+  # pinned in the source and in both generated agents so they cannot drift away.
+  for phrase in unexplained reproduce; do
+    assert "sync: the planner says $phrase" grep -q "$phrase" "$repo/docs/factory/roles/planner.md"
+    assert "sync: the OpenCode planner says $phrase" grep -q "$phrase" "$repo/.opencode/agents/factory-planner.md"
+    assert "sync: the Claude planner says $phrase" grep -q "$phrase" "$repo/.claude/agents/factory-planner.md"
   done
   for f in "$repo"/.claude/agents/factory-*.md; do
     allowed=" name description tools model maxTurns "
@@ -566,7 +973,8 @@ section_sync() {
   if [ -n "$pcmd" ]; then
     rc=0
     # shellcheck disable=SC2086  # the command is a word list on purpose
-    (cd "$repo" && $pcmd --check docs/factory .opencode .claude/agents .claude/commands >/dev/null 2>&1) || rc=$?
+    pout=$(cd "$repo" && $pcmd --check docs/factory .opencode .claude/agents .claude/commands 2>&1) || rc=$?
+    if [ "$rc" != 0 ]; then printf '%s\n' "$pout" >&2; fi
     assert "sync: generated files and sources are prettier-clean" test "$rc" = 0
   else
     printf 'skip: prettier is not installed and FACTORY_TEST_PRETTIER is not set\n'
@@ -590,6 +998,7 @@ make_driver_stubs() {
 #   hook-<kind>.sh   sourced first; set handled=1 to skip the default action
 #   noop-<kind>      skip the default action;  exit-<kind>  exit with that code afterwards
 #   owner-open       the plan leaves an owner decision open
+#   material-revise  the plan revision changes the body, not only the owner section
 #   commits          number of commits the implementer makes (default 1)
 d=${STUB_DIR:?}
 name=$(basename "$0")
@@ -620,13 +1029,14 @@ art=${FACTORY_ARTIFACT:-}
 n=$(($(cat "$d/count" 2>/dev/null || echo 0) + 1))
 echo "$n" >"$d/count"
 kind=""
+body=${prompt#*$'\n'$'\n'}
 case "$art" in
-  */plan.md) case "$prompt" in "Revise the plan"*) kind=plan-revise ;; *) kind=plan ;; esac ;;
+  */plan.md) case "$body" in "Revise the plan"*) kind=plan-revise ;; *) kind=plan ;; esac ;;
   */review-plan-post.md) kind=plan-review-post ;;
   */review-plan-*.md) kind=plan-review ;;
   */review-code-*.md) kind=code-review ;;
   */pr.md) kind=pr ;;
-  "") case "$prompt" in "Address the findings"*) kind=fix ;; *) kind=implement ;; esac ;;
+  "") case "$body" in "Address the findings"*) kind=fix ;; *) kind=implement ;; esac ;;
 esac
 {
   echo "CALL $n $name role=$role kind=$kind artifact=$art"
@@ -668,6 +1078,11 @@ if [ "$handled" != 1 ] && [ ! -f "$d/noop-$kind" ]; then
     plan-revise)
       printf '\n## Changelog\n\n- revised by call %s\n' "$n" >>"$art"
       if [ -s "$FACTORY_RUN_DIR/decisions.md" ]; then sed -i 's/^- Which licence?$/None./' "$art"; fi
+      # Only the owner-gate revision changes the body: a review revision on the same switch would
+      # make the later answer look immaterial.
+      if [ -f "$d/material-revise" ] && [[ "$prompt" == *decisions.md* ]]; then
+        sed -i 's/^Do it\.$/Do it well./' "$art"
+      fi
       ;;
     plan-review) printf '# Review\n\nChecked.\n\n%s\n' "$(pop plan-review 'VERDICT: APPROVED')" >"$art" ;;
     plan-review-post) printf '# Review\n\nChecked.\n\n%s\n' "$(pop post 'VERDICT: APPROVED')" >"$art" ;;
@@ -820,7 +1235,7 @@ lib() {
 }
 
 section_driver() {
-  local be before id mut
+  local be before id mut d48light d48full d46review
   # Built at runtime so that no home-directory path or personal-looking name sits in the repository.
   local hm=/ho rp=quasi
   hm+=me
@@ -920,7 +1335,161 @@ section_driver() {
     assert "D5 an approved verdict with trailing blanks and spaces is APPROVED" test "$(lib parse_verdict "$vf")" = APPROVED
   done
 
-  # D6 and D20: the owner gate.
+  # The light-path classifier, called on stdin inside a library subshell. `<path>|<reason>`.
+  # shellcheck disable=SC2329  # called through lib
+  # shellcheck disable=SC2031  # the subshell is where classify_task sets them
+  classify_probe() {
+    classify_task <<<"$1" >/dev/null
+    printf '%s|%s\n' "$class_path" "$class_reason"
+  }
+  assert "classify: .gitignore and an ignored directory is light" test "$(lib classify_probe $'Add /.serena/ to .gitignore.\nKeep the rest.')" = 'light|1 file, 2 lines'
+  assert "classify: README.md is light" test "$(lib classify_probe 'Update README.md.')" = 'light|1 file, 1 line'
+  assert "classify: docs/testing.md is light" test "$(lib classify_probe 'Rewrite docs/testing.md')" = 'light|1 file, 1 line'
+  assert "classify: a directory mention is full" has "$(lib classify_probe 'Update docs/')" '^full|.*only the directory docs/$'
+  assert "classify: .git/ is full" has "$(lib classify_probe 'Write .git/config')" '^full|.*\.git'
+  assert "classify: docs/README.md is light" test "$(lib classify_probe 'Update docs/README.md')" = 'light|1 file, 1 line'
+  assert "classify: notes.md is light" test "$(lib classify_probe 'Add notes.md')" = 'light|1 file, 1 line'
+  # shellcheck disable=SC2016  # a literal backtick in a task text
+  assert "classify: backticks are stripped" test "$(lib classify_probe 'Update `README.md`.')" = 'light|1 file, 1 line'
+  assert "classify: docs/factory is named" has "$(lib classify_probe 'Update docs/factory/process.md')" '^full|.*docs/factory$'
+  assert "classify: scripts is named" has "$(lib classify_probe 'Touch scripts')" '^full|.*scripts$'
+  assert "classify: Cargo.toml is named" has "$(lib classify_probe 'Cargo.toml and README.md')" '^full|.*Cargo\.toml$'
+  assert "classify: AGENTS.md is refused" has "$(lib classify_probe 'Change AGENTS.md')" '^full|.*AGENTS\.md$'
+  assert "classify: .factory is named" has "$(lib classify_probe 'Read .factory/runs/x/plan.md')" '^full|.*\.factory$'
+  assert "classify: crates is named" has "$(lib classify_probe 'Change crates/x/notes.txt')" '^full|.*crates$'
+  assert "classify: no file is full" has "$(lib classify_probe 'Fix the bug')" '^full|.*no file$'
+  assert "classify: four files are too many" has "$(lib classify_probe 'Update a.md b.md c.md d.md')" '^full|.*4 files$'
+  assert "classify: notes.markdown is refused" has "$(lib classify_probe 'Add notes.markdown')" '^full|.*notes\.markdown$'
+  assert "classify: a URL is not a file" has "$(lib classify_probe 'Update https://example.com/README.md')" '^full|.*https://example\.com/README\.md$'
+  assert "classify: a file URL is not a file" has "$(lib classify_probe 'Read file:///tmp/README.md')" '^full|.*file:///tmp/README\.md$'
+  assert "classify: a scheme without slashes is refused" has "$(lib classify_probe 'Read file:/notes/README.md')" '^full|.*file:/notes/README\.md$'
+  # A `./` prefix, `//` and `/./` name the same protected path: the classifier accepts only the
+  # canonical spelling plus one leading `./`, so none of them is a light-path bypass.
+  assert "classify: ./AGENTS.md is refused" has "$(lib classify_probe 'Change ./AGENTS.md')" '^full|'
+  assert "classify: ./CLAUDE.md is refused" has "$(lib classify_probe 'Change ./CLAUDE.md')" '^full|'
+  assert "classify: docs/./factory is refused" has "$(lib classify_probe 'Update docs/./factory/process.md')" '^full|.*docs/\./factory/process\.md$'
+  assert "classify: docs//factory is refused" has "$(lib classify_probe 'Update docs//factory/process.md')" '^full|.*docs//factory/process\.md$'
+  assert "classify: ./README.md stays light" test "$(lib classify_probe 'Update ./README.md.')" = 'light|1 file, 1 line'
+  assert "classify: ./scripts is refused" has "$(lib classify_probe 'Change ./scripts/x.sh')" '^full|'
+  # Case variants name the protected file on a case-insensitive file system.
+  assert "classify: Agents.md is refused" has "$(lib classify_probe 'Change Agents.md')" '^full|.*AGENTS\.md$'
+  assert "classify: agents.md is refused" has "$(lib classify_probe 'Change agents.md')" '^full|.*AGENTS\.md$'
+  assert "classify: docs/Factory is refused" has "$(lib classify_probe 'Update docs/Factory/process.md')" '^full|.*docs/factory$'
+  # The exact forms of the round-3 blocker: a doubled slash behind a `./` prefix, alone and in a
+  # directory mention beside a named file.
+  assert "classify: .//AGENTS.md is refused" has "$(lib classify_probe 'Change .//AGENTS.md')" '^full|'
+  assert "classify: .///CLAUDE.md is refused" has "$(lib classify_probe 'Change .///CLAUDE.md')" '^full|'
+  assert "classify: ././/AGENTS.md is refused" has "$(lib classify_probe 'Change ././/AGENTS.md')" '^full|'
+  assert "classify: .//docs//factory/process.md is refused" has "$(lib classify_probe 'Update .//docs//factory/process.md')" '^full|'
+  assert "classify: a .// protected directory beside a file is refused" has "$(lib classify_probe 'Update .//docs//factory/ and README.md')" '^full|'
+  assert "classify: a .// protected name beside a file is refused" has "$(lib classify_probe 'Update .//AGENTS.md/ and README.md')" '^full|'
+
+  # Every spelling of a name the light path may never touch is full when a benign file sits beside
+  # it. The pair matters: without a benign file an ignored spelling is still "full" for naming no
+  # file, which is the hole the earlier generated test left. The names come from the same lists the
+  # step-2 prefilter reads.
+  local proto spelling name upper lower escaped encoded wide full_a cyr_a
+  local -a classify_names=()
+  # shellcheck disable=SC2016  # the array names expand in the library subshell, not here
+  while IFS= read -r name; do
+    [ -n "$name" ] && classify_names+=("$name")
+  done < <(lib eval 'printf "%s\n" "${PROTECTED[@]}" "${UNSAFE_DIRS[@]}" "${UNSAFE_FILES[@]}"')
+  full_a=$'\uff21'
+  cyr_a=$'\u0410'
+  wide=$'\u3002'
+  for proto in "${classify_names[@]}"; do
+    upper=$(printf '%s' "$proto" | tr '[:lower:]' '[:upper:]')
+    lower=$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')
+    escaped=${proto//./\\.}
+    encoded=${proto//./%2E}
+    for spelling in "$proto!" "$proto?" "[guide]($proto)" "$escaped" "$encoded" \
+      "${proto//./$wide}" ".\\$proto" "file:$proto" "-$proto" "./$proto" ".//$proto" \
+      "././$proto" ".///$proto" "$proto/" "$proto/." "$proto//" "../$proto" "x/../$proto" \
+      "docs/../$proto" "${full_a}${proto:1}" "${cyr_a}${proto:1}" "$upper" "$lower"; do
+      assert "classify: $proto as '$spelling' beside a benign file is full" \
+        has "$(lib classify_probe "Change $spelling and README.md")" '^full|'
+    done
+    case "$proto" in
+      *.md | *.json)
+        for spelling in "${proto%.*} md" "${proto%.*} .md" "${proto%.*}"$'\n'".${proto##*.}"; do
+          assert "classify: $proto split as '$spelling' beside a benign file is full" \
+            has "$(lib classify_probe "Change $spelling and README.md")" '^full|'
+        done
+        ;;
+    esac
+  done
+  # The exact spellings of the round-4 blocker, each beside a benign file so that an ignored token
+  # cannot pass as "the task text names no file".
+  for spelling in 'AGENTS.md!' '[guide](AGENTS.md)' 'AGENTS\.md' 'AGENTS%2Emd' $'AGENTS\u3002md' \
+    $'AGENTS.md\u200b' '.\AGENTS.md' 'file:AGENTS.md' 'AGENTS md' 'AGENTS .md' $'AGENTS\n.md' \
+    'Cargo.TOML!' 'DENY.TOML!' 'OPENCODE.JSON!' '.mcp.json!'; do
+    assert "classify: the round-4 spelling '$spelling' is full" \
+      has "$(lib classify_probe "Change $spelling and README.md")" '^full|'
+  done
+  # The canonical neighbours stay light, so the whitelist did not swallow ordinary prose files.
+  # Digits, dashes, underscores and inner dots are ordinary in a name.
+  for name in README.md docs/index.md notes.txt .gitignore notes2.md notes-v2.md notes_v2.md \
+    notes.v2.md; do
+    assert "classify: $name stays light" test "$(lib classify_probe "Update $name")" = 'light|1 file, 1 line'
+  done
+  assert "classify: an oversize text is full" has "$(lib classify_probe "$(printf 'x%.0s' $(seq 1 1500))")" '^full|.*too large'
+  assert "classify: 13 lines are too many" has "$(lib classify_probe "$(printf 'line %s\n' $(seq 1 12))"$'\n'"README.md")" '^full|.*13 lines'
+  assert "classify: 12 lines with a final newline are light" test "$(lib classify_probe "$(printf 'line %s\n' $(seq 1 11))"$'\n'"README.md"$'\n')" = 'light|1 file, 12 lines'
+
+  # A path-like token is dropped from the slug, and so is a bare secret-shaped token or the current
+  # user name, so none of them reaches a branch name or a session title. The tokens are built at run
+  # time so that this file holds no credential-shaped literal.
+  local sprefix=gh sbody=p_ sbody32=abcdefghijklmnopqrstuvwxyzabcdef suser=quasi
+  sbody+=abcdefghijklmnop
+  suser+=owner
+  assert "slug: a path-like first word is dropped" test "$(lib slugify "$hm/quasi/Projects/x/README.md")" = task
+  assert "slug: a path in the middle is dropped" test "$(lib slugify "Fix $hm/quasi/x and notes.md")" = fix-and-notes-md
+  refute "slug: the home path does not survive" has "$(lib slugify "Fix $hm/quasi/x")" 'quasi'
+  assert "slug: a bare credential token is dropped" test "$(lib slugify "Fix $sprefix$sbody notes.md")" = fix-notes-md
+  assert "slug: a long opaque token is dropped" test "$(lib slugify "Fix $sbody32 notes.md")" = fix-notes-md
+  assert "slug: the current user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix $suser notes.md")" = fix-notes-md
+  assert "slug: the current host name is dropped" test "$(FACTORY_SCRUB_HOST=$suser lib slugify "Fix $suser notes.md")" = fix-notes-md
+  assert "slug: a possessive user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix ${suser}'s notes.md")" = fix-notes-md
+  assert "slug: a comma after the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Ask $suser, please")" = ask-please
+  assert "slug: a period after the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix $suser. notes.md")" = fix-notes-md
+  # A name after punctuation inside a token is a whole word too, so the token is dropped.
+  assert "slug: a hyphen before the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x-$suser notes.md")" = fix-notes-md
+  assert "slug: a period before the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x.$suser notes.md")" = fix-notes-md
+  assert "slug: an underscore before the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x_$suser notes.md")" = fix-notes-md
+  assert "slug: a quote before the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x'$suser notes.md")" = fix-notes-md
+  assert "slug: a name after punctuation as a host is dropped" test "$(FACTORY_SCRUB_HOST=$suser lib slugify "Fix x-$suser notes.md")" = fix-notes-md
+  assert "slug: an uppercase name after punctuation is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x-$(printf '%s' "$suser" | tr '[:lower:]' '[:upper:]') notes.md")" = fix-notes-md
+
+  # A failed diff is an escalation, not a silent pass with a half-read change set.
+  local ld_out ld_rc
+  ld_rc=0
+  ld_out=$(lib eval "base_sha=0000000000000000000000000000000000000000; run_dir=$tmp; light_diff_check" 2>&1) || ld_rc=$?
+  assert "light_diff_check: an unreadable base escalates" test "$ld_rc" = 1
+  assert "light_diff_check names the unreadable diff" has "$ld_out" 'could not be read'
+
+  for v in .gitignore README.md docs/testing.md notes.txt ./README.md; do
+    assert "light_path_ok accepts $v" lib light_path_ok "$v"
+  done
+  for v in scripts/x.sh .opencode/x AGENTS.md CLAUDE.md .github/x docs/factory/x.md \
+    .factory/runs/x/plan.md .superpowers/sdd/x/design.md .git/config target/x.txt /abs/x.md ../x.md \
+    crates/x/notes.txt examples/x/notes.txt src/notes.txt crates/x/src/lib.rs \
+    Agents.md agents.md AGENTS.MD AGENTS.Md docs/Factory/index.md .//AGENTS.md .///CLAUDE.md \
+    ././/AGENTS.md docs//factory/x.md docs/./factory/x.md -notes.md 'back\slash.md' x:y.md \
+    $'a\nb.md' $'a\nAGENTS.md' $'AGENTS.md\nx'; do
+    refute "light_path_ok rejects $v" lib light_path_ok "$v"
+  done
+
+  # plan_body drops the owner and changelog sections, so answering a question in place keeps the
+  # same body and only a real edit makes a revision material.
+  local pba=$tmp/plan-a.md pbb=$tmp/plan-b.md
+  printf '# Plan\n\n## Goal\n\nDo it.\n\n## Owner decisions\n\n- Which licence?\n\n## Changelog\n\n- none\n' >"$pba"
+  printf '# Plan\n\n## Goal\n\nDo it.\n\n## Owner decisions\n\nNone.\n\n## Changelog\n\n- revised\n' >"$pbb"
+  assert "plan_body ignores the owner and changelog sections" test "$(lib plan_body "$pba" | sha256sum)" = "$(lib plan_body "$pbb" | sha256sum)"
+  printf '# Plan\n\n## Goal\n\nDo it well.\n\n## Owner decisions\n\nNone.\n' >"$pbb"
+  refute "plan_body sees a body edit" test "$(lib plan_body "$pba" | sha256sum)" = "$(lib plan_body "$pbb" | sha256sum)"
+
+  # D6 and D20: the owner gate. A revision that only answers the question is not material: no post
+  # review follows.
   new_case stub
   : >"$sd/owner-open"
   drive --backend opencode "t"
@@ -934,12 +1503,28 @@ section_driver() {
   drive --resume "$id"
   assert "D6 resume with decisions exits 0" test "$drv_rc" = 0
   assert "D6 resume revised the plan once" test "$(count_calls 'kind=plan-revise')" = 1
-  assert "D6 exactly one post-decision review" test "$(count_calls 'kind=plan-review-post')" = 1
-  assert "D6 the post review flag persisted" test "$(state_of post_decision_review)" = 1
+  assert "D6 an immaterial revision runs no post review" test "$(count_calls 'kind=plan-review-post')" = 0
+  assert "D6 the immaterial revision is recorded" test "$(state_of plan_material)" = 0
+  assert "D6 the post review flag stays 0" test "$(state_of post_decision_review)" = 0
+  assert "D6 the skipped review says so" has "$drv_out" '^factory: the plan did not change materially; the post-decision review is skipped$'
   assert "D6 the plan round persisted" test "$(state_of plan_round)" = 1
 
   new_case stub
   : >"$sd/owner-open"
+  : >"$sd/material-revise"
+  drive --backend opencode "t"
+  assert "D6 a material case stops at the gate too" test "$drv_rc" = 10
+  id=$(basename "$(run_dir_of)")
+  printf 'Use MIT OR Apache-2.0.\n' >"$(run_dir_of)/decisions.md"
+  drive --resume "$id"
+  assert "D6 a material revision finishes" test "$drv_rc" = 0
+  assert "D6 exactly one post-decision review" test "$(count_calls 'kind=plan-review-post')" = 1
+  assert "D6 the material revision is recorded" test "$(state_of plan_material)" = 1
+  assert "D6 the post review flag persisted" test "$(state_of post_decision_review)" = 1
+
+  new_case stub
+  : >"$sd/owner-open"
+  : >"$sd/material-revise"
   printf 'VERDICT: CHANGES NEEDED\n%.0s' 1 2 3 >"$sd/q-plan-review"
   drive --backend opencode "t"
   assert "D6 approved at round 4 with open decisions still stops at the gate" test "$drv_rc" = 10
@@ -950,6 +1535,25 @@ section_driver() {
   assert "D6 round 4 plus decisions finishes" test "$drv_rc" = 0
   assert "D6 round 4 still gets the post review" test "$(count_calls 'kind=plan-review-post')" = 1
   assert "D6 the plan reviewer ran 4 plus 1 times" test "$(count_calls 'role=plan-reviewer')" = 5
+
+  # D6 and D20: the gate reports a question that is not marked BLOCKING and does not report one that
+  # is. The marker is reported, not trusted: the run still stops while the section is not `None.`.
+  new_case stub
+  cat >"$sd/hook-plan.sh" <<'HOOK'
+printf '# Plan\n\n## Goal\n\nDo it.\n\n## Owner decisions\n\n- BLOCKING: Which licence?\n' >"$FACTORY_ARTIFACT"
+handled=1
+HOOK
+  drive --backend opencode "t"
+  assert "D6 a marked question still stops the gate" test "$drv_rc" = 10
+  refute "D6 a marked question is not reported as unmarked" has "$drv_out" 'Unmarked lines'
+  new_case stub
+  cat >"$sd/hook-plan.sh" <<'HOOK'
+printf '# Plan\n\n## Goal\n\nDo it.\n\n## Owner decisions\n\n- Which licence?\n' >"$FACTORY_ARTIFACT"
+handled=1
+HOOK
+  drive --backend opencode "t"
+  assert "D6 an unmarked question still stops the gate" test "$drv_rc" = 10
+  assert "D6 an unmarked question is named" has "$drv_out" 'Unmarked lines.*Which licence\?'
 
   # D7: a readonly phase changes state.
   local -a mutations=(
@@ -1286,6 +1890,312 @@ STUB
   assert "D45 a different client on resume is a usage error" test "$drv_rc" = 2
   assert "D45 the refused resume starts no phase" test ! -s "$sd/calls.log"
 
+  # D46: the light happy path. A two-line task naming one allowed file; the stub implementer commits
+  # a note, which stays inside the light limits.
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+echo "note" >notes.txt
+git add notes.txt
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add a note"
+handled=1
+HOOK
+  drv_extra=(FACTORY_MODEL_MAIN=main/model FACTORY_MODEL_HELPER=helper/model)
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  drv_extra=()
+  assert "D46 the light run exits 0" test "$drv_rc" = 0
+  assert "D46 the run records the light path" test "$(state_of path)" = light
+  assert "D46 no plan review runs" test "$(count_calls 'role=plan-reviewer')" = 0
+  assert "D46 the roles run in the light order" test "$(call_roles)" = "planner,implementer,code-reviewer,pr-writer"
+  assert "D46 exactly one code review" test "$(count_calls 'role=code-reviewer')" = 1
+  assert "D46 the planner runs on the helper model" has "$(argv_of planner)" ' --model helper/model '
+  assert "D46 the implementer runs on the main model" has "$(argv_of implementer)" ' --model main/model '
+  assert "D46 the planner reads the short template" has "$(cat "$sd/calls.log")" 'PROMPT .*Write a short implementation plan'
+  assert "D46 the review reads the short template" has "$(cat "$sd/calls.log")" 'PROMPT .*Read the one commit'
+  d46review=$(grep '^PROMPT .*Read the one commit' "$sd/calls.log")
+  assert "D46 the light review runs the per-commit gate on the branch" has "$d46review" 'scripts/timed\.sh 600 -- scripts/gate\.sh --since [0-9a-f]{7,}'
+  refute "D46 the light review does not fall back to the empty index" has "$d46review" 'scripts/timed\.sh 600 -- scripts/gate\.sh --commit'
+  assert "D46 the summary names the light path" has "$drv_out" '^factory: summary: path light, '
+
+  # D46 dry run: the classifier reads a task file too.
+  new_case stub
+  printf 'Add /.serena/ to .gitignore\n' >"$clone/task.md"
+  drive --dry-run --backend claude --task-file task.md
+  assert "D46 the dry run classifies a task file" has "$drv_out" '^path: light \(1 file, 1 line\)$'
+  assert "D46 the dry run prints the light schedule" has "$drv_out" '^phases: plan, owner-gate, implement, code-review, final-gate, pr$'
+  assert "D46 the dry run called nothing" test ! -s "$sd/calls.log"
+
+  # D47: the real diff escalates a light run that turned out to touch code.
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+mkdir -p src
+echo "pub fn f() {}" >src/lib.rs
+git add src/lib.rs
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "feat: add a function"
+handled=1
+HOOK
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D47 the escalated run finishes" test "$drv_rc" = 0
+  assert "D47 the path escalated to full" test "$(state_of path)" = full
+  assert "D47 the escalation reason is kept" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D47 the escalation names the path" has "$(cat "$(run_dir_of)/light-escalation.txt")" 'src/lib\.rs'
+  assert "D47 the review is the full template" has "$(cat "$sd/calls.log")" 'PROMPT .*Review the commits on branch'
+  refute "D47 the review is not the light template" has "$(cat "$sd/calls.log")" 'PROMPT .*Read the one commit'
+  assert "D47 the run reviews once" test "$(count_calls 'role=code-reviewer')" = 1
+  assert "D47 the summary names the escalation" has "$drv_out" '^factory: summary: path full \(escalated\), '
+
+  # D48: a light review that asks for changes escalates, and the next round is the full review.
+  new_case stub
+  printf 'VERDICT: CHANGES NEEDED\n' >"$sd/q-code"
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+echo "note" >notes.txt
+git add notes.txt
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add a note"
+handled=1
+HOOK
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D48 the escalated run finishes" test "$drv_rc" = 0
+  assert "D48 the fix phase ran" test "$(count_calls 'role=implementer')" = 2
+  assert "D48 two code reviews" test "$(count_calls 'role=code-reviewer')" = 2
+  assert "D48 the path escalated to full" test "$(state_of path)" = full
+  d48light=$(grep -n '^PROMPT .*Read the one commit' "$sd/calls.log" | cut -d: -f1)
+  d48full=$(grep -n '^PROMPT .*Review the commits on branch' "$sd/calls.log" | cut -d: -f1)
+  assert "D48 the first review reads the light template" test -n "$d48light"
+  assert "D48 the second review reads the full template" test -n "$d48full"
+  assert "D48 the light review comes first" test "$d48light" -lt "$d48full"
+  assert "D48 the code round is two" test "$(state_of code_round)" = 2
+
+  # D49: the owner gate on the light path. An answer that only fills in the decision keeps the plan
+  # body and skips the post-decision review; one that changes the body escalates and gets it.
+  new_case stub
+  : >"$sd/owner-open"
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D49 a light run with an open decision stops at the gate" test "$drv_rc" = 10
+  assert "D49 the light plan was not reviewed" test "$(count_calls 'role=plan-reviewer')" = 0
+  id=$(basename "$(run_dir_of)")
+  printf 'Use MIT OR Apache-2.0.\n' >"$(run_dir_of)/decisions.md"
+  drive --resume "$id"
+  assert "D49 an immaterial light answer finishes" test "$drv_rc" = 0
+  assert "D49 an immaterial light answer runs no post review" test "$(count_calls 'kind=plan-review-post')" = 0
+  assert "D49 an immaterial light answer stays light" test "$(state_of path)" = light
+  assert "D49 an immaterial light answer is recorded" test "$(state_of plan_material)" = 0
+  assert "D49 an immaterial light answer still implements" test "$(count_calls 'role=implementer')" = 1
+
+  new_case stub
+  : >"$sd/owner-open"
+  : >"$sd/material-revise"
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D49 a material light case stops at the gate too" test "$drv_rc" = 10
+  id=$(basename "$(run_dir_of)")
+  printf 'Use MIT OR Apache-2.0.\n' >"$(run_dir_of)/decisions.md"
+  drive --resume "$id"
+  assert "D49 a material light answer finishes" test "$drv_rc" = 0
+  assert "D49 a material light answer runs one post review" test "$(count_calls 'kind=plan-review-post')" = 1
+  assert "D49 a material light answer escalates" test "$(state_of path)" = full
+  assert "D49 the material escalation is kept" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D49 a material light answer is recorded" test "$(state_of plan_material)" = 1
+
+  # D49 legacy state: a run written before `plan_material` existed sits at owner-gate:post. A missing
+  # key must run the post-decision review, not skip it; only an explicit 0 skips.
+  new_case stub
+  : >"$sd/owner-open"
+  drive --backend opencode "t"
+  assert "D49 a legacy case stops at the gate" test "$drv_rc" = 10
+  id=$(basename "$(run_dir_of)")
+  printf 'Use MIT OR Apache-2.0.\n' >"$(run_dir_of)/decisions.md"
+  sed -i -e 's/^step=.*/step=post/' -e '/^plan_material=/d' "$(run_dir_of)/state"
+  : >"$sd/calls.log"
+  drive --resume "$id"
+  assert "D49 a legacy post state finishes" test "$drv_rc" = 0
+  assert "D49 a legacy post state runs the review" test "$(count_calls 'kind=plan-review-post')" = 1
+  assert "D49 a legacy post state records the review" test "$(state_of post_decision_review)" = 1
+  assert "D49 a legacy post state records the material revision" test "$(state_of plan_material)" = 1
+
+  # D55: --stop-after implement measures the diff before it stops.
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+mkdir -p src
+echo "pub fn f() {}" >src/lib.rs
+git add src/lib.rs
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "feat: add a function"
+handled=1
+HOOK
+  drive --backend opencode --stop-after implement $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D55 a rejected diff stops 0" test "$drv_rc" = 0
+  assert "D55 a rejected diff escalates the path" test "$(state_of path)" = full
+  assert "D55 a rejected diff writes the escalation file" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D55 nothing is reviewed after the stop" test "$(count_calls 'role=code-reviewer')" = 0
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+echo "note" >notes.txt
+git add notes.txt
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add a note"
+handled=1
+HOOK
+  drive --backend opencode --stop-after implement $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D55 a light diff stops 0" test "$drv_rc" = 0
+  assert "D55 a light diff keeps the path" test "$(state_of path)" = light
+  assert "D55 a light diff writes no escalation file" test ! -e "$(run_dir_of)/light-escalation.txt"
+
+  # D56: a rename hides its old side from `git diff --name-only`, so a manifest renamed to a `.md`
+  # name must still escalate. `--no-renames` keeps the deletion visible.
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+git mv Cargo.toml notes.md
+git add -A
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: rename the manifest"
+handled=1
+HOOK
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D56 the renamed manifest run finishes" test "$drv_rc" = 0
+  assert "D56 the renamed manifest escalates the path" test "$(state_of path)" = full
+  assert "D56 the escalation names the old path" has "$(cat "$(run_dir_of)/light-escalation.txt")" 'Cargo\.toml'
+  assert "D56 the renamed manifest gets the full review" has "$(cat "$sd/calls.log")" 'PROMPT .*Review the commits on branch'
+  assert "D56 the renamed manifest reviews once" test "$(count_calls 'role=code-reviewer')" = 1
+
+  # D50: every phase kind has its own budget, and the banner and the final gate name it.
+  new_case stub
+  drive --backend opencode "t"
+  assert "D50 the run finishes" test "$drv_rc" = 0
+  assert "D50 the plan banner names its budget" has "$drv_out" 'phase plan \(planner, round 0/0, budget 1200 s\)'
+  assert "D50 the plan review banner names its budget" has "$drv_out" 'phase plan-review \(plan-reviewer, round 1/4, budget 900 s\)'
+  assert "D50 the implement banner names its budget" has "$drv_out" 'phase implement \(implementer, round 0/0, budget 7200 s\)'
+  assert "D50 the code review banner names its budget" has "$drv_out" 'phase code-review \(code-reviewer, round 1/3, budget 1500 s\)'
+  assert "D50 the pr banner names its budget" has "$drv_out" 'phase pr \(pr-writer, round 0/0, budget 600 s\)'
+  assert "D50 the final gate names its budget" has "$drv_out" 'final gate \(scripts/gate.sh --full, budget 7200 s\)'
+  new_case stub
+  printf 'sleep 3041\n' >"$sd/hook-plan.sh"
+  drive --backend opencode --phase-timeout 3 "t"
+  assert "D50 --phase-timeout overrides the table" has "$drv_out" 'phase plan \(planner, round 0/0, budget 3 s\)'
+  assert "D50 the overridden timeout exits 20" test "$drv_rc" = 20
+  assert "D50 the stop names the budget it used" has "$drv_out" 'used its budget of 3 s'
+
+  # D51: a light timeout in an artifact phase escalates and retries the unit once, in process.
+  new_case stub
+  cat >"$sd/hook-plan.sh" <<'HOOK'
+if [ ! -f "$STUB_DIR/plan-attempt" ]; then
+  : >"$STUB_DIR/plan-attempt"
+  sleep 3043
+fi
+HOOK
+  drv_extra=(FACTORY_MODEL_MAIN=main/model FACTORY_MODEL_HELPER=helper/model)
+  drive --backend opencode --phase-timeout 2 $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  drv_extra=()
+  assert "D51 the escalated plan run finishes" test "$drv_rc" = 0
+  assert "D51 the plan timed out once, then ran again" test "$(count_calls 'role=planner')" = 2
+  assert "D51 the retry runs on the main model" test "$(argv_of planner | tail -n 1 | grep -c -- '--model main/model')" = 1
+  assert "D51 the path escalated to full" test "$(state_of path)" = full
+  assert "D51 the escalation file exists" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D51 the plan review runs after the escalation" test "$(count_calls 'role=plan-reviewer')" = 1
+
+  # D51: a light timeout in implement escalates, stops 20, and a resume continues on the full path.
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+n=$(($(cat "$STUB_DIR/impl-count" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$STUB_DIR/impl-count"
+echo "note $n" >"notes-$n.txt"
+git add "notes-$n.txt"
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add note $n"
+if [ "$n" = 1 ]; then sleep 3047; fi
+handled=1
+HOOK
+  drive --backend opencode --phase-timeout 3 $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D51 the implement timeout exits 20" test "$drv_rc" = 20
+  assert "D51 the implement timeout escalated" test "$(state_of path)" = full
+  assert "D51 the implement escalation file exists" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D51 the stop names the budget and the resume" has "$drv_out" 'used its budget of 3 s; resume to continue on the full path'
+  id=$(basename "$(run_dir_of)")
+  : >"$sd/calls.log"
+  drive --resume "$id" --phase-timeout 60
+  assert "D51 the resume finishes on the full path" test "$drv_rc" = 0
+  assert "D51 the resume keeps the full path" test "$(state_of path)" = full
+  assert "D51 the resumed review is the full template" has "$(cat "$sd/calls.log")" 'PROMPT .*Review the commits on branch'
+
+  # D52: a phase that exits 0 without its report is retried once, then stops 20.
+  new_case stub
+  : >"$sd/noop-plan"
+  drive --backend opencode "t"
+  assert "D52 a clean exit without artifact is retried once" test "$(count_calls 'role=planner')" = 2
+  assert "D52 the second miss stops 20" test "$drv_rc" = 20
+  assert "D52 the retry is announced" has "$drv_out" 'ended without its report; retrying once'
+  assert "D52 the handoff names the cause" has "$(cat "$(run_dir_of)/handoff.md")" 'ended without its report'
+  assert "D52 the retry is noted in the log" grep -q '^# retry: ' "$(run_dir_of)/logs/plan.log"
+  new_case stub
+  printf 'VERDICT: CHANGES NEEDED\n' >"$sd/q-plan-review"
+  : >"$sd/noop-plan-revise"
+  drive --backend opencode "t"
+  assert "D52 a revision that changes nothing is retried once" test "$(count_calls 'kind=plan-revise')" = 2
+  assert "D52 the second revision miss stops 20" test "$drv_rc" = 20
+  assert "D52 the revision handoff names the cause" has "$(cat "$(run_dir_of)/handoff.md")" 'ended without its report'
+  new_case stub
+  : >"$sd/noop-plan"
+  printf '1\n' >"$sd/exit-plan"
+  drive --backend opencode "t"
+  assert "D52 a non-zero exit without artifact makes one call" test "$(count_calls 'role=planner')" = 1
+
+  # D53: the session name comes from the first line of the prompt, and no call passes --title.
+  prompt_of() { sed -n 's/^PROMPT //p' "$sd/calls.log" | sed -n "$1p"; }
+  new_case stub
+  drive --backend opencode "t"
+  assert "D53 the run finishes" test "$drv_rc" = 0
+  refute "D53 no call passes --title" grep -q -- '--title' "$sd/calls.log"
+  assert "D53 the plan prompt is named after the run and the phase" has "$(prompt_of 1)" '^Factory t: plan 1~'
+  assert "D53 the plan review prompt names its round" has "$(prompt_of 2)" '^Factory t: plan-review 1~'
+  assert "D53 the code review prompt names its round" has "$(prompt_of 4)" '^Factory t: code-review 1~'
+  assert "D53 the header is followed by a blank line" has "$(prompt_of 1)" '^Factory t: plan 1~~[^~]'
+  new_case stub
+  printf 'VERDICT: CHANGES NEEDED\n' >"$sd/q-plan-review"
+  drive --backend opencode "t"
+  assert "D53 a plan revision keeps its kind" test "$(count_calls 'kind=plan-revise')" = 1
+  assert "D53 the revision prompt names the phase" has "$(prompt_of 3)" '^Factory t: plan-revise 1~'
+  assert "D53 the second review prompt names round 2" has "$(prompt_of 4)" '^Factory t: plan-review 2~'
+  new_case stub
+  printf 'VERDICT: CHANGES NEEDED\n' >"$sd/q-code"
+  drive --backend opencode "t"
+  assert "D53 a fix keeps its kind" test "$(count_calls 'kind=fix')" = 1
+  assert "D53 the fix prompt names its round" has "$(prompt_of 5)" '^Factory t: fix 1~'
+  new_case stub
+  drive --backend opencode --opencode-bin "$oc2" "t"
+  assert "D53 the 2.x run finishes" test "$drv_rc" = 0
+  refute "D53 no 2.x call passes --title" grep -q -- '--title' "$sd/calls.log"
+  assert "D53 the 2.x prompt carries the same header" has "$(prompt_of 1)" '^Factory t: plan 1~'
+
+  # D54: one duration per phase, a summary at the end, and phases.tsv for --status.
+  new_case stub
+  drive --backend opencode "t"
+  assert "D54 the run finishes" test "$drv_rc" = 0
+  assert "D54 the per-call line names its exit" has "$drv_out" '^factory: phase plan took [0-9]+s \(exit 0\)$'
+  assert "D54 the summary names the path, the runs and the time" has "$drv_out" '^factory: summary: path full, 6 phase runs, [0-9]+m[0-9]{2}s$'
+  assert "D54 the summary lists one indented line per phase" test "$(grep -Ec '^  (plan|plan-review|implement|code-review|final-gate|pr) [0-9]+m[0-9]{2}s$' <<<"$drv_out")" = 6
+  assert "D54 phases.tsv has a final-gate row" grep -q $'^final-gate\t' "$(run_dir_of)/phases.tsv"
+  assert "D54 the formatter prints minutes below an hour" test "$(lib fmt_duration 60)" = '1m00s'
+  assert "D54 the formatter prints hours at an hour" test "$(lib fmt_duration 3660)" = '1h01m00s'
+  new_case stub
+  : >"$sd/owner-open"
+  drive --backend opencode "t"
+  assert "D54 a stopped run prints a summary" has "$drv_out" '^factory: summary: path full, 2 phase runs, '
+  assert "D54 the handoff has a timings section" has "$(cat "$(run_dir_of)/handoff.md")" '^## Timings$'
+  assert "D54 the timings name a phase and its exit" has "$(cat "$(run_dir_of)/handoff.md")" '^- plan [0-9]+m[0-9]{2}s \(exit 0\)$'
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+echo "note" >notes.txt
+git add notes.txt
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add a note"
+handled=1
+HOOK
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D54 a light run says so in the summary" has "$drv_out" '^factory: summary: path light, 5 phase runs, '
+  new_case stub
+  drive --backend opencode --stop-after plan $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D54 a one-phase run uses the singular" has "$drv_out" '^factory: summary: path light, 1 phase run, '
+
   # D13: dry run.
   new_case stub
   drive --dry-run --backend claude "t"
@@ -1430,6 +2340,7 @@ HOOK
   assert "D24 the driver exits 130 on SIGTERM" test "$drv_rc" = 130
   assert "D24 the state is stopped" test "$(state_of status)" = stopped
   assert "D24 the exit code is 20, resumable" test "$(state_of exit_code)" = 20
+  assert "D24 the interrupted run prints a summary" has "$(cat "$sd/driver.out")" '^factory: summary: path full, '
   sleep 1
   refute "D24 no grandchild survives" pgrep -f 'sleep 3021'
 
@@ -1521,6 +2432,7 @@ HOOK
   printf '%s\n' "visit https://example.invalid/login to sign in" "please login again later" "token=$tok_a" "key $tok_b" "plain line kept" >"$sd/loglines"
   # shellcheck disable=SC2016  # the hook expands STUB_DIR inside the stub
   printf 'cat "$STUB_DIR/loglines"\nhandled=1\n' >"$sd/hook-plan.sh"
+  printf '1\n' >"$sd/exit-plan"
   drive --backend claude "t"
   handoff=$(cat "$(run_dir_of)/handoff.md")
   assert "D36 [token] exits 20" test "$drv_rc" = 20
@@ -1732,6 +2644,7 @@ HOOK
     (cd "$clone" && GATE_PRETTIER=0 scripts/gate.sh --commit >"$tmp/d28.log" 2>&1) || grc=$?
     (cd "$clone" && lib take_snapshot >"$snap_b")
     assert "D28 the real gate passes in the clone" test "$grc" = 0
+    assert "D28 the missing deny policy is a skip" has "$(cat "$tmp/d28.log")" '^SKIP +deny +deny.toml not present$'
     assert "D28 the snapshot is identical around the real gate" cmp -s "$snap_a" "$snap_b"
     assert "D28 the gate left a clean tree" test -z "$(git -C "$clone" status --porcelain)"
   else
@@ -2130,6 +3043,20 @@ STUB
   assert "L10 that process is still alive" kill -0 "$spid"
   kill "$spid" 2>/dev/null || true
   rm -f "$lroot/.factory/launch/stub.sleep"
+
+  # L11: --status prefers phases.tsv and names the recorded path.
+  rdir=$lroot/.factory/runs/$rid
+  printf 'path=light\n' >>"$rdir/state"
+  printf 'plan\t75\t0\nfinal-gate\t3665\t0\n' >"$rdir/phases.tsv"
+  launch -- --status "$rid"
+  assert "L11 --status prints the recorded path" has "$l_out" 'path:     light'
+  assert "L11 the short phase comes from phases.tsv" has "$l_out" 'plan +1m15s \(exit 0\)'
+  assert "L11 the hour-long phase comes from phases.tsv" has "$l_out" 'final-gate +1h01m05s \(exit 0\)'
+  refute "L11 the log heuristic is not used when phases.tsv exists" has "$l_out" 'started 10:00:00'
+  sed -i '/^path=/d' "$rdir/state"
+  launch -- --status "$rid"
+  refute "L11 a state without path prints no path line" has "$l_out" 'path: '
+  assert "L11 the phases still come from phases.tsv" has "$l_out" 'plan +1m15s \(exit 0\)'
 }
 
 # Permission tests: the two configuration files, the generated OpenCode agent overlays and, when
@@ -2145,7 +3072,7 @@ section_perm() {
     mkdir -p "$agents_dir"
     # The output holds the contributor's global configuration: parse it, never print it.
     assert "perm: the OpenCode config resolves" bash -c "cd '$repo' && opencode debug config >/dev/null 2>&1"
-    for role in planner plan-reviewer implementer code-reviewer pr-writer; do
+    for role in planner plan-reviewer implementer code-reviewer pr-writer launcher; do
       assert "perm: the OpenCode agent factory-$role resolves" bash -c "cd '$repo' && opencode debug agent factory-$role >'$agents_dir/factory-$role.json' 2>/dev/null"
     done
   else
@@ -2198,7 +3125,7 @@ section_static() {
   refute "static: no factory file narrows the client to one kind of device" git -C "$repo" grep -qiwE "$w1|$w2|$w3" -- docs/factory scripts .opencode .claude
   # shellcheck disable=SC2016  # literal characters
   refute "static: no command template holds an argument placeholder, !\` or an @ file reference" grep -rEq '\$ARGUMENTS|\$[0-9]|!`|@[A-Za-z0-9._/~-]' "$repo/docs/factory/commands" "$repo/.opencode/commands"
-  refute "static: generated prompts never claim to be official" grep -rilE 'official' "$repo/.opencode" "$repo/.claude/agents" "$repo/.claude/commands" "$repo/docs/factory"
+  refute "static: generated prompts never claim to be official" git -C "$repo" grep -qilE 'official' -- .opencode .claude/agents .claude/commands docs/factory
 
   local pcmd
   pcmd=$(prettier_for_tests)
@@ -2210,13 +3137,13 @@ section_static() {
 
 sections=("$@")
 if [ ${#sections[@]} -eq 0 ]; then
-  sections=(gate fixture hooks sync perm driver launch probes static)
+  sections=(gate fixture hooks sync perm driver launch timed probes static)
 fi
 for s in "${sections[@]}"; do
   case "$s" in
-    gate | fixture | hooks | sync | perm | driver | launch | probes | static) "section_$s" ;;
+    gate | fixture | hooks | sync | perm | driver | launch | timed | probes | static) "section_$s" ;;
     *)
-      printf 'usage: %s [gate] [fixture] [hooks] [sync] [perm] [driver] [launch] [probes] [static]\n' "$0" >&2
+      printf 'usage: %s [gate] [fixture] [hooks] [sync] [perm] [driver] [launch] [timed] [probes] [static]\n' "$0" >&2
       exit 2
       ;;
   esac

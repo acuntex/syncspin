@@ -49,3 +49,19 @@ sort* --output*
 sort* --compress-program*
 tree* -o*
 file* -C*
+scripts/timed.sh * -- git push *
+scripts/timed.sh * -- git commit *--no-verify*
+scripts/timed.sh * -- git commit * -n*
+scripts/timed.sh * -- git commit * -n *
+scripts/timed.sh * -- git config *
+scripts/timed.sh * -- git -c *
+scripts/timed.sh * -- git reset --hard *
+scripts/timed.sh * -- gh pr merge *
+scripts/timed.sh * -- rm *
+scripts/timed.sh * -- bash *
+scripts/timed.sh * -- sh *
+scripts/timed.sh * -- env *
+scripts/timed.sh * -- python*
+scripts/timed.sh * -- curl *
+scripts/timed.sh * -- wget *
+scripts/timed.sh * -- sudo *

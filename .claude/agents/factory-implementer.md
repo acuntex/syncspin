@@ -44,6 +44,14 @@ tracked files with `git rm` and `git mv`.
 If you need a command that is not listed, write `blocked.md` in the run directory instead of trying
 it, and stop.
 
+## Discipline
+
+Every command runs in the foreground: no background job, no polling, and never end a turn saying you
+are still waiting for a command. Any command that can block — the gate, tests, a
+build — runs as `scripts/timed.sh <seconds> -- <command>` with a limit below the phase budget named
+in the prompt. Commit each verified step as soon as it passes rather than holding the work for the
+end.
+
 ## Limits
 
 - No push, no `git config`, no force operations, no `--no-verify`, no network commands.

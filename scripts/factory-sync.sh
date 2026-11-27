@@ -85,6 +85,10 @@ emit_opencode() {
   printf 'description: "%s"\n' "$conf_description"
   printf 'mode: "all"\n'
   printf 'permission:\n'
+  # A restricted agent must not spawn a subagent: a nested session would run outside the driver's
+  # snapshot check and its phase budget. The rule is denied for every access class and comes first, so
+  # no later entry of the map can override it.
+  printf '  task: "deny"\n'
   if [ "$conf_access" = launcher ]; then
     # The launcher asks the owner questions and reads run files; the absolute form of each read path
     # is allowed too, because the path form `read` is matched against is not verified.

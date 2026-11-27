@@ -30,7 +30,8 @@ the sensible next step. You change nothing yourself. This command takes no argum
 3. Ask what to do next with one `question`, offering only what fits:
    - look at one run in detail (Recommended when a run is still running or stopped): the answer names
      the run, which you then show with `scripts/factory-launch.sh --status <run id>`: phase, step,
-     rounds, exit code, how long the phases took
+     rounds, exit code, how long the phases took (from `phases.tsv` when the driver wrote it, otherwise
+     estimated from the logs)
    - stop a running launch (the launch id is in the `launches` list; if several are running ask which
      one)
    - resume a run stopped with exit 10 or 20: tell the owner to run `/factory-resume`; do not resume

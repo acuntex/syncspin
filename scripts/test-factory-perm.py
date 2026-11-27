@@ -90,6 +90,9 @@ def overlay(path):
             in_perm = True
         elif in_perm and re.fullmatch(r"  (edit|bash|read):", line):
             tool = line.strip()[:-1]
+        elif in_perm and re.fullmatch(r'  task: "(allow|ask|deny)"', line):
+            tool = None
+            rules.append(("task", "*", line.split('"')[1]))
         elif in_perm and re.fullmatch(r'  question: "(allow|ask|deny)"', line):
             tool = None
             rules.append(("question", "*", line.split('"')[1]))
@@ -196,7 +199,7 @@ def list_decide(entries, text):
 
 # Commands every role may run: read-only inspection, cargo and the repository scripts.
 common = [
-    "cargo test", "scripts/gate.sh --commit", "ls x", "rg x", "grep x y", "wc -l x", "diff a b",
+    "cargo test", "scripts/timed.sh 600 -- cargo test", "scripts/gate.sh --commit", "ls x", "rg x", "grep x y", "wc -l x", "diff a b",
     "git status", "git diff", "git log", "git show HEAD", "git write-tree",
     "cat x", "head -n 5 x", "tail -n 5 x", "find . -name x", "stat x", "file x", "tree -L 2", "sort x",
     "uniq x", "cut -d: -f1 x", "tr a b", "basename x", "dirname x", "realpath x", "pwd", "which x",
@@ -212,7 +215,10 @@ orchestrator_only = ["git fetch origin main", "git switch -c factory/x", "gh pr 
 # Never allowed to a factory agent in either tool.
 never = [
     "rm x", "git push origin factory/x", "tee x", "cp a b", "mv a b", "touch x", "dd if=a of=b",
-    "sed -i s/a/b/ x", "git branch -D x",
+    "sed -i s/a/b/ x", "git branch -D x", "timeout 600 cargo test",
+    "scripts/timed.sh 1 -- git push origin main", "scripts/timed.sh 1 -- git commit --no-verify -m x",
+    "scripts/timed.sh 1 -- gh pr merge 1", "scripts/timed.sh 1 -- rm x",
+    "scripts/timed.sh 1 -- git config user.name x", "scripts/timed.sh 1 -- bash -c true",
 ]
 
 # The OpenCode factory agents: the project rules, then the agent's own rules.
@@ -316,7 +322,7 @@ for name, readonly in roles.items():
 
 def v2_shape(readonly):
     """The ordered list the same sources would produce: baseline deny first, allows, every deny last."""
-    entries = []
+    entries = [{"action": "task", "resource": "*", "effect": "deny"}]
     if readonly:
         entries.append({"action": "edit", "resource": "*", "effect": "deny"})
         entries.append({"action": "edit", "resource": ".factory/runs/*", "effect": "allow"})
@@ -347,7 +353,8 @@ for cmd in orchestrator_only:
     check("v2 shape code denies: " + cmd, decide_v2(v2_code, "bash", cmd) == "deny")
 check(
     "v2 shape: the shell baseline is the first shell rule",
-    v2_readonly[2] == {"action": "shell", "resource": "*", "effect": "deny"},
+    next(entry for entry in v2_readonly if entry["action"] == "shell")
+    == {"action": "shell", "resource": "*", "effect": "deny"},
 )
 shell_rules = [entry for entry in v2_readonly if entry["action"] == "shell"]
 last_allow = max(i for i, entry in enumerate(shell_rules) if entry["effect"] == "allow")
@@ -423,6 +430,21 @@ for path in launcher_read_no:
 check("launcher: no ask rule", all(act != "ask" for _, _, act in launcher_overlay))
 check("no Claude counterpart of the launcher agent", not __import__("os").path.exists(repo + "/.claude/agents/factory-launcher.md"))
 
+# The `task` tool (subagents) is denied to every generated agent, the launcher included, in the shape
+# the generator writes and in the 2.x shape. No role may allow or ask it, and the project files stay
+# silent about it: it is a factory-layer rule.
+all_agents = list(roles) + ["factory-launcher"]
+for name in all_agents:
+    rules = global_rules + overlay(repo + "/.opencode/agents/" + name + ".md")
+    check("opencode " + name + " denies: task", decide(rules, "task", "*") == "deny")
+    check("v2 " + name + " denies: task", decide_v2(to_v2(rules), "task", "*") == "deny")
+    check(
+        "opencode " + name + ": no task allow or ask rule",
+        not any(tool == "task" and act in ("allow", "ask") for tool, _, act in overlay(repo + "/.opencode/agents/" + name + ".md")),
+    )
+check("opencode.json: does not mention task", not any(tool == "task" for tool, _, _ in global_rules))
+check("claude settings: does not mention task", "task" not in json.dumps(cc))
+
 for name, readonly in roles.items():
     if agent_json_dir:
         path = agent_json_dir + "/" + name + ".json"
@@ -435,5 +457,32 @@ for name, readonly in roles.items():
             results.append("SKIP resolved rules of " + name + ": unrecognised output shape")
             continue
         agent_checks("resolved " + name + ":", resolved, readonly)
+
+# The launcher's resolved rules too: its edit and read allowlists differ from the roles', so the
+# role probes above do not fit; apply the overlay probes to what OpenCode actually resolved.
+if agent_json_dir:
+    name = "factory-launcher"
+    path = agent_json_dir + "/" + name + ".json"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        raw = data if isinstance(data, list) else data.get("permission")
+        resolved = [(r["permission"], r["pattern"], r["action"]) for r in raw]
+    except Exception:
+        results.append("SKIP resolved rules of " + name + ": unrecognised output shape")
+    else:
+        for cmd in launcher_calls:
+            check("resolved " + name + " allows: " + cmd, decide(resolved, "bash", cmd) == "allow")
+        for cmd in launcher_denied:
+            check("resolved " + name + " denies: " + cmd, decide(resolved, "bash", cmd) == "deny")
+        for p in launcher_edit_ok:
+            check("resolved " + name + " may edit: " + p, decide(resolved, "edit", p) == "allow")
+        for p in launcher_edit_no:
+            check("resolved " + name + " may not edit: " + p, decide(resolved, "edit", p) == "deny")
+        for p in launcher_read_ok:
+            check("resolved " + name + " may read: " + p, decide(resolved, "read", p) == "allow")
+        for p in launcher_read_no:
+            check("resolved " + name + " may not read: " + p, decide(resolved, "read", p) == "deny")
+        check("resolved " + name + " denies: task", decide(resolved, "task", "*") == "deny")
 
 print("\n".join(results))

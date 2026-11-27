@@ -17,6 +17,9 @@
 /.claude/settings.local.json
 CLAUDE.local.md
 
+# A coding agent's project tooling keeps per-machine configuration here.
+/.serena/
+
 # `cargo test` (via an external tool or runner) leaves `trait_test*` files in the repository root
 # when invoked from there. Root-anchored to avoid masking any intentional files in subdirectories.
 /trait_test*

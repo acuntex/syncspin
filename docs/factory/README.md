@@ -58,8 +58,51 @@ such a run stops before the push. The driver is the unattended path for both too
 code reviews, flags can only lower them), the verdict parsing, the snapshot checks, the commit and
 pull request text checks and the push are shell code with tests. The agents do the thinking.
 
+`scripts/gate.sh` runs only the steps the changed paths need: Rust paths select the cargo steps,
+shell paths `shellcheck`, factory paths (including `.github/`, `.mcp.json` and the ignore files) the
+generator check and the factory tests, while a docs or markup path selects no cargo step. A rename
+keeps both sides visible. A path in no class, a failed `merge-base` or an empty index leaves the set
+unknown, which selects every step of the mode. A changed `deny.toml` selects the `deny` step in every
+mode, so deleting the policy fails the gate instead of skipping the step. `--since REF` selects the
+per-commit steps for a committed range; the light code review uses it because its index is clean. CI
+still runs the whole set on every pull request, so a step the local gate skipped cannot reach `main`
+unchecked.
+
 The Claude Code `/factory` command is prompt-driven: the same procedure, but the caps and checks are
 instructions to a model. Prefer the driver when the outcome matters.
+
+## Light path
+
+A trivial task does not need the full path. The driver classifies the task text itself, in shell code
+and without a model:
+
+- **light** when the text is at most 1200 bytes and 12 lines, names one to three files, and every
+  named file is `.gitignore` or has a `.md` or `.txt` name. A URL with a scheme, a `//host` path or a
+  directory mention is not a named file. A named path has to be canonical: ASCII letters, digits,
+  `.`, `_` and `-` in segments separated by single slashes, no `.` or `..` segment, no leading `/`,
+  `~` or `-`, no backslash, colon, newline or carriage return; one leading `./` is stripped. A token
+  that is not a file candidate and carries a backslash, a percent or a non-ASCII byte is full, and so
+  is a protected stem split from its extension (`AGENTS md`). The protected names and directory
+  prefixes are compared without regard to case, so `Agents.md` is refused like `AGENTS.md` on a
+  case-insensitive file system. A light run writes a short plan on the helper model, skips the plan
+  review, makes one implementer call and then measures the real diff: it stays light while that diff
+  touches at most three such files, adds and deletes at most 80 lines and is a single commit.
+- **full** otherwise, including a task that names no file, names only directories, names more than
+  three files, or mentions `scripts`, `crates`, `src`, `.github`, `Cargo.toml` or any other protected
+  path or code. A directory mention beside a named file does not by itself make the task full unless
+  it is protected. The classifier is a cost heuristic: it decides the starting path, not the safety.
+  A name it does not recognise (prose, an escape, a look-alike) can still start a light run; the
+  measured diff and the protected-path check are the safety net. `light_diff_check` escalates on a
+  path outside the allowlist, and a change to a protected path without `--allow-protected` stops the
+  run with exit 13.
+
+A light run that leaves those limits after the implementer call — a code file, a protected path, too
+many lines — escalates: `light-escalation.txt` in the run directory records why, the state says
+`path=full`, and the run continues on the full path from the code review on. An answer to an owner
+decision that changes the plan body escalates the same way before the post-decision review. The
+skipped plan review cannot be added back, so a spelling the classifier can read errs towards full,
+while the measured diff, the protected-path check, the owner gate, the one review and CI carry the
+safety. `--dry-run` prints the path, its reason and the light schedule.
 
 ```sh
 scripts/factory.sh --backend claude "add a --list flag to the player example"
@@ -69,11 +112,13 @@ scripts/factory.sh --dry-run --backend claude "anything"   # print the phases an
 
 `--allow-protected`, `--plan-rounds N`, `--code-rounds N`, `--model-helper M`, `--model-main M`,
 `--variant-helper V`, `--variant-main V`, `--opencode-attach URL`, `--opencode-bin PATH` and
-`--phase-timeout SECS` are the other options. `FACTORY_PASS_ENV` names the variables to pass to the agent (for a model
-provider key); everything else is removed from its environment.
+`--phase-timeout SECS` (overrides every phase budget) are the other options. `FACTORY_PASS_ENV` names
+the variables to pass to the agent (for a model provider key); everything else is removed from its
+environment.
 
-`--stop-after plan` stops after the reviewed plan and leaves the branch that preflight created in the
-local repository. Delete it by hand when you abandon the run.
+`--stop-after plan` stops after the plan: reviewed on the full path, unreviewed and short on the light
+path, where the driver says so. It leaves the branch that preflight created in the local repository.
+Delete it by hand when you abandon the run.
 
 ## Writing a task text
 
@@ -83,9 +128,14 @@ the crate or file if you know it, and what must not change. Put long requests in
 
 ## What the human decides
 
-- Owner decisions: when the plan lists open questions (public API, breaking changes, scope, limits)
-  the run stops with exit 10. Write the answers to `decisions.md` in the run directory and run
-  `scripts/factory.sh --resume <run id>`. The plan is revised and reviewed once more.
+- Owner decisions: the planner asks only questions that change what will be built, each written
+  `- BLOCKING: <question>`; everything else goes under `## Notes` and runs on. When the section is not
+  `None.` the run stops with exit 10; write the answers to `decisions.md` in the run directory and run
+  `scripts/factory.sh --resume <run id>`. The stop lists the questions and names any line that is not
+  marked blocking, so a misplaced non-blocking question costs a stop rather than passing silently. The
+  plan is revised, and reviewed once more only when the revision changed the plan outside the owner
+  decisions and the changelog; answering a question in place is not a change. On the light path such a
+  change also escalates the run to the full path.
 - Everything after a stop that is not resumable (exit 11 to 16): read `handoff.md`, then fix by hand
   or start a new run.
 - The pull request: read it, in particular the protected-path diff, and merge it yourself.
@@ -94,8 +144,8 @@ the crate or file if you know it, and what must not change. Put long requests in
 
 `.factory/runs/<run id>/` is gitignored and holds `task.md`, `plan.md`, `review-plan-N.md`,
 `review-plan-post.md`, `decisions.md`, `review-code-N.md`, `pr.md`, `blocked.md`, `handoff.md`,
-`state` and `logs/<phase>.log`. Logs can contain paths and model provider output: never attach them
-to a public issue.
+`state`, `phases.tsv`, `light-escalation.txt` and `logs/<phase>.log`. Logs can contain paths and model
+provider output: never attach them to a public issue.
 
 ## Exit codes
 
@@ -116,17 +166,23 @@ to a public issue.
 ## Model and cost
 
 The Claude agents use `sonnet`. For OpenCode no model is committed: set `FACTORY_MODEL_HELPER` (the
-reviewers and the pull request writer) and `FACTORY_MODEL_MAIN` (planner and implementer) or the flags
-above; without a helper model the driver warns once and the reviewers use the session default. A
-run makes one planner call, one to five plan reviews, one implementer call, one to three code reviews
-(plus fixes) and one pull request writer call. Phases time out after 45 minutes (implement and fix:
-two hours) unless `--phase-timeout` says otherwise.
+reviewers, the pull request writer and the light planner) and `FACTORY_MODEL_MAIN` (the full-path
+planner and the implementer) or the flags above; without a helper model the driver warns once and the
+reviewers use the session default. A full run makes one planner call, one to five plan reviews, one
+implementer call, one to three code reviews (plus fixes) and one pull request writer call; a light run
+makes one planner call on the helper model, no plan review, one implementer call and at most one short
+review.
+Every phase kind has its own budget: 20 minutes for the plan, 15 for a plan revision and a plan
+review, 10 for the post-decision review and the pull request text, two hours for the implementer,
+90 minutes for a fix, 25 for a code review and two hours for the final gate, 45 minutes for anything
+else. `--phase-timeout SECS` overrides every one of them.
 
 ### Reasoning variant (OpenCode)
 
 `opencode run --variant` selects a provider-specific reasoning effort (for example `minimal`, `high` or
-`max`). Set `FACTORY_VARIANT_MAIN` (planner and implementer) and `FACTORY_VARIANT_HELPER` (reviewers and
-pull request writer), or `--variant-main V` and `--variant-helper V`. A variant is passed as
+`max`). Set `FACTORY_VARIANT_MAIN` (the full-path planner and the implementer) and
+`FACTORY_VARIANT_HELPER` (reviewers and pull request writer), or `--variant-main V` and
+`--variant-helper V`. A variant is passed as
 `--variant V` to the OpenCode backend only, and only when set; it must match `^[a-z0-9][a-z0-9._-]*$`, so
 nothing else can reach the command line. The Claude backend ignores it with a one-line warning. The
 driver does not know which variants a model supports: an unsupported one fails in OpenCode. `--dry-run`
@@ -185,7 +241,10 @@ a command template after it has substituted the typed arguments (unverified), so
 
 The commands run in the generated `factory-launcher` agent (`.opencode/agents/factory-launcher.md`).
 Its rules: bash denied except `scripts/factory-launch.sh *`, every shared deny last; `edit` only under
-`.factory/launch/`; `read` only under `.factory/runs/` and `.factory/launch/`; `question` allowed.
+`.factory/launch/`; `read` only under `.factory/runs/` and `.factory/launch/`; `question` allowed;
+`task` denied, like every factory agent, so it cannot start a subagent. It runs the launcher in
+exactly the form each command template names, with no option a template does not name: never the
+driver, never the gate, never `cargo`, and it never waits for a run.
 Everything is generated from `docs/factory/commands/`, `roles/launcher.md` and `meta/launcher*`. The
 commands exist for OpenCode only: Claude Code has its own `/factory`.
 
@@ -250,10 +309,15 @@ systemd loads it for the unit (`EnvironmentFile`), or the detached shell sources
 After the questions the agent reports the launcher's summary: the launch id, `journalctl --user -u
 factory-<id> -f` (or the log path), `scripts/factory-launch.sh --status`, `scripts/factory-launch.sh
 --stop <launch id>`, and where the run directory appears (`.factory/runs/`). With an attached server,
-every phase is also a session in that server. `--status` lists the five newest launches and runs;
-phase durations are the last log header (`== <phase> HH:MM:SS`, UTC) against the log's last write.
-`--stop` ends the systemd unit or the fallback process group; an agent phase of the fallback may run
-on until its own timeout.
+every phase is also a session in that server; a client that derives the title from the first prompt
+line shows `Factory <slug>: <phase> <round>` (reasoned, not run). The driver prints one line per phase
+with its duration and its exit code, and ends every run — finished, stopped or interrupted by a signal
+— with a summary: the path, the number of phase runs and the time spent inside them, then one line per
+phase. It also records every phase in
+`phases.tsv` in the run directory. `--status` lists the five newest launches and runs and reads
+`phases.tsv` when the driver wrote one; without it, the durations fall back to the last log header
+(`== <phase> HH:MM:SS`, UTC) against the log's last write. `--stop` ends the systemd unit or
+the fallback process group; an agent phase of the fallback may run on until its own timeout.
 
 ### Limits
 
@@ -301,6 +365,7 @@ the factory layer:
 | Factory-only denies              | `docs/factory/meta/deny-factory.txt`: in the generated OpenCode agents, and passed by the driver to Claude per phase    |
 | Allowed commands                 | `docs/factory/meta/claude-allow-*.txt`: OpenCode agents carry them as bash rules, the Claude driver as `--allowedTools` |
 | Edit rules of the readonly roles | The generated OpenCode agents; for Claude the driver's `Edit(<artifact>)` grant                                         |
+| The `task` tool (subagents)      | `task: "deny"` in every generated OpenCode agent; no agent spawns another                                               |
 
 | Aspect                   | OpenCode (generated agents)                                          | Claude Code (driver flags)                                       |
 | ------------------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------- |
@@ -324,17 +389,23 @@ rests on the driver's post-phase snapshot check (a changed file is exit 13) and 
 
 ## Troubleshooting
 
-When a phase exits non-zero or ends without its artifact, the driver stays on exit 20 (resumable),
+When a phase exits non-zero or ends without its report, the driver stays on exit 20 (resumable),
 prints one `factory: cause: ...` line and adds a `## Cause` section to `handoff.md` with the first 12 non-blank
-lines of `logs/<phase>.log` (ANSI codes removed, lines with personal data withheld). Fix the cause,
-then run `scripts/factory.sh --resume <run id>`.
+lines of `logs/<phase>.log` (ANSI codes removed, lines with personal data withheld). A phase that
+exits **0** without its artifact is retried once before the run stops; a non-zero exit is not
+retried. Fix the cause, then run `scripts/factory.sh --resume <run id>`.
 
 | Cause in handoff.md       | What the log said                                 | Fix                                                                   |
 | ------------------------- | ------------------------------------------------- | --------------------------------------------------------------------- |
 | not logged in             | `Not logged in`, `run /login`                     | Log in once: run the tool interactively (Claude Code: `/login`).      |
 | workspace not trusted     | `has not been trusted`, `trust dialog`            | Run `claude` in the clone once and accept the workspace trust dialog. |
 | rate or usage limit       | `rate_limit`, `usage limit`, `spend limit`, `429` | Wait until the limit resets, or switch backend with `--backend`.      |
+| ended without its report  | the phase exited 0 and wrote nothing              | Read the log; a turn cap or a refused tool call may have ended it.    |
 | no known cause in the log | none of the above                                 | Read the log. On Claude Code the `Edit(...)` rule form may be wrong.  |
+
+A phase that ends before writing its report usually did not keep its commands in the foreground. The
+`## Discipline` section of the reviewer and implementer roles forbids background jobs and polling and
+asks for the artifact first, so this should be rare: read the log for a command that was killed.
 
 ## Known limits
 
@@ -351,6 +422,13 @@ then run `scripts/factory.sh --resume <run id>`.
   it is not a gate. The per-commit check is `scripts/gate.sh --commit`. The deny lists block
   `--no-verify`, `-n` and `--no-v*` for `git commit`, but not every combined short form (`-an`,
   `-anm`): a glob cannot tell flag letters from a commit message.
+- The gate selects its steps from the changed paths, so a change that looks unrelated to the step it
+  would have needed can skip it locally. `.gitignore` keeps the generator check and the factory tests
+  for that reason, and a path outside every class selects every step of the mode. The CI jobs always
+  run the whole set on the pull request, so nothing skipped locally reaches `main` unchecked; `deny`
+  skips only when `deny.toml` was never tracked, and deleting a tracked policy fails the gate. The
+  `prettier` step can be red on files the branch does not touch, because not every committed Markdown
+  file is fully formatted: read its log before attributing the failure to the change.
 - The snapshot ignores ignored paths on purpose (`target/`, `mutants.out*`, identity files): a new
   file in some other ignored location is invisible to it.
 - The deny lists also block the `--output` option of `git diff`, `git log` and `git show`, which
@@ -388,6 +466,12 @@ Not yet verified against a live model. What runs in CI and locally is the hermet
 versions used and the result of each of these checks:
 
 - a tiny task on each backend with `--no-push`;
+- one real light run (`--no-push --stop-after review`) on a Markdown-only task: one planner call, no
+  plan review, one implementer call, one light review, and a summary line;
+- one run ended by a signal (or stopped through the launcher) prints the `factory: summary:` line;
+- `opencode debug agent factory-planner` and `opencode debug agent factory-launcher` on an
+  installation that has the client, to confirm both resolve with `task: "deny"` and that a session
+  title comes out readable;
 - `gh pr merge` and `git push origin main` refused inside both tools;
 - a readonly OpenCode role cannot edit `src/` but can write its artifact (this confirms the `edit`
   path form and the rule order on OpenCode 1.x);
