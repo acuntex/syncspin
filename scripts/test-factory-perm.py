@@ -199,7 +199,7 @@ def list_decide(entries, text):
 
 # Commands every role may run: read-only inspection, cargo and the repository scripts.
 common = [
-    "cargo test", "scripts/gate.sh --commit", "ls x", "rg x", "grep x y", "wc -l x", "diff a b",
+    "cargo test", "scripts/timed.sh 600 -- cargo test", "scripts/gate.sh --commit", "ls x", "rg x", "grep x y", "wc -l x", "diff a b",
     "git status", "git diff", "git log", "git show HEAD", "git write-tree",
     "cat x", "head -n 5 x", "tail -n 5 x", "find . -name x", "stat x", "file x", "tree -L 2", "sort x",
     "uniq x", "cut -d: -f1 x", "tr a b", "basename x", "dirname x", "realpath x", "pwd", "which x",
@@ -215,7 +215,7 @@ orchestrator_only = ["git fetch origin main", "git switch -c factory/x", "gh pr 
 # Never allowed to a factory agent in either tool.
 never = [
     "rm x", "git push origin factory/x", "tee x", "cp a b", "mv a b", "touch x", "dd if=a of=b",
-    "sed -i s/a/b/ x", "git branch -D x",
+    "sed -i s/a/b/ x", "git branch -D x", "timeout 600 cargo test",
 ]
 
 # The OpenCode factory agents: the project rules, then the agent's own rules.

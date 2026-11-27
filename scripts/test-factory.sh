@@ -706,6 +706,17 @@ section_sync() {
   assert "sync: code-review-light.md names the observed section" grep -qF -- '`## Observed`' "$light_review"
   assert "sync: code-review-light.md runs the gate through the wrapper" grep -qF -- 'scripts/timed.sh 600 -- {{GATE_CMD}}' "$light_review"
   assert "sync: code-review-light.md names the verdict" grep -q 'VERDICT: APPROVED' "$light_review"
+  # Every reviewer and the implementer keeps its commands in the foreground, and every gate runs
+  # through the only timed form an agent may use. The plan review has no gate at all.
+  for role in plan-reviewer code-reviewer implementer; do
+    assert "sync: $role has a discipline section" grep -q '^## Discipline$' "$repo/docs/factory/roles/$role.md"
+    assert "sync: $role never waits for a command" grep -q 'never end a turn' "$repo/docs/factory/roles/$role.md"
+  done
+  for t in implement fix code-review code-review-light; do
+    # shellcheck disable=SC2016  # the literal placeholder, not a shell expansion
+    assert "sync: $t runs the gate through the wrapper" grep -Eq 'scripts/timed\.sh [0-9]+ -- \{\{GATE_CMD\}\}' "$repo/docs/factory/phases/$t.md"
+  done
+  refute "sync: plan-review.md has no gate" grep -qF -- '{{GATE_CMD}}' "$repo/docs/factory/phases/plan-review.md"
   for f in "$repo"/.claude/agents/factory-*.md; do
     allowed=" name description tools model maxTurns "
     assert "sync: $(basename "$f") (claude agent) has a closed fence" frontmatter_keys "$f" >/dev/null

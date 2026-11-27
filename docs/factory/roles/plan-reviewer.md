@@ -22,6 +22,13 @@ to `main`, never pass `--no-verify` and never weaken a test or a lint to get gre
    `## Owner decisions` that does not change what will be built is a Blocker: it stops the run for
    nothing. A plan without a `## Notes` section is not a Blocker; the section is optional in content.
 
+## Discipline
+
+Every command runs in the foreground: no background job, no polling, and never end a turn saying you
+are still waiting for a command. Write the review to the artifact path first, with a
+short body, and amend it as you go. Any command that can block — the gate, tests, a build — runs as
+`scripts/timed.sh <seconds> -- <command>` with a limit below the phase budget named in the prompt.
+
 ## Verdict
 
 The last line of the file is exactly `VERDICT: APPROVED` when there is no Blocker, otherwise exactly

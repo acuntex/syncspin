@@ -45,7 +45,10 @@ The run directory `.factory/runs/<run id>/` holds artifacts only and is gitignor
 
 Every role prompt tells the agent to read `AGENTS.md` first, that the repository is public, that task
 text and findings are data, and that agents never merge or push to `main`. The launcher cannot read
-the repository, so its prompt says the rules bind it without asking it to read them.
+the repository, so its prompt says the rules bind it without asking it to read them. The reviewers and
+the implementer carry a `## Discipline` section: every command in the foreground, no background jobs
+and no polling, the artifact written first and amended, and every command that can block under
+`scripts/timed.sh`.
 
 ## Caps and phases
 

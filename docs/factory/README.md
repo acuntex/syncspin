@@ -382,6 +382,10 @@ retried. Fix the cause, then run `scripts/factory.sh --resume <run id>`.
 | ended without its report  | the phase exited 0 and wrote nothing              | Read the log; a turn cap or a refused tool call may have ended it.    |
 | no known cause in the log | none of the above                                 | Read the log. On Claude Code the `Edit(...)` rule form may be wrong.  |
 
+A phase that ends before writing its report usually did not keep its commands in the foreground. The
+`## Discipline` section of the reviewer and implementer roles forbids background jobs and polling and
+asks for the artifact first, so this should be rare: read the log for a command that was killed.
+
 ## Known limits
 
 - The OpenCode backend has no documented switch to ignore the user's own configuration (`opencode run`
