@@ -1694,6 +1694,28 @@ HOOK
   assert "D51 the resume keeps the full path" test "$(state_of path)" = full
   assert "D51 the resumed review is the full template" has "$(cat "$sd/calls.log")" 'PROMPT .*Review the commits on branch'
 
+  # D52: a phase that exits 0 without its report is retried once, then stops 20.
+  new_case stub
+  : >"$sd/noop-plan"
+  drive --backend opencode "t"
+  assert "D52 a clean exit without artifact is retried once" test "$(count_calls 'role=planner')" = 2
+  assert "D52 the second miss stops 20" test "$drv_rc" = 20
+  assert "D52 the retry is announced" has "$drv_out" 'ended without its report; retrying once'
+  assert "D52 the handoff names the cause" has "$(cat "$(run_dir_of)/handoff.md")" 'ended without its report'
+  assert "D52 the retry is noted in the log" grep -q '^# retry: ' "$(run_dir_of)/logs/plan.log"
+  new_case stub
+  printf 'VERDICT: CHANGES NEEDED\n' >"$sd/q-plan-review"
+  : >"$sd/noop-plan-revise"
+  drive --backend opencode "t"
+  assert "D52 a revision that changes nothing is retried once" test "$(count_calls 'kind=plan-revise')" = 2
+  assert "D52 the second revision miss stops 20" test "$drv_rc" = 20
+  assert "D52 the revision handoff names the cause" has "$(cat "$(run_dir_of)/handoff.md")" 'ended without its report'
+  new_case stub
+  : >"$sd/noop-plan"
+  printf '1\n' >"$sd/exit-plan"
+  drive --backend opencode "t"
+  assert "D52 a non-zero exit without artifact makes one call" test "$(count_calls 'role=planner')" = 1
+
   # D13: dry run.
   new_case stub
   drive --dry-run --backend claude "t"
@@ -1929,6 +1951,7 @@ HOOK
   printf '%s\n' "visit https://example.invalid/login to sign in" "please login again later" "token=$tok_a" "key $tok_b" "plain line kept" >"$sd/loglines"
   # shellcheck disable=SC2016  # the hook expands STUB_DIR inside the stub
   printf 'cat "$STUB_DIR/loglines"\nhandled=1\n' >"$sd/hook-plan.sh"
+  printf '1\n' >"$sd/exit-plan"
   drive --backend claude "t"
   handoff=$(cat "$(run_dir_of)/handoff.md")
   assert "D36 [token] exits 20" test "$drv_rc" = 20

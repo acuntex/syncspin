@@ -358,16 +358,18 @@ rests on the driver's post-phase snapshot check (a changed file is exit 13) and 
 
 ## Troubleshooting
 
-When a phase exits non-zero or ends without its artifact, the driver stays on exit 20 (resumable),
+When a phase exits non-zero or ends without its report, the driver stays on exit 20 (resumable),
 prints one `factory: cause: ...` line and adds a `## Cause` section to `handoff.md` with the first 12 non-blank
-lines of `logs/<phase>.log` (ANSI codes removed, lines with personal data withheld). Fix the cause,
-then run `scripts/factory.sh --resume <run id>`.
+lines of `logs/<phase>.log` (ANSI codes removed, lines with personal data withheld). A phase that
+exits **0** without its artifact is retried once before the run stops; a non-zero exit is not
+retried. Fix the cause, then run `scripts/factory.sh --resume <run id>`.
 
 | Cause in handoff.md       | What the log said                                 | Fix                                                                   |
 | ------------------------- | ------------------------------------------------- | --------------------------------------------------------------------- |
 | not logged in             | `Not logged in`, `run /login`                     | Log in once: run the tool interactively (Claude Code: `/login`).      |
 | workspace not trusted     | `has not been trusted`, `trust dialog`            | Run `claude` in the clone once and accept the workspace trust dialog. |
 | rate or usage limit       | `rate_limit`, `usage limit`, `spend limit`, `429` | Wait until the limit resets, or switch backend with `--backend`.      |
+| ended without its report  | the phase exited 0 and wrote nothing              | Read the log; a turn cap or a refused tool call may have ended it.    |
 | no known cause in the log | none of the above                                 | Read the log. On Claude Code the `Edit(...)` rule form may be wrong.  |
 
 ## Known limits

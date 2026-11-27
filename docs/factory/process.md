@@ -140,11 +140,17 @@ code-review final-gate pr done`. `step` names the unit of work inside it.
 
 `handoff.md` is written on every stop with a fixed layout: `# Handoff`, `Run:`, `Branch:`,
 `Stopped at:`, `Exit code:`, `Reason:`, `Artifacts:`, `Open findings:` and `Resume:` (the exact
-command, or `not resumable`). When a phase exits non-zero or ends without its artifact, a `## Cause`
+command, or `not resumable`). When a phase exits non-zero or ends without its report, a `## Cause`
 section follows `Reason:`: the classification of `logs/<phase>.log` (not logged in, workspace not
-trusted, rate or usage limit, or no known cause), the fix, and the first 12 non-blank lines of the log, each cut
-at 200 characters, with ANSI codes removed and lines that hold personal data withheld. The driver
-prints the same cause as one line to stderr; the exit code stays 20.
+trusted, rate or usage limit, ended without its report, or no known cause), the fix, and the first 12
+non-blank lines of the log, each cut at 200 characters, with ANSI codes removed and lines that hold
+personal data withheld. The driver prints the same cause as one line to stderr; the exit code stays 20.
+
+A phase that exits **0** without its artifact is retried once, with `# retry: the phase exited 0
+without its artifact` appended to its log and one line on stderr; a second clean miss stops the run
+with `ended without its report`. A non-zero exit is not retried. A plan revision that leaves the plan
+byte-identical counts as a miss and follows the same rule. A light-path timeout escalates instead and
+runs the unit again on the full template (see "Caps and phases").
 
 Run directory files: `task.md plan.md review-plan-N.md review-plan-post.md decisions.md
 review-code-N.md pr.md blocked.md handoff.md state light-escalation.txt logs/<phase>.log`. Logs can

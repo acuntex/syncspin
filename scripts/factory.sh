@@ -535,33 +535,39 @@ log_head() {
 
 cause_md=""
 
-# diagnose <phase-name> <artifact-missing 0|1>: sets cause_md for handoff.md and prints one line to
-# stderr. Called only when a phase is about to stop the run; the exit code is the caller's business.
+# diagnose <phase-name> <artifact-missing 0|1> [report]: sets cause_md for handoff.md and prints one
+# line to stderr. Called only when a phase is about to stop the run; the exit code is the caller's
+# business. `report` names a phase that exited 0 and never wrote its artifact, retry included.
 diagnose() {
-  local name=$1 missing=$2 kind text fix summary head_lines line
+  local name=$1 missing=$2 why=${3:-} kind text fix summary head_lines line
   text=$(phase_log_text "$run_dir/logs/$name.log")
   kind=$(classify_log <<<"$text")
-  case "$kind" in
-    login)
-      summary="not logged in"
-      fix="log in once (run the backend interactively and sign in; Claude Code: /login), then resume"
-      ;;
-    trust)
-      summary="workspace not trusted"
-      fix="open claude in this clone once and accept the workspace trust dialog, then resume"
-      ;;
-    limit)
-      summary="rate or usage limit"
-      fix="wait until the limit resets or switch backend (--backend), then resume"
-      ;;
-    *)
-      summary="no known cause in the log"
-      fix="read logs/$name.log"
-      if [ "$backend" = claude ] && [ "$missing" = 1 ]; then
-        fix="$fix; the Edit(...) rule form may be wrong for this Claude Code version"
-      fi
-      ;;
-  esac
+  if [ "$why" = report ]; then
+    summary="ended without its report"
+    fix="the phase exited 0 and wrote nothing; read logs/$name.log and resume"
+  else
+    case "$kind" in
+      login)
+        summary="not logged in"
+        fix="log in once (run the backend interactively and sign in; Claude Code: /login), then resume"
+        ;;
+      trust)
+        summary="workspace not trusted"
+        fix="open claude in this clone once and accept the workspace trust dialog, then resume"
+        ;;
+      limit)
+        summary="rate or usage limit"
+        fix="wait until the limit resets or switch backend (--backend), then resume"
+        ;;
+      *)
+        summary="no known cause in the log"
+        fix="read logs/$name.log"
+        if [ "$backend" = claude ] && [ "$missing" = 1 ]; then
+          fix="$fix; the Edit(...) rule form may be wrong for this Claude Code version"
+        fi
+        ;;
+    esac
+  fi
   head_lines=$(log_head 12 <<<"$text")
   cause_md=$(
     printf '## Cause\n\n%s. Fix: %s.\n\n' "$summary" "$fix"
@@ -1330,24 +1336,69 @@ verify_phase() {
   take_snapshot "$branch" >"$run_dir/snap.base"
 }
 
-# Artifact phases: the backend must leave its artifact behind. Returns 1 only on a light-path
-# timeout, so the caller can retry the unit on the full template; every other stop ends the run.
+# Artifact phases: the backend must leave its artifact behind. A clean exit without one is retried
+# once. Returns 1 only on a light-path timeout, so the caller can retry the unit on the full template;
+# every other stop ends the run.
 artifact_phase() {
-  local role=$1 name=$2 template=$3 artifact=$4
+  local role=$1 name=$2 template=$3 artifact=$4 attempt=0
   rm -f "${ROOT:?}/$artifact"
-  run_phase "$role" readonly "$name" "$template" "$artifact" "$name"
-  if [ "$phase_timed_out" = 1 ]; then
-    if [ "$path" = light ]; then
-      escalate_light "the $name phase used its budget of $phase_secs s"
-      return 1
+  while :; do
+    attempt=$((attempt + 1))
+    run_phase "$role" readonly "$name" "$template" "$artifact" "$name"
+    if [ "$phase_timed_out" = 1 ]; then
+      if [ "$path" = light ]; then
+        escalate_light "the $name phase used its budget of $phase_secs s"
+        return 1
+      fi
+      stop 20 "the $name phase used its budget of $phase_secs s (exit 20)"
     fi
-    stop 20 "the $name phase used its budget of $phase_secs s (exit 20)"
-  fi
-  if [ ! -s "$ROOT/$artifact" ]; then
+    if [ -s "$ROOT/$artifact" ]; then
+      verify_phase readonly
+      return 0
+    fi
+    if [ "$phase_rc" = 0 ] && [ "$attempt" = 1 ]; then
+      printf '# retry: the phase exited 0 without its artifact\n' >>"$run_dir/logs/$name.log"
+      printf 'factory: the %s phase ended without its report; retrying once\n' "$name" >&2
+      continue
+    fi
+    if [ "$phase_rc" = 0 ]; then
+      diagnose "$name" 1 report
+      stop 20 "the $name phase ended without its report (exit $phase_rc)"
+    fi
     diagnose "$name" 1
     stop 20 "the $name phase ended (exit $phase_rc) without its artifact $artifact"
-  fi
-  verify_phase readonly
+  done
+}
+
+# revise_unit <name>: one plan revision. A light timeout escalates and runs the unit again on the full
+# path; a clean exit that leaves the plan byte-identical is retried once; a non-zero exit or a second
+# miss stops 20. Returns 0 when the plan changed.
+revise_unit() {
+  local name=$1 attempt=0 before
+  before=$(hash_file "$ROOT/$plan_file")
+  while :; do
+    attempt=$((attempt + 1))
+    run_phase planner readonly "$name" "$name" "$plan_file" "$name"
+    if [ "$phase_timed_out" = 1 ]; then
+      if [ "$path" = light ] && [ "$attempt" = 1 ]; then
+        escalate_light "the $name phase used its budget of $phase_secs s"
+        continue
+      fi
+      stop 20 "the $name phase used its budget of $phase_secs s (exit 20)"
+    fi
+    if [ "$(hash_file "$ROOT/$plan_file")" != "$before" ]; then return 0; fi
+    if [ "$phase_rc" = 0 ] && [ "$attempt" = 1 ]; then
+      printf '# retry: the phase exited 0 without a revised plan\n' >>"$run_dir/logs/$name.log"
+      printf 'factory: the %s phase ended without its report; retrying once\n' "$name" >&2
+      continue
+    fi
+    if [ "$phase_rc" = 0 ]; then
+      diagnose "$name" 1 report
+      stop 20 "the $name phase ended without its report (exit $phase_rc)"
+    fi
+    diagnose "$name" 1
+    stop 20 "the $name phase ended (exit $phase_rc) without a revised plan"
+  done
 }
 
 # Code phases (implement, fix): success criteria and post-phase checks.
@@ -1434,24 +1485,7 @@ while :; do
       P_MAX=$plan_cap
       P_REVIEW=$(rel "$run_dir")/review-plan-$plan_round.md
       cp "$ROOT/$plan_file" "$run_dir/plan-before-revision-$plan_round.md"
-      before=$(hash_file "$ROOT/$plan_file")
-      run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
-      if [ "$phase_timed_out" = 1 ]; then
-        if [ "$path" = light ]; then
-          # The light planner ran out of its budget: retry the unit once on the full path.
-          escalate_light "the plan-revise phase used its budget of $phase_secs s"
-          run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
-          if [ "$phase_timed_out" = 1 ]; then
-            stop 20 "the plan-revise phase used its budget of $phase_secs s (exit 20)"
-          fi
-        else
-          stop 20 "the plan-revise phase used its budget of $phase_secs s (exit 20)"
-        fi
-      fi
-      if [ "$(hash_file "$ROOT/$plan_file")" = "$before" ]; then
-        diagnose plan-revise 1
-        stop 20 "the plan-revise phase ended (exit $phase_rc) without a revised plan"
-      fi
+      revise_unit plan-revise
       verify_phase readonly
       resuming=0
       plan_round=$((plan_round + 1))
@@ -1476,24 +1510,7 @@ while :; do
       P_MAX=$plan_cap
       # The light path has no review findings: an empty path says so.
       if [ "$path" = light ]; then P_REVIEW=""; else P_REVIEW=$(rel "$run_dir")/review-plan-$plan_round.md; fi
-      before=$(hash_file "$ROOT/$plan_file")
-      run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
-      if [ "$phase_timed_out" = 1 ]; then
-        if [ "$path" = light ]; then
-          # The light planner ran out of its budget: retry the unit once on the full path.
-          escalate_light "the plan-revise phase used its budget of $phase_secs s"
-          run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
-          if [ "$phase_timed_out" = 1 ]; then
-            stop 20 "the plan-revise phase used its budget of $phase_secs s (exit 20)"
-          fi
-        else
-          stop 20 "the plan-revise phase used its budget of $phase_secs s (exit 20)"
-        fi
-      fi
-      if [ "$(hash_file "$ROOT/$plan_file")" = "$before" ]; then
-        diagnose plan-revise 1
-        stop 20 "the plan-revise phase ended (exit $phase_rc) without a revised plan"
-      fi
+      revise_unit plan-revise
       verify_phase readonly
       resuming=0
       step=post
