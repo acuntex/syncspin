@@ -102,7 +102,28 @@ case "$*" in
 esac
 exit 0
 STUB
-  chmod +x "$bin/cargo" "$bin/rustup"
+  # The deny step's command is `cargo deny check` (the stub cargo runs it); this stub makes the
+  # "cargo-deny is installed" probe deterministic, so only the policy file decides the skip.
+  cat >"$bin/cargo-deny" <<'STUB'
+#!/usr/bin/env bash
+printf 'cargo-deny %s\n' "$*" >>"${STUB_LOG:?}"
+exit 0
+STUB
+  chmod +x "$bin/cargo" "$bin/rustup" "$bin/cargo-deny"
+}
+
+# gate_branch <repo> <path>...: point refs/remotes/origin/main at the current tip, then add the given
+# paths and commit them, so the branch change set of the fixture is exactly those paths. No network.
+gate_branch() {
+  local root=$1 p
+  shift
+  git -C "$root" update-ref refs/remotes/origin/main "$(git -C "$root" rev-parse HEAD)"
+  for p in "$@"; do
+    mkdir -p "$root/$(dirname "$p")"
+    printf 'x\n' >>"$root/$p"
+  done
+  git -C "$root" add -A
+  git -C "$root" commit -q -m "chore: change $*"
 }
 
 stub_script() {
@@ -165,19 +186,29 @@ section_gate() {
   assert "G3 --list shows the step command" has "$gate_out" 'cargo fmt --all -- --check'
   assert "G3 --list wrote no log" test ! -e "$root/target/gate"
 
-  # G4: --commit selects steps by staged paths.
+  # G4: --commit selects steps by the staged paths; an empty index is unknown.
   root=$tmp/g4
   new_repo "$root"
   run_gate "$root" --list --commit
-  assert "G4 nothing staged selects no factory tests" hasnt "$gate_out" '^factory-tests '
-  assert "G4 nothing staged selects no deny" hasnt "$gate_out" '^deny '
+  assert "G4 an empty index is unknown" has "$gate_out" '^paths: unknown \(every step of this mode\)$'
+  assert "G4 an empty index selects no factory tests" has "$gate_out" '^factory-tests '
+  assert "G4 an empty index selects the generator check" has "$gate_out" '^factory-sync '
+  assert "G4 an empty index selects doc-default" has "$gate_out" '^doc-default '
+  for step in fmt clippy example-versions test doc-default shellcheck factory-sync factory-tests prettier deny msrv; do
+    assert "G4 an empty index selects $step" has "$gate_out" "^$step "
+  done
+  for step in roles test-pairing test-lib-defaults test-mdns doc-all arm package secrets; do
+    assert "G4 an empty index does not select $step" hasnt "$gate_out" "^$step "
+  done
   mkdir -p "$root/scripts"
   printf '#!/usr/bin/env bash\n' >"$root/scripts/x.sh"
   git -C "$root" add scripts/x.sh
   run_gate "$root" --list --commit
   assert "G4 staged scripts select factory tests" has "$gate_out" '^factory-tests '
   assert "G4 staged scripts select the generator check" has "$gate_out" '^factory-sync '
+  assert "G4 staged scripts select shellcheck" has "$gate_out" '^shellcheck '
   assert "G4 staged scripts do not select deny" hasnt "$gate_out" '^deny '
+  assert "G4 staged scripts select no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
   git -C "$root" reset -q
   printf 'x\n' >"$root/Cargo.lock"
   git -C "$root" add Cargo.lock
@@ -192,6 +223,117 @@ section_gate() {
   assert "G4 --full lists msrv" has "$gate_out" '^msrv '
   assert "G4 --full lists package" has "$gate_out" '^package '
   assert "G4 --full lists secrets" has "$gate_out" '^secrets '
+
+  # G11: a docs-only branch change set selects no cargo or docs step, but keeps prettier; with
+  # `docs/factory` in the set the factory steps stay.
+  root=$tmp/g11
+  new_repo "$root"
+  gate_branch "$root" docs/notes.md
+  run_gate "$root" --list
+  assert "G11 the docs change set is named" has "$gate_out" '^paths: 1 changed \(branch since origin/main\)$'
+  for step in fmt clippy example-versions test test-pairing test-lib-defaults test-mdns doc-default doc-all arm; do
+    assert "G11 a docs-only change selects no $step" hasnt "$gate_out" "^$step "
+  done
+  assert "G11 a docs-only change keeps prettier" has "$gate_out" '^prettier '
+  gate_branch "$root" docs/factory/notes.md
+  run_gate "$root" --list
+  assert "G11 a factory docs change keeps the generator check" has "$gate_out" '^factory-sync '
+  assert "G11 a factory docs change keeps the factory tests" has "$gate_out" '^factory-tests '
+  assert "G11 a factory docs change selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+
+  # G12: a .gitignore-only change set keeps the factory steps (it can hide files from the generator).
+  root=$tmp/g12
+  new_repo "$root"
+  gate_branch "$root" .gitignore
+  run_gate "$root" --list
+  assert "G12 a .gitignore change keeps the generator check" has "$gate_out" '^factory-sync '
+  assert "G12 a .gitignore change keeps the factory tests" has "$gate_out" '^factory-tests '
+  assert "G12 a .gitignore change selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+
+  # G13: a *.sh-only change set keeps shellcheck and nothing cargo.
+  root=$tmp/g13
+  new_repo "$root"
+  gate_branch "$root" tool.sh
+  run_gate "$root" --list
+  assert "G13 a shell change keeps shellcheck" has "$gate_out" '^shellcheck '
+  for step in fmt clippy example-versions roles test test-pairing doc-default doc-all arm; do
+    assert "G13 a shell change selects no $step" hasnt "$gate_out" "^$step "
+  done
+
+  # G14: a Rust path selects the cargo steps of the mode.
+  root=$tmp/g14
+  new_repo "$root"
+  mkdir -p "$root/crates/syncspin-client/src"
+  printf 'pub fn x() {}\n' >"$root/crates/syncspin-client/src/lib.rs"
+  git -C "$root" add -A
+  run_gate "$root" --list --commit
+  for step in fmt clippy example-versions test doc-default; do
+    assert "G14 a staged Rust file selects $step" has "$gate_out" "^$step "
+  done
+  assert "G14 a staged Rust file selects no deny" hasnt "$gate_out" '^deny '
+  assert "G14 a staged Rust file selects no msrv" hasnt "$gate_out" '^msrv '
+  gate_branch "$root" crates/syncspin-client/src/main.rs
+  run_gate "$root" --list
+  for step in fmt clippy example-versions roles test test-pairing test-lib-defaults test-mdns doc-default doc-all arm; do
+    assert "G14 a Rust branch change selects $step" has "$gate_out" "^$step "
+  done
+  run_gate "$root" --list --full
+  for step in msrv deny package; do
+    assert "G14 --full on a Rust change selects $step" has "$gate_out" "^$step "
+  done
+
+  # G15: an undeterminable change set selects every step of the mode.
+  root=$tmp/g15
+  new_repo "$root"
+  run_gate "$root" --list
+  assert "G15 a missing origin/main is unknown" has "$gate_out" '^paths: unknown \(every step of this mode\)$'
+  for step in fmt clippy example-versions roles test test-pairing test-lib-defaults test-mdns doc-default doc-all arm shellcheck factory-sync factory-tests prettier; do
+    assert "G15 a missing origin/main selects $step" has "$gate_out" "^$step "
+  done
+  for step in msrv deny package secrets; do
+    assert "G15 standard mode does not select $step" hasnt "$gate_out" "^$step "
+  done
+  gate_branch "$root" notes.txt
+  run_gate "$root" --list
+  assert "G15 a known change set of a non-code file is named" has "$gate_out" '^paths: 1 changed \(branch since origin/main\)$'
+  assert "G15 a non-code change selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+  printf 'pub fn x() {}\n' >"$root/experiment.rs"
+  run_gate "$root" --list
+  assert "G15 an untracked Rust file is in the change set" has "$gate_out" '^paths: 2 changed \(branch since origin/main\)$'
+  assert "G15 an untracked Rust file selects the cargo steps" has "$gate_out" '^fmt '
+  root=$tmp/g15c
+  new_repo "$root"
+  printf 'x\n' >"$root/notes.txt"
+  git -C "$root" add notes.txt
+  run_gate "$root" --list --commit
+  assert "G15 the staged change set is named" has "$gate_out" '^paths: 1 changed \(commit index\)$'
+  assert "G15 a staged text file selects no cargo step" hasnt "$gate_out" '^(fmt|clippy|test) '
+
+  # G16: --list always prints the change-set line.
+  root=$tmp/g16
+  new_repo "$root"
+  printf 'x\n' >"$root/notes.txt"
+  git -C "$root" add notes.txt
+  run_gate "$root" --list --commit
+  assert "G16 --commit names the commit index" has "$gate_out" '^paths: 1 changed \(commit index\)$'
+  assert "G16 --commit --list prints the step table" has "$gate_out" '^prettier +LOCAL ONLY'
+  run_gate "$root" --list
+  assert "G16 standard names the branch" has "$gate_out" '^paths: .* \((branch since origin/main|every step of this mode)\)$'
+
+  # G17: the deny step skips without its policy file and never fetches the advisory database.
+  root=$tmp/g17
+  new_repo "$root"
+  : >"$tmp/stub.log"
+  run_gate "$root" --commit
+  assert "G17 a missing deny.toml is skipped with its reason" has "$gate_out" '^SKIP +deny +deny.toml not present$'
+  refute "G17 the absent policy never runs cargo deny" grep -q '^deny check' "$tmp/stub.log"
+  printf '# policy\n' >"$root/deny.toml"
+  printf 'x\n' >"$root/Cargo.toml"
+  git -C "$root" add deny.toml Cargo.toml
+  : >"$tmp/stub.log"
+  run_gate "$root" --commit
+  assert "G17 a present policy runs the deny step" has "$gate_out" '^PASS +deny '
+  assert "G17 the deny step calls cargo deny check" grep -q '^deny check$' "$tmp/stub.log"
 
   # G5: a script-backed step with an absent script is SKIP not present, and runs once it exists.
   root=$tmp/g5
@@ -287,6 +429,12 @@ name = "fx"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+# The msrv step's command names these two features; an unknown change set selects it, so the fixture
+# must declare them or that command would be an error.
+[features]
+pairing-code = []
+storage-file = []
 TOML
   cat >"$root/crates/fx/src/lib.rs" <<'RS'
 //! A fixture crate for the gate test.
@@ -330,9 +478,14 @@ section_fixture() {
   assert "fixture --commit PASS fmt" has "$out" '^PASS +fmt '
   assert "fixture --commit PASS clippy" has "$out" '^PASS +clippy '
   assert "fixture --commit PASS test" has "$out" '^PASS +test '
+  assert "fixture --commit PASS doc-default" has "$out" '^PASS +doc-default '
   assert "fixture --commit SKIP example-versions" has "$out" '^SKIP +example-versions +not present'
   assert "fixture --commit SKIP prettier" has "$out" '^SKIP +prettier +disabled'
   assert "fixture --commit SKIP shellcheck" has "$out" '^SKIP +shellcheck +no shell files'
+  assert "fixture --commit SKIP factory-sync" has "$out" '^SKIP +factory-sync +not present'
+  assert "fixture --commit SKIP factory-tests" has "$out" '^SKIP +factory-tests +not present'
+  assert "fixture --commit SKIP deny" has "$out" '^SKIP +deny +deny.toml not present'
+  assert "fixture --commit reports msrv" has "$out" '^(PASS|SKIP) +msrv '
   assert "fixture worktree is clean after --commit" test -z "$(git -C "$root" status --porcelain)"
 
   rc=0
@@ -1779,6 +1932,7 @@ HOOK
     (cd "$clone" && GATE_PRETTIER=0 scripts/gate.sh --commit >"$tmp/d28.log" 2>&1) || grc=$?
     (cd "$clone" && lib take_snapshot >"$snap_b")
     assert "D28 the real gate passes in the clone" test "$grc" = 0
+    assert "D28 the missing deny policy is a skip" has "$(cat "$tmp/d28.log")" '^SKIP +deny +deny.toml not present$'
     assert "D28 the snapshot is identical around the real gate" cmp -s "$snap_a" "$snap_b"
     assert "D28 the gate left a clean tree" test -z "$(git -C "$clone" status --porcelain)"
   else

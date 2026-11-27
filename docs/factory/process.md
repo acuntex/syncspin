@@ -10,24 +10,24 @@ agent files, and `scripts/factory.sh` fills in the phase templates. The human pa
 
 ## Components
 
-| Component                                    | Role                                                                  |
-| -------------------------------------------- | --------------------------------------------------------------------- |
-| `docs/factory/roles/*.md`                    | Role system prompts (source of truth).                                |
-| `docs/factory/phases/*.md`                   | Per-phase user-prompt templates, filled in by the driver.             |
-| `docs/factory/meta/*.conf`                   | Per-role metadata: name, description, access class, model class.      |
-| `scripts/gate.sh`                            | Tool-independent gate: `--commit`, standard, `--full`, `--list`.      |
-| `.githooks/pre-commit`, `.githooks/pre-push` | Driver-only hooks, activated through environment variables.           |
-| `scripts/factory-sync.sh`                    | Generates the agent files for both tools from the sources; `--check`. |
-| `.opencode/agents/`, `.claude/agents/`       | Generated agent files. Never edit them by hand.                       |
-| `.claude/commands/factory.md`                | Generated interactive `/factory` command (Claude Code only).          |
-| `opencode.json`, `.claude/settings.json`     | Project permissions: only the `AGENTS.md` denies, for every session.  |
-| `docs/factory/meta/deny-*.txt`               | Deny rules (project level and factory only).                          |
-| `CLAUDE.md`                                  | Git symlink to `AGENTS.md`; no content of its own.                    |
-| `scripts/factory.sh`                         | Deterministic driver; the only OpenCode path and the unattended path. |
-| `scripts/factory-launch.sh`                  | Detaches a run; `--status` and `--stop`. Used by the OpenCode client. |
-| `docs/factory/commands/`                     | Sources of the OpenCode commands `/factory`, `-resume`, `-status`.    |
-| `.opencode/commands/`                        | Generated OpenCode commands, run by the `factory-launcher` agent.     |
-| `scripts/test-factory.sh`                    | Hermetic tests with stub CLIs; no model is ever run.                  |
+| Component                                    | Role                                                                                  |
+| -------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `docs/factory/roles/*.md`                    | Role system prompts (source of truth).                                                |
+| `docs/factory/phases/*.md`                   | Per-phase user-prompt templates, filled in by the driver.                             |
+| `docs/factory/meta/*.conf`                   | Per-role metadata: name, description, access class, model class.                      |
+| `scripts/gate.sh`                            | Tool-independent gate: `--commit`, standard, `--full`, `--list`; path-selected steps. |
+| `.githooks/pre-commit`, `.githooks/pre-push` | Driver-only hooks, activated through environment variables.                           |
+| `scripts/factory-sync.sh`                    | Generates the agent files for both tools from the sources; `--check`.                 |
+| `.opencode/agents/`, `.claude/agents/`       | Generated agent files. Never edit them by hand.                                       |
+| `.claude/commands/factory.md`                | Generated interactive `/factory` command (Claude Code only).                          |
+| `opencode.json`, `.claude/settings.json`     | Project permissions: only the `AGENTS.md` denies, for every session.                  |
+| `docs/factory/meta/deny-*.txt`               | Deny rules (project level and factory only).                                          |
+| `CLAUDE.md`                                  | Git symlink to `AGENTS.md`; no content of its own.                                    |
+| `scripts/factory.sh`                         | Deterministic driver; the only OpenCode path and the unattended path.                 |
+| `scripts/factory-launch.sh`                  | Detaches a run; `--status` and `--stop`. Used by the OpenCode client.                 |
+| `docs/factory/commands/`                     | Sources of the OpenCode commands `/factory`, `-resume`, `-status`.                    |
+| `.opencode/commands/`                        | Generated OpenCode commands, run by the `factory-launcher` agent.                     |
+| `scripts/test-factory.sh`                    | Hermetic tests with stub CLIs; no model is ever run.                                  |
 
 The run directory `.factory/runs/<run id>/` holds artifacts only and is gitignored.
 

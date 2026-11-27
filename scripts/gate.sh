@@ -3,12 +3,20 @@
 # The tool-independent gate: one command that runs what CI runs, in a fixed order, with a stable
 # output format. The code factory, the code reviewer and a human all call it.
 #
-#   scripts/gate.sh --commit       per-commit check: fmt, clippy, example versions, tests, plus the
-#                                  steps the staged paths need (shellcheck, prettier, factory
-#                                  tests and generator check, deny and MSRV for Cargo changes)
-#   scripts/gate.sh                standard: everything the CI lint, test, docs and arm jobs run
-#   scripts/gate.sh --full         standard plus msrv, deny, package and secrets
-#   scripts/gate.sh --list         print the selected steps and why, run nothing
+# The steps are selected from the paths a run has to consider: the staged index with `--commit`, and
+# the branch since `origin/main` plus untracked files otherwise. Rust paths add the cargo steps, shell
+# paths shellcheck, factory paths the generator check and the factory tests, and prettier runs in
+# every mode (staged markup with `--commit`, the whole tree otherwise). `--full` adds msrv, deny and
+# package for Rust paths and always runs secrets. A failing `merge-base`, a missing `origin/main` or an
+# empty change set means the set is unknown, and every step the mode can select is selected.
+#
+#   scripts/gate.sh --commit       per-commit check: fmt, clippy, example versions, tests and
+#                                  doc-default for Rust paths, shellcheck for shell files, the factory
+#                                  steps for factory paths, prettier for staged markup, and deny and
+#                                  MSRV when a Cargo manifest is staged
+#   scripts/gate.sh                standard: the CI lint, test, docs and arm steps the paths need
+#   scripts/gate.sh --full         standard plus msrv, deny, package (Rust paths) and secrets
+#   scripts/gate.sh --list         print the change set, the selected steps and why, run nothing
 #   scripts/gate.sh --keep-going   do not stop at the first failing step
 #   scripts/gate.sh --require-all  a skipped step is a failure
 #
@@ -19,8 +27,10 @@
 #
 # Output: `==> <step> (<command>)` per step, a log per step in target/gate/<step>.log, the last 40 lines
 # of a failing step, and a final table of PASS, FAIL and SKIP lines. A step whose input is absent is
-# skipped with its reason, never failed. Exit 0 without a FAIL (and without a SKIP under
-# --require-all), 1 on a failure, 2 on bad usage. The gate never formats or edits files.
+# skipped with its reason, never failed (which is why the deny step skips without `deny.toml`: the
+# advisory database is fetched over the network, and the factory tests must stay offline). Exit 0
+# without a FAIL (and without a SKIP under --require-all), 1 on a failure, 2 on bad usage. The gate
+# never formats or edits files.
 #
 # A passing run stamps the index tree hash in `.git/syncspin-gate-ok` when the worktree matches the
 # index; `.githooks/pre-commit` compares it. The stamp is a speed bump, not a control: it lives in
@@ -70,6 +80,51 @@ staged_match() {
   grep -Eq "$1" <<<"$staged"
 }
 
+# The change set: the paths this run has to consider, one per line, and where they came from.
+# `--commit` looks at the staged index. Standard and `--full` look at everything since the merge base
+# with `origin/main` (committed, staged and unstaged) plus the untracked files. A failing merge-base
+# (no `origin/main`) and an empty set leave the selection unknown.
+changed=""
+paths_state=unknown
+paths_src="commit index"
+if [ "$mode" = commit ]; then
+  changed=$staged
+  if [ -n "$changed" ]; then paths_state=known; fi
+else
+  paths_src="branch since origin/main"
+  merge_base=$(git merge-base HEAD refs/remotes/origin/main 2>/dev/null) || merge_base=""
+  if [ -n "$merge_base" ]; then
+    changed=$({
+      git diff --name-only --diff-filter=ACMRD "$merge_base" || true
+      git ls-files --others --exclude-standard || true
+    } | LC_ALL=C sort -u)
+    if [ -n "$changed" ]; then paths_state=known; fi
+  fi
+fi
+
+# The path classes the selection is built from.
+class_rust=0
+class_shell=0
+class_factory=0
+if [ "$paths_state" = known ]; then
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    case "$path" in
+      *.rs | Cargo.toml | */Cargo.toml | Cargo.lock | */Cargo.lock | rust-toolchain.toml | */rust-toolchain.toml | .cargo/* | deny.toml | crates/* | examples/*)
+        class_rust=1
+        ;;
+    esac
+    case "$path" in
+      *.sh | .githooks/*) class_shell=1 ;;
+    esac
+    case "$path" in
+      scripts/* | docs/factory/* | .githooks/* | .opencode/* | .claude/* | opencode.json | opencode.jsonc | AGENTS.md | CLAUDE.md | .gitignore)
+        class_factory=1
+        ;;
+    esac
+  done <<<"$changed"
+fi
+
 # Staged markdown, yaml and json files that exist and are not symlinks (prettier refuses an
 # explicit symlink argument).
 prettier_files() {
@@ -88,35 +143,47 @@ add() {
   sel_why+=("$2")
 }
 
-add fmt "CI lint: cargo fmt"
-add clippy "CI lint: clippy with all targets and features"
-add example-versions "CI lint: example manifests"
-if [ "$mode" != commit ]; then
-  add roles "CI lint and test: client role feature sets"
-fi
-add test "CI test: workspace tests"
-if [ "$mode" != commit ]; then
-  add test-pairing "CI test: pairing-code and storage-file features"
-  add test-lib-defaults "CI test: library crates with their own defaults"
-  add test-mdns "CI test: the mdns-pair flow"
+# Rust paths, or an unknown change set, select the cargo steps of the mode.
+if [ "$class_rust" = 1 ] || [ "$paths_state" = unknown ]; then
+  add fmt "CI lint: cargo fmt"
+  add clippy "CI lint: clippy with all targets and features"
+  add example-versions "CI lint: example manifests"
+  if [ "$mode" != commit ]; then
+    add roles "CI lint and test: client role feature sets"
+  fi
+  add test "CI test: workspace tests"
+  if [ "$mode" != commit ]; then
+    add test-pairing "CI test: pairing-code and storage-file features"
+    add test-lib-defaults "CI test: library crates with their own defaults"
+    add test-mdns "CI test: the mdns-pair flow"
+  fi
   add doc-default "CI docs: default features, warnings denied"
-  add doc-all "CI docs: all features, warnings denied"
-  add arm "CI arm: armv7 compile guard"
+  if [ "$mode" != commit ]; then
+    add doc-all "CI docs: all features, warnings denied"
+    add arm "CI arm: armv7 compile guard"
+  fi
 fi
-add shellcheck "CI lint: shell scripts and hooks"
-if [ "$mode" != commit ] || staged_match '^(scripts/|docs/factory/|\.githooks/|\.opencode/|\.claude/|opencode\.json$|AGENTS\.md$|CLAUDE\.md$|\.gitignore$)'; then
+if [ "$class_shell" = 1 ] || [ "$paths_state" = unknown ]; then
+  add shellcheck "CI lint: shell scripts and hooks"
+fi
+if [ "$class_factory" = 1 ] || [ "$paths_state" = unknown ]; then
   add factory-sync "CI lint: generated agent files match their sources"
   add factory-tests "CI lint: factory tests with stub CLIs"
 fi
 add prettier "LOCAL ONLY: a pre-commit hook, not a CI job"
 if [ "$mode" = full ]; then
-  add msrv "CI msrv: tests on Rust 1.85"
-  add deny "CI deny: licences, advisories, sources"
-  add package "CI package: cargo package for syncspin-core"
+  if [ "$class_rust" = 1 ] || [ "$paths_state" = unknown ]; then
+    add msrv "CI msrv: tests on Rust 1.85"
+    add deny "CI deny: licences, advisories, sources"
+    add package "CI package: cargo package for syncspin-core"
+  fi
   add secrets "CI secrets: gitleaks over the history"
-elif [ "$mode" = commit ] && staged_match '(^|/)Cargo\.(toml|lock)$'; then
-  add deny "Cargo manifests are staged: licences, advisories, sources"
-  add msrv "Cargo manifests are staged: tests on Rust 1.85"
+elif [ "$mode" = commit ]; then
+  # A staged Cargo manifest keeps today's deny and MSRV steps; an unknown index selects them too.
+  if [ "$paths_state" = unknown ] || staged_match '(^|/)Cargo\.(toml|lock)$'; then
+    add deny "licences, advisories, sources"
+    add msrv "tests on Rust 1.85"
+  fi
 fi
 
 step_command() {
@@ -227,7 +294,11 @@ skip_reason() {
       fi
       ;;
     deny)
-      command -v cargo-deny >/dev/null 2>&1 || printf 'cargo-deny not installed'
+      if [ ! -f deny.toml ]; then
+        printf 'deny.toml not present'
+      elif ! command -v cargo-deny >/dev/null 2>&1; then
+        printf 'cargo-deny not installed'
+      fi
       ;;
     package)
       have_pkg syncspin-core || printf 'package not present'
@@ -239,6 +310,11 @@ skip_reason() {
 }
 
 if [ "$list" = 1 ]; then
+  if [ "$paths_state" = known ]; then
+    printf 'paths: %s changed (%s)\n' "$(printf '%s\n' "$changed" | grep -c . || true)" "$paths_src"
+  else
+    printf 'paths: unknown (every step of this mode)\n'
+  fi
   for i in "${!sel_names[@]}"; do
     name="${sel_names[$i]}"
     printf '%-18s %s\n' "$name" "${sel_why[$i]}"

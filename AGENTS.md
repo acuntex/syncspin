@@ -51,9 +51,9 @@ cargo check -p syncspin-client \
 cargo check -p syncspin-client --no-default-features \
   --target armv7-unknown-linux-gnueabihf --locked       # and with no role feature at all
 scripts/check-roles.sh                                 # every role feature set: tests, docs, clippy
-scripts/gate.sh --commit                               # the per-commit check; before every commit
-scripts/gate.sh                                        # what the CI lint, test, docs and arm jobs run
-scripts/gate.sh --full                                 # plus msrv, deny, package and secrets
+scripts/gate.sh --commit                               # per-commit check: the steps the staged paths need
+scripts/gate.sh                                        # the CI lint, test, docs and arm steps the paths need
+scripts/gate.sh --full                                 # plus msrv, deny, package (Rust paths) and secrets
 scripts/test-factory.sh                                # factory tests with stub CLIs, no model
 scripts/factory-sync.sh --check                        # generated agent files match docs/factory
 cargo zigbuild --target armv7-unknown-linux-gnueabihf  # once a dependency needs a C toolchain

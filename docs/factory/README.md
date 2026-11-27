@@ -58,6 +58,11 @@ such a run stops before the push. The driver is the unattended path for both too
 code reviews, flags can only lower them), the verdict parsing, the snapshot checks, the commit and
 pull request text checks and the push are shell code with tests. The agents do the thinking.
 
+`scripts/gate.sh` runs only the steps the changed paths need: Rust paths select the cargo steps,
+shell paths `shellcheck`, factory paths the generator check and the factory tests, and an unknown
+change set (a failed `merge-base`, an empty index) selects every step of the mode. CI still runs the
+whole set on every pull request, so a step the local gate skipped cannot reach `main` unchecked.
+
 The Claude Code `/factory` command is prompt-driven: the same procedure, but the caps and checks are
 instructions to a model. Prefer the driver when the outcome matters.
 
@@ -355,6 +360,10 @@ then run `scripts/factory.sh --resume <run id>`.
   it is not a gate. The per-commit check is `scripts/gate.sh --commit`. The deny lists block
   `--no-verify`, `-n` and `--no-v*` for `git commit`, but not every combined short form (`-an`,
   `-anm`): a glob cannot tell flag letters from a commit message.
+- The gate selects its steps from the changed paths, so a change that looks unrelated to the step it
+  would have needed can skip it locally. `.gitignore` keeps the generator check and the factory tests
+  for that reason. The CI jobs always run the whole set on the pull request, so nothing skipped
+  locally reaches `main` unchecked; `deny` also skips when `deny.toml` is absent.
 - The snapshot ignores ignored paths on purpose (`target/`, `mutants.out*`, identity files): a new
   file in some other ignored location is invisible to it.
 - The deny lists also block the `--output` option of `git diff`, `git log` and `git show`, which
