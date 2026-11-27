@@ -78,11 +78,14 @@ and without a model:
 
 - **light** when the text is at most 1200 bytes and 12 lines, names one to three files, and every
   named file is `.gitignore` or has a `.md` or `.txt` name. A URL with a scheme, a `//host` path or a
-  directory mention is not a named file. The names are normalised first, so `./AGENTS.md`,
-  `docs/./factory/process.md` and `docs//factory/process.md` are the protected paths they name. A
-  light run writes a short plan on the helper model, skips the plan review, makes one implementer call
-  and then measures the real diff: it stays light while that diff touches at most three such files,
-  adds and deletes at most 80 lines and is a single commit.
+  directory mention is not a named file. A named path has to be canonical: ASCII letters, digits,
+  `.`, `_` and `-` in segments separated by single slashes, no `.` or `..` segment, no leading `/`,
+  `~` or `-`, no backslash or colon; one leading `./` is stripped. Anything else is unclear, and
+  unclear is full. The protected names and directory prefixes are compared without regard to case,
+  so `Agents.md` is refused like `AGENTS.md` on a case-insensitive file system. A light run writes a
+  short plan on the helper model, skips the plan review, makes one implementer call and then
+  measures the real diff: it stays light while that diff touches at most three such files, adds and
+  deletes at most 80 lines and is a single commit.
 - **full** otherwise, including a task that names no file, names only directories, names more than
   three files, or mentions `scripts`, `crates`, `src`, `.github`, `Cargo.toml` or any other protected
   path or code. A directory mention beside a named file does not by itself make the task full unless
@@ -417,7 +420,9 @@ asks for the artifact first, so this should be rare: read the log for a command 
   would have needed can skip it locally. `.gitignore` keeps the generator check and the factory tests
   for that reason, and a path outside every class selects every step of the mode. The CI jobs always
   run the whole set on the pull request, so nothing skipped locally reaches `main` unchecked; `deny`
-  skips only when `deny.toml` was never tracked, and deleting a tracked policy fails the gate.
+  skips only when `deny.toml` was never tracked, and deleting a tracked policy fails the gate. The
+  `prettier` step can be red on files the branch does not touch, because not every committed Markdown
+  file is fully formatted: read its log before attributing the failure to the change.
 - The snapshot ignores ignored paths on purpose (`target/`, `mutants.out*`, identity files): a new
   file in some other ignored location is invisible to it.
 - The deny lists also block the `--output` option of `git diff`, `git log` and `git show`, which

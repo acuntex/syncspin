@@ -65,10 +65,19 @@ LIGHT_MAX_TASK_LINES=12
 LIGHT_MAX_FILES=3
 LIGHT_MAX_DIFF_LINES=80
 LIGHT_MAX_COMMITS=1
+# A path named by a light task has to be the canonical spelling; a longer one is unclear, so full.
+LIGHT_MAX_PATH_BYTES=512
 # Configuration the tools read at project level, and the files that decide what they may do.
 # `.claude/settings.local.json` and `CLAUDE.local.md` are gitignored, so git status never shows them;
 # take_snapshot hashes them separately (the `localcfg` component).
 PROTECTED=(.githooks scripts .opencode .claude opencode.json opencode.jsonc .mcp.json AGENTS.md CLAUDE.md .github)
+# The same entries lowercased: the light path compares names without regard to case, because on a
+# case-insensitive file system (`macOS` APFS by default) `Agents.md` is `AGENTS.md`.
+PROTECTED_LC=()
+for _protected in "${PROTECTED[@]}"; do
+  PROTECTED_LC+=("$(printf '%s' "$_protected" | tr '[:upper:]' '[:lower:]')")
+done
+unset _protected
 LOCAL_CONFIG=(.claude/settings.local.json CLAUDE.local.md)
 CONVENTIONAL='^(feat|fix|docs|test|refactor|perf|chore|build|ci|style|revert)(\([a-z0-9._-]+\))?!?: .+'
 GENERIC_NAMES=" root runner ubuntu user admin build home test dev github docker localhost "
@@ -172,19 +181,29 @@ scrub() {
 slugify() {
   local words slug user host
   # The first four words, skipping a path-like token, a secret-shaped token and the current user or
-  # host name (unless it is a generic word): a task that starts with `/home/<name>/...`, carries a
-  # token such as `ghp_...` or names the user must not put any of them in a branch name, a session
-  # title or a run header.
+  # host name (unless it is a generic word), also when punctuation or a possessive is attached: a
+  # task that starts with `/home/<name>/...`, carries a token such as `ghp_...` or names the user as
+  # `Alice's`, `Alice,` or `alice.` must not put any of them in a branch name, a session title or a
+  # run header.
   user=${FACTORY_SCRUB_USER-$(id -un 2>/dev/null || true)}
   host=${FACTORY_SCRUB_HOST-$(hostname -s 2>/dev/null || true)}
   words=$(printf '%s' "$1" | tr '\n' ' ' | awk -v user="$user" -v host="$host" -v generic="$GENERIC_NAMES" '
-    function private(word, w) {
-      w = tolower(word)
+    function named(w, name,   n) {
+      if (length(name) <= 4) return 0
+      n = tolower(name)
+      if (index(generic, " " n " ") != 0) return 0
+      if (w == n) return 1
+      if (index(w, n) == 1 && length(w) > length(n) && substr(w, length(n) + 1, 1) !~ /[a-z0-9]/) return 1
+      return 0
+    }
+    function private(word,   w) {
       if (word ~ /[\/~@\\]/) return 1
       if (length(word) >= 32 && word ~ /^[A-Za-z0-9_-]+$/) return 1
       if (word ~ /(^|[^A-Za-z0-9])(sk-|ghp_|gho_|github_pat_|xox)/) return 1
-      if (length(user) > 4 && w == tolower(user) && index(generic, " " w " ") == 0) return 1
-      if (length(host) > 4 && w == tolower(host) && index(generic, " " w " ") == 0) return 1
+      w = tolower(word)
+      gsub(/^[^a-z0-9]+/, "", w)
+      gsub(/[^a-z0-9]+$/, "", w)
+      if (named(w, user) || named(w, host)) return 1
       return 0
     }
     {
@@ -217,38 +236,48 @@ fmt_duration() {
 # The light path: whether a task is trivial enough for the short plan, the missing plan review and
 # the one short code review. The classification is conservative: anything unclear is full.
 
-# normalize_path <path>: print the path with a leading `./`, repeated slashes and `/./` removed, so
-# `./AGENTS.md`, `docs//factory/x` and `docs/./factory/x` are the paths they name. Return 1 for an
-# absolute or `~` path and for any empty, `.` or `..` segment: a caller that treats anything unclear
-# as full never sees a normalised form of an unsafe path.
+# canonical_path <path>: return 0 when the path already has the only form the light path accepts:
+# segments of ASCII letters, digits, `.`, `_` and `-`, separated by single slashes, none empty and
+# none `.` or `..`; no leading `/`, `~` or `-`; no backslash or colon; at most LIGHT_MAX_PATH_BYTES
+# bytes. Anything else is unclear, so the caller treats it as full.
+canonical_path() {
+  local p=$1
+  [ -n "$p" ] || return 1
+  [ "${#p}" -le "$LIGHT_MAX_PATH_BYTES" ] || return 1
+  case "$p" in /* | "~"* | -* | *\\* | *:*) return 1 ;; esac
+  case "/$p/" in *//* | */./* | */../*) return 1 ;; esac
+  if printf '%s' "$p" | LC_ALL=C grep -q '[^A-Za-z0-9._/-]'; then return 1; fi
+  return 0
+}
+
+# normalize_path <path>: print the path a light task names, or return 1 when it is unclear. A single
+# leading `./` is the only spelling that is canonicalised: it is stripped once and the result must
+# pass canonical_path from the start. Every other spelling (a repeated slash, a `/./` or `..`
+# segment, a backslash, a colon, a leading `-`) is left as written and rejected, so a caller that
+# treats anything unclear as full never sees a normalised form of an unsafe path.
 normalize_path() {
-  local p=$1 prev
-  case "$p" in /* | "~"* ) return 1 ;; esac
-  while [ "$p" != "${p#./}" ]; do p=${p#./}; done
-  while :; do
-    prev=$p
-    p=${p//\/.\//\/}
-    p=${p//\/\//\/}
-    [ "$p" = "$prev" ] && break
-  done
-  case "/$p/" in */../* | */./*) return 1 ;; esac
-  case "$p" in "" | */) return 1 ;; esac
+  local p=$1
+  case "$p" in ./*) p=${p#./} ;; esac
+  canonical_path "$p" || return 1
   printf '%s' "$p"
 }
 
 # light_path_ok <path>: the allowlist of the light path. A file whose basename ends in `.md` or
-# `.txt`, and `.gitignore`, may change; prosa and nothing else. The path is normalised first, so
-# `./AGENTS.md`, `docs/./factory/x` and `docs//factory/x` are the protected paths they name.
+# `.txt`, and `.gitignore`, may change; prosa and nothing else. The path has to be canonical (see
+# normalize_path), the protected names and directory prefixes are compared without regard to case,
+# and a name equal to or under a protected entry is protected whatever its extension.
 light_path_ok() {
-  local p=$1 entry base
+  local p=$1 entry base lower
   p=$(normalize_path "$1") || return 1
-  for entry in "${PROTECTED[@]}"; do
-    case "$p" in "$entry" | "$entry"/*) return 1 ;; esac
+  p=$(normalize_path "$p") || return 1
+  lower=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')
+  for entry in "${PROTECTED_LC[@]}"; do
+    case "$lower" in "$entry" | "$entry"/*) return 1 ;; esac
   done
-  case "$p" in
+  case "$lower" in
     docs/factory/* | .factory/* | .superpowers/* | .git/* | target/* | crates/* | examples/* | src/*) return 1 ;;
   esac
-  [ "$p" = .gitignore ] && return 0
+  [ "$lower" = .gitignore ] && return 0
   base=${p##*/}
   case "$base" in *.md | *.txt) return 0 ;; esac
   return 1
@@ -287,7 +316,7 @@ light_size_reason() {
 # are not part of the text (command substitution drops them), so a 13-line text without a final
 # newline is 13 lines. Never calls a model and never touches the tree.
 classify_task() {
-  local text bytes lines word w w_norm tok esc entry first_dir="" files=0 reject="" oldifs=$IFS had_glob=0
+  local text bytes lines word w w_norm w_lc tok esc entry first_dir="" files=0 reject="" oldifs=$IFS had_glob=0
   text=$(cat)
   class_path=full
   bytes=$(printf '%s' "$text" | wc -c)
@@ -314,9 +343,10 @@ classify_task() {
     [ -n "$w" ] || continue
     case "$w" in
       */)
-        # A directory mention: normalise a relative one first, so `./scripts/` and
-        # `docs/./factory/` are the protected directories they name. An absolute or home-path
-        # mention is not a repository directory and stays a mention; anything unclear is full.
+        # A directory mention has to be canonical too: only one leading `./` is stripped, and a
+        # repeated slash, a `/./` segment or a `..` segment makes the task full. An absolute or
+        # home-path mention is not a repository directory and stays a mention; anything unclear is
+        # full.
         case "$w" in
           /* | "~"*) ;;
           *)
@@ -328,15 +358,17 @@ classify_task() {
             fi
             ;;
         esac
-        # A normalised directory mention: unsafe immediately, otherwise remembered and ignored.
-        case "$w" in
+        # A canonical directory mention: the protected directories and prefixes are matched without
+        # regard to case, because `Scripts/` is `scripts/` on a case-insensitive file system.
+        w_lc=$(printf '%s' "$w" | tr '[:upper:]' '[:lower:]')
+        case "$w_lc" in
           scripts/* | crates/* | examples/* | src/* | docs/factory/* | .github/* | .githooks/* | .opencode/* | .claude/* | .factory/* | .superpowers/* | .git/* | target/*)
             reject=$w
             break
             ;;
         esac
-        for entry in "${PROTECTED[@]}"; do
-          case "$w" in "$entry"/*) reject=$w ;; esac
+        for entry in "${PROTECTED_LC[@]}"; do
+          case "$w_lc" in "$entry"/*) reject=$w ;; esac
         done
         if [ -n "$reject" ]; then break; fi
         if [ -z "$first_dir" ]; then first_dir=$w; fi

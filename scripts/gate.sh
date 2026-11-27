@@ -37,9 +37,9 @@
 # of a failing step, and a final table of PASS, FAIL and SKIP lines. A step whose input is absent is
 # skipped with its reason, never failed (which is why the deny step skips without `deny.toml`: the
 # advisory database is fetched over the network, and the factory tests must stay offline). A tracked
-# script or policy input that was deleted is a failure, not an absent input. Exit 0 without a FAIL
-# (and without a SKIP under --require-all), 1 on a failure, 2 on bad usage. The gate never formats or
-# edits files.
+# script or policy input of a selected step that was deleted is a failure, not an absent input.
+# Exit 0 without a FAIL (and without a SKIP under --require-all), 1 on a failure, 2 on bad usage.
+# The gate never formats or edits files.
 #
 # A passing run stamps the index tree hash in `.git/syncspin-gate-ok` when the worktree matches the
 # index; `.githooks/pre-commit` compares it. The stamp is a speed bump, not a control: it lives in

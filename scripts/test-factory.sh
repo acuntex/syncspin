@@ -1363,14 +1363,48 @@ section_driver() {
   assert "classify: a URL is not a file" has "$(lib classify_probe 'Update https://example.com/README.md')" '^full|.*https://example\.com/README\.md$'
   assert "classify: a file URL is not a file" has "$(lib classify_probe 'Read file:///tmp/README.md')" '^full|.*file:///tmp/README\.md$'
   assert "classify: a scheme without slashes is refused" has "$(lib classify_probe 'Read file:/notes/README.md')" '^full|.*file:/notes/README\.md$'
-  # A `./` prefix, `//` and `/./` name the same protected path: the classifier normalises the token
-  # before the allowlist, so none of them is a light-path bypass.
+  # A `./` prefix, `//` and `/./` name the same protected path: the classifier accepts only the
+  # canonical spelling plus one leading `./`, so none of them is a light-path bypass.
   assert "classify: ./AGENTS.md is refused" has "$(lib classify_probe 'Change ./AGENTS.md')" '^full|.*\./AGENTS\.md$'
   assert "classify: ./CLAUDE.md is refused" has "$(lib classify_probe 'Change ./CLAUDE.md')" '^full|.*\./CLAUDE\.md$'
   assert "classify: docs/./factory is refused" has "$(lib classify_probe 'Update docs/./factory/process.md')" '^full|.*docs/\./factory/process\.md$'
   assert "classify: docs//factory is refused" has "$(lib classify_probe 'Update docs//factory/process.md')" '^full|.*docs//factory/process\.md$'
   assert "classify: ./README.md stays light" test "$(lib classify_probe 'Update ./README.md.')" = 'light|1 file, 1 line'
   assert "classify: ./scripts is refused" has "$(lib classify_probe 'Change ./scripts/x.sh')" '^full|.*\./scripts/x\.sh$'
+  # Case variants name the protected file on a case-insensitive file system.
+  assert "classify: Agents.md is refused" has "$(lib classify_probe 'Change Agents.md')" '^full|.*Agents\.md$'
+  assert "classify: agents.md is refused" has "$(lib classify_probe 'Change agents.md')" '^full|.*agents\.md$'
+  assert "classify: docs/Factory is refused" has "$(lib classify_probe 'Update docs/Factory/process.md')" '^full|.*docs/Factory/process\.md$'
+  # The exact forms of the round-3 blocker: a doubled slash behind a `./` prefix, alone and in a
+  # directory mention beside a named file.
+  assert "classify: .//AGENTS.md is refused" has "$(lib classify_probe 'Change .//AGENTS.md')" '^full|'
+  assert "classify: .///CLAUDE.md is refused" has "$(lib classify_probe 'Change .///CLAUDE.md')" '^full|'
+  assert "classify: ././/AGENTS.md is refused" has "$(lib classify_probe 'Change ././/AGENTS.md')" '^full|'
+  assert "classify: .//docs//factory/process.md is refused" has "$(lib classify_probe 'Update .//docs//factory/process.md')" '^full|'
+  assert "classify: a .// protected directory beside a file is refused" has "$(lib classify_probe 'Update .//docs//factory/ and README.md')" '^full|'
+  assert "classify: a .// protected name beside a file is refused" has "$(lib classify_probe 'Update .//AGENTS.md/ and README.md')" '^full|'
+
+  # Every non-canonical spelling of a protected name is unclear, and unclear is full. Generated, so
+  # that a prefix, separator or look-alike cannot slip through a spelling at a time as in the three
+  # earlier rounds.
+  local proto spelling full_a cyr_a
+  local -a protos=(AGENTS.md CLAUDE.md docs/factory/process.md)
+  full_a=$'\uff21'
+  cyr_a=$'\u0410'
+  for proto in "${protos[@]}"; do
+    for spelling in "$proto" "./$proto" ".//$proto" "././$proto" ".///$proto" "$proto/" \
+      "$proto/." "$proto//" "-$proto" "$proto " " $proto" $'\t'"$proto" "$proto"$'\n' \
+      "x/../$proto" "../$proto" "docs/../$proto" "${full_a}${proto:1}" "${cyr_a}${proto:1}" \
+      "$(printf '%s' "$proto" | tr '[:lower:]' '[:upper:]')" \
+      "$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')"; do
+      [ "$spelling" = "$proto" ] && continue
+      assert "classify: a non-canonical spelling of $proto is refused" has "$(lib classify_probe "Change $spelling")" '^full|'
+    done
+  done
+  # The canonical neighbours stay light, so the whitelist did not swallow ordinary prose files.
+  for proto in README.md docs/index.md notes.txt .gitignore; do
+    assert "classify: $proto stays light" test "$(lib classify_probe "Update $proto")" = 'light|1 file, 1 line'
+  done
   assert "classify: an oversize text is full" has "$(lib classify_probe "$(printf 'x%.0s' $(seq 1 1500))")" '^full|.*too large'
   assert "classify: 13 lines are too many" has "$(lib classify_probe "$(printf 'line %s\n' $(seq 1 12))"$'\n'"README.md")" '^full|.*13 lines'
   assert "classify: 12 lines with a final newline are light" test "$(lib classify_probe "$(printf 'line %s\n' $(seq 1 11))"$'\n'"README.md"$'\n')" = 'light|1 file, 12 lines'
@@ -1388,6 +1422,9 @@ section_driver() {
   assert "slug: a long opaque token is dropped" test "$(lib slugify "Fix $sbody32 notes.md")" = fix-notes-md
   assert "slug: the current user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix $suser notes.md")" = fix-notes-md
   assert "slug: the current host name is dropped" test "$(FACTORY_SCRUB_HOST=$suser lib slugify "Fix $suser notes.md")" = fix-notes-md
+  assert "slug: a possessive user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix ${suser}'s notes.md")" = fix-notes-md
+  assert "slug: a comma after the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Ask $suser, please")" = ask-please
+  assert "slug: a period after the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix $suser. notes.md")" = fix-notes-md
 
   # A failed diff is an escalation, not a silent pass with a half-read change set.
   local ld_out ld_rc
@@ -1396,12 +1433,14 @@ section_driver() {
   assert "light_diff_check: an unreadable base escalates" test "$ld_rc" = 1
   assert "light_diff_check names the unreadable diff" has "$ld_out" 'could not be read'
 
-  for v in .gitignore README.md docs/testing.md notes.txt; do
+  for v in .gitignore README.md docs/testing.md notes.txt ./README.md; do
     assert "light_path_ok accepts $v" lib light_path_ok "$v"
   done
   for v in scripts/x.sh .opencode/x AGENTS.md CLAUDE.md .github/x docs/factory/x.md \
     .factory/runs/x/plan.md .superpowers/sdd/x/design.md .git/config target/x.txt /abs/x.md ../x.md \
-    crates/x/notes.txt examples/x/notes.txt src/notes.txt crates/x/src/lib.rs; do
+    crates/x/notes.txt examples/x/notes.txt src/notes.txt crates/x/src/lib.rs \
+    Agents.md agents.md AGENTS.MD AGENTS.Md docs/Factory/index.md .//AGENTS.md .///CLAUDE.md \
+    ././/AGENTS.md docs//factory/x.md docs/./factory/x.md -notes.md 'back\slash.md' x:y.md; do
     refute "light_path_ok rejects $v" lib light_path_ok "$v"
   done
 
