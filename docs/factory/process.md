@@ -179,6 +179,11 @@ Redirection is not covered. Command-prefix rules match the command text, so `cat
 planner and the reviewers does not rest on the allow list: it rests on the driver's post-phase
 snapshot check (a changed file is exit 13) and on the artifact-only `Edit` grant.
 
+`scripts/timed.sh SECONDS -- command` is the only timed form an agent may use, and it is allowed
+through `scripts/*`; a bare `timeout` is not, because a `timeout *` rule would also allow
+`timeout 1 rm -rf ...`. The wrapper refuses `0` and any limit above `7200` (the longest phase
+budget), so a wrapped command cannot outlive every phase budget.
+
 How the layers merge, and how sure we are.
 
 - Verified (OpenCode 1.19.5, `opencode debug agent factory-planner`, read-only, no model): the

@@ -7,7 +7,7 @@
 #   scripts/test-factory.sh              all sections
 #   scripts/test-factory.sh gate hooks   only the named sections
 #
-# Sections: gate, fixture, hooks, sync, perm, driver, launch, probes, static.
+# Sections: gate, fixture, hooks, sync, perm, driver, launch, timed, probes, static.
 #
 # FACTORY_TEST_SKIP_CLI=1 skips every check that starts a real opencode or claude binary (they only
 # print configuration, never run a model, but a contributor may not want them started).
@@ -400,6 +400,42 @@ section_hooks() {
   refute "H2 a tag push is refused" hook_push origin refs/tags/v-test
   assert "H2 the remote branch survived" git -C "$remote" show-ref --verify --quiet refs/heads/factory/x
   refute "H2 the remote has no main" git -C "$remote" show-ref --verify --quiet refs/heads/main
+}
+
+# Timed wrapper (scripts/timed.sh): the only timed form a factory agent may use. The command's exit
+# code passes through, a hit limit is 124/137, and the limit itself is validated.
+section_timed() {
+  local rc out start end
+  # T1: the command's own exit code.
+  rc=0
+  (cd "$repo" && scripts/timed.sh 5 -- true) || rc=$?
+  assert "T1 a quick command exits 0" test "$rc" = 0
+  rc=0
+  (cd "$repo" && scripts/timed.sh 5 -- false) || rc=$?
+  assert "T1 the command's own exit code passes through" test "$rc" = 1
+
+  # T2: the limit ends a slow command early.
+  start=$(date +%s)
+  rc=0
+  (cd "$repo" && scripts/timed.sh 1 -- sleep 5) || rc=$?
+  end=$(date +%s)
+  assert "T2 a command over its limit exits 124" test "$rc" = 124
+  assert "T2 the limit ends the command before it finishes" test "$((end - start))" -lt 5
+
+  # T3: every malformed call is a usage error with the usage line.
+  local c
+  for c in '5 true' 'x -- true' '0 -- true' '7201 -- true' '5 --'; do
+    rc=0
+    # shellcheck disable=SC2086  # the case is a word list on purpose
+    out=$(cd "$repo" && scripts/timed.sh $c 2>&1) || rc=$?
+    assert "T3 '$c' is a usage error" test "$rc" = 2
+    assert "T3 '$c' prints the usage line" has "$out" '^usage: .*SECONDS -- command'
+  done
+
+  # T4: 7200 is the largest allowed limit (the longest phase budget).
+  rc=0
+  (cd "$repo" && scripts/timed.sh 7200 -- true) || rc=$?
+  assert "T4 7200 seconds is accepted" test "$rc" = 0
 }
 
 # The prettier command the tests may use, or nothing: an explicit FACTORY_TEST_PRETTIER_CMD, a
@@ -2221,13 +2257,13 @@ section_static() {
 
 sections=("$@")
 if [ ${#sections[@]} -eq 0 ]; then
-  sections=(gate fixture hooks sync perm driver launch probes static)
+  sections=(gate fixture hooks sync perm driver launch timed probes static)
 fi
 for s in "${sections[@]}"; do
   case "$s" in
-    gate | fixture | hooks | sync | perm | driver | launch | probes | static) "section_$s" ;;
+    gate | fixture | hooks | sync | perm | driver | launch | timed | probes | static) "section_$s" ;;
     *)
-      printf 'usage: %s [gate] [fixture] [hooks] [sync] [perm] [driver] [launch] [probes] [static]\n' "$0" >&2
+      printf 'usage: %s [gate] [fixture] [hooks] [sync] [perm] [driver] [launch] [timed] [probes] [static]\n' "$0" >&2
       exit 2
       ;;
   esac
