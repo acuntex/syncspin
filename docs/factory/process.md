@@ -144,7 +144,9 @@ command, or `not resumable`). When a phase exits non-zero or ends without its re
 section follows `Reason:`: the classification of `logs/<phase>.log` (not logged in, workspace not
 trusted, rate or usage limit, ended without its report, or no known cause), the fix, and the first 12
 non-blank lines of the log, each cut at 200 characters, with ANSI codes removed and lines that hold
-personal data withheld. The driver prints the same cause as one line to stderr; the exit code stays 20.
+personal data withheld. A `## Timings` section follows it when the run wrote `phases.tsv`: one line per
+phase with its duration and exit code. The driver prints the same cause as one line to stderr; the
+exit code stays 20.
 
 A phase that exits **0** without its artifact is retried once, with `# retry: the phase exited 0
 without its artifact` appended to its log and one line on stderr; a second clean miss stops the run
@@ -153,8 +155,10 @@ byte-identical counts as a miss and follows the same rule. A light-path timeout 
 runs the unit again on the full template (see "Caps and phases").
 
 Run directory files: `task.md plan.md review-plan-N.md review-plan-post.md decisions.md
-review-code-N.md pr.md blocked.md handoff.md state light-escalation.txt logs/<phase>.log`. Logs can
-hold paths and model provider output: never attach them to a public issue.
+review-code-N.md pr.md blocked.md handoff.md state phases.tsv light-escalation.txt logs/<phase>.log`.
+`phases.tsv` holds one `<phase>\t<seconds>\t<exit>` row per phase run; the driver prints the same
+durations as it goes and repeats them in a summary at the end of every run, a run ended by a signal
+included. Logs can hold paths and model provider output: never attach them to a public issue.
 
 ## Protected paths and the snapshot
 

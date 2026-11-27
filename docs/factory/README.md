@@ -120,8 +120,8 @@ the crate or file if you know it, and what must not change. Put long requests in
 
 `.factory/runs/<run id>/` is gitignored and holds `task.md`, `plan.md`, `review-plan-N.md`,
 `review-plan-post.md`, `decisions.md`, `review-code-N.md`, `pr.md`, `blocked.md`, `handoff.md`,
-`state`, `light-escalation.txt` and `logs/<phase>.log`. Logs can contain paths and model provider
-output: never attach them to a public issue.
+`state`, `phases.tsv`, `light-escalation.txt` and `logs/<phase>.log`. Logs can contain paths and model
+provider output: never attach them to a public issue.
 
 ## Exit codes
 
@@ -284,8 +284,12 @@ After the questions the agent reports the launcher's summary: the launch id, `jo
 factory-<id> -f` (or the log path), `scripts/factory-launch.sh --status`, `scripts/factory-launch.sh
 --stop <launch id>`, and where the run directory appears (`.factory/runs/`). With an attached server,
 every phase is also a session in that server, named `Factory <slug>: <phase> <round>` after the first
-line of its prompt. `--status` lists the five newest launches and runs; phase durations are the last
-log header (`== <phase> HH:MM:SS`, UTC) against the log's last write. `--stop` ends the systemd unit or
+line of its prompt. The driver prints one line per phase with its duration and its exit code, and ends
+every run — finished, stopped or interrupted by a signal — with a summary: the path, the number of
+phase runs and the time spent inside them, then one line per phase. It also records every phase in
+`phases.tsv` in the run directory. `--status` lists the five newest launches and runs and reads
+`phases.tsv` when the driver wrote one; without it, the durations fall back to the last log header
+(`== <phase> HH:MM:SS`, UTC) against the log's last write. `--stop` ends the systemd unit or
 the fallback process group; an agent phase of the fallback may run on until its own timeout.
 
 ### Limits

@@ -1744,6 +1744,33 @@ HOOK
   refute "D53 no 2.x call passes --title" grep -q -- '--title' "$sd/calls.log"
   assert "D53 the 2.x prompt carries the same header" has "$(prompt_of 1)" '^Factory t: plan 1~'
 
+  # D54: one duration per phase, a summary at the end, and phases.tsv for --status.
+  new_case stub
+  drive --backend opencode "t"
+  assert "D54 the run finishes" test "$drv_rc" = 0
+  assert "D54 the per-call line names its exit" has "$drv_out" '^factory: phase plan took [0-9]+s \(exit 0\)$'
+  assert "D54 the summary names the path, the runs and the time" has "$drv_out" '^factory: summary: path full, 6 phase runs, [0-9]+m[0-9]{2}s$'
+  assert "D54 the summary lists one indented line per phase" test "$(grep -Ec '^  (plan|plan-review|implement|code-review|final-gate|pr) [0-9]+m[0-9]{2}s$' <<<"$drv_out")" = 6
+  assert "D54 phases.tsv has a final-gate row" grep -q $'^final-gate\t' "$(run_dir_of)/phases.tsv"
+  assert "D54 the formatter prints minutes below an hour" test "$(lib fmt_duration 60)" = '1m00s'
+  assert "D54 the formatter prints hours at an hour" test "$(lib fmt_duration 3660)" = '1h01m00s'
+  new_case stub
+  : >"$sd/owner-open"
+  drive --backend opencode "t"
+  assert "D54 a stopped run prints a summary" has "$drv_out" '^factory: summary: path full, 2 phase runs, '
+  assert "D54 the handoff has a timings section" has "$(cat "$(run_dir_of)/handoff.md")" '^## Timings$'
+  assert "D54 the timings name a phase and its exit" has "$(cat "$(run_dir_of)/handoff.md")" '^- plan [0-9]+m[0-9]{2}s \(exit 0\)$'
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+echo "note" >notes.txt
+git add notes.txt
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add a note"
+handled=1
+HOOK
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D54 a light run says so in the summary" has "$drv_out" '^factory: summary: path light, 5 phase runs, '
+
   # D13: dry run.
   new_case stub
   drive --dry-run --backend claude "t"
@@ -1888,6 +1915,7 @@ HOOK
   assert "D24 the driver exits 130 on SIGTERM" test "$drv_rc" = 130
   assert "D24 the state is stopped" test "$(state_of status)" = stopped
   assert "D24 the exit code is 20, resumable" test "$(state_of exit_code)" = 20
+  assert "D24 the interrupted run prints a summary" has "$(cat "$sd/driver.out")" '^factory: summary: path full, '
   sleep 1
   refute "D24 no grandchild survives" pgrep -f 'sleep 3021'
 
@@ -2590,6 +2618,20 @@ STUB
   assert "L10 that process is still alive" kill -0 "$spid"
   kill "$spid" 2>/dev/null || true
   rm -f "$lroot/.factory/launch/stub.sleep"
+
+  # L11: --status prefers phases.tsv and names the recorded path.
+  rdir=$lroot/.factory/runs/$rid
+  printf 'path=light\n' >>"$rdir/state"
+  printf 'plan\t75\t0\nfinal-gate\t3665\t0\n' >"$rdir/phases.tsv"
+  launch -- --status "$rid"
+  assert "L11 --status prints the recorded path" has "$l_out" 'path:     light'
+  assert "L11 the short phase comes from phases.tsv" has "$l_out" 'plan +1m15s \(exit 0\)'
+  assert "L11 the hour-long phase comes from phases.tsv" has "$l_out" 'final-gate +1h01m05s \(exit 0\)'
+  refute "L11 the log heuristic is not used when phases.tsv exists" has "$l_out" 'started 10:00:00'
+  sed -i '/^path=/d' "$rdir/state"
+  launch -- --status "$rid"
+  refute "L11 a state without path prints no path line" has "$l_out" 'path: '
+  assert "L11 the phases still come from phases.tsv" has "$l_out" 'plan +1m15s \(exit 0\)'
 }
 
 # Permission tests: the two configuration files, the generated OpenCode agent overlays and, when

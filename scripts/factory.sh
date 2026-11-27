@@ -158,6 +158,16 @@ shortid() {
   od -An -N3 -tx1 /dev/urandom | tr -d ' \n'
 }
 
+# fmt_duration <seconds>: the launcher's format, so `--status` and the driver's summary agree.
+fmt_duration() {
+  local s=$1
+  if [ "$s" -ge 3600 ]; then
+    printf '%dh%02dm%02ds' $((s / 3600)) $((s % 3600 / 60)) $((s % 60))
+  else
+    printf '%dm%02ds' $((s / 60)) $((s % 60))
+  fi
+}
+
 # ---------------------------------------------------------------------------------------------
 # The light path: whether a task is trivial enough for the short plan, the missing plan review and
 # the one short code review. The classification is conservative: anything unclear is full.
@@ -1016,7 +1026,7 @@ plan_reviewed() {
 }
 
 write_handoff() {
-  local code=$1 reason=$2 review resume f
+  local code=$1 reason=$2 review resume f tname tsecs trc
   review=$(last_review_file)
   if [ "$code" = 10 ] || [ "$code" = 20 ]; then
     resume="scripts/factory.sh --resume $run_id"
@@ -1050,8 +1060,35 @@ write_handoff() {
       printf '\nProtected paths changed (--allow-protected):\n'
       sed -e 's/^/- /' "$run_dir/protected-diff.txt"
     fi
+    if [ -s "$run_dir/phases.tsv" ]; then
+      printf '\n## Timings\n\n'
+      while IFS=$'\t' read -r tname tsecs trc; do
+        printf -- '- %s %s (exit %s)\n' "$tname" "$(fmt_duration "$tsecs")" "$trc"
+      done <"$run_dir/phases.tsv"
+    fi
     printf '\nResume: %s\n' "$resume"
   } >"$run_dir/handoff.md"
+}
+
+# print_summary: the path, the number of phase runs and the time spent inside phases, then one line
+# per phase. Called by finish, stop and on_signal, so an interrupted run summarises too.
+print_summary() {
+  local total=0 runs=0 escalated="" tname tsecs trc
+  [ -n "$run_dir" ] || return 0
+  if [ -s "$run_dir/phases.tsv" ]; then
+    while IFS=$'\t' read -r tname tsecs trc; do
+      total=$((total + tsecs))
+      runs=$((runs + 1))
+    done <"$run_dir/phases.tsv"
+  fi
+  if [ -f "$run_dir/light-escalation.txt" ]; then escalated=" (escalated)"; fi
+  printf 'factory: summary: path %s%s, %s phase runs, %s\n' "${path:-full}" "$escalated" "$runs" \
+    "$(fmt_duration "$total")"
+  if [ -s "$run_dir/phases.tsv" ]; then
+    while IFS=$'\t' read -r tname tsecs trc; do
+      printf '  %s %s\n' "$tname" "$(fmt_duration "$tsecs")"
+    done <"$run_dir/phases.tsv"
+  fi
 }
 
 stop() {
@@ -1062,6 +1099,7 @@ stop() {
   stopped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   save_state
   write_handoff "$code" "$*"
+  print_summary
   printf 'factory: stopped, exit %s (%s): %s\n' "$code" "$(exit_name "$code")" "$*" >&2
   printf 'factory: see %s/handoff.md\n' "${run_dir#"$ROOT"/}" >&2
   exit "$code"
@@ -1074,6 +1112,7 @@ finish() {
   exit_code=0
   stopped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   save_state
+  print_summary
   printf 'factory: done (%s)\n' "$*"
   exit 0
 }
@@ -1097,6 +1136,7 @@ on_signal() {
   stopped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   save_state
   write_handoff 20 "interrupted by a signal; the agent process group was terminated"
+  print_summary
   exit 130
 }
 
@@ -1282,6 +1322,7 @@ run_phase() {
   done
   printf 'factory: phase %s (%s, round %s/%s, budget %s s)\n' "$name" "$role" "${P_ROUND:-0}" "${P_MAX:-0}" "$secs"
   printf '== %s %s\n' "$name" "$(date -u +%H:%M:%S)" >>"$run_dir/logs/$name.log"
+  local started_at=$SECONDS
   if [ "$backend" = opencode ] && [ -n "$opencode_attach" ] && [ -n "${OPENCODE_SERVER_PASSWORD:-}${OPENCODE_SERVER_USERNAME:-}" ]; then
     # The server credentials never go on a command line (the process list shows it): they travel
     # through file descriptor 3 and a one-line shim that exports them inside the scrubbed environment.
@@ -1311,6 +1352,9 @@ run_phase() {
   phase_rc=$rc
   phase_timed_out=0
   if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then phase_timed_out=1; fi
+  local took=$((SECONDS - started_at))
+  printf '%s\t%s\t%s\n' "$name" "$took" "$rc" >>"$run_dir/phases.tsv"
+  printf 'factory: phase %s took %ss (exit %s)\n' "$name" "$took" "$rc"
 }
 
 # Verify the snapshot after a phase and retake the baseline. readonly|code.
@@ -1588,7 +1632,11 @@ while :; do
       gate_budget=$(timeout_for final-gate)
       printf 'factory: final gate (scripts/gate.sh --full, budget %s s)\n' "$gate_budget"
       gate_rc=0
+      gate_started=$SECONDS
       timeout -k 30 "$gate_budget" scripts/gate.sh --full >"$run_dir/logs/final-gate.log" 2>&1 || gate_rc=$?
+      gate_secs=$((SECONDS - gate_started))
+      printf 'final-gate\t%s\t%s\n' "$gate_secs" "$gate_rc" >>"$run_dir/phases.tsv"
+      printf 'factory: phase final-gate took %ss (exit %s)\n' "$gate_secs" "$gate_rc"
       if [ "$gate_rc" = 124 ] || [ "$gate_rc" = 137 ]; then
         stop 20 "the final gate used its budget of $gate_budget s (exit $gate_rc)"
       fi

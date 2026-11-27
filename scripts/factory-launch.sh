@@ -266,12 +266,20 @@ fmt_duration() {
   fi
 }
 
-# phase_durations <run dir>: one line per phase log. The driver writes `== <phase> HH:MM:SS` (UTC)
-# at the start of every attempt and appends output, so the last header gives the start and the
-# file's modification time the last activity. The date comes from the modification time; a start
-# later than that belongs to the day before.
+# phase_durations <run dir>: one line per phase. `phases.tsv` (written by the driver) is the
+# authority when it exists. Otherwise the driver writes `== <phase> HH:MM:SS` (UTC) at the start of
+# every attempt and appends output, so the last header gives the start and the file's modification
+# time the last activity. The date comes from the modification time; a start later than that belongs
+# to the day before.
 phase_durations() {
-  local dir=$1 log name header hms mtime day start
+  local dir=$1 log name header hms mtime day start secs rc
+  if [ -s "$dir/phases.tsv" ]; then
+    while IFS=$'\t' read -r name secs rc; do
+      [ -n "$name" ] || continue
+      printf '  %-14s %s (exit %s)\n' "$name" "$(fmt_duration "$secs")" "$rc"
+    done <"$dir/phases.tsv"
+    return 0
+  fi
   for log in $(ls -1tr "$dir"/logs/*.log 2>/dev/null || true); do
     name=$(basename "$log" .log)
     header=$(grep -E '^== [^ ]+ [0-9]{2}:[0-9]{2}:[0-9]{2}$' "$log" | tail -n 1 || true)
@@ -300,6 +308,7 @@ status_run() {
   code=$(state_get "$st" exit_code)
   printf '  status:   %s\n' "$(state_get "$st" status)"
   printf '  phase:    %s (step %s)\n' "$(state_get "$st" phase)" "$(state_get "$st" step)"
+  if [ -n "$(state_get "$st" path)" ]; then printf '  path:     %s\n' "$(state_get "$st" path)"; fi
   printf '  rounds:   plan %s, code %s\n' "$(state_get "$st" plan_round)" "$(state_get "$st" code_round)"
   printf '  backend:  %s\n' "$(state_get "$st" backend)"
   printf '  branch:   %s\n' "$(state_get "$st" branch)"
@@ -316,7 +325,7 @@ status_run() {
     if [ -n "$reason" ]; then printf '  reason:   %s\n' "$reason"; fi
     printf '  handoff:  %s/handoff.md\n' "$dir"
   fi
-  printf 'phases (from the logs):\n'
+  printf 'phases:\n'
   phase_durations "$dir"
 }
 
