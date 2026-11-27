@@ -1365,16 +1365,16 @@ section_driver() {
   assert "classify: a scheme without slashes is refused" has "$(lib classify_probe 'Read file:/notes/README.md')" '^full|.*file:/notes/README\.md$'
   # A `./` prefix, `//` and `/./` name the same protected path: the classifier accepts only the
   # canonical spelling plus one leading `./`, so none of them is a light-path bypass.
-  assert "classify: ./AGENTS.md is refused" has "$(lib classify_probe 'Change ./AGENTS.md')" '^full|.*\./AGENTS\.md$'
-  assert "classify: ./CLAUDE.md is refused" has "$(lib classify_probe 'Change ./CLAUDE.md')" '^full|.*\./CLAUDE\.md$'
+  assert "classify: ./AGENTS.md is refused" has "$(lib classify_probe 'Change ./AGENTS.md')" '^full|'
+  assert "classify: ./CLAUDE.md is refused" has "$(lib classify_probe 'Change ./CLAUDE.md')" '^full|'
   assert "classify: docs/./factory is refused" has "$(lib classify_probe 'Update docs/./factory/process.md')" '^full|.*docs/\./factory/process\.md$'
   assert "classify: docs//factory is refused" has "$(lib classify_probe 'Update docs//factory/process.md')" '^full|.*docs//factory/process\.md$'
   assert "classify: ./README.md stays light" test "$(lib classify_probe 'Update ./README.md.')" = 'light|1 file, 1 line'
-  assert "classify: ./scripts is refused" has "$(lib classify_probe 'Change ./scripts/x.sh')" '^full|.*\./scripts/x\.sh$'
+  assert "classify: ./scripts is refused" has "$(lib classify_probe 'Change ./scripts/x.sh')" '^full|'
   # Case variants name the protected file on a case-insensitive file system.
-  assert "classify: Agents.md is refused" has "$(lib classify_probe 'Change Agents.md')" '^full|.*Agents\.md$'
-  assert "classify: agents.md is refused" has "$(lib classify_probe 'Change agents.md')" '^full|.*agents\.md$'
-  assert "classify: docs/Factory is refused" has "$(lib classify_probe 'Update docs/Factory/process.md')" '^full|.*docs/Factory/process\.md$'
+  assert "classify: Agents.md is refused" has "$(lib classify_probe 'Change Agents.md')" '^full|.*AGENTS\.md$'
+  assert "classify: agents.md is refused" has "$(lib classify_probe 'Change agents.md')" '^full|.*AGENTS\.md$'
+  assert "classify: docs/Factory is refused" has "$(lib classify_probe 'Update docs/Factory/process.md')" '^full|.*docs/factory$'
   # The exact forms of the round-3 blocker: a doubled slash behind a `./` prefix, alone and in a
   # directory mention beside a named file.
   assert "classify: .//AGENTS.md is refused" has "$(lib classify_probe 'Change .//AGENTS.md')" '^full|'
@@ -1384,26 +1384,53 @@ section_driver() {
   assert "classify: a .// protected directory beside a file is refused" has "$(lib classify_probe 'Update .//docs//factory/ and README.md')" '^full|'
   assert "classify: a .// protected name beside a file is refused" has "$(lib classify_probe 'Update .//AGENTS.md/ and README.md')" '^full|'
 
-  # Every non-canonical spelling of a protected name is unclear, and unclear is full. Generated, so
-  # that a prefix, separator or look-alike cannot slip through a spelling at a time as in the three
-  # earlier rounds.
-  local proto spelling full_a cyr_a
-  local -a protos=(AGENTS.md CLAUDE.md docs/factory/process.md)
+  # Every spelling of a name the light path may never touch is full when a benign file sits beside
+  # it. The pair matters: without a benign file an ignored spelling is still "full" for naming no
+  # file, which is the hole the earlier generated test left. The names come from the same lists the
+  # step-2 prefilter reads.
+  local proto spelling name upper lower escaped encoded wide full_a cyr_a
+  local -a classify_names=()
+  # shellcheck disable=SC2016  # the array names expand in the library subshell, not here
+  while IFS= read -r name; do
+    [ -n "$name" ] && classify_names+=("$name")
+  done < <(lib eval 'printf "%s\n" "${PROTECTED[@]}" "${UNSAFE_DIRS[@]}" "${UNSAFE_FILES[@]}"')
   full_a=$'\uff21'
   cyr_a=$'\u0410'
-  for proto in "${protos[@]}"; do
-    for spelling in "$proto" "./$proto" ".//$proto" "././$proto" ".///$proto" "$proto/" \
-      "$proto/." "$proto//" "-$proto" "$proto " " $proto" $'\t'"$proto" "$proto"$'\n' \
-      "x/../$proto" "../$proto" "docs/../$proto" "${full_a}${proto:1}" "${cyr_a}${proto:1}" \
-      "$(printf '%s' "$proto" | tr '[:lower:]' '[:upper:]')" \
-      "$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')"; do
-      [ "$spelling" = "$proto" ] && continue
-      assert "classify: a non-canonical spelling of $proto is refused" has "$(lib classify_probe "Change $spelling")" '^full|'
+  wide=$'\u3002'
+  for proto in "${classify_names[@]}"; do
+    upper=$(printf '%s' "$proto" | tr '[:lower:]' '[:upper:]')
+    lower=$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')
+    escaped=${proto//./\\.}
+    encoded=${proto//./%2E}
+    for spelling in "$proto!" "$proto?" "[guide]($proto)" "$escaped" "$encoded" \
+      "${proto//./$wide}" ".\\$proto" "file:$proto" "-$proto" "./$proto" ".//$proto" \
+      "././$proto" ".///$proto" "$proto/" "$proto/." "$proto//" "../$proto" "x/../$proto" \
+      "docs/../$proto" "${full_a}${proto:1}" "${cyr_a}${proto:1}" "$upper" "$lower"; do
+      assert "classify: $proto as '$spelling' beside a benign file is full" \
+        has "$(lib classify_probe "Change $spelling and README.md")" '^full|'
     done
+    case "$proto" in
+      *.md | *.json)
+        for spelling in "${proto%.*} md" "${proto%.*} .md" "${proto%.*}"$'\n'".${proto##*.}"; do
+          assert "classify: $proto split as '$spelling' beside a benign file is full" \
+            has "$(lib classify_probe "Change $spelling and README.md")" '^full|'
+        done
+        ;;
+    esac
+  done
+  # The exact spellings of the round-4 blocker, each beside a benign file so that an ignored token
+  # cannot pass as "the task text names no file".
+  for spelling in 'AGENTS.md!' '[guide](AGENTS.md)' 'AGENTS\.md' 'AGENTS%2Emd' $'AGENTS\u3002md' \
+    $'AGENTS.md\u200b' '.\AGENTS.md' 'file:AGENTS.md' 'AGENTS md' 'AGENTS .md' $'AGENTS\n.md' \
+    'Cargo.TOML!' 'DENY.TOML!' 'OPENCODE.JSON!' '.mcp.json!'; do
+    assert "classify: the round-4 spelling '$spelling' is full" \
+      has "$(lib classify_probe "Change $spelling and README.md")" '^full|'
   done
   # The canonical neighbours stay light, so the whitelist did not swallow ordinary prose files.
-  for proto in README.md docs/index.md notes.txt .gitignore; do
-    assert "classify: $proto stays light" test "$(lib classify_probe "Update $proto")" = 'light|1 file, 1 line'
+  # Digits, dashes, underscores and inner dots are ordinary in a name.
+  for name in README.md docs/index.md notes.txt .gitignore notes2.md notes-v2.md notes_v2.md \
+    notes.v2.md; do
+    assert "classify: $name stays light" test "$(lib classify_probe "Update $name")" = 'light|1 file, 1 line'
   done
   assert "classify: an oversize text is full" has "$(lib classify_probe "$(printf 'x%.0s' $(seq 1 1500))")" '^full|.*too large'
   assert "classify: 13 lines are too many" has "$(lib classify_probe "$(printf 'line %s\n' $(seq 1 12))"$'\n'"README.md")" '^full|.*13 lines'
@@ -1425,6 +1452,13 @@ section_driver() {
   assert "slug: a possessive user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix ${suser}'s notes.md")" = fix-notes-md
   assert "slug: a comma after the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Ask $suser, please")" = ask-please
   assert "slug: a period after the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix $suser. notes.md")" = fix-notes-md
+  # A name after punctuation inside a token is a whole word too, so the token is dropped.
+  assert "slug: a hyphen before the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x-$suser notes.md")" = fix-notes-md
+  assert "slug: a period before the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x.$suser notes.md")" = fix-notes-md
+  assert "slug: an underscore before the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x_$suser notes.md")" = fix-notes-md
+  assert "slug: a quote before the user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x'$suser notes.md")" = fix-notes-md
+  assert "slug: a name after punctuation as a host is dropped" test "$(FACTORY_SCRUB_HOST=$suser lib slugify "Fix x-$suser notes.md")" = fix-notes-md
+  assert "slug: an uppercase name after punctuation is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix x-$(printf '%s' "$suser" | tr '[:lower:]' '[:upper:]') notes.md")" = fix-notes-md
 
   # A failed diff is an escalation, not a silent pass with a half-read change set.
   local ld_out ld_rc
@@ -1440,7 +1474,8 @@ section_driver() {
     .factory/runs/x/plan.md .superpowers/sdd/x/design.md .git/config target/x.txt /abs/x.md ../x.md \
     crates/x/notes.txt examples/x/notes.txt src/notes.txt crates/x/src/lib.rs \
     Agents.md agents.md AGENTS.MD AGENTS.Md docs/Factory/index.md .//AGENTS.md .///CLAUDE.md \
-    ././/AGENTS.md docs//factory/x.md docs/./factory/x.md -notes.md 'back\slash.md' x:y.md; do
+    ././/AGENTS.md docs//factory/x.md docs/./factory/x.md -notes.md 'back\slash.md' x:y.md \
+    $'a\nb.md' $'a\nAGENTS.md' $'AGENTS.md\nx'; do
     refute "light_path_ok rejects $v" lib light_path_ok "$v"
   done
 

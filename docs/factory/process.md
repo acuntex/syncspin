@@ -68,10 +68,13 @@ The caps are constants; flags can only lower them. Agents never merge. The owner
 The light path plans a trivial task with `phases/plan-light.md` instead of `phases/plan.md`, skips
 `plan-review` entirely (`plan_round` is still 1, so an owner-gate revision renders round 1) and
 reviews the single commit with `phases/code-review-light.md` at round 1. The phase sequence of a full
-change is unchanged. The classification is conservative shell code: a task that names no file, names
-only directories, names more than three files, or names a protected path or code is full. A directory
-mention beside a named file does not by itself make the task full unless it is protected. The README
-describes the allowlist.
+change is unchanged. The classifier is a cost heuristic in shell code and decides only the starting
+path: a task that names no file, names only directories, names more than three files, or names a
+protected path or code starts full, while a name it does not recognise (prose, an escape, a
+look-alike) can still start light. The safety does not rest on it: the measured diff after the
+implementer call escalates on a path outside the allowlist, and a change to a protected path without
+`--allow-protected` stops the run with exit 13. A directory mention beside a named file does not by
+itself make the task full unless it is protected. The README describes the allowlist.
 
 Escalation is state only: `escalate_light` sets `path=full`, writes `light-escalation.txt` and saves
 the state, and each caller picks the next step. After the implementer call the driver measures the

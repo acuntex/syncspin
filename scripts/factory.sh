@@ -59,13 +59,16 @@ PLAN_CAP=4
 CODE_CAP=3
 # The limits of the light path: a task whose text is short, names at most three files from the
 # allowlist and no code, and whose real diff stays below these limits keeps the short plan, the
-# missing plan review and the one short code review. Everything else is the full path.
+# missing plan review and the one short code review. A task that breaks a limit on its text starts on
+# the full path; the classifier is a cost heuristic, and the measured diff and the protected-path
+# check decide after the implementer call.
 LIGHT_MAX_TASK_BYTES=1200
 LIGHT_MAX_TASK_LINES=12
 LIGHT_MAX_FILES=3
 LIGHT_MAX_DIFF_LINES=80
 LIGHT_MAX_COMMITS=1
-# A path named by a light task has to be the canonical spelling; a longer one is unclear, so full.
+# A path named by a light task has to be the canonical spelling; a longer one is rejected, so the
+# task starts on the full path.
 LIGHT_MAX_PATH_BYTES=512
 # Configuration the tools read at project level, and the files that decide what they may do.
 # `.claude/settings.local.json` and `CLAUDE.local.md` are gitignored, so git status never shows them;
@@ -78,6 +81,11 @@ for _protected in "${PROTECTED[@]}"; do
   PROTECTED_LC+=("$(printf '%s' "$_protected" | tr '[:upper:]' '[:lower:]')")
 done
 unset _protected
+# Unsafe for the light path but not in PROTECTED: paths whose content is code, generated output or
+# the factory's own state. The step-2 prefilter of `classify_task` and its generated tests both read
+# these lists, together with PROTECTED, so a name added to one cannot drift away from the other.
+UNSAFE_DIRS=(docs/factory .factory .superpowers .git target crates examples src)
+UNSAFE_FILES=(Cargo.toml Cargo.lock rust-toolchain.toml deny.toml cliff.toml Makefile)
 LOCAL_CONFIG=(.claude/settings.local.json CLAUDE.local.md)
 CONVENTIONAL='^(feat|fix|docs|test|refactor|perf|chore|build|ci|style|revert)(\([a-z0-9._-]+\))?!?: .+'
 GENERIC_NAMES=" root runner ubuntu user admin build home test dev github docker localhost "
@@ -183,17 +191,27 @@ slugify() {
   # The first four words, skipping a path-like token, a secret-shaped token and the current user or
   # host name (unless it is a generic word), also when punctuation or a possessive is attached: a
   # task that starts with `/home/<name>/...`, carries a token such as `ghp_...` or names the user as
-  # `Alice's`, `Alice,` or `alice.` must not put any of them in a branch name, a session title or a
-  # run header.
+  # a possessive, a comma, a period or after a hyphen must not put any of it in a branch name, a
+  # session title or a run header.
   user=${FACTORY_SCRUB_USER-$(id -un 2>/dev/null || true)}
   host=${FACTORY_SCRUB_HOST-$(hostname -s 2>/dev/null || true)}
   words=$(printf '%s' "$1" | tr '\n' ' ' | awk -v user="$user" -v host="$host" -v generic="$GENERIC_NAMES" '
-    function named(w, name,   n) {
+    # named(w, name): 1 when the lowercased token contains the name as a whole word, with a
+    # non-alphanumeric character (or either end) on both sides, so a name after punctuation is
+    # recognised, not only the token that starts with the name.
+    function named(w, name,   n, rest, off, i, pos) {
       if (length(name) <= 4) return 0
       n = tolower(name)
       if (index(generic, " " n " ") != 0) return 0
-      if (w == n) return 1
-      if (index(w, n) == 1 && length(w) > length(n) && substr(w, length(n) + 1, 1) !~ /[a-z0-9]/) return 1
+      off = 0
+      rest = w
+      while ((i = index(rest, n)) > 0) {
+        pos = off + i
+        if ((pos == 1 || substr(w, pos - 1, 1) !~ /[a-z0-9]/) &&
+            (pos + length(n) > length(w) || substr(w, pos + length(n), 1) !~ /[a-z0-9]/)) return 1
+        off = pos
+        rest = substr(w, pos + 1)
+      }
       return 0
     }
     function private(word,   w) {
@@ -234,27 +252,32 @@ fmt_duration() {
 
 # ---------------------------------------------------------------------------------------------
 # The light path: whether a task is trivial enough for the short plan, the missing plan review and
-# the one short code review. The classification is conservative: anything unclear is full.
+# the one short code review. The classification is a cost heuristic in shell code: it picks the
+# starting path, and a name it cannot read (prose, an escape, a look-alike) may still start light.
+# The measured diff and the protected-path check are the safety net, not the classifier.
 
 # canonical_path <path>: return 0 when the path already has the only form the light path accepts:
 # segments of ASCII letters, digits, `.`, `_` and `-`, separated by single slashes, none empty and
-# none `.` or `..`; no leading `/`, `~` or `-`; no backslash or colon; at most LIGHT_MAX_PATH_BYTES
-# bytes. Anything else is unclear, so the caller treats it as full.
+# none `.` or `..`; no leading `/`, `~` or `-`; no backslash, colon or control character; at most
+# LIGHT_MAX_PATH_BYTES bytes. A name the function rejects is treated as full by its callers.
 canonical_path() {
   local p=$1
   [ -n "$p" ] || return 1
   [ "${#p}" -le "$LIGHT_MAX_PATH_BYTES" ] || return 1
   case "$p" in /* | "~"* | -* | *\\* | *:*) return 1 ;; esac
+  # The character check below is line-based, so a newline would let `a<newline>b.md` pass: reject it
+  # before, because a diff name is one name and a newline is never part of a canonical segment.
+  case "$p" in *$'\n'* | *$'\r'*) return 1 ;; esac
   case "/$p/" in *//* | */./* | */../*) return 1 ;; esac
   if printf '%s' "$p" | LC_ALL=C grep -q '[^A-Za-z0-9._/-]'; then return 1; fi
   return 0
 }
 
-# normalize_path <path>: print the path a light task names, or return 1 when it is unclear. A single
-# leading `./` is the only spelling that is canonicalised: it is stripped once and the result must
-# pass canonical_path from the start. Every other spelling (a repeated slash, a `/./` or `..`
+# normalize_path <path>: print the path a light task names, or return 1 when it is not canonical. A
+# single leading `./` is the only spelling that is canonicalised: it is stripped once and the result
+# must pass canonical_path from the start. Every other spelling (a repeated slash, a `/./` or `..`
 # segment, a backslash, a colon, a leading `-`) is left as written and rejected, so a caller that
-# treats anything unclear as full never sees a normalised form of an unsafe path.
+# treats a rejected name as full never sees a normalised form of an unsafe path.
 normalize_path() {
   local p=$1
   case "$p" in ./*) p=${p#./} ;; esac
@@ -268,8 +291,8 @@ normalize_path() {
 # and a name equal to or under a protected entry is protected whatever its extension.
 light_path_ok() {
   local p=$1 entry base lower
+  # normalize_path already returns the validated canonical form, so no second pass is needed.
   p=$(normalize_path "$1") || return 1
-  p=$(normalize_path "$p") || return 1
   lower=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')
   for entry in "${PROTECTED_LC[@]}"; do
     case "$lower" in "$entry" | "$entry"/*) return 1 ;; esac
@@ -316,7 +339,7 @@ light_size_reason() {
 # are not part of the text (command substitution drops them), so a 13-line text without a final
 # newline is 13 lines. Never calls a model and never touches the tree.
 classify_task() {
-  local text bytes lines word w w_norm w_lc tok esc entry first_dir="" files=0 reject="" oldifs=$IFS had_glob=0
+  local text scan_text bytes lines word w w_norm w_lc tok esc entry candidate first_dir="" files=0 reject="" oldifs=$IFS had_glob=0
   text=$(cat)
   class_path=full
   bytes=$(printf '%s' "$text" | wc -c)
@@ -325,12 +348,26 @@ classify_task() {
     class_reason="the task text is too large ($bytes bytes, $lines lines)"
     return 0
   fi
-  # A path the light path may never touch, named anywhere in the text as a whole word.
-  for tok in scripts crates examples src docs/factory .github .githooks .opencode .claude .factory \
-    .superpowers .git target Cargo.toml Cargo.lock rust-toolchain.toml deny.toml cliff.toml \
-    opencode.json opencode.jsonc Makefile; do
+  # A copy for the line-based scans: a newline becomes a space and a Markdown link's text and
+  # target are separated, so `AGENTS` followed by a line break and `.md`, and `[guide](AGENTS.md)`,
+  # cannot hide a name between two pieces read one at a time.
+  scan_text=$(printf '%s' "$text" | tr '\n' ' ')
+  scan_text=${scan_text//']('/']( '}
+  # A path the light path may never touch, named anywhere in the text as a whole word. The names
+  # come from PROTECTED and the unsafe lists above, and the match ignores case, because on a
+  # case-insensitive file system `agents.md` is `AGENTS.md`.
+  for tok in "${PROTECTED[@]}" "${UNSAFE_DIRS[@]}" "${UNSAFE_FILES[@]}"; do
     esc=${tok//./\\.}
-    if grep -Eq "(^|[^[:alnum:]_.-])$esc([^[:alnum:]_.-]|$)" <<<"$text"; then
+    if LC_ALL=C grep -Eiq "(^|[^[:alnum:]_.-])$esc([^[:alnum:]_.-]|$)" <<<"$scan_text"; then
+      class_reason="the task text names $tok"
+      return 0
+    fi
+  done
+  # A protected stem split from its extension (`AGENTS md`, `AGENTS .md`, or a line break between
+  # them, which the scan copy turned into a space) names the same file.
+  for tok in AGENTS CLAUDE .mcp; do
+    esc=${tok//./\\.}
+    if LC_ALL=C grep -Eiq "(^|[^[:alnum:]_.-])${esc}[[:space:]]*\.?(md|json)([^[:alnum:]_.-]|$)" <<<"$scan_text"; then
       class_reason="the task text names $tok"
       return 0
     fi
@@ -338,15 +375,15 @@ classify_task() {
   case $- in *f*) had_glob=1 ;; esac
   IFS=$' \t\n'
   set -f
-  for word in $text; do
+  for word in $scan_text; do
     w=$(clean_word "$word")
     [ -n "$w" ] || continue
     case "$w" in
       */)
         # A directory mention has to be canonical too: only one leading `./` is stripped, and a
         # repeated slash, a `/./` segment or a `..` segment makes the task full. An absolute or
-        # home-path mention is not a repository directory and stays a mention; anything unclear is
-        # full.
+        # home-path mention is not a repository directory and stays a mention; a rejected mention
+        # is full.
         case "$w" in
           /* | "~"*) ;;
           *)
@@ -374,18 +411,32 @@ classify_task() {
         if [ -z "$first_dir" ]; then first_dir=$w; fi
         ;;
       *)
+        # A URL is not a repository file, however much it looks like one: a token with a scheme
+        # (`https:`, `file:`) or a protocol-relative `//host` path. Checked before the candidate
+        # test, so `file:AGENTS.md` never reaches the allowlist.
+        if [[ "$w" =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]] || [[ "$w" == //* ]]; then
+          reject=$w
+          break
+        fi
+        candidate=0
         if [[ "$w" == */* ]] || [[ "$w" =~ ^[[:alnum:]_.+-]*\.[[:alpha:]][[:alnum:]]{0,9}$ ]]; then
-          # A URL is not a repository file, however much it looks like one: a token with a scheme
-          # (`https:`, `file:`) or a protocol-relative `//host` path.
-          if [[ "$w" =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]] || [[ "$w" == //* ]]; then
+          candidate=1
+        fi
+        if [ "$candidate" = 0 ]; then
+          # Prose normally ends here. A token that carries a backslash, a percent or a byte outside
+          # ASCII is a spelling the scanner cannot read as a name (`AGENTS\.md`, `AGENTS%2Emd`,
+          # `AGENTS。md`), so it rejects the task instead of being ignored.
+          case "$w" in *\\* | *%*) reject=$w; break ;; esac
+          if printf '%s' "$w" | LC_ALL=C grep -q '[^ -~]'; then
             reject=$w
             break
           fi
-          if light_path_ok "$w"; then
-            files=$((files + 1))
-          elif [ -z "$reject" ]; then
-            reject=$w
-          fi
+          continue
+        fi
+        if light_path_ok "$w"; then
+          files=$((files + 1))
+        elif [ -z "$reject" ]; then
+          reject=$w
         fi
         ;;
     esac

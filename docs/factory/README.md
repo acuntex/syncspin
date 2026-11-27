@@ -80,23 +80,29 @@ and without a model:
   named file is `.gitignore` or has a `.md` or `.txt` name. A URL with a scheme, a `//host` path or a
   directory mention is not a named file. A named path has to be canonical: ASCII letters, digits,
   `.`, `_` and `-` in segments separated by single slashes, no `.` or `..` segment, no leading `/`,
-  `~` or `-`, no backslash or colon; one leading `./` is stripped. Anything else is unclear, and
-  unclear is full. The protected names and directory prefixes are compared without regard to case,
-  so `Agents.md` is refused like `AGENTS.md` on a case-insensitive file system. A light run writes a
-  short plan on the helper model, skips the plan review, makes one implementer call and then
-  measures the real diff: it stays light while that diff touches at most three such files, adds and
-  deletes at most 80 lines and is a single commit.
+  `~` or `-`, no backslash, colon, newline or carriage return; one leading `./` is stripped. A token
+  that is not a file candidate and carries a backslash, a percent or a non-ASCII byte is full, and so
+  is a protected stem split from its extension (`AGENTS md`). The protected names and directory
+  prefixes are compared without regard to case, so `Agents.md` is refused like `AGENTS.md` on a
+  case-insensitive file system. A light run writes a short plan on the helper model, skips the plan
+  review, makes one implementer call and then measures the real diff: it stays light while that diff
+  touches at most three such files, adds and deletes at most 80 lines and is a single commit.
 - **full** otherwise, including a task that names no file, names only directories, names more than
   three files, or mentions `scripts`, `crates`, `src`, `.github`, `Cargo.toml` or any other protected
   path or code. A directory mention beside a named file does not by itself make the task full unless
-  it is protected. Anything unclear is full.
+  it is protected. The classifier is a cost heuristic: it decides the starting path, not the safety.
+  A name it does not recognise (prose, an escape, a look-alike) can still start a light run; the
+  measured diff and the protected-path check are the safety net. `light_diff_check` escalates on a
+  path outside the allowlist, and a change to a protected path without `--allow-protected` stops the
+  run with exit 13.
 
 A light run that leaves those limits after the implementer call — a code file, a protected path, too
 many lines — escalates: `light-escalation.txt` in the run directory records why, the state says
 `path=full`, and the run continues on the full path from the code review on. An answer to an owner
 decision that changes the plan body escalates the same way before the post-decision review. The
-skipped plan review cannot be added back, which is why the classifier is conservative: the owner gate,
-the one review and CI remain. `--dry-run` prints the path, its reason and the light schedule.
+skipped plan review cannot be added back, so a spelling the classifier can read errs towards full,
+while the measured diff, the protected-path check, the owner gate, the one review and CI carry the
+safety. `--dry-run` prints the path, its reason and the light schedule.
 
 ```sh
 scripts/factory.sh --backend claude "add a --list flag to the player example"
