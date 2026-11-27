@@ -19,6 +19,12 @@
 # real pre-commit stamp check.
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE
 unset GATE_ROOT GATE_PRETTIER GATE_PRETTIER_CMD
+# The same child inherits the run's own defaults (models, variants, client, attach URL, credentials):
+# every test sets what it needs, so none of them may leak in from the environment that started the
+# suite.
+unset FACTORY_BACKEND FACTORY_MODEL_MAIN FACTORY_MODEL_HELPER FACTORY_VARIANT_MAIN \
+  FACTORY_VARIANT_HELPER FACTORY_OPENCODE_BIN FACTORY_OPENCODE_ATTACH FACTORY_PASS_ENV \
+  FACTORY_LAUNCH_ENVFILE OPENCODE_SERVER_USERNAME OPENCODE_SERVER_PASSWORD
 
 set -euo pipefail
 
@@ -486,7 +492,11 @@ section_sync() {
     assert "sync: $(basename "$f") (opencode) bash rules start with the deny baseline" test "$(grep -A1 '^  bash:$' "$f" | tail -n 1)" = '    "*": "deny"'
     refute "sync: $(basename "$f") (opencode) has no ask rule" grep -q '": "ask"' "$f"
     assert "sync: $(basename "$f") (opencode) orders baseline, allows, denies" has "$(sed -n '/^  bash:$/,/^---$/p' "$f" | grep -o '": "\(allow\|deny\)"' | tr -d '\n')" '^": "deny"(": "allow")+(": "deny")+$'
+    assert "sync: $(basename "$f") (opencode) denies the task tool exactly once" test "$(grep -c '^  task: "deny"$' "$f")" = 1
+    refute "sync: $(basename "$f") (opencode) never allows or asks the task tool" grep -Eq '^  task: "(allow|ask)"' "$f"
   done
+  assert "sync: the launcher role names the exact call form" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'exactly the form each command template names'
+  assert "sync: the launcher role says it cannot start a subagent" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'cannot start a subagent'
   for f in "$repo"/.claude/agents/factory-*.md; do
     allowed=" name description tools model maxTurns "
     assert "sync: $(basename "$f") (claude agent) has a closed fence" frontmatter_keys "$f" >/dev/null
@@ -566,7 +576,8 @@ section_sync() {
   if [ -n "$pcmd" ]; then
     rc=0
     # shellcheck disable=SC2086  # the command is a word list on purpose
-    (cd "$repo" && $pcmd --check docs/factory .opencode .claude/agents .claude/commands >/dev/null 2>&1) || rc=$?
+    pout=$(cd "$repo" && $pcmd --check docs/factory .opencode .claude/agents .claude/commands 2>&1) || rc=$?
+    if [ "$rc" != 0 ]; then printf '%s\n' "$pout" >&2; fi
     assert "sync: generated files and sources are prettier-clean" test "$rc" = 0
   else
     printf 'skip: prettier is not installed and FACTORY_TEST_PRETTIER is not set\n'
@@ -2145,7 +2156,7 @@ section_perm() {
     mkdir -p "$agents_dir"
     # The output holds the contributor's global configuration: parse it, never print it.
     assert "perm: the OpenCode config resolves" bash -c "cd '$repo' && opencode debug config >/dev/null 2>&1"
-    for role in planner plan-reviewer implementer code-reviewer pr-writer; do
+    for role in planner plan-reviewer implementer code-reviewer pr-writer launcher; do
       assert "perm: the OpenCode agent factory-$role resolves" bash -c "cd '$repo' && opencode debug agent factory-$role >'$agents_dir/factory-$role.json' 2>/dev/null"
     done
   else
@@ -2198,7 +2209,7 @@ section_static() {
   refute "static: no factory file narrows the client to one kind of device" git -C "$repo" grep -qiwE "$w1|$w2|$w3" -- docs/factory scripts .opencode .claude
   # shellcheck disable=SC2016  # literal characters
   refute "static: no command template holds an argument placeholder, !\` or an @ file reference" grep -rEq '\$ARGUMENTS|\$[0-9]|!`|@[A-Za-z0-9._/~-]' "$repo/docs/factory/commands" "$repo/.opencode/commands"
-  refute "static: generated prompts never claim to be official" grep -rilE 'official' "$repo/.opencode" "$repo/.claude/agents" "$repo/.claude/commands" "$repo/docs/factory"
+  refute "static: generated prompts never claim to be official" git -C "$repo" grep -qilE 'official' -- .opencode .claude/agents .claude/commands docs/factory
 
   local pcmd
   pcmd=$(prettier_for_tests)

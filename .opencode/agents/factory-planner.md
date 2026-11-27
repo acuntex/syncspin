@@ -2,6 +2,7 @@
 description: "Writes an implementation plan for a task; read-only apart from its plan file."
 mode: "all"
 permission:
+  task: "deny"
   edit:
     "*": "deny"
     ".factory/runs/*": "allow"

@@ -159,7 +159,9 @@ Factory level. Everything else lives only in the factory layer.
   is `deny`, not `ask`: a headless run cannot answer a prompt, so an `ask` would hang until the
   phase timeout, while a deny fails at once with a message the model can act on. The readonly
   agents get no mutating allow, and `edit` denied except `.factory/runs/*`; the implementer gets
-  `edit` allowed.
+  `edit` allowed. `task: "deny"` comes first in every agent's permission map, the launcher's
+  included: no factory agent spawns a subagent, because a nested session would run outside the
+  driver's snapshot check and its phase budget.
 - Claude Code: the driver passes `--allowedTools <grant>` and `--disallowedTools <denies>` per phase
   (`claude_tools` and `claude_denies` in `scripts/factory.sh`). The only file-edit grant of a
   readonly phase is `Edit(/.factory/runs/<run id>/<artifact file>)`: the one file the phase writes,
@@ -189,6 +191,10 @@ How the layers merge, and how sure we are.
 - Reasoned, not run: that the last-match-wins evaluation is what a live OpenCode applies at run time
   (documented for 1.x), that a deny returns at once in a headless run, and that matching is
   case-sensitive.
+- Reasoned, not run: the `task` permission key. That a `task: "deny"` entry is accepted by both
+  OpenCode generations and that it stops a subagent call is unverified against a live OpenCode,
+  pinned by `scripts/test-factory.sh` and by the `opencode debug agent` probe of all six generated
+  agents where it is installed.
 - Reasoned, not run: for Claude Code, that `--disallowedTools` entries win over `--allowedTools` and
   over the project settings under `dontAsk` (deny wins over allow in Claude's rule order), and that
   a long deny list in the argument is accepted. Claude agent frontmatter was not used for denies:

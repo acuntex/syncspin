@@ -2,6 +2,7 @@
 description: "Reviews an implementation plan against the code, spec and CI; read-only."
 mode: "all"
 permission:
+  task: "deny"
   edit:
     "*": "deny"
     ".factory/runs/*": "allow"

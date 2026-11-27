@@ -185,7 +185,10 @@ a command template after it has substituted the typed arguments (unverified), so
 
 The commands run in the generated `factory-launcher` agent (`.opencode/agents/factory-launcher.md`).
 Its rules: bash denied except `scripts/factory-launch.sh *`, every shared deny last; `edit` only under
-`.factory/launch/`; `read` only under `.factory/runs/` and `.factory/launch/`; `question` allowed.
+`.factory/launch/`; `read` only under `.factory/runs/` and `.factory/launch/`; `question` allowed;
+`task` denied, like every factory agent, so it cannot start a subagent. It runs the launcher in
+exactly the form each command template names, with no option a template does not name: never the
+driver, never the gate, never `cargo`, and it never waits for a run.
 Everything is generated from `docs/factory/commands/`, `roles/launcher.md` and `meta/launcher*`. The
 commands exist for OpenCode only: Claude Code has its own `/factory`.
 
@@ -301,6 +304,7 @@ the factory layer:
 | Factory-only denies              | `docs/factory/meta/deny-factory.txt`: in the generated OpenCode agents, and passed by the driver to Claude per phase    |
 | Allowed commands                 | `docs/factory/meta/claude-allow-*.txt`: OpenCode agents carry them as bash rules, the Claude driver as `--allowedTools` |
 | Edit rules of the readonly roles | The generated OpenCode agents; for Claude the driver's `Edit(<artifact>)` grant                                         |
+| The `task` tool (subagents)      | `task: "deny"` in every generated OpenCode agent; no agent spawns another                                               |
 
 | Aspect                   | OpenCode (generated agents)                                          | Claude Code (driver flags)                                       |
 | ------------------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------- |

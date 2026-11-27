@@ -90,6 +90,9 @@ def overlay(path):
             in_perm = True
         elif in_perm and re.fullmatch(r"  (edit|bash|read):", line):
             tool = line.strip()[:-1]
+        elif in_perm and re.fullmatch(r'  task: "(allow|ask|deny)"', line):
+            tool = None
+            rules.append(("task", "*", line.split('"')[1]))
         elif in_perm and re.fullmatch(r'  question: "(allow|ask|deny)"', line):
             tool = None
             rules.append(("question", "*", line.split('"')[1]))
@@ -316,7 +319,7 @@ for name, readonly in roles.items():
 
 def v2_shape(readonly):
     """The ordered list the same sources would produce: baseline deny first, allows, every deny last."""
-    entries = []
+    entries = [{"action": "task", "resource": "*", "effect": "deny"}]
     if readonly:
         entries.append({"action": "edit", "resource": "*", "effect": "deny"})
         entries.append({"action": "edit", "resource": ".factory/runs/*", "effect": "allow"})
@@ -347,7 +350,8 @@ for cmd in orchestrator_only:
     check("v2 shape code denies: " + cmd, decide_v2(v2_code, "bash", cmd) == "deny")
 check(
     "v2 shape: the shell baseline is the first shell rule",
-    v2_readonly[2] == {"action": "shell", "resource": "*", "effect": "deny"},
+    next(entry for entry in v2_readonly if entry["action"] == "shell")
+    == {"action": "shell", "resource": "*", "effect": "deny"},
 )
 shell_rules = [entry for entry in v2_readonly if entry["action"] == "shell"]
 last_allow = max(i for i, entry in enumerate(shell_rules) if entry["effect"] == "allow")
@@ -422,6 +426,21 @@ for path in launcher_read_no:
     check("v2 launcher may not read: " + path, decide_v2(to_v2(launcher_rules), "read", path) == "deny")
 check("launcher: no ask rule", all(act != "ask" for _, _, act in launcher_overlay))
 check("no Claude counterpart of the launcher agent", not __import__("os").path.exists(repo + "/.claude/agents/factory-launcher.md"))
+
+# The `task` tool (subagents) is denied to every generated agent, the launcher included, in the shape
+# the generator writes and in the 2.x shape. No role may allow or ask it, and the project files stay
+# silent about it: it is a factory-layer rule.
+all_agents = list(roles) + ["factory-launcher"]
+for name in all_agents:
+    rules = global_rules + overlay(repo + "/.opencode/agents/" + name + ".md")
+    check("opencode " + name + " denies: task", decide(rules, "task", "*") == "deny")
+    check("v2 " + name + " denies: task", decide_v2(to_v2(rules), "task", "*") == "deny")
+    check(
+        "opencode " + name + ": no task allow or ask rule",
+        not any(tool == "task" and act in ("allow", "ask") for tool, _, act in overlay(repo + "/.opencode/agents/" + name + ".md")),
+    )
+check("opencode.json: does not mention task", not any(tool == "task" for tool, _, _ in global_rules))
+check("claude settings: does not mention task", "task" not in json.dumps(cc))
 
 for name, readonly in roles.items():
     if agent_json_dir:

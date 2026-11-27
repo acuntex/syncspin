@@ -2,6 +2,7 @@
 description: "Writes the pull request title and body from the commits; read-only."
 mode: "all"
 permission:
+  task: "deny"
   edit:
     "*": "deny"
     ".factory/runs/*": "allow"

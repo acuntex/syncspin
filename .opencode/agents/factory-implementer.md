@@ -2,6 +2,7 @@
 description: "Implements an approved plan as small verified commits; never pushes."
 mode: "all"
 permission:
+  task: "deny"
   edit:
     "*": "allow"
   bash:

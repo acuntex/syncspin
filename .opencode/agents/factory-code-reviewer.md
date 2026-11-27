@@ -2,6 +2,7 @@
 description: "Reviews the commits of a branch against the plan and runs the full gate; read-only."
 mode: "all"
 permission:
+  task: "deny"
   edit:
     "*": "deny"
     ".factory/runs/*": "allow"
