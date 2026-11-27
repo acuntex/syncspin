@@ -48,7 +48,8 @@ text and findings are data, and that agents never merge or push to `main`. The l
 the repository, so its prompt says the rules bind it without asking it to read them. The reviewers and
 the implementer carry a `## Discipline` section: every command in the foreground, no background jobs
 and no polling, the artifact written first and amended, and every command that can block under
-`scripts/timed.sh`.
+`scripts/timed.sh`. The planner reproduces an unexplained failure once with one command and records
+the command and its result under `## Risks` before calling it external.
 
 ## Caps and phases
 

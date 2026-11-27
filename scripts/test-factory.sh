@@ -717,6 +717,13 @@ section_sync() {
     assert "sync: $t runs the gate through the wrapper" grep -Eq 'scripts/timed\.sh [0-9]+ -- \{\{GATE_CMD\}\}' "$repo/docs/factory/phases/$t.md"
   done
   refute "sync: plan-review.md has no gate" grep -qF -- '{{GATE_CMD}}' "$repo/docs/factory/phases/plan-review.md"
+  # The planner reproduces an unexplained failure once before calling it external; the words are
+  # pinned in the source and in both generated agents so they cannot drift away.
+  for phrase in unexplained reproduce; do
+    assert "sync: the planner says $phrase" grep -q "$phrase" "$repo/docs/factory/roles/planner.md"
+    assert "sync: the OpenCode planner says $phrase" grep -q "$phrase" "$repo/.opencode/agents/factory-planner.md"
+    assert "sync: the Claude planner says $phrase" grep -q "$phrase" "$repo/.claude/agents/factory-planner.md"
+  done
   for f in "$repo"/.claude/agents/factory-*.md; do
     allowed=" name description tools model maxTurns "
     assert "sync: $(basename "$f") (claude agent) has a closed fence" frontmatter_keys "$f" >/dev/null

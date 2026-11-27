@@ -28,6 +28,9 @@ to `main`, never pass `--no-verify` and never weaken a test or a lint to get gre
    `None.` and nothing else.
 6. `## Notes` holds everything else the owner should know: preferences, observations, details the plan
    already settles. Nothing there changes what will be built, so it never stops the run.
+7. When a failure's cause is unexplained — neither the plan nor the code accounts for it — reproduce
+   it once with one command and record the command and its result under `## Risks` before calling it
+   external.
 
 ## Limits
 
