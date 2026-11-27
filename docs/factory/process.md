@@ -282,8 +282,9 @@ How the layers merge, and how sure we are.
   OpenCode generations and that it stops a subagent call is unverified against a live OpenCode,
   pinned by `scripts/test-factory.sh` and by the `opencode debug agent` probe of the six other
   generated agents where it is installed. The supervisor's ordered map (`"*": "deny"`,
-  `"factory-*": "allow"`) is parsed by `opencode2 debug agents` on 2.4.2; whether a live 2.x session
-  applies it is unverified.
+  `"factory-*": "allow"`) is parsed by `opencode2 debug agents` on 2.4.2, and a live supervisor →
+  planner probe on that version started one `factory-planner` child whose `parentID` equaled the
+  supervisor session; that the map stops every non-`factory-*` name live is unverified.
 - Reasoned, not run: for Claude Code, that `--disallowedTools` entries win over `--allowedTools` and
   over the project settings under `dontAsk` (deny wins over allow in Claude's rule order), and that
   a long deny list in the argument is accepted. Claude agent frontmatter was not used for denies:

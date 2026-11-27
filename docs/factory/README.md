@@ -476,9 +476,9 @@ commit both.
 ## Verified with
 
 The driver flows are not yet verified against a live model. What runs in CI and locally is the
-hermetic suite (`scripts/test-factory.sh`), which uses stub CLIs. The native supervisor edge is a
-separate manual acceptance step; record its version and result under "Factory Supervisor (minimal)".
-Record here, after the first manual run, the versions used and the result of each of these checks:
+hermetic suite (`scripts/test-factory.sh`), which uses stub CLIs. The native supervisor probe ran on
+OpenCode 2.4.2; its command and result are the first two items below. Record the driver checks here
+after the first manual run:
 
 - a tiny task on each backend with `--no-push`;
 - one real light run (`--no-push --stop-after review`) on a Markdown-only task: one planner call, no
@@ -487,10 +487,14 @@ Record here, after the first manual run, the versions used and the result of eac
 - `opencode debug agent factory-planner` and `opencode debug agent factory-launcher` on an
   installation that has the client, to confirm both resolve with `task: "deny"` and that a session
   title comes out readable;
-- `opencode2 debug agents` on an installation that has the 2.x client, to confirm
-  `factory-supervisor` resolves as `mode: "primary"` with the ordered `task` map (`"*": "deny"`,
-  `"factory-*": "allow"`), `question: "allow"` and deny-only `edit`/`bash`, and one supervisor →
-  `factory-planner` child whose `parentID` is the supervisor session and whose plan artifact exists;
+- `opencode2 debug agents` on OpenCode 2.4.2: `factory-supervisor` resolves as `mode: "primary"`
+  with the ordered `task` map (`"*": "deny"`, `"factory-*": "allow"`), `question: "allow"` and
+  deny-only `edit`/`bash`;
+- one native supervisor → planner probe on OpenCode 2.4.2 with
+  `opencode2 run --server <server> --agent factory-supervisor --model <model> --title "A8a supervisor probe" "Start exactly one factory-planner child ..."`:
+  the supervisor session started exactly one `factory-planner` child, the child's `parentID` equaled
+  the supervisor session, the child replied `DONE`, and `.factory/runs/a8a-probe/plan.md` existed with
+  two lines. No session ids are recorded;
 - `gh pr merge` and `git push origin main` refused inside both tools;
 - a readonly OpenCode role cannot edit `src/` but can write its artifact (this confirms the `edit`
   path form and the rule order on OpenCode 1.x);
