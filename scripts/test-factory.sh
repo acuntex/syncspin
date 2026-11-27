@@ -800,6 +800,7 @@ make_driver_stubs() {
 #   hook-<kind>.sh   sourced first; set handled=1 to skip the default action
 #   noop-<kind>      skip the default action;  exit-<kind>  exit with that code afterwards
 #   owner-open       the plan leaves an owner decision open
+#   material-revise  the plan revision changes the body, not only the owner section
 #   commits          number of commits the implementer makes (default 1)
 d=${STUB_DIR:?}
 name=$(basename "$0")
@@ -879,6 +880,11 @@ if [ "$handled" != 1 ] && [ ! -f "$d/noop-$kind" ]; then
     plan-revise)
       printf '\n## Changelog\n\n- revised by call %s\n' "$n" >>"$art"
       if [ -s "$FACTORY_RUN_DIR/decisions.md" ]; then sed -i 's/^- Which licence?$/None./' "$art"; fi
+      # Only the owner-gate revision changes the body: a review revision on the same switch would
+      # make the later answer look immaterial.
+      if [ -f "$d/material-revise" ] && [[ "$prompt" == *decisions.md* ]]; then
+        sed -i 's/^Do it\.$/Do it well./' "$art"
+      fi
       ;;
     plan-review) printf '# Review\n\nChecked.\n\n%s\n' "$(pop plan-review 'VERDICT: APPROVED')" >"$art" ;;
     plan-review-post) printf '# Review\n\nChecked.\n\n%s\n' "$(pop post 'VERDICT: APPROVED')" >"$art" ;;
@@ -1169,7 +1175,17 @@ section_driver() {
     refute "light_path_ok rejects $v" lib light_path_ok "$v"
   done
 
-  # D6 and D20: the owner gate.
+  # plan_body drops the owner and changelog sections, so answering a question in place keeps the
+  # same body and only a real edit makes a revision material.
+  local pba=$tmp/plan-a.md pbb=$tmp/plan-b.md
+  printf '# Plan\n\n## Goal\n\nDo it.\n\n## Owner decisions\n\n- Which licence?\n\n## Changelog\n\n- none\n' >"$pba"
+  printf '# Plan\n\n## Goal\n\nDo it.\n\n## Owner decisions\n\nNone.\n\n## Changelog\n\n- revised\n' >"$pbb"
+  assert "plan_body ignores the owner and changelog sections" test "$(lib plan_body "$pba" | sha256sum)" = "$(lib plan_body "$pbb" | sha256sum)"
+  printf '# Plan\n\n## Goal\n\nDo it well.\n\n## Owner decisions\n\nNone.\n' >"$pbb"
+  refute "plan_body sees a body edit" test "$(lib plan_body "$pba" | sha256sum)" = "$(lib plan_body "$pbb" | sha256sum)"
+
+  # D6 and D20: the owner gate. A revision that only answers the question is not material: no post
+  # review follows.
   new_case stub
   : >"$sd/owner-open"
   drive --backend opencode "t"
@@ -1183,12 +1199,28 @@ section_driver() {
   drive --resume "$id"
   assert "D6 resume with decisions exits 0" test "$drv_rc" = 0
   assert "D6 resume revised the plan once" test "$(count_calls 'kind=plan-revise')" = 1
-  assert "D6 exactly one post-decision review" test "$(count_calls 'kind=plan-review-post')" = 1
-  assert "D6 the post review flag persisted" test "$(state_of post_decision_review)" = 1
+  assert "D6 an immaterial revision runs no post review" test "$(count_calls 'kind=plan-review-post')" = 0
+  assert "D6 the immaterial revision is recorded" test "$(state_of plan_material)" = 0
+  assert "D6 the post review flag stays 0" test "$(state_of post_decision_review)" = 0
+  assert "D6 the skipped review says so" has "$drv_out" '^factory: the plan did not change materially; the post-decision review is skipped$'
   assert "D6 the plan round persisted" test "$(state_of plan_round)" = 1
 
   new_case stub
   : >"$sd/owner-open"
+  : >"$sd/material-revise"
+  drive --backend opencode "t"
+  assert "D6 a material case stops at the gate too" test "$drv_rc" = 10
+  id=$(basename "$(run_dir_of)")
+  printf 'Use MIT OR Apache-2.0.\n' >"$(run_dir_of)/decisions.md"
+  drive --resume "$id"
+  assert "D6 a material revision finishes" test "$drv_rc" = 0
+  assert "D6 exactly one post-decision review" test "$(count_calls 'kind=plan-review-post')" = 1
+  assert "D6 the material revision is recorded" test "$(state_of plan_material)" = 1
+  assert "D6 the post review flag persisted" test "$(state_of post_decision_review)" = 1
+
+  new_case stub
+  : >"$sd/owner-open"
+  : >"$sd/material-revise"
   printf 'VERDICT: CHANGES NEEDED\n%.0s' 1 2 3 >"$sd/q-plan-review"
   drive --backend opencode "t"
   assert "D6 approved at round 4 with open decisions still stops at the gate" test "$drv_rc" = 10
@@ -1607,6 +1639,36 @@ HOOK
   assert "D48 the second review reads the full template" test -n "$d48full"
   assert "D48 the light review comes first" test "$d48light" -lt "$d48full"
   assert "D48 the code round is two" test "$(state_of code_round)" = 2
+
+  # D49: the owner gate on the light path. An answer that only fills in the decision keeps the plan
+  # body and skips the post-decision review; one that changes the body escalates and gets it.
+  new_case stub
+  : >"$sd/owner-open"
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D49 a light run with an open decision stops at the gate" test "$drv_rc" = 10
+  assert "D49 the light plan was not reviewed" test "$(count_calls 'role=plan-reviewer')" = 0
+  id=$(basename "$(run_dir_of)")
+  printf 'Use MIT OR Apache-2.0.\n' >"$(run_dir_of)/decisions.md"
+  drive --resume "$id"
+  assert "D49 an immaterial light answer finishes" test "$drv_rc" = 0
+  assert "D49 an immaterial light answer runs no post review" test "$(count_calls 'kind=plan-review-post')" = 0
+  assert "D49 an immaterial light answer stays light" test "$(state_of path)" = light
+  assert "D49 an immaterial light answer is recorded" test "$(state_of plan_material)" = 0
+  assert "D49 an immaterial light answer still implements" test "$(count_calls 'role=implementer')" = 1
+
+  new_case stub
+  : >"$sd/owner-open"
+  : >"$sd/material-revise"
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D49 a material light case stops at the gate too" test "$drv_rc" = 10
+  id=$(basename "$(run_dir_of)")
+  printf 'Use MIT OR Apache-2.0.\n' >"$(run_dir_of)/decisions.md"
+  drive --resume "$id"
+  assert "D49 a material light answer finishes" test "$drv_rc" = 0
+  assert "D49 a material light answer runs one post review" test "$(count_calls 'kind=plan-review-post')" = 1
+  assert "D49 a material light answer escalates" test "$(state_of path)" = full
+  assert "D49 the material escalation is kept" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D49 a material light answer is recorded" test "$(state_of plan_material)" = 1
 
   # D55: --stop-after implement measures the diff before it stops.
   new_case stub

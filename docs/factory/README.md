@@ -82,9 +82,10 @@ and without a model:
 
 A light run that leaves those limits after the implementer call — a code file, a protected path, too
 many lines — escalates: `light-escalation.txt` in the run directory records why, the state says
-`path=full`, and the run continues on the full path from the code review on. The skipped plan review
-cannot be added back, which is why the classifier is conservative: the owner gate, the one review and
-CI remain. `--dry-run` prints the path, its reason and the light schedule.
+`path=full`, and the run continues on the full path from the code review on. An answer to an owner
+decision that changes the plan body escalates the same way before the post-decision review. The
+skipped plan review cannot be added back, which is why the classifier is conservative: the owner gate,
+the one review and CI remain. `--dry-run` prints the path, its reason and the light schedule.
 
 ```sh
 scripts/factory.sh --backend claude "add a --list flag to the player example"
@@ -111,7 +112,9 @@ the crate or file if you know it, and what must not change. Put long requests in
 
 - Owner decisions: when the plan lists open questions (public API, breaking changes, scope, limits)
   the run stops with exit 10. Write the answers to `decisions.md` in the run directory and run
-  `scripts/factory.sh --resume <run id>`. The plan is revised and reviewed once more.
+  `scripts/factory.sh --resume <run id>`. The plan is revised, and reviewed once more only when the
+  revision changed the plan outside the owner decisions and the changelog; answering a question in
+  place is not a change. On the light path such a change also escalates the run to the full path.
 - Everything after a stop that is not resumable (exit 11 to 16): read `handoff.md`, then fix by hand
   or start a new run.
 - The pull request: read it, in particular the protected-path diff, and merge it yourself.

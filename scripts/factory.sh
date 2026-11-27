@@ -104,6 +104,20 @@ owner_section_closed() {
   [ "$(owner_section "$1")" = "None." ]
 }
 
+# plan_body <file>: the plan without its `## Owner decisions` and `## Changelog` sections, with
+# trailing whitespace stripped and blank lines squeezed, so a revision that merely answers a question
+# hashes the same as before.
+plan_body() {
+  awk '
+    /^## (Owner decisions|Changelog)[[:space:]]*$/ { skip = 1; next }
+    skip && /^## / { skip = 0 }
+    !skip { print }
+  ' "$1" | sed -e 's/[[:space:]]*$//' | awk '
+    /^$/ { if (blank) next; blank = 1; print; next }
+    { blank = 0; print }
+  '
+}
+
 # A user or host name that already occurs as a whole word in the base tree is an ordinary word there
 # (a machine called `server` or `laptop`), not a leak: it is not scrubbed. Cached per name.
 SCRUB_KNOWN_WORDS=" "
@@ -1558,22 +1572,39 @@ while :; do
       P_MAX=$plan_cap
       # The light path has no review findings: an empty path says so.
       if [ "$path" = light ]; then P_REVIEW=""; else P_REVIEW=$(rel "$run_dir")/review-plan-$plan_round.md; fi
+      body_before=$(plan_body "$ROOT/$plan_file" | hash_stdin)
       revise_unit plan-revise
       verify_phase readonly
       resuming=0
+      if [ "$(plan_body "$ROOT/$plan_file" | hash_stdin)" = "$body_before" ]; then
+        plan_material=0
+      else
+        plan_material=1
+      fi
+      # A light plan whose body changed is no longer trivial: the full post-decision review follows.
+      if [ "$plan_material" = 1 ] && [ "$path" = light ]; then
+        escalate_light "the owner decisions changed the plan"
+      fi
       step=post
       ;;
     owner-gate:post)
-      P_DECISIONS=$decisions_file
-      P_ROUND=$((plan_cap + 1))
-      P_MAX=$((plan_cap + 1))
-      artifact_phase plan-reviewer plan-review-post plan-review-post "$(rel "$run_dir")/review-plan-post.md" || continue
-      resuming=0
-      post_decision_review=1
-      if [ "$(parse_verdict "$run_dir/review-plan-post.md")" != APPROVED ]; then
-        stop 11 "the post-decision review did not approve the plan"
+      if [ "$plan_material" = 1 ]; then
+        P_DECISIONS=$decisions_file
+        P_ROUND=$((plan_cap + 1))
+        P_MAX=$((plan_cap + 1))
+        artifact_phase plan-reviewer plan-review-post plan-review-post "$(rel "$run_dir")/review-plan-post.md" || continue
+        resuming=0
+        post_decision_review=1
+        if [ "$(parse_verdict "$run_dir/review-plan-post.md")" != APPROVED ]; then
+          stop 11 "the post-decision review did not approve the plan"
+        fi
+      else
+        printf 'factory: the plan did not change materially; the post-decision review is skipped\n'
       fi
-      if [ "$stop_after" = plan ]; then finish "reviewed plan, stopped after plan"; fi
+      if [ "$stop_after" = plan ]; then
+        if plan_reviewed; then finish "reviewed plan, stopped after plan"; fi
+        finish "plan written without review, stopped after plan"
+      fi
       phase=implement
       step=implement
       ;;
