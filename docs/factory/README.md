@@ -355,8 +355,10 @@ OpenCode agent that starts exactly one `factory-planner` child through the `suba
 its reply and reports the child session id and reply. Its ordered `task` map allows `factory-*` and
 denies every other name; `question` is allowed, `edit` and `bash` are deny-only, so it writes no files
 and runs no shell. It is not the run path: the driver above remains the only path that takes a task to
-a pull request. The role source is `docs/factory/roles/supervisor.md`; the generator writes the agent
-to OpenCode only, with no Claude counterpart until M1b.
+a pull request. It requires OpenCode 2.x and `experimental.subagent_depth: 2` in the server's global
+OpenCode configuration; that is not a repository setting, so a fresh machine must set it once. The
+role source is `docs/factory/roles/supervisor.md`; the generator writes the agent to OpenCode only,
+with no Claude counterpart until M1b.
 
 ## Permissions
 

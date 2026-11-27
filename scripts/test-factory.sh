@@ -3110,7 +3110,52 @@ section_perm() {
   done < <(python3 -I "$repo/scripts/test-factory-perm.py" "$repo" "$agents_dir")
 }
 
+# subagent_depth: the effective `experimental.subagent_depth` of the installed OpenCode 2.x, or the
+# global config when the CLI is absent. Prints the integer; `absent` when the config is readable but
+# has no such value; nothing and exit 1 when neither source is readable. The config can hold
+# providers, headers and credentials: parse it, never print it.
+subagent_depth() {
+  local cfg="" file depth used_cli=0
+  if [ "${FACTORY_TEST_SKIP_CLI:-0}" != 1 ] && command -v opencode2 >/dev/null 2>&1; then
+    if cfg=$(cd "$repo" && opencode2 debug config 2>/dev/null); then used_cli=1; fi
+  fi
+  if [ "$used_cli" = 0 ]; then
+    file=${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json
+    [ -r "$file" ] || return 1
+    cfg=$(cat "$file" 2>/dev/null) || return 1
+  fi
+  # shellcheck disable=SC2016  # the Python source is literal, never a shell expansion
+  depth=$(printf '%s' "$cfg" | python3 -I -c '
+import json, sys
+try:
+    config = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+# `debug config` prints the config sources as a list of {path, type, info}; a global file is a single
+# object. The later source wins, as the 2.x CLI loads them in order.
+if isinstance(config, dict):
+    layers = [config]
+elif isinstance(config, list):
+    layers = [entry.get("info") for entry in config if isinstance(entry, dict)]
+else:
+    layers = []
+values = []
+for layer in layers:
+    if not isinstance(layer, dict):
+        continue
+    experimental = layer.get("experimental")
+    if not isinstance(experimental, dict):
+        continue
+    value = experimental.get("subagent_depth")
+    if isinstance(value, int) and not isinstance(value, bool):
+        values.append(value)
+print(values[-1] if values else "")
+' 2>/dev/null) || return 1
+  printf '%s\n' "${depth:-absent}"
+}
+
 section_static() {
+  local depth
   if command -v shellcheck >/dev/null 2>&1; then
     assert "static: shellcheck is clean over scripts and hooks" bash -c "git -C '$repo' ls-files -z '*.sh' '.githooks/*' | (cd '$repo' && xargs -0 shellcheck)"
   else
@@ -3151,6 +3196,18 @@ section_static() {
   # shellcheck disable=SC2016  # literal characters
   refute "static: no command template holds an argument placeholder, !\` or an @ file reference" grep -rEq '\$ARGUMENTS|\$[0-9]|!`|@[A-Za-z0-9._/~-]' "$repo/docs/factory/commands" "$repo/.opencode/commands"
   refute "static: generated prompts never claim to be official" git -C "$repo" grep -qilE 'official' -- .opencode .claude/agents .claude/commands docs/factory
+
+  # The native supervisor tree needs the server's global `experimental.subagent_depth: 2`; the
+  # default 1 blocks a supervisor → planner child. This is not a repository setting: read the
+  # effective 2.x config or, without the CLI, the global file. A readable config without the value
+  # fails too; only an unreadable source is a skip.
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'skip: python3 is not installed, the subagent depth is not checked\n'
+  elif depth=$(subagent_depth); then
+    assert "static: the effective subagent depth is 2" test "$depth" = 2
+  else
+    printf 'skip: neither opencode2 debug config nor the global config is readable\n'
+  fi
 
   local pcmd
   pcmd=$(prettier_for_tests)

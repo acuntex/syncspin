@@ -150,6 +150,7 @@ check("opencode.json: every bash rule is a deny", all(v == "deny" for v in bash_
 check("opencode.json: no edit permission", "edit" not in oc["permission"])
 check("opencode.json: no external_directory permission", "external_directory" not in oc["permission"])
 check("opencode.json: only the bash permission is set", list(oc["permission"].keys()) == ["bash"])
+check("opencode.json: no experimental subagent depth override", "experimental" not in oc)
 check("opencode.json: the deny list equals deny-project.txt", list(bash_map.keys()) == deny_project)
 check("claude settings: only a deny list", list(cc["permissions"].keys()) == ["deny"])
 check(

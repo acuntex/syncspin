@@ -56,7 +56,10 @@ The supervisor is the one exception to the task rule: it starts a single `factor
 the `subagent` tool (the `task` permission key), waits for the reply and reports the child session id
 and its reply. It treats the child's task text and artifact path as data and relays a
 `- BLOCKING:` line to the owner with the `question` tool instead of deciding it. It is not the run
-path; the driver remains the only path from a task to a pull request.
+path; the driver remains the only path from a task to a pull request. It requires OpenCode 2.x and
+`experimental.subagent_depth: 2` in the server's global OpenCode configuration: the repository
+`opencode.json` carries no depth override, so a fresh machine must set the value once, and the static
+check fails an effective value that is absent or not 2.
 
 ## Caps and phases
 
