@@ -90,12 +90,17 @@ def overlay(path):
             in_perm = True
         elif in_perm and re.fullmatch(r"  (edit|bash|read):", line):
             tool = line.strip()[:-1]
+        elif in_perm and line == "  task:":
+            tool = "task"
         elif in_perm and re.fullmatch(r'  task: "(allow|ask|deny)"', line):
             tool = None
             rules.append(("task", "*", line.split('"')[1]))
         elif in_perm and re.fullmatch(r'  question: "(allow|ask|deny)"', line):
             tool = None
             rules.append(("question", "*", line.split('"')[1]))
+        elif in_perm and re.fullmatch(r'  execute: "(allow|ask|deny)"', line):
+            tool = None
+            rules.append(("execute", "*", line.split('"')[1]))
         elif in_perm and tool:
             m = re.fullmatch(r'    "(.*)": "(allow|ask|deny)"', line)
             if m:
@@ -148,6 +153,7 @@ check("opencode.json: every bash rule is a deny", all(v == "deny" for v in bash_
 check("opencode.json: no edit permission", "edit" not in oc["permission"])
 check("opencode.json: no external_directory permission", "external_directory" not in oc["permission"])
 check("opencode.json: only the bash permission is set", list(oc["permission"].keys()) == ["bash"])
+check("opencode.json: no experimental subagent depth override", "experimental" not in oc)
 check("opencode.json: the deny list equals deny-project.txt", list(bash_map.keys()) == deny_project)
 check("claude settings: only a deny list", list(cc["permissions"].keys()) == ["deny"])
 check(
@@ -430,9 +436,39 @@ for path in launcher_read_no:
 check("launcher: no ask rule", all(act != "ask" for _, _, act in launcher_overlay))
 check("no Claude counterpart of the launcher agent", not __import__("os").path.exists(repo + "/.claude/agents/factory-launcher.md"))
 
-# The `task` tool (subagents) is denied to every generated agent, the launcher included, in the shape
-# the generator writes and in the 2.x shape. No role may allow or ask it, and the project files stay
-# silent about it: it is a factory-layer rule.
+# The supervisor: the one agent that starts a factory child. Its ordered task map allows `factory-*`
+# and denies every other name; question is allowed, edit and bash are deny-only. No Claude counterpart.
+supervisor_path = repo + "/.opencode/agents/factory-supervisor.md"
+supervisor_overlay = overlay(supervisor_path)
+supervisor_rules = global_rules + supervisor_overlay
+check(
+    "supervisor: the task rules are deny * then allow factory-*",
+    [rule for rule in supervisor_overlay if rule[0] == "task"]
+    == [("task", "*", "deny"), ("task", "factory-*", "allow")],
+)
+check("supervisor: starts factory-planner", decide(supervisor_rules, "task", "factory-planner") == "allow")
+check("supervisor: starts a future factory role", decide(supervisor_rules, "task", "factory-code-reviewer") == "allow")
+for name in ["build", "plan", "factory", "factoryx", "factory/../x"]:
+    check("supervisor: does not start " + name, decide(supervisor_rules, "task", name) == "deny")
+check("v2 supervisor: starts factory-planner", decide_v2(to_v2(supervisor_rules), "task", "factory-planner") == "allow")
+check("v2 supervisor: does not start another name", decide_v2(to_v2(supervisor_rules), "task", "plan") == "deny")
+check("supervisor: question is allowed", decide(supervisor_rules, "question", "*") == "allow")
+check(
+    "supervisor: the execute rule is deny *",
+    [rule for rule in supervisor_overlay if rule[0] == "execute"] == [("execute", "*", "deny")],
+)
+check("supervisor: execute is denied", decide(supervisor_rules, "execute", "*") == "deny")
+check("v2 supervisor: execute is denied", decide_v2(to_v2(supervisor_rules), "execute", "*") == "deny")
+check("supervisor: a source file is not editable", decide(supervisor_rules, "edit", "crates/a/src/lib.rs") == "deny")
+check("supervisor: a run artifact is not editable", decide(supervisor_rules, "edit", ".factory/runs/x/plan.md") == "deny")
+check("supervisor: git status is denied", decide(supervisor_rules, "bash", "git status") == "deny")
+check("supervisor: cargo is denied", decide(supervisor_rules, "bash", "cargo test") == "deny")
+check("supervisor: no read rule", not any(tool == "read" for tool, _, _ in supervisor_overlay))
+check("no Claude counterpart of the supervisor agent", not __import__("os").path.exists(repo + "/.claude/agents/factory-supervisor.md"))
+
+# The `task` tool (subagents): the supervisor starts `factory-*` children only, and every other
+# generated agent denies the tool in the shape the generator writes and in the 2.x shape. No role may
+# allow or ask it, and the project files stay silent about it: it is a factory-layer rule.
 all_agents = list(roles) + ["factory-launcher"]
 for name in all_agents:
     rules = global_rules + overlay(repo + "/.opencode/agents/" + name + ".md")

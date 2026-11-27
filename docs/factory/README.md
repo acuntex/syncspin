@@ -242,9 +242,10 @@ a command template after it has substituted the typed arguments (unverified), so
 The commands run in the generated `factory-launcher` agent (`.opencode/agents/factory-launcher.md`).
 Its rules: bash denied except `scripts/factory-launch.sh *`, every shared deny last; `edit` only under
 `.factory/launch/`; `read` only under `.factory/runs/` and `.factory/launch/`; `question` allowed;
-`task` denied, like every factory agent, so it cannot start a subagent. It runs the launcher in
-exactly the form each command template names, with no option a template does not name: never the
-driver, never the gate, never `cargo`, and it never waits for a run.
+`task` denied like every other factory agent (the supervisor is the one exception), so it cannot start
+a subagent. It
+runs the launcher in exactly the form each command template names, with no option a template does not
+name: never the driver, never the gate, never `cargo`, and it never waits for a run.
 Everything is generated from `docs/factory/commands/`, `roles/launcher.md` and `meta/launcher*`. The
 commands exist for OpenCode only: Claude Code has its own `/factory`.
 
@@ -347,6 +348,19 @@ the fallback process group; an agent phase of the fallback may run on until its 
 - The launcher needs `setsid`, `git` and `od`; it exits 3 when the directory it runs in is not a
   repository root with `scripts/factory.sh`, or an env file is missing, and 2 on a usage error.
 
+## Factory Supervisor (minimal)
+
+`.opencode/agents/factory-supervisor.md` is a bootstrap for the future Task Orchestrator: a primary
+OpenCode agent that starts exactly one `factory-planner` child through the `subagent` tool, waits for
+its reply and reports the child session id and reply. Its ordered `task` map allows `factory-*` and
+denies every other name; `question` is allowed, `edit`, `bash` and `execute` are deny-only, so it
+writes no files, runs no shell and cannot use Code Mode. It is not the run path: the driver above
+remains the only path that takes a task to a pull request. It requires OpenCode 2.x and
+`experimental.subagent_depth: 2` in the server's global OpenCode configuration; that is not a
+repository setting, so a fresh machine must set it once. The role source is
+`docs/factory/roles/supervisor.md`; the generator writes the agent to OpenCode only, with no Claude
+counterpart until M1b.
+
 ## Permissions
 
 Both tools get guardrails, not security boundaries; the vendors say so too. The real layers are the
@@ -365,7 +379,7 @@ the factory layer:
 | Factory-only denies              | `docs/factory/meta/deny-factory.txt`: in the generated OpenCode agents, and passed by the driver to Claude per phase    |
 | Allowed commands                 | `docs/factory/meta/claude-allow-*.txt`: OpenCode agents carry them as bash rules, the Claude driver as `--allowedTools` |
 | Edit rules of the readonly roles | The generated OpenCode agents; for Claude the driver's `Edit(<artifact>)` grant                                         |
-| The `task` tool (subagents)      | `task: "deny"` in every generated OpenCode agent; no agent spawns another                                               |
+| The `task` tool (subagents)      | `task: "deny"` in every generated OpenCode agent except `factory-supervisor`, whose `task` map allows `factory-*`       |
 
 | Aspect                   | OpenCode (generated agents)                                          | Claude Code (driver flags)                                       |
 | ------------------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------- |
@@ -453,17 +467,19 @@ directly. Always edit `AGENTS.md`, never the link.
 ## Generated files
 
 `scripts/factory-sync.sh` writes `.opencode/agents/`, `.opencode/commands/`, `.claude/agents/` and
-`.claude/commands/factory.md` from `roles/`, `commands/`, `meta/` and `meta/claude-allow-*.txt` (the
-launcher agent from `roles/launcher.md` and `meta/launcher-allow.txt`, the OpenCode commands from
-`commands/`). `--check` (run by the
+`.claude/commands/factory.md` from `roles/`, `commands/`, `meta/` and `meta/claude-allow-*.txt`. The
+launcher agent (`roles/launcher.md`, `meta/launcher-allow.txt`) is OpenCode-only, and so is the
+supervisor (`roles/supervisor.md`, `meta/supervisor.conf`, no Claude counterpart until M1b); the
+OpenCode commands come from `commands/`. `--check` (run by the
 `lint` job) fails when a generated file differs from its source. Edit the source, run the script,
 commit both.
 
 ## Verified with
 
-Not yet verified against a live model. What runs in CI and locally is the hermetic suite
-(`scripts/test-factory.sh`), which uses stub CLIs. Record here, after the first manual run, the
-versions used and the result of each of these checks:
+The driver flows are not yet verified against a live model. What runs in CI and locally is the
+hermetic suite (`scripts/test-factory.sh`), which uses stub CLIs. The native supervisor probe ran on
+OpenCode 2.4.2; its command and result are the last two items below. Record the driver checks here
+after the first manual run:
 
 - a tiny task on each backend with `--no-push`;
 - one real light run (`--no-push --stop-after review`) on a Markdown-only task: one planner call, no
@@ -480,7 +496,15 @@ versions used and the result of each of these checks:
 - what OpenCode does headless when a rule says `ask`;
 - the OpenCode commands: `.opencode/commands/` is found, `/factory` starts a detached run, the
   `question` tool is shown by the client and by `opencode run`, and the `factory-launcher` read and
-  edit path forms match (1.x and 2.x).
+  edit path forms match (1.x and 2.x);
+- `opencode2 debug agents` on OpenCode 2.4.2: `factory-supervisor` resolves as `mode: "primary"`
+  with the ordered `task` map (`"*": "deny"`, `"factory-*": "allow"`), `question: "allow"` and
+  deny-only `edit`/`bash`/`execute`;
+- one native supervisor → planner probe on OpenCode 2.4.2 with
+  `opencode2 run --server <server> --agent factory-supervisor --model <model> --title "A8a supervisor probe" "Start exactly one factory-planner child ..."`:
+  the supervisor session started exactly one `factory-planner` child, the child's `parentID` equaled
+  the supervisor session, the child replied `DONE`, and `.factory/runs/a8a-probe/plan.md` existed with
+  two lines. No session ids are recorded.
 
 ## Manual cleanup
 

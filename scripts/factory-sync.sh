@@ -12,11 +12,13 @@
 # command and, as bash rules, the allows of the OpenCode agents) and docs/factory/meta/deny-{project,factory}.txt
 # (the deny rules; the project-level ones are also committed in opencode.json and .claude/settings.json).
 # Output: .opencode/agents/<name>.md and .claude/agents/<name>.md for every role that is not the
-# orchestrator or the launcher, and .claude/commands/factory.md for the orchestrator. The launcher
-# (access class `launcher`) is an OpenCode agent only, with the bash allows of
+# orchestrator, the launcher or the supervisor, and .claude/commands/factory.md for the orchestrator.
+# The launcher (access class `launcher`) is an OpenCode agent only, with the bash allows of
 # docs/factory/meta/launcher-allow.txt; its commands come from docs/factory/commands/<name>.md (body)
-# and <name>.conf (description, agent) and land in .opencode/commands/<name>.md. Never edit the
-# output by hand.
+# and <name>.conf (description, agent) and land in .opencode/commands/<name>.md. The supervisor
+# (access class `supervisor`) is an OpenCode agent only too: mode primary, a `task` map that allows
+# `factory-*` children, and no edit or shell rule and no Code Mode beyond the deny baseline. Never edit
+# the output by hand.
 #
 # The generated frontmatter is block-style YAML with simple keys unquoted and pattern keys and string
 # values double-quoted, so prettier leaves it alone. Tool differences live only in emit_opencode,
@@ -55,7 +57,7 @@ read_conf() {
   [[ "$conf_name" =~ ^factory(-[a-z]+)*$ ]] || die "$file: bad name"
   [ -n "$conf_description" ] && [ "${#conf_description}" -le 100 ] || die "$file: description missing or longer than 100 characters"
   [[ "$conf_description" != *[\"\\]* ]] || die "$file: description must not contain a quote or backslash"
-  case "$conf_access" in readonly | code | orchestrator | launcher) ;; *) die "$file: bad access" ;; esac
+  case "$conf_access" in readonly | code | orchestrator | launcher | supervisor) ;; *) die "$file: bad access" ;; esac
   case "$conf_model_class" in helper | main) ;; *) die "$file: bad model_class" ;; esac
   [[ "$conf_max_turns" =~ ^[0-9]+$ ]] || die "$file: bad max_turns"
 }
@@ -83,58 +85,75 @@ emit_opencode() {
   local -a files=("$src/meta/claude-allow-common.txt")
   printf -- '---\n'
   printf 'description: "%s"\n' "$conf_description"
-  printf 'mode: "all"\n'
-  printf 'permission:\n'
-  # A restricted agent must not spawn a subagent: a nested session would run outside the driver's
-  # snapshot check and its phase budget. The rule is denied for every access class and comes first, so
-  # no later entry of the map can override it.
-  printf '  task: "deny"\n'
-  if [ "$conf_access" = launcher ]; then
-    # The launcher asks the owner questions and reads run files; the absolute form of each read path
-    # is allowed too, because the path form `read` is matched against is not verified.
+  if [ "$conf_access" = supervisor ]; then
+    # The supervisor is the one agent with a task allow: it starts a `factory-*` child and reports the
+    # child's id and reply. The `task` map is ordered and the last matching rule wins, so the deny comes
+    # first and the allow for `factory-*` names follow. It has no edit, no shell and no Code Mode.
+    printf 'mode: "primary"\n'
+    printf 'permission:\n'
+    printf '  task:\n'
+    printf '    "*": "deny"\n'
+    printf '    "factory-*": "allow"\n'
     printf '  question: "allow"\n'
-    printf '  read:\n'
+    printf '  edit:\n'
     printf '    "*": "deny"\n'
-    printf '    ".factory/runs/*": "allow"\n'
-    printf '    "*/.factory/runs/*": "allow"\n'
-    printf '    ".factory/launch/*": "allow"\n'
-    printf '    "*/.factory/launch/*": "allow"\n'
-  fi
-  # Edit rules: deny everything, then allow the run directory (the last matching rule wins). The
-  # implementer may edit anywhere; the driver's snapshot check guards the protected paths. The
-  # launcher may write only its own launch directory.
-  printf '  edit:\n'
-  if [ "$conf_access" = readonly ]; then
+    printf '  bash:\n'
     printf '    "*": "deny"\n'
-    printf '    ".factory/runs/*": "allow"\n'
-  elif [ "$conf_access" = launcher ]; then
-    printf '    "*": "deny"\n'
-    printf '    ".factory/launch/*": "allow"\n'
+    printf '  execute: "deny"\n'
   else
-    printf '    "*": "allow"\n'
+    printf 'mode: "all"\n'
+    printf 'permission:\n'
+    # A restricted agent must not spawn a subagent: a nested session would run outside the driver's
+    # snapshot check and its phase budget. Apart from the supervisor, the rule is denied for every
+    # access class and comes first, so no later entry of the map can override it.
+    printf '  task: "deny"\n'
+    if [ "$conf_access" = launcher ]; then
+      # The launcher asks the owner questions and reads run files; the absolute form of each read path
+      # is allowed too, because the path form `read` is matched against is not verified.
+      printf '  question: "allow"\n'
+      printf '  read:\n'
+      printf '    "*": "deny"\n'
+      printf '    ".factory/runs/*": "allow"\n'
+      printf '    "*/.factory/runs/*": "allow"\n'
+      printf '    ".factory/launch/*": "allow"\n'
+      printf '    "*/.factory/launch/*": "allow"\n'
+    fi
+    # Edit rules: deny everything, then allow the run directory (the last matching rule wins). The
+    # implementer may edit anywhere; the driver's snapshot check guards the protected paths. The
+    # launcher may write only its own launch directory.
+    printf '  edit:\n'
+    if [ "$conf_access" = readonly ]; then
+      printf '    "*": "deny"\n'
+      printf '    ".factory/runs/*": "allow"\n'
+    elif [ "$conf_access" = launcher ]; then
+      printf '    "*": "deny"\n'
+      printf '    ".factory/launch/*": "allow"\n'
+    else
+      printf '    "*": "allow"\n'
+    fi
+    # Bash rules in the order OpenCode evaluates them (the last matching rule wins): the baseline
+    # first, then the allows of the access class, then every deny, so that no allow can override a
+    # deny. The baseline is "deny", not "ask": a headless run cannot answer a prompt, and a deny fails
+    # at once with a message the model can act on. opencode.json holds only the denies of AGENTS.md
+    # and comes earlier in the resolved list, so these rules decide.
+    printf '  bash:\n'
+    printf '    "*": "deny"\n'
+    if [ "$conf_access" = launcher ]; then
+      files=("$src/meta/launcher-allow.txt")
+    elif [ "$conf_access" != readonly ]; then
+      files+=("$src/meta/claude-allow-code.txt")
+    fi
+    while IFS= read -r cmd; do
+      case "$seen" in *$'\n'"$cmd"$'\n'*) die "duplicate bash rule: $cmd" ;; esac
+      seen+="$cmd"$'\n'
+      printf '    "%s": "allow"\n' "$cmd"
+    done < <(bash_entries "${files[@]}")
+    while IFS= read -r cmd; do
+      case "$seen" in *$'\n'"$cmd"$'\n'*) die "duplicate bash rule: $cmd" ;; esac
+      seen+="$cmd"$'\n'
+      printf '    "%s": "deny"\n' "$cmd"
+    done < <(deny_entries)
   fi
-  # Bash rules in the order OpenCode evaluates them (the last matching rule wins): the baseline
-  # first, then the allows of the access class, then every deny, so that no allow can override a
-  # deny. The baseline is "deny", not "ask": a headless run cannot answer a prompt, and a deny fails
-  # at once with a message the model can act on. opencode.json holds only the denies of AGENTS.md
-  # and comes earlier in the resolved list, so these rules decide.
-  printf '  bash:\n'
-  printf '    "*": "deny"\n'
-  if [ "$conf_access" = launcher ]; then
-    files=("$src/meta/launcher-allow.txt")
-  elif [ "$conf_access" != readonly ]; then
-    files+=("$src/meta/claude-allow-code.txt")
-  fi
-  while IFS= read -r cmd; do
-    case "$seen" in *$'\n'"$cmd"$'\n'*) die "duplicate bash rule: $cmd" ;; esac
-    seen+="$cmd"$'\n'
-    printf '    "%s": "allow"\n' "$cmd"
-  done < <(bash_entries "${files[@]}")
-  while IFS= read -r cmd; do
-    case "$seen" in *$'\n'"$cmd"$'\n'*) die "duplicate bash rule: $cmd" ;; esac
-    seen+="$cmd"$'\n'
-    printf '    "%s": "deny"\n' "$cmd"
-  done < <(deny_entries)
   printf -- '---\n'
   generated_comment "$role"
   cat "$src/roles/$role.md"
@@ -181,6 +200,10 @@ generate() {
       mkdir -p "$out/.claude/commands"
       emit_claude_command "$role" >"$out/.claude/commands/factory.md"
     elif [ "$conf_access" = launcher ]; then
+      mkdir -p "$out/.opencode/agents"
+      emit_opencode "$role" >"$out/.opencode/agents/$conf_name.md"
+    elif [ "$conf_access" = supervisor ]; then
+      # The supervisor is OpenCode-only in this bootstrap: no Claude counterpart until M1b.
       mkdir -p "$out/.opencode/agents"
       emit_opencode "$role" >"$out/.opencode/agents/$conf_name.md"
     else

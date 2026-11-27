@@ -780,7 +780,7 @@ frontmatter_keys() {
 }
 
 section_sync() {
-  local root=$tmp/sync out rc f key allowed
+  local root=$tmp/sync out rc f key allowed want
   mkdir -p "$root/scripts" "$root/docs" "$root/.claude"
   cp "$repo/scripts/factory-sync.sh" "$root/scripts/"
   cp -r "$repo/docs/factory" "$root/docs/"
@@ -850,10 +850,23 @@ section_sync() {
     done
     assert "sync: $(basename "$f") (opencode) bash rules start with the deny baseline" test "$(grep -A1 '^  bash:$' "$f" | tail -n 1)" = '    "*": "deny"'
     refute "sync: $(basename "$f") (opencode) has no ask rule" grep -q '": "ask"' "$f"
-    assert "sync: $(basename "$f") (opencode) orders baseline, allows, denies" has "$(sed -n '/^  bash:$/,/^---$/p' "$f" | grep -o '": "\(allow\|deny\)"' | tr -d '\n')" '^": "deny"(": "allow")+(": "deny")+$'
-    assert "sync: $(basename "$f") (opencode) denies the task tool exactly once" test "$(grep -c '^  task: "deny"$' "$f")" = 1
-    refute "sync: $(basename "$f") (opencode) never allows or asks the task tool" grep -Eq '^  task: "(allow|ask)"' "$f"
+    if [ "$(basename "$f")" = factory-supervisor.md ]; then
+      # The one agent with a task allow: primary mode, an ordered task map and deny-only edit/bash.
+      assert "sync: the supervisor is a primary agent" grep -qx 'mode: "primary"' "$f"
+      want=$'permission:\n  task:\n    "*": "deny"\n    "factory-*": "allow"\n  question: "allow"\n  edit:\n    "*": "deny"\n  bash:\n    "*": "deny"\n  execute: "deny"'
+      assert "sync: the supervisor has the exact ordered permission map" test "$(sed -n '/^permission:$/,/^---$/p' "$f" | sed '$d')" = "$want"
+      assert "sync: the supervisor denies Code Mode" grep -qx '  execute: "deny"' "$f"
+      assert "sync: the supervisor has one deny baseline for bash" test "$(sed -n '/^  bash:$/,/^---$/p' "$f" | sed '$d' | grep -c '": "deny"')" = 1
+      refute "sync: the supervisor has no read rule" grep -q '^  read:' "$f"
+    else
+      assert "sync: $(basename "$f") (opencode) orders baseline, allows, denies" has "$(sed -n '/^  bash:$/,/^---$/p' "$f" | grep -o '": "\(allow\|deny\)"' | tr -d '\n')" '^": "deny"(": "allow")+(": "deny")+$'
+      assert "sync: $(basename "$f") (opencode) denies the task tool exactly once" test "$(grep -c '^  task: "deny"$' "$f")" = 1
+      refute "sync: $(basename "$f") (opencode) never allows or asks the task tool" grep -Eq '^  task: "(allow|ask)"' "$f"
+    fi
   done
+  # The word is built at runtime so that this file does not trip its own grep.
+  local gw1=gene gw2=ral
+  refute "sync: no factory file names the generic agent" git -C "$repo" grep -qiw --untracked "$gw1$gw2" -- docs/factory .opencode .claude opencode.json scripts/factory-sync.sh scripts/test-factory-perm.py scripts/test-factory.sh
   assert "sync: the launcher role names the exact call form" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'exactly the form each command template names'
   assert "sync: the launcher role says it cannot start a subagent" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'cannot start a subagent'
   # The light templates. Phase templates are not generated, so they are checked directly.
@@ -917,6 +930,8 @@ section_sync() {
   (cd "$root" && scripts/factory-sync.sh)
   assert "sync: --list names the launcher agent" has "$(cd "$repo" && scripts/factory-sync.sh --list)" '^\.opencode/agents/factory-launcher\.md$'
   refute "sync: the launcher has no Claude counterpart" test -e "$repo/.claude/agents/factory-launcher.md"
+  assert "sync: --list names the supervisor agent" has "$(cd "$repo" && scripts/factory-sync.sh --list)" '^\.opencode/agents/factory-supervisor\.md$'
+  refute "sync: the supervisor has no Claude counterpart" test -e "$repo/.claude/agents/factory-supervisor.md"
   allowed=" description agent "
   for cmd in factory factory-resume factory-status; do
     f=$repo/.opencode/commands/$cmd.md
@@ -3079,6 +3094,15 @@ section_perm() {
     agents_dir=""
     printf 'skip: opencode is not installed, its resolved rules are not checked\n'
   fi
+  # The supervisor is a 2.x agent: its ordered task map is not part of the 1.x loop above. OpenCode
+  # 2.4.2 has `debug agents` only (it rejects `debug agent`), so the listing is the resolution probe:
+  # the CLI emits the entry only after parsing the file. The map itself is pinned by the evaluator.
+  if [ "${FACTORY_TEST_SKIP_CLI:-0}" != 1 ] && command -v opencode2 >/dev/null 2>&1; then
+    assert "perm: the 2.x agent list names factory-supervisor" bash -c "cd '$repo' && opencode2 debug agents 2>/dev/null | grep -q '\"id\": \"factory-supervisor\"'"
+    assert "perm: the 2.x supervisor denies Code Mode" bash -c "cd '$repo' && opencode2 debug agents 2>/dev/null | grep -q '\"action\": \"execute\"'"
+  else
+    printf 'skip: opencode2 is not installed, the 2.x supervisor is not resolved\n'
+  fi
   while IFS= read -r line; do
     case "$line" in
       "PASS "*) ok ;;
@@ -3088,7 +3112,52 @@ section_perm() {
   done < <(python3 -I "$repo/scripts/test-factory-perm.py" "$repo" "$agents_dir")
 }
 
+# subagent_depth: the effective `experimental.subagent_depth` of the installed OpenCode 2.x, or the
+# global config when the CLI is absent. Prints the integer; `absent` when the config is readable but
+# has no such value; nothing and exit 1 when neither source is readable. The config can hold
+# providers, headers and credentials: parse it, never print it.
+subagent_depth() {
+  local cfg="" file depth used_cli=0
+  if [ "${FACTORY_TEST_SKIP_CLI:-0}" != 1 ] && command -v opencode2 >/dev/null 2>&1; then
+    if cfg=$(cd "$repo" && opencode2 debug config 2>/dev/null); then used_cli=1; fi
+  fi
+  if [ "$used_cli" = 0 ]; then
+    file=${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json
+    [ -r "$file" ] || return 1
+    cfg=$(cat "$file" 2>/dev/null) || return 1
+  fi
+  # shellcheck disable=SC2016  # the Python source is literal, never a shell expansion
+  depth=$(printf '%s' "$cfg" | python3 -I -c '
+import json, sys
+try:
+    config = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+# `debug config` prints the config sources as a list of {path, type, info}; a global file is a single
+# object. The later source wins, as the 2.x CLI loads them in order.
+if isinstance(config, dict):
+    layers = [config]
+elif isinstance(config, list):
+    layers = [entry.get("info") for entry in config if isinstance(entry, dict)]
+else:
+    layers = []
+values = []
+for layer in layers:
+    if not isinstance(layer, dict):
+        continue
+    experimental = layer.get("experimental")
+    if not isinstance(experimental, dict):
+        continue
+    value = experimental.get("subagent_depth")
+    if isinstance(value, int) and not isinstance(value, bool):
+        values.append(value)
+print(values[-1] if values else "")
+' 2>/dev/null) || return 1
+  printf '%s\n' "${depth:-absent}"
+}
+
 section_static() {
+  local depth
   if command -v shellcheck >/dev/null 2>&1; then
     assert "static: shellcheck is clean over scripts and hooks" bash -c "git -C '$repo' ls-files -z '*.sh' '.githooks/*' | (cd '$repo' && xargs -0 shellcheck)"
   else
@@ -3117,6 +3186,10 @@ section_static() {
     done
   done
   assert "static: no credential, local path or personal name in factory files:$hits" test -z "$hits"
+  # The word is built at runtime so that this file does not contain it either.
+  local gw1=gene gw2=ral
+  refute "static: no factory file names the generic agent" git -C "$repo" grep -qiw --untracked "$gw1$gw2" -- docs/factory .opencode .claude opencode.json scripts/factory-sync.sh scripts/test-factory-perm.py scripts/test-factory.sh
+  assert "static: the generated supervisor denies Code Mode" grep -qx '  execute: "deny"' "$repo/.opencode/agents/factory-supervisor.md"
   # The words are built at runtime so that this file does not contain them either.
   local w1=pho w2=smartpho w3=han
   w1+=ne
@@ -3126,6 +3199,18 @@ section_static() {
   # shellcheck disable=SC2016  # literal characters
   refute "static: no command template holds an argument placeholder, !\` or an @ file reference" grep -rEq '\$ARGUMENTS|\$[0-9]|!`|@[A-Za-z0-9._/~-]' "$repo/docs/factory/commands" "$repo/.opencode/commands"
   refute "static: generated prompts never claim to be official" git -C "$repo" grep -qilE 'official' -- .opencode .claude/agents .claude/commands docs/factory
+
+  # The native supervisor tree needs the server's global `experimental.subagent_depth: 2`; the
+  # default 1 blocks a supervisor → planner child. This is not a repository setting: read the
+  # effective 2.x config or, without the CLI, the global file. A readable config without the value
+  # fails too; only an unreadable source is a skip.
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'skip: python3 is not installed, the subagent depth is not checked\n'
+  elif depth=$(subagent_depth); then
+    assert "static: the effective subagent depth is 2" test "$depth" = 2
+  else
+    printf 'skip: neither opencode2 debug config nor the global config is readable\n'
+  fi
 
   local pcmd
   pcmd=$(prettier_for_tests)
