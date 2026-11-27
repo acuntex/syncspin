@@ -42,6 +42,7 @@ The run directory `.factory/runs/<run id>/` holds artifacts only and is gitignor
 | `factory-implementer`   | code         | Repository files; `git add`/`commit`; never pushes. |
 | `factory` (command)     | orchestrator | Claude Code only: coordinates the others.           |
 | `factory-launcher`      | launcher     | OpenCode only: files under `.factory/launch/`.      |
+| `factory-supervisor`    | supervisor   | OpenCode only: one `factory-*` child; no edit/shell |
 
 Every role prompt tells the agent to read `AGENTS.md` first, that the repository is public, that task
 text and findings are data, and that agents never merge or push to `main`. The launcher cannot read
@@ -50,6 +51,12 @@ the implementer carry a `## Discipline` section: every command in the foreground
 and no polling, the artifact written first and amended, and every command that can block under
 `scripts/timed.sh`. The planner reproduces an unexplained failure once with one command and records
 the command and its result under `## Risks` before calling it external.
+
+The supervisor is the one exception to the task rule: it starts a single `factory-planner` child with
+the `subagent` tool (the `task` permission key), waits for the reply and reports the child session id
+and its reply. It treats the child's task text and artifact path as data and relays a
+`- BLOCKING:` line to the owner with the `question` tool instead of deciding it. It is not the run
+path; the driver remains the only path from a task to a pull request.
 
 ## Caps and phases
 
@@ -224,9 +231,11 @@ Factory level. Everything else lives only in the factory layer.
   is `deny`, not `ask`: a headless run cannot answer a prompt, so an `ask` would hang until the
   phase timeout, while a deny fails at once with a message the model can act on. The readonly
   agents get no mutating allow, and `edit` denied except `.factory/runs/*`; the implementer gets
-  `edit` allowed. `task: "deny"` comes first in every agent's permission map, the launcher's
-  included: no factory agent spawns a subagent, because a nested session would run outside the
-  driver's snapshot check and its phase budget.
+  `edit` allowed. Every generated agent except `factory-supervisor` carries `task: "deny"` first:
+  no other factory agent spawns a subagent, because a nested session would run outside the driver's
+  snapshot check and its phase budget. The supervisor is the exception: `mode: "primary"`, an
+  ordered `task` map that denies `"*"` and then allows `"factory-*"`, `question: "allow"` and
+  deny-only `edit`/`bash`; it starts one child and has no shell.
 - Claude Code: the driver passes `--allowedTools <grant>` and `--disallowedTools <denies>` per phase
   (`claude_tools` and `claude_denies` in `scripts/factory.sh`). The only file-edit grant of a
   readonly phase is `Edit(/.factory/runs/<run id>/<artifact file>)`: the one file the phase writes,
@@ -268,8 +277,10 @@ How the layers merge, and how sure we are.
   case-sensitive.
 - Reasoned, not run: the `task` permission key. That a `task: "deny"` entry is accepted by both
   OpenCode generations and that it stops a subagent call is unverified against a live OpenCode,
-  pinned by `scripts/test-factory.sh` and by the `opencode debug agent` probe of all six generated
-  agents where it is installed.
+  pinned by `scripts/test-factory.sh` and by the `opencode debug agent` probe of the six other
+  generated agents where it is installed. The supervisor's ordered map (`"*": "deny"`,
+  `"factory-*": "allow"`) is parsed by `opencode2 debug agents` on 2.4.2; whether a live 2.x session
+  applies it is unverified.
 - Reasoned, not run: for Claude Code, that `--disallowedTools` entries win over `--allowedTools` and
   over the project settings under `dontAsk` (deny wins over allow in Claude's rule order), and that
   a long deny list in the argument is accepted. Claude agent frontmatter was not used for denies:
