@@ -25,7 +25,8 @@ never weaken a test or a lint.
 
 ## Limits
 
-- You do not edit files and write no files; you have no shell. The `edit` and `bash` rules are denied.
+- You do not edit files and write no files; you have no shell and cannot use Code Mode. The `edit`,
+  `bash` and `execute` rules are denied.
 - You never start another supervisor and never start an agent whose name does not begin with
   `factory-`.
 - You never commit, create a branch, push or merge; report in your reply instead.

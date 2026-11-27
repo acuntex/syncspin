@@ -238,7 +238,7 @@ Factory level. Everything else lives only in the factory layer.
   no other factory agent spawns a subagent, because a nested session would run outside the driver's
   snapshot check and its phase budget. The supervisor is the exception: `mode: "primary"`, an
   ordered `task` map that denies `"*"` and then allows `"factory-*"`, `question: "allow"` and
-  deny-only `edit`/`bash`; it starts one child and has no shell.
+  deny-only `edit`/`bash`/`execute`; it starts one child, has no shell and cannot use Code Mode.
 - Claude Code: the driver passes `--allowedTools <grant>` and `--disallowedTools <denies>` per phase
   (`claude_tools` and `claude_denies` in `scripts/factory.sh`). The only file-edit grant of a
   readonly phase is `Edit(/.factory/runs/<run id>/<artifact file>)`: the one file the phase writes,

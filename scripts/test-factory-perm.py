@@ -98,6 +98,9 @@ def overlay(path):
         elif in_perm and re.fullmatch(r'  question: "(allow|ask|deny)"', line):
             tool = None
             rules.append(("question", "*", line.split('"')[1]))
+        elif in_perm and re.fullmatch(r'  execute: "(allow|ask|deny)"', line):
+            tool = None
+            rules.append(("execute", "*", line.split('"')[1]))
         elif in_perm and tool:
             m = re.fullmatch(r'    "(.*)": "(allow|ask|deny)"', line)
             if m:
@@ -450,6 +453,12 @@ for name in ["build", "plan", "factory", "factoryx", "factory/../x"]:
 check("v2 supervisor: starts factory-planner", decide_v2(to_v2(supervisor_rules), "task", "factory-planner") == "allow")
 check("v2 supervisor: does not start another name", decide_v2(to_v2(supervisor_rules), "task", "plan") == "deny")
 check("supervisor: question is allowed", decide(supervisor_rules, "question", "*") == "allow")
+check(
+    "supervisor: the execute rule is deny *",
+    [rule for rule in supervisor_overlay if rule[0] == "execute"] == [("execute", "*", "deny")],
+)
+check("supervisor: execute is denied", decide(supervisor_rules, "execute", "*") == "deny")
+check("v2 supervisor: execute is denied", decide_v2(to_v2(supervisor_rules), "execute", "*") == "deny")
 check("supervisor: a source file is not editable", decide(supervisor_rules, "edit", "crates/a/src/lib.rs") == "deny")
 check("supervisor: a run artifact is not editable", decide(supervisor_rules, "edit", ".factory/runs/x/plan.md") == "deny")
 check("supervisor: git status is denied", decide(supervisor_rules, "bash", "git status") == "deny")

@@ -353,12 +353,13 @@ the fallback process group; an agent phase of the fallback may run on until its 
 `.opencode/agents/factory-supervisor.md` is a bootstrap for the future Task Orchestrator: a primary
 OpenCode agent that starts exactly one `factory-planner` child through the `subagent` tool, waits for
 its reply and reports the child session id and reply. Its ordered `task` map allows `factory-*` and
-denies every other name; `question` is allowed, `edit` and `bash` are deny-only, so it writes no files
-and runs no shell. It is not the run path: the driver above remains the only path that takes a task to
-a pull request. It requires OpenCode 2.x and `experimental.subagent_depth: 2` in the server's global
-OpenCode configuration; that is not a repository setting, so a fresh machine must set it once. The
-role source is `docs/factory/roles/supervisor.md`; the generator writes the agent to OpenCode only,
-with no Claude counterpart until M1b.
+denies every other name; `question` is allowed, `edit`, `bash` and `execute` are deny-only, so it
+writes no files, runs no shell and cannot use Code Mode. It is not the run path: the driver above
+remains the only path that takes a task to a pull request. It requires OpenCode 2.x and
+`experimental.subagent_depth: 2` in the server's global OpenCode configuration; that is not a
+repository setting, so a fresh machine must set it once. The role source is
+`docs/factory/roles/supervisor.md`; the generator writes the agent to OpenCode only, with no Claude
+counterpart until M1b.
 
 ## Permissions
 
@@ -477,7 +478,7 @@ commit both.
 
 The driver flows are not yet verified against a live model. What runs in CI and locally is the
 hermetic suite (`scripts/test-factory.sh`), which uses stub CLIs. The native supervisor probe ran on
-OpenCode 2.4.2; its command and result are the first two items below. Record the driver checks here
+OpenCode 2.4.2; its command and result are the last two items below. Record the driver checks here
 after the first manual run:
 
 - a tiny task on each backend with `--no-push`;
@@ -487,14 +488,6 @@ after the first manual run:
 - `opencode debug agent factory-planner` and `opencode debug agent factory-launcher` on an
   installation that has the client, to confirm both resolve with `task: "deny"` and that a session
   title comes out readable;
-- `opencode2 debug agents` on OpenCode 2.4.2: `factory-supervisor` resolves as `mode: "primary"`
-  with the ordered `task` map (`"*": "deny"`, `"factory-*": "allow"`), `question: "allow"` and
-  deny-only `edit`/`bash`;
-- one native supervisor → planner probe on OpenCode 2.4.2 with
-  `opencode2 run --server <server> --agent factory-supervisor --model <model> --title "A8a supervisor probe" "Start exactly one factory-planner child ..."`:
-  the supervisor session started exactly one `factory-planner` child, the child's `parentID` equaled
-  the supervisor session, the child replied `DONE`, and `.factory/runs/a8a-probe/plan.md` existed with
-  two lines. No session ids are recorded;
 - `gh pr merge` and `git push origin main` refused inside both tools;
 - a readonly OpenCode role cannot edit `src/` but can write its artifact (this confirms the `edit`
   path form and the rule order on OpenCode 1.x);
@@ -503,7 +496,15 @@ after the first manual run:
 - what OpenCode does headless when a rule says `ask`;
 - the OpenCode commands: `.opencode/commands/` is found, `/factory` starts a detached run, the
   `question` tool is shown by the client and by `opencode run`, and the `factory-launcher` read and
-  edit path forms match (1.x and 2.x).
+  edit path forms match (1.x and 2.x);
+- `opencode2 debug agents` on OpenCode 2.4.2: `factory-supervisor` resolves as `mode: "primary"`
+  with the ordered `task` map (`"*": "deny"`, `"factory-*": "allow"`), `question: "allow"` and
+  deny-only `edit`/`bash`/`execute`;
+- one native supervisor → planner probe on OpenCode 2.4.2 with
+  `opencode2 run --server <server> --agent factory-supervisor --model <model> --title "A8a supervisor probe" "Start exactly one factory-planner child ..."`:
+  the supervisor session started exactly one `factory-planner` child, the child's `parentID` equaled
+  the supervisor session, the child replied `DONE`, and `.factory/runs/a8a-probe/plan.md` existed with
+  two lines. No session ids are recorded.
 
 ## Manual cleanup
 

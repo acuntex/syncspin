@@ -17,8 +17,8 @@
 # docs/factory/meta/launcher-allow.txt; its commands come from docs/factory/commands/<name>.md (body)
 # and <name>.conf (description, agent) and land in .opencode/commands/<name>.md. The supervisor
 # (access class `supervisor`) is an OpenCode agent only too: mode primary, a `task` map that allows
-# `factory-*` children, and no edit or bash rule beyond the deny baseline. Never edit the output by
-# hand.
+# `factory-*` children, and no edit or shell rule and no Code Mode beyond the deny baseline. Never edit
+# the output by hand.
 #
 # The generated frontmatter is block-style YAML with simple keys unquoted and pattern keys and string
 # values double-quoted, so prettier leaves it alone. Tool differences live only in emit_opencode,
@@ -88,7 +88,7 @@ emit_opencode() {
   if [ "$conf_access" = supervisor ]; then
     # The supervisor is the one agent with a task allow: it starts a `factory-*` child and reports the
     # child's id and reply. The `task` map is ordered and the last matching rule wins, so the deny comes
-    # first and the allow for `factory-*` names follow. It has no edit and no shell.
+    # first and the allow for `factory-*` names follow. It has no edit, no shell and no Code Mode.
     printf 'mode: "primary"\n'
     printf 'permission:\n'
     printf '  task:\n'
@@ -99,6 +99,7 @@ emit_opencode() {
     printf '    "*": "deny"\n'
     printf '  bash:\n'
     printf '    "*": "deny"\n'
+    printf '  execute: "deny"\n'
   else
     printf 'mode: "all"\n'
     printf 'permission:\n'

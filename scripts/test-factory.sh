@@ -853,8 +853,9 @@ section_sync() {
     if [ "$(basename "$f")" = factory-supervisor.md ]; then
       # The one agent with a task allow: primary mode, an ordered task map and deny-only edit/bash.
       assert "sync: the supervisor is a primary agent" grep -qx 'mode: "primary"' "$f"
-      want=$'permission:\n  task:\n    "*": "deny"\n    "factory-*": "allow"\n  question: "allow"\n  edit:\n    "*": "deny"\n  bash:\n    "*": "deny"'
+      want=$'permission:\n  task:\n    "*": "deny"\n    "factory-*": "allow"\n  question: "allow"\n  edit:\n    "*": "deny"\n  bash:\n    "*": "deny"\n  execute: "deny"'
       assert "sync: the supervisor has the exact ordered permission map" test "$(sed -n '/^permission:$/,/^---$/p' "$f" | sed '$d')" = "$want"
+      assert "sync: the supervisor denies Code Mode" grep -qx '  execute: "deny"' "$f"
       assert "sync: the supervisor has one deny baseline for bash" test "$(sed -n '/^  bash:$/,/^---$/p' "$f" | sed '$d' | grep -c '": "deny"')" = 1
       refute "sync: the supervisor has no read rule" grep -q '^  read:' "$f"
     else
@@ -3098,6 +3099,7 @@ section_perm() {
   # the CLI emits the entry only after parsing the file. The map itself is pinned by the evaluator.
   if [ "${FACTORY_TEST_SKIP_CLI:-0}" != 1 ] && command -v opencode2 >/dev/null 2>&1; then
     assert "perm: the 2.x agent list names factory-supervisor" bash -c "cd '$repo' && opencode2 debug agents 2>/dev/null | grep -q '\"id\": \"factory-supervisor\"'"
+    assert "perm: the 2.x supervisor denies Code Mode" bash -c "cd '$repo' && opencode2 debug agents 2>/dev/null | grep -q '\"action\": \"execute\"'"
   else
     printf 'skip: opencode2 is not installed, the 2.x supervisor is not resolved\n'
   fi
@@ -3187,6 +3189,7 @@ section_static() {
   # The word is built at runtime so that this file does not contain it either.
   local gw1=gene gw2=ral
   refute "static: no factory file names the generic agent" git -C "$repo" grep -qiw --untracked "$gw1$gw2" -- docs/factory .opencode .claude opencode.json scripts/factory-sync.sh scripts/test-factory-perm.py scripts/test-factory.sh
+  assert "static: the generated supervisor denies Code Mode" grep -qx '  execute: "deny"' "$repo/.opencode/agents/factory-supervisor.md"
   # The words are built at runtime so that this file does not contain them either.
   local w1=pho w2=smartpho w3=han
   w1+=ne
