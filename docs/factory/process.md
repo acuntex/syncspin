@@ -75,6 +75,29 @@ real diff and escalates when it touches a path outside the allowlist, more than 
 `CHANGES NEEDED` escalates too, keeps `code_round=1` and sets `step=fix`, so the next review is the
 full one at round 2. The skipped plan review cannot be added back.
 
+Every phase kind has its own wall-clock budget. `--phase-timeout SECS` overrides every entry.
+
+| Phase              | Budget |
+| ------------------ | ------ |
+| `plan`             | 1200 s |
+| `plan-revise`      | 900 s  |
+| `plan-review`      | 900 s  |
+| `plan-review-post` | 600 s  |
+| `implement`        | 7200 s |
+| `fix`              | 5400 s |
+| `code-review`      | 1500 s |
+| `pr`               | 600 s  |
+| `final-gate`       | 7200 s |
+| any other          | 2700 s |
+
+The phase banner and the final gate line name the budget they use, and a phase that exhausts it stops
+the run with `the <phase> phase used its budget of <n> s (exit 20)`. On the light path an artifact
+phase escalates and runs the same unit again on the full template in process; a code phase escalates
+and stops resumable, so a resume repeats the unit on the full path. Claude Code also enforces a turn
+cap per role (`maxTurns`: planner 60, implementer 200, plan reviewer 40, code reviewer 60, pull
+request writer 20). OpenCode ignores it and enforces only the time budget; whether a turn cap ends a
+phase with a non-zero exit is unverified, and such an exit is not retried.
+
 Verdicts: the last non-empty line of a review, with trailing carriage return and spaces stripped,
 must equal exactly `VERDICT: APPROVED` or `VERDICT: CHANGES NEEDED`. Anything else (missing or empty
 file, wrong case, trailing text, verdict not last) counts as `CHANGES NEEDED`.

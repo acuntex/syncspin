@@ -94,8 +94,9 @@ scripts/factory.sh --dry-run --backend claude "anything"   # print the phases an
 
 `--allow-protected`, `--plan-rounds N`, `--code-rounds N`, `--model-helper M`, `--model-main M`,
 `--variant-helper V`, `--variant-main V`, `--opencode-attach URL`, `--opencode-bin PATH` and
-`--phase-timeout SECS` are the other options. `FACTORY_PASS_ENV` names the variables to pass to the agent (for a model
-provider key); everything else is removed from its environment.
+`--phase-timeout SECS` (overrides every phase budget) are the other options. `FACTORY_PASS_ENV` names
+the variables to pass to the agent (for a model provider key); everything else is removed from its
+environment.
 
 `--stop-after plan` stops after the reviewed plan and leaves the branch that preflight created in the
 local repository. Delete it by hand when you abandon the run.
@@ -146,8 +147,10 @@ implementer) or the flags above; without a helper model the driver warns once an
 the session default. A full run makes one planner call, one to five plan reviews, one implementer
 call, one to three code reviews (plus fixes) and one pull request writer call; a light run makes one
 planner call on the helper model, no plan review, one implementer call and at most one short review.
-Phases time out after 45 minutes (implement and fix: two hours) unless `--phase-timeout` says
-otherwise.
+Every phase kind has its own budget: 20 minutes for the plan, 15 for a plan revision and a plan
+review, 10 for the post-decision review and the pull request text, two hours for the implementer,
+90 minutes for a fix, 25 for a code review and two hours for the final gate, 45 minutes for anything
+else. `--phase-timeout SECS` overrides every one of them.
 
 ### Reasoning variant (OpenCode)
 

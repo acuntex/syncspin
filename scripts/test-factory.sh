@@ -1635,6 +1635,65 @@ HOOK
   assert "D55 a light diff keeps the path" test "$(state_of path)" = light
   assert "D55 a light diff writes no escalation file" test ! -e "$(run_dir_of)/light-escalation.txt"
 
+  # D50: every phase kind has its own budget, and the banner and the final gate name it.
+  new_case stub
+  drive --backend opencode "t"
+  assert "D50 the run finishes" test "$drv_rc" = 0
+  assert "D50 the plan banner names its budget" has "$drv_out" 'phase plan \(planner, round 0/0, budget 1200 s\)'
+  assert "D50 the plan review banner names its budget" has "$drv_out" 'phase plan-review \(plan-reviewer, round 1/4, budget 900 s\)'
+  assert "D50 the implement banner names its budget" has "$drv_out" 'phase implement \(implementer, round 0/0, budget 7200 s\)'
+  assert "D50 the code review banner names its budget" has "$drv_out" 'phase code-review \(code-reviewer, round 1/3, budget 1500 s\)'
+  assert "D50 the pr banner names its budget" has "$drv_out" 'phase pr \(pr-writer, round 0/0, budget 600 s\)'
+  assert "D50 the final gate names its budget" has "$drv_out" 'final gate \(scripts/gate.sh --full, budget 7200 s\)'
+  new_case stub
+  printf 'sleep 3041\n' >"$sd/hook-plan.sh"
+  drive --backend opencode --phase-timeout 3 "t"
+  assert "D50 --phase-timeout overrides the table" has "$drv_out" 'phase plan \(planner, round 0/0, budget 3 s\)'
+  assert "D50 the overridden timeout exits 20" test "$drv_rc" = 20
+  assert "D50 the stop names the budget it used" has "$drv_out" 'used its budget of 3 s'
+
+  # D51: a light timeout in an artifact phase escalates and retries the unit once, in process.
+  new_case stub
+  cat >"$sd/hook-plan.sh" <<'HOOK'
+if [ ! -f "$STUB_DIR/plan-attempt" ]; then
+  : >"$STUB_DIR/plan-attempt"
+  sleep 3043
+fi
+HOOK
+  drv_extra=(FACTORY_MODEL_MAIN=main/model FACTORY_MODEL_HELPER=helper/model)
+  drive --backend opencode --phase-timeout 2 $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  drv_extra=()
+  assert "D51 the escalated plan run finishes" test "$drv_rc" = 0
+  assert "D51 the plan timed out once, then ran again" test "$(count_calls 'role=planner')" = 2
+  assert "D51 the retry runs on the main model" test "$(argv_of planner | tail -n 1 | grep -c -- '--model main/model')" = 1
+  assert "D51 the path escalated to full" test "$(state_of path)" = full
+  assert "D51 the escalation file exists" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D51 the plan review runs after the escalation" test "$(count_calls 'role=plan-reviewer')" = 1
+
+  # D51: a light timeout in implement escalates, stops 20, and a resume continues on the full path.
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+n=$(($(cat "$STUB_DIR/impl-count" 2>/dev/null || echo 0) + 1))
+echo "$n" >"$STUB_DIR/impl-count"
+echo "note $n" >"notes-$n.txt"
+git add "notes-$n.txt"
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add note $n"
+if [ "$n" = 1 ]; then sleep 3047; fi
+handled=1
+HOOK
+  drive --backend opencode --phase-timeout 3 $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D51 the implement timeout exits 20" test "$drv_rc" = 20
+  assert "D51 the implement timeout escalated" test "$(state_of path)" = full
+  assert "D51 the implement escalation file exists" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D51 the stop names the budget and the resume" has "$drv_out" 'used its budget of 3 s; resume to continue on the full path'
+  id=$(basename "$(run_dir_of)")
+  : >"$sd/calls.log"
+  drive --resume "$id" --phase-timeout 60
+  assert "D51 the resume finishes on the full path" test "$drv_rc" = 0
+  assert "D51 the resume keeps the full path" test "$(state_of path)" = full
+  assert "D51 the resumed review is the full template" has "$(cat "$sd/calls.log")" 'PROMPT .*Review the commits on branch'
+
   # D13: dry run.
   new_case stub
   drive --dry-run --backend claude "t"

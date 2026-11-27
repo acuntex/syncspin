@@ -30,7 +30,9 @@
 #     --opencode-attach URL         run every OpenCode phase against a running OpenCode server
 #                                   ($FACTORY_OPENCODE_ATTACH); http(s)://host[:port], nothing else. The
 #                                   server password travels only as $OPENCODE_SERVER_PASSWORD.
-#     --phase-timeout SECS          timeout of every phase (default 2700; implement and fix 7200)
+#     --phase-timeout SECS          override every phase budget: plan 1200, plan-revise and
+#                                   plan-review 900, plan-review-post 600, implement 7200, fix 5400,
+#                                   code-review 1500, pr 600, final-gate 7200, anything else 2700
 #
 # The variant, client and attach options apply to the OpenCode backend only; the Claude backend
 # ignores them with a warning.
@@ -1231,11 +1233,22 @@ trap on_signal INT TERM
 
 timeout_for() {
   if [ -n "$phase_timeout" ]; then printf '%s' "$phase_timeout"; return; fi
-  case "$1" in implement | fix) printf '7200' ;; *) printf '2700' ;; esac
+  case "$1" in
+    plan) printf '1200' ;;
+    plan-revise) printf '900' ;;
+    plan-review) printf '900' ;;
+    plan-review-post) printf '600' ;;
+    implement) printf '7200' ;;
+    fix) printf '5400' ;;
+    code-review) printf '1500' ;;
+    pr) printf '600' ;;
+    final-gate) printf '7200' ;;
+    *) printf '2700' ;;
+  esac
 }
 
 # run_phase <role> <access> <phase-name> <template> <artifact-path-or-empty> <timeout-kind>
-# Sets phase_rc and phase_timed_out. Template values come from the P_* variables.
+# Sets phase_rc, phase_timed_out and phase_secs. Template values come from the P_* variables.
 run_phase() {
   local role=$1 access=$2 name=$3 template=$4 artifact=$5 tkind=$6 prompt secs rc=0 var
   local -a envargs
@@ -1247,6 +1260,7 @@ run_phase() {
   prompt=$(render <"docs/factory/phases/$template.md")
   build_cmd "$role" "$access" "$name" "$prompt" "$artifact"
   secs=$(timeout_for "$tkind")
+  phase_secs=$secs
   envargs=(env -i)
   for var in PATH HOME TERM LANG; do
     if [ -n "${!var+x}" ]; then envargs+=("$var=${!var}"); fi
@@ -1256,7 +1270,7 @@ run_phase() {
   for var in ${FACTORY_PASS_ENV:-}; do
     if [ -n "${!var+x}" ]; then envargs+=("$var=${!var}"); fi
   done
-  printf 'factory: phase %s (%s, round %s/%s)\n' "$name" "$role" "${P_ROUND:-0}" "${P_MAX:-0}"
+  printf 'factory: phase %s (%s, round %s/%s, budget %s s)\n' "$name" "$role" "${P_ROUND:-0}" "${P_MAX:-0}" "$secs"
   printf '== %s %s\n' "$name" "$(date -u +%H:%M:%S)" >>"$run_dir/logs/$name.log"
   if [ "$backend" = opencode ] && [ -n "$opencode_attach" ] && [ -n "${OPENCODE_SERVER_PASSWORD:-}${OPENCODE_SERVER_USERNAME:-}" ]; then
     # The server credentials never go on a command line (the process list shows it): they travel
@@ -1316,12 +1330,19 @@ verify_phase() {
   take_snapshot "$branch" >"$run_dir/snap.base"
 }
 
-# Artifact phases: the backend must leave its artifact behind. Returns nothing; stops on failure.
+# Artifact phases: the backend must leave its artifact behind. Returns 1 only on a light-path
+# timeout, so the caller can retry the unit on the full template; every other stop ends the run.
 artifact_phase() {
   local role=$1 name=$2 template=$3 artifact=$4
   rm -f "${ROOT:?}/$artifact"
   run_phase "$role" readonly "$name" "$template" "$artifact" "$name"
-  if [ "$phase_timed_out" = 1 ]; then stop 20 "the $name phase timed out"; fi
+  if [ "$phase_timed_out" = 1 ]; then
+    if [ "$path" = light ]; then
+      escalate_light "the $name phase used its budget of $phase_secs s"
+      return 1
+    fi
+    stop 20 "the $name phase used its budget of $phase_secs s (exit 20)"
+  fi
   if [ ! -s "$ROOT/$artifact" ]; then
     diagnose "$name" 1
     stop 20 "the $name phase ended (exit $phase_rc) without its artifact $artifact"
@@ -1334,7 +1355,13 @@ code_phase() {
   local role=implementer name=$1 template=$2 progress
   head_before=$(git rev-parse HEAD)
   run_phase "$role" code "$name" "$template" "" "$name"
-  if [ "$phase_timed_out" = 1 ]; then stop 20 "the $name phase timed out"; fi
+  if [ "$phase_timed_out" = 1 ]; then
+    if [ "$path" = light ]; then
+      escalate_light "the $name phase used its budget of $phase_secs s"
+      stop 20 "the $name phase used its budget of $phase_secs s; resume to continue on the full path"
+    fi
+    stop 20 "the $name phase used its budget of $phase_secs s (exit 20)"
+  fi
   progress=$(git rev-list --count "$head_before..HEAD")
   if [ "$phase_rc" != 0 ] && [ "$progress" = 0 ]; then
     diagnose "$name" 0
@@ -1372,9 +1399,9 @@ while :; do
     plan:write)
       P_RESUME=$(resume_context)
       if [ "$path" = light ]; then
-        artifact_phase planner plan plan-light "$plan_file"
+        artifact_phase planner plan plan-light "$plan_file" || continue
       else
-        artifact_phase planner plan plan "$plan_file"
+        artifact_phase planner plan plan "$plan_file" || continue
       fi
       resuming=0
       plan_round=1
@@ -1391,7 +1418,7 @@ while :; do
       P_ROUND=$plan_round
       P_MAX=$plan_cap
       review_file=$(rel "$run_dir")/review-plan-$plan_round.md
-      artifact_phase plan-reviewer plan-review plan-review "$review_file"
+      artifact_phase plan-reviewer plan-review plan-review "$review_file" || continue
       resuming=0
       if [ "$(parse_verdict "$ROOT/$review_file")" = APPROVED ]; then
         phase=owner-gate
@@ -1409,7 +1436,18 @@ while :; do
       cp "$ROOT/$plan_file" "$run_dir/plan-before-revision-$plan_round.md"
       before=$(hash_file "$ROOT/$plan_file")
       run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
-      if [ "$phase_timed_out" = 1 ]; then stop 20 "the plan-revise phase timed out"; fi
+      if [ "$phase_timed_out" = 1 ]; then
+        if [ "$path" = light ]; then
+          # The light planner ran out of its budget: retry the unit once on the full path.
+          escalate_light "the plan-revise phase used its budget of $phase_secs s"
+          run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
+          if [ "$phase_timed_out" = 1 ]; then
+            stop 20 "the plan-revise phase used its budget of $phase_secs s (exit 20)"
+          fi
+        else
+          stop 20 "the plan-revise phase used its budget of $phase_secs s (exit 20)"
+        fi
+      fi
       if [ "$(hash_file "$ROOT/$plan_file")" = "$before" ]; then
         diagnose plan-revise 1
         stop 20 "the plan-revise phase ended (exit $phase_rc) without a revised plan"
@@ -1440,7 +1478,18 @@ while :; do
       if [ "$path" = light ]; then P_REVIEW=""; else P_REVIEW=$(rel "$run_dir")/review-plan-$plan_round.md; fi
       before=$(hash_file "$ROOT/$plan_file")
       run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
-      if [ "$phase_timed_out" = 1 ]; then stop 20 "the plan-revise phase timed out"; fi
+      if [ "$phase_timed_out" = 1 ]; then
+        if [ "$path" = light ]; then
+          # The light planner ran out of its budget: retry the unit once on the full path.
+          escalate_light "the plan-revise phase used its budget of $phase_secs s"
+          run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
+          if [ "$phase_timed_out" = 1 ]; then
+            stop 20 "the plan-revise phase used its budget of $phase_secs s (exit 20)"
+          fi
+        else
+          stop 20 "the plan-revise phase used its budget of $phase_secs s (exit 20)"
+        fi
+      fi
       if [ "$(hash_file "$ROOT/$plan_file")" = "$before" ]; then
         diagnose plan-revise 1
         stop 20 "the plan-revise phase ended (exit $phase_rc) without a revised plan"
@@ -1453,7 +1502,7 @@ while :; do
       P_DECISIONS=$decisions_file
       P_ROUND=$((plan_cap + 1))
       P_MAX=$((plan_cap + 1))
-      artifact_phase plan-reviewer plan-review-post plan-review-post "$(rel "$run_dir")/review-plan-post.md"
+      artifact_phase plan-reviewer plan-review-post plan-review-post "$(rel "$run_dir")/review-plan-post.md" || continue
       resuming=0
       post_decision_review=1
       if [ "$(parse_verdict "$run_dir/review-plan-post.md")" != APPROVED ]; then
@@ -1488,7 +1537,7 @@ while :; do
         P_GATE="scripts/gate.sh --commit"
       fi
       review_file=$(rel "$run_dir")/review-code-$code_round.md
-      artifact_phase code-reviewer code-review "$review_template" "$review_file"
+      artifact_phase code-reviewer code-review "$review_template" "$review_file" || continue
       resuming=0
       if [ "$(parse_verdict "$ROOT/$review_file")" = APPROVED ]; then
         if [ "$stop_after" = review ]; then finish "reviewed, stopped after review"; fi
@@ -1515,10 +1564,13 @@ while :; do
       step=review
       ;;
     final-gate:gate)
-      printf 'factory: final gate (scripts/gate.sh --full)\n'
+      gate_budget=$(timeout_for final-gate)
+      printf 'factory: final gate (scripts/gate.sh --full, budget %s s)\n' "$gate_budget"
       gate_rc=0
-      timeout -k 30 "$(timeout_for implement)" scripts/gate.sh --full >"$run_dir/logs/final-gate.log" 2>&1 || gate_rc=$?
-      if [ "$gate_rc" = 124 ] || [ "$gate_rc" = 137 ]; then stop 20 "the final gate timed out"; fi
+      timeout -k 30 "$gate_budget" scripts/gate.sh --full >"$run_dir/logs/final-gate.log" 2>&1 || gate_rc=$?
+      if [ "$gate_rc" = 124 ] || [ "$gate_rc" = 137 ]; then
+        stop 20 "the final gate used its budget of $gate_budget s (exit $gate_rc)"
+      fi
       grep '^SKIP' "$run_dir/logs/final-gate.log" >"$run_dir/gate-skips.txt" || true
       if [ "$gate_rc" != 0 ]; then
         stop 15 "scripts/gate.sh --full failed (exit $gate_rc); no automatic fix is attempted; see $(rel "$run_dir")/logs/final-gate.log"
@@ -1528,7 +1580,7 @@ while :; do
       ;;
     pr:pr-write)
       P_RESUME=""
-      artifact_phase pr-writer pr pr "$(rel "$run_dir")/pr.md"
+      artifact_phase pr-writer pr pr "$(rel "$run_dir")/pr.md" || continue
       resuming=0
       if ! problems=$(lint_pr "$run_dir/pr.md"); then
         stop 16 "the pull request text failed its lint: $(tr '\n' ';' <<<"$problems")"
