@@ -10,24 +10,24 @@ agent files, and `scripts/factory.sh` fills in the phase templates. The human pa
 
 ## Components
 
-| Component                                    | Role                                                                                  |
-| -------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `docs/factory/roles/*.md`                    | Role system prompts (source of truth).                                                |
-| `docs/factory/phases/*.md`                   | Per-phase user-prompt templates, filled in by the driver.                             |
-| `docs/factory/meta/*.conf`                   | Per-role metadata: name, description, access class, model class.                      |
-| `scripts/gate.sh`                            | Tool-independent gate: `--commit`, standard, `--full`, `--list`; path-selected steps. |
-| `.githooks/pre-commit`, `.githooks/pre-push` | Driver-only hooks, activated through environment variables.                           |
-| `scripts/factory-sync.sh`                    | Generates the agent files for both tools from the sources; `--check`.                 |
-| `.opencode/agents/`, `.claude/agents/`       | Generated agent files. Never edit them by hand.                                       |
-| `.claude/commands/factory.md`                | Generated interactive `/factory` command (Claude Code only).                          |
-| `opencode.json`, `.claude/settings.json`     | Project permissions: only the `AGENTS.md` denies, for every session.                  |
-| `docs/factory/meta/deny-*.txt`               | Deny rules (project level and factory only).                                          |
-| `CLAUDE.md`                                  | Git symlink to `AGENTS.md`; no content of its own.                                    |
-| `scripts/factory.sh`                         | Deterministic driver; the only OpenCode path and the unattended path.                 |
-| `scripts/factory-launch.sh`                  | Detaches a run; `--status` and `--stop`. Used by the OpenCode client.                 |
-| `docs/factory/commands/`                     | Sources of the OpenCode commands `/factory`, `-resume`, `-status`.                    |
-| `.opencode/commands/`                        | Generated OpenCode commands, run by the `factory-launcher` agent.                     |
-| `scripts/test-factory.sh`                    | Hermetic tests with stub CLIs; no model is ever run.                                  |
+| Component                                    | Role                                                                                                            |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `docs/factory/roles/*.md`                    | Role system prompts (source of truth).                                                                          |
+| `docs/factory/phases/*.md`                   | Per-phase user-prompt templates, filled in by the driver; `plan-light` and `code-review-light` for a light run. |
+| `docs/factory/meta/*.conf`                   | Per-role metadata: name, description, access class, model class.                                                |
+| `scripts/gate.sh`                            | Tool-independent gate: `--commit`, standard, `--full`, `--list`; path-selected steps.                           |
+| `.githooks/pre-commit`, `.githooks/pre-push` | Driver-only hooks, activated through environment variables.                                                     |
+| `scripts/factory-sync.sh`                    | Generates the agent files for both tools from the sources; `--check`.                                           |
+| `.opencode/agents/`, `.claude/agents/`       | Generated agent files. Never edit them by hand.                                                                 |
+| `.claude/commands/factory.md`                | Generated interactive `/factory` command (Claude Code only).                                                    |
+| `opencode.json`, `.claude/settings.json`     | Project permissions: only the `AGENTS.md` denies, for every session.                                            |
+| `docs/factory/meta/deny-*.txt`               | Deny rules (project level and factory only).                                                                    |
+| `CLAUDE.md`                                  | Git symlink to `AGENTS.md`; no content of its own.                                                              |
+| `scripts/factory.sh`                         | Deterministic driver; the only OpenCode path and the unattended path.                                           |
+| `scripts/factory-launch.sh`                  | Detaches a run; `--status` and `--stop`. Used by the OpenCode client.                                           |
+| `docs/factory/commands/`                     | Sources of the OpenCode commands `/factory`, `-resume`, `-status`.                                              |
+| `.opencode/commands/`                        | Generated OpenCode commands, run by the `factory-launcher` agent.                                               |
+| `scripts/test-factory.sh`                    | Hermetic tests with stub CLIs; no model is ever run.                                                            |
 
 The run directory `.factory/runs/<run id>/` holds artifacts only and is gitignored.
 
@@ -60,6 +60,20 @@ the repository, so its prompt says the rules bind it without asking it to read t
 | `pr`          | -   | The pr-writer writes `pr.md`; the driver pushes and opens the pull request.          |
 
 The caps are constants; flags can only lower them. Agents never merge. The owner reviews and merges.
+
+The light path plans a trivial task with `phases/plan-light.md` instead of `phases/plan.md`, skips
+`plan-review` entirely (`plan_round` is still 1, so an owner-gate revision renders round 1) and
+reviews the single commit with `phases/code-review-light.md` at round 1. A full change is unchanged.
+The classification is conservative shell code: a task that names no file, names only a directory,
+names more than three files, or names a protected path, code or a directory the allowlist does not
+know is full. The README describes the allowlist.
+
+Escalation is state only: `escalate_light` sets `path=full`, writes `light-escalation.txt` and saves
+the state, and each caller picks the next step. After the implementer call the driver measures the
+real diff and escalates when it touches a path outside the allowlist, more than three paths, more than
+80 added and deleted lines, more than one commit, or nothing at all; a light review that answers
+`CHANGES NEEDED` escalates too, keeps `code_round=1` and sets `step=fix`, so the next review is the
+full one at round 2. The skipped plan review cannot be added back.
 
 Verdicts: the last non-empty line of a review, with trailing carriage return and spaces stripped,
 must equal exactly `VERDICT: APPROVED` or `VERDICT: CHANGES NEEDED`. Anything else (missing or empty
@@ -96,8 +110,10 @@ the local repository; delete it by hand when you abandon the run.
 
 `state` (in the run directory, `key=value`, one per line, rewritten atomically after every
 transition) holds: `run_id backend branch base_sha phase step plan_round code_round
-post_decision_review status exit_code stopped_at`. `phase` is one of `preflight plan plan-review
-owner-gate implement code-review final-gate pr done`. `step` names the unit of work inside it.
+post_decision_review status exit_code stopped_at path slug plan_material`. `path` is `light` or `full`,
+`slug` is the task slug the branch name uses and `plan_material` records whether the last plan
+revision changed the body. `phase` is one of `preflight plan plan-review owner-gate implement
+code-review final-gate pr done`. `step` names the unit of work inside it.
 
 `handoff.md` is written on every stop with a fixed layout: `# Handoff`, `Run:`, `Branch:`,
 `Stopped at:`, `Exit code:`, `Reason:`, `Artifacts:`, `Open findings:` and `Resume:` (the exact
@@ -108,8 +124,8 @@ at 200 characters, with ANSI codes removed and lines that hold personal data wit
 prints the same cause as one line to stderr; the exit code stays 20.
 
 Run directory files: `task.md plan.md review-plan-N.md review-plan-post.md decisions.md
-review-code-N.md pr.md blocked.md handoff.md state logs/<phase>.log`. Logs can hold paths and model
-provider output: never attach them to a public issue.
+review-code-N.md pr.md blocked.md handoff.md state light-escalation.txt logs/<phase>.log`. Logs can
+hold paths and model provider output: never attach them to a public issue.
 
 ## Protected paths and the snapshot
 

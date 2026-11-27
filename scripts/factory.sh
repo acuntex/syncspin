@@ -11,15 +11,17 @@
 #     --backend opencode|claude     default $FACTORY_BACKEND, else the first installed
 #     --resume ID                   continue a run stopped with exit 10 or exit 20
 #     --stop-after plan|implement|review|pr
-#                                   stop after the reviewed plan, the implement phase, the code review
-#                                   loop, or run everything (default). `plan` leaves the branch that
-#                                   preflight created in the local repository.
+#                                   stop after the plan (reviewed, or not on the light path), the
+#                                   implement phase, the code review loop, or run everything (default).
+#                                   `plan` leaves the branch that preflight created in the local
+#                                   repository.
 #     --no-push                     do not push and do not open the pull request
-#     --dry-run                     print the phases and command shapes, call nothing
+#     --dry-run                     print the path, the phases and command shapes, call nothing
 #     --allow-protected             let the implementer change the protected paths (default off)
 #     --plan-rounds N               lower the plan review cap (4) to N
 #     --code-rounds N               lower the code review cap (3) to N
-#     --model-helper M              model for the reviewers and the pr-writer ($FACTORY_MODEL_HELPER)
+#     --model-helper M              model for the reviewers, the pr-writer and the light planner
+#                                   ($FACTORY_MODEL_HELPER)
 #     --model-main M                model for the planner and the implementer ($FACTORY_MODEL_MAIN)
 #     --variant-helper V            OpenCode reasoning variant for the helper roles ($FACTORY_VARIANT_HELPER)
 #     --variant-main V              OpenCode reasoning variant for the main roles ($FACTORY_VARIANT_MAIN)
@@ -52,6 +54,14 @@ shopt -u patsub_replacement 2>/dev/null || true
 
 PLAN_CAP=4
 CODE_CAP=3
+# The limits of the light path: a task whose text is short, names at most three files from the
+# allowlist and no code, and whose real diff stays below these limits keeps the short plan, the
+# missing plan review and the one short code review. Everything else is the full path.
+LIGHT_MAX_TASK_BYTES=1200
+LIGHT_MAX_TASK_LINES=12
+LIGHT_MAX_FILES=3
+LIGHT_MAX_DIFF_LINES=80
+LIGHT_MAX_COMMITS=1
 # Configuration the tools read at project level, and the files that decide what they may do.
 # `.claude/settings.local.json` and `CLAUDE.local.md` are gitignored, so git status never shows them;
 # take_snapshot hashes them separately (the `localcfg` component).
@@ -144,6 +154,129 @@ slugify() {
 
 shortid() {
   od -An -N3 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# ---------------------------------------------------------------------------------------------
+# The light path: whether a task is trivial enough for the short plan, the missing plan review and
+# the one short code review. The classification is conservative: anything unclear is full.
+
+# light_path_ok <path>: the allowlist of the light path. A file whose basename ends in `.md` or
+# `.txt`, and `.gitignore`, may change; prosa and nothing else.
+light_path_ok() {
+  local p=$1 entry base
+  case "$p" in /* | "~"* ) return 1 ;; esac
+  case "/$p/" in */../*) return 1 ;; esac
+  for entry in "${PROTECTED[@]}"; do
+    case "$p" in "$entry" | "$entry"/*) return 1 ;; esac
+  done
+  case "$p" in
+    docs/factory/* | .factory/* | .superpowers/* | .git/* | target/* | crates/* | examples/* | src/*) return 1 ;;
+  esac
+  [ "$p" = .gitignore ] && return 0
+  base=${p##*/}
+  case "$base" in *.md | *.txt) return 0 ;; esac
+  return 1
+}
+
+# clean_word <word>: the word without quotes, brackets and backticks, and without trailing
+# punctuation, so that "`README.md`," becomes README.md.
+clean_word() {
+  local w=$1
+  w=${w//[\"\'\`]/}
+  w=${w//\(/}
+  w=${w//\)/}
+  w=${w//\[/}
+  w=${w//\]/}
+  w=${w//\{/}
+  w=${w//\}/}
+  w=${w//</}
+  w=${w//>/}
+  while [ -n "$w" ]; do
+    case "${w: -1}" in
+      . | , | ';' | ':') w=${w%?} ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$w"
+}
+
+# light_size_reason <files> <lines>: the reason of a light task, without a repeated "light".
+light_size_reason() {
+  local files=$1 lines=$2
+  printf '%s file%s, %s line%s' "$files" "$([ "$files" = 1 ] || printf s)" "$lines" \
+    "$([ "$lines" = 1 ] || printf s)"
+}
+
+# classify_task: reads the task text on stdin and sets class_path and class_reason. Trailing newlines
+# are not part of the text (command substitution drops them), so a 13-line text without a final
+# newline is 13 lines. Never calls a model and never touches the tree.
+classify_task() {
+  local text bytes lines word w tok esc entry first_dir="" files=0 reject="" oldifs=$IFS
+  text=$(cat)
+  class_path=full
+  bytes=$(printf '%s' "$text" | wc -c)
+  lines=$(printf '%s' "$text" | awk 'END { print NR }')
+  if [ "$bytes" -gt "$LIGHT_MAX_TASK_BYTES" ] || [ "$lines" -gt "$LIGHT_MAX_TASK_LINES" ]; then
+    class_reason="the task text is too large ($bytes bytes, $lines lines)"
+    return 0
+  fi
+  # A path the light path may never touch, named anywhere in the text as a whole word.
+  for tok in scripts crates examples src docs/factory .github .githooks .opencode .claude .factory \
+    .superpowers .git target Cargo.toml Cargo.lock rust-toolchain.toml deny.toml cliff.toml \
+    opencode.json opencode.jsonc Makefile; do
+    esc=${tok//./\\.}
+    if grep -Eq "(^|[^[:alnum:]_.-])$esc([^[:alnum:]_.-]|$)" <<<"$text"; then
+      class_reason="the task text names $tok"
+      return 0
+    fi
+  done
+  IFS=$' \t\n'
+  set -f
+  for word in $text; do
+    w=$(clean_word "$word")
+    [ -n "$w" ] || continue
+    case "$w" in
+      */)
+        # A directory mention: unsafe immediately, otherwise remembered and ignored.
+        case "$w" in
+          scripts/* | crates/* | examples/* | src/* | docs/factory/* | .github/* | .githooks/* | .opencode/* | .claude/* | .factory/* | .superpowers/* | .git/* | target/*)
+            reject=$w
+            break
+            ;;
+        esac
+        for entry in "${PROTECTED[@]}"; do
+          case "$w" in "$entry"/*) reject=$w ;; esac
+        done
+        if [ -n "$reject" ]; then break; fi
+        if [ -z "$first_dir" ]; then first_dir=$w; fi
+        ;;
+      *)
+        if [[ "$w" == */* ]] || [[ "$w" =~ ^[[:alnum:]_.+-]*\.[[:alpha:]][[:alnum:]]{0,9}$ ]]; then
+          if light_path_ok "$w"; then
+            files=$((files + 1))
+          elif [ -z "$reject" ]; then
+            reject=$w
+          fi
+        fi
+        ;;
+    esac
+  done
+  IFS=$oldifs
+  set +f
+  if [ -n "$reject" ]; then
+    class_reason="the task text names $reject"
+  elif [ "$files" = 0 ]; then
+    if [ -n "$first_dir" ]; then
+      class_reason="the task text names only the directory $first_dir"
+    else
+      class_reason="the task text names no file"
+    fi
+  elif [ "$files" -gt "$LIGHT_MAX_FILES" ]; then
+    class_reason="the task text names $files files"
+  else
+    class_path=light
+    class_reason=$(light_size_reason "$files" "$lines")
+  fi
 }
 
 # detect_opencode_generation <bin>: print the major version (1 or 2) from `<bin> --version`, and fail
@@ -551,14 +684,21 @@ role_class() {
 }
 
 model_for() {
-  case "$(role_class "$1")" in
+  local role=$1 class
+  class=$(role_class "$role")
+  # The light planner plans on the helper model: the short plan does not need the strong one.
+  if [ "$role" = planner ] && [ "${path:-full}" = light ]; then class=helper; fi
+  case "$class" in
     helper) printf '%s' "$model_helper" ;;
     *) printf '%s' "$model_main" ;;
   esac
 }
 
 variant_for() {
-  case "$(role_class "$1")" in
+  local role=$1 class
+  class=$(role_class "$role")
+  if [ "$role" = planner ] && [ "${path:-full}" = light ]; then class=helper; fi
+  case "$class" in
     helper) printf '%s' "$variant_helper" ;;
     *) printf '%s' "$variant_main" ;;
   esac
@@ -716,10 +856,23 @@ if [ "$dry_run" = 1 ]; then
     need_opencode_client
     resolve_opencode_generation
   fi
+  # The command-line form and the file form both classify.
+  if [ -n "$task_file" ]; then task_text=$(cat "$task_file"); fi
+  classify_task <<<"$task_text"
+  path=$class_path
   printf 'factory dry run: nothing is called, nothing is changed\n'
   printf 'backend: %s\n' "$backend"
+  if [ "$path" = light ]; then
+    printf 'path: light (%s)\n' "$class_reason"
+  else
+    printf 'path: full (%s)\n' "$class_reason"
+  fi
   printf 'caps: plan review %s rounds, code review %s rounds\n' "$plan_cap" "$code_cap"
-  printf 'phases: plan, plan-review, owner-gate, implement, code-review, final-gate, pr\n'
+  if [ "$path" = light ]; then
+    printf 'phases: plan, owner-gate, implement, code-review, final-gate, pr\n'
+  else
+    printf 'phases: plan, plan-review, owner-gate, implement, code-review, final-gate, pr\n'
+  fi
   printf 'stop after: %s%s\n' "$stop_after" "$( [ "$no_push" = 1 ] && printf ', no push' || true)"
   if [ "$backend" = opencode ]; then
     printf 'opencode client: %s (generation %s)\n' "$opencode_bin" "$opencode_gen"
@@ -755,12 +908,15 @@ child_pgid=""
 resuming=0
 head_before=""
 main_before=""
+path=full
+slug=""
+plan_material=0
 
 save_state() {
   [ -n "$run_dir" ] || return 0
   local k
   {
-    for k in run_id backend branch base_sha phase step plan_round code_round post_decision_review status exit_code stopped_at opencode_bin opencode_gen; do
+    for k in run_id backend branch base_sha phase step plan_round code_round post_decision_review status exit_code stopped_at opencode_bin opencode_gen path slug plan_material; do
       printf '%s=%s\n' "$k" "${!k}"
     done
   } >"$run_dir/state.tmp"
@@ -774,11 +930,62 @@ load_state() {
     key=${BASH_REMATCH[1]}
     value=${BASH_REMATCH[2]}
     case "$key" in
-      run_id | backend | branch | base_sha | phase | step | plan_round | code_round | post_decision_review | status | exit_code | stopped_at | opencode_bin | opencode_gen)
+      run_id | backend | branch | base_sha | phase | step | plan_round | code_round | post_decision_review | status | exit_code | stopped_at | opencode_bin | opencode_gen | path | slug | plan_material)
         printf -v "$key" '%s' "$value"
         ;;
     esac
   done <"$run_dir/state"
+}
+
+# escalate_light <reason>: the light path becomes a full one. State only: every caller sets its own
+# next phase and step. The reason is kept in the run directory and in the state.
+escalate_light() {
+  path=full
+  printf '%s\n' "$1" >"$run_dir/light-escalation.txt"
+  save_state
+  printf 'factory: the light path escalated to full: %s\n' "$1"
+}
+
+# light_diff_check: prints nothing and returns 0 when the real diff since the base stays within the
+# light limits, otherwise prints one reason and returns 1. NUL-separated names keep a name with a
+# space or a newline in one piece.
+light_diff_check() {
+  local base=$base_sha p lines=0 commits
+  local -a names=()
+  while IFS= read -r -d '' p; do
+    if [ -n "$p" ]; then names+=("$p"); fi
+  done < <({
+    git diff --name-only -z --diff-filter=ACMRD "$base"
+    git ls-files -z --others --exclude-standard
+  })
+  if [ "${#names[@]}" = 0 ]; then
+    printf 'the change touched no file'
+    return 1
+  fi
+  for p in "${names[@]}"; do
+    if ! light_path_ok "$p"; then
+      printf 'the change touches %s' "$p"
+      return 1
+    fi
+  done
+  if [ "${#names[@]}" -gt "$LIGHT_MAX_FILES" ]; then
+    printf 'the change touches %s files' "${#names[@]}"
+    return 1
+  fi
+  lines=$(git diff --numstat "$base" | awk '{ a += $1; d += $2 } END { print a + d }')
+  while IFS= read -r -d '' p; do
+    if [ -n "$p" ]; then lines=$((lines + $(wc -l <"$p"))); fi
+  done < <(git ls-files -z --others --exclude-standard)
+  if [ "$lines" -gt "$LIGHT_MAX_DIFF_LINES" ]; then
+    printf 'the change is %s added and deleted lines' "$lines"
+    return 1
+  fi
+  commits=$(git rev-list --count "$base..HEAD")
+  if [ "$commits" -gt "$LIGHT_MAX_COMMITS" ]; then
+    printf 'the change is %s commits' "$commits"
+    return 1
+  fi
+  return 0
 }
 
 last_review_file() {
@@ -788,6 +995,15 @@ last_review_file() {
     if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest=$f; fi
   done
   printf '%s' "$newest"
+}
+
+# plan_reviewed: a plan review artifact exists. The light path has none: its plan goes unreviewed.
+plan_reviewed() {
+  local f
+  for f in "$run_dir"/review-plan-*.md; do
+    if [ -e "$f" ]; then return 0; fi
+  done
+  return 1
 }
 
 write_handoff() {
@@ -920,6 +1136,9 @@ if [ -z "$resume_id" ]; then
   if [ -n "$task_file" ]; then task_text=$(cat "$task_file"); fi
   [ -n "$task_text" ] || die_preflight "the task is empty"
   slug=$(slugify "$task_text")
+  # The path is chosen from the task text once, before any phase runs.
+  classify_task <<<"$task_text"
+  path=$class_path
   sid=$(shortid)
   branch="factory/$slug-$sid"
   if git show-ref --verify -q "refs/heads/$branch"; then
@@ -943,12 +1162,17 @@ if [ -z "$resume_id" ]; then
   printf '%s\n' "$main_before" >"$run_dir/main-before"
   snap_take_to "$run_dir/snap.base"
   printf 'factory: run %s on branch %s (backend %s)\n' "$run_id" "$branch" "$backend"
+  printf 'factory: %s path (%s)\n' "$path" "$class_reason"
 else
   export_hooks
   run_dir="$ROOT/.factory/runs/$resume_id"
   [ -f "$run_dir/state" ] || die_usage "no such run: $resume_id"
   opencode_bin_requested=$opencode_bin
   load_state
+  # A state written by an older driver carries none of these keys.
+  path=${path:-full}
+  plan_material=${plan_material:-0}
+  slug=${slug:-$(slugify "$(cat "$run_dir/task.md")")}
   if [ "$status" != stopped ] || { [ "$exit_code" != 10 ] && [ "$exit_code" != 20 ]; }; then
     die_usage "run $resume_id cannot be resumed (status $status, exit code ${exit_code:-none}); see $(rel "$run_dir")/handoff.md"
   fi
@@ -1147,11 +1371,21 @@ while :; do
   case "$phase:$step" in
     plan:write)
       P_RESUME=$(resume_context)
-      artifact_phase planner plan plan "$plan_file"
+      if [ "$path" = light ]; then
+        artifact_phase planner plan plan-light "$plan_file"
+      else
+        artifact_phase planner plan plan "$plan_file"
+      fi
       resuming=0
-      phase=plan-review
-      step=review
       plan_round=1
+      if [ "$path" = light ]; then
+        # The short plan is not reviewed: the owner gate follows it at once.
+        phase=owner-gate
+        step=check
+      else
+        phase=plan-review
+        step=review
+      fi
       ;;
     plan-review:review)
       P_ROUND=$plan_round
@@ -1187,7 +1421,10 @@ while :; do
       ;;
     owner-gate:check)
       if owner_section_closed "$ROOT/$plan_file"; then
-        if [ "$stop_after" = plan ]; then finish "reviewed plan, stopped after plan"; fi
+        if [ "$stop_after" = plan ]; then
+          if plan_reviewed; then finish "reviewed plan, stopped after plan"; fi
+          finish "plan written without review, stopped after plan"
+        fi
         phase=implement
         step=implement
       else
@@ -1199,7 +1436,8 @@ while :; do
       P_DECISIONS=$decisions_file
       P_ROUND=$plan_round
       P_MAX=$plan_cap
-      P_REVIEW=$(rel "$run_dir")/review-plan-$plan_round.md
+      # The light path has no review findings: an empty path says so.
+      if [ "$path" = light ]; then P_REVIEW=""; else P_REVIEW=$(rel "$run_dir")/review-plan-$plan_round.md; fi
       before=$(hash_file "$ROOT/$plan_file")
       run_phase planner readonly plan-revise plan-revise "$plan_file" plan-revise
       if [ "$phase_timed_out" = 1 ]; then stop 20 "the plan-revise phase timed out"; fi
@@ -1230,6 +1468,10 @@ while :; do
       P_RESUME=$(resume_context)
       code_phase implement implement
       resuming=0
+      # The real diff decides, before a `--stop-after implement` can end the run.
+      if [ "$path" = light ]; then
+        reason=$(light_diff_check) || escalate_light "$reason"
+      fi
       if [ "$stop_after" = implement ]; then finish "implemented, stopped after implement"; fi
       phase=code-review
       step=review
@@ -1239,14 +1481,23 @@ while :; do
       P_ROUND=$code_round
       P_MAX=$code_cap
       P_GATE="scripts/gate.sh"
+      review_template=code-review
+      # One short review of a light change; every later round is the full one.
+      if [ "$path" = light ] && [ "$code_round" = 1 ]; then
+        review_template=code-review-light
+        P_GATE="scripts/gate.sh --commit"
+      fi
       review_file=$(rel "$run_dir")/review-code-$code_round.md
-      artifact_phase code-reviewer code-review code-review "$review_file"
+      artifact_phase code-reviewer code-review "$review_template" "$review_file"
       resuming=0
       if [ "$(parse_verdict "$ROOT/$review_file")" = APPROVED ]; then
         if [ "$stop_after" = review ]; then finish "reviewed, stopped after review"; fi
         phase=final-gate
         step=gate
       elif [ "$code_round" -lt "$code_cap" ]; then
+        if [ "$path" = light ]; then
+          escalate_light "the light review asked for changes"
+        fi
         step=fix
       else
         stop 12 "the code was not approved within $code_cap review rounds"

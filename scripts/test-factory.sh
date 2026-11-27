@@ -686,6 +686,16 @@ section_sync() {
   done
   assert "sync: the launcher role names the exact call form" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'exactly the form each command template names'
   assert "sync: the launcher role says it cannot start a subagent" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'cannot start a subagent'
+  # The light templates. Phase templates are not generated, so they are checked directly.
+  local light_plan=$repo/docs/factory/phases/plan-light.md light_review=$repo/docs/factory/phases/code-review-light.md
+  for h in '## Goal' '## Constraints' '## Files' '## Commit breakdown' '## Test plan' '## Docs to update' '## Risks' '## Owner decisions'; do
+    assert "sync: plan-light.md names $h" grep -qF -- "$h" "$light_plan"
+  done
+  assert "sync: plan-light.md plans one commit" grep -q 'one commit' "$light_plan"
+  # shellcheck disable=SC2016  # a literal backtick in the template text
+  assert "sync: code-review-light.md names the observed section" grep -qF -- '`## Observed`' "$light_review"
+  assert "sync: code-review-light.md runs the gate through the wrapper" grep -qF -- 'scripts/timed.sh 600 -- {{GATE_CMD}}' "$light_review"
+  assert "sync: code-review-light.md names the verdict" grep -q 'VERDICT: APPROVED' "$light_review"
   for f in "$repo"/.claude/agents/factory-*.md; do
     allowed=" name description tools model maxTurns "
     assert "sync: $(basename "$f") (claude agent) has a closed fence" frontmatter_keys "$f" >/dev/null
@@ -1020,7 +1030,7 @@ lib() {
 }
 
 section_driver() {
-  local be before id mut
+  local be before id mut d48light d48full
   # Built at runtime so that no home-directory path or personal-looking name sits in the repository.
   local hm=/ho rp=quasi
   hm+=me
@@ -1118,6 +1128,44 @@ section_driver() {
   for v in 'VERDICT: APPROVED' 'VERDICT: APPROVED   ' $'VERDICT: APPROVED\r'; do
     printf 'text\n%s\n\n\n' "$v" >"$vf"
     assert "D5 an approved verdict with trailing blanks and spaces is APPROVED" test "$(lib parse_verdict "$vf")" = APPROVED
+  done
+
+  # The light-path classifier, called on stdin inside a library subshell. `<path>|<reason>`.
+  # shellcheck disable=SC2329  # called through lib
+  # shellcheck disable=SC2031  # the subshell is where classify_task sets them
+  classify_probe() {
+    classify_task <<<"$1" >/dev/null
+    printf '%s|%s\n' "$class_path" "$class_reason"
+  }
+  assert "classify: .gitignore and an ignored directory is light" test "$(lib classify_probe $'Add /.serena/ to .gitignore.\nKeep the rest.')" = 'light|1 file, 2 lines'
+  assert "classify: README.md is light" test "$(lib classify_probe 'Update README.md.')" = 'light|1 file, 1 line'
+  assert "classify: docs/testing.md is light" test "$(lib classify_probe 'Rewrite docs/testing.md')" = 'light|1 file, 1 line'
+  assert "classify: a directory mention is full" has "$(lib classify_probe 'Update docs/')" '^full|.*only the directory docs/$'
+  assert "classify: .git/ is full" has "$(lib classify_probe 'Write .git/config')" '^full|.*\.git'
+  assert "classify: docs/README.md is light" test "$(lib classify_probe 'Update docs/README.md')" = 'light|1 file, 1 line'
+  assert "classify: notes.md is light" test "$(lib classify_probe 'Add notes.md')" = 'light|1 file, 1 line'
+  # shellcheck disable=SC2016  # a literal backtick in a task text
+  assert "classify: backticks are stripped" test "$(lib classify_probe 'Update `README.md`.')" = 'light|1 file, 1 line'
+  assert "classify: docs/factory is named" has "$(lib classify_probe 'Update docs/factory/process.md')" '^full|.*docs/factory$'
+  assert "classify: scripts is named" has "$(lib classify_probe 'Touch scripts')" '^full|.*scripts$'
+  assert "classify: Cargo.toml is named" has "$(lib classify_probe 'Cargo.toml and README.md')" '^full|.*Cargo\.toml$'
+  assert "classify: AGENTS.md is refused" has "$(lib classify_probe 'Change AGENTS.md')" '^full|.*AGENTS\.md$'
+  assert "classify: .factory is named" has "$(lib classify_probe 'Read .factory/runs/x/plan.md')" '^full|.*\.factory$'
+  assert "classify: crates is named" has "$(lib classify_probe 'Change crates/x/notes.txt')" '^full|.*crates$'
+  assert "classify: no file is full" has "$(lib classify_probe 'Fix the bug')" '^full|.*no file$'
+  assert "classify: four files are too many" has "$(lib classify_probe 'Update a.md b.md c.md d.md')" '^full|.*4 files$'
+  assert "classify: notes.markdown is refused" has "$(lib classify_probe 'Add notes.markdown')" '^full|.*notes\.markdown$'
+  assert "classify: an oversize text is full" has "$(lib classify_probe "$(printf 'x%.0s' $(seq 1 1500))")" '^full|.*too large'
+  assert "classify: 13 lines are too many" has "$(lib classify_probe "$(printf 'line %s\n' $(seq 1 12))"$'\n'"README.md")" '^full|.*13 lines'
+  assert "classify: 12 lines with a final newline are light" test "$(lib classify_probe "$(printf 'line %s\n' $(seq 1 11))"$'\n'"README.md"$'\n')" = 'light|1 file, 12 lines'
+
+  for v in .gitignore README.md docs/testing.md notes.txt; do
+    assert "light_path_ok accepts $v" lib light_path_ok "$v"
+  done
+  for v in scripts/x.sh .opencode/x AGENTS.md CLAUDE.md .github/x docs/factory/x.md \
+    .factory/runs/x/plan.md .superpowers/sdd/x/design.md .git/config target/x.txt /abs/x.md ../x.md \
+    crates/x/notes.txt examples/x/notes.txt src/notes.txt crates/x/src/lib.rs; do
+    refute "light_path_ok rejects $v" lib light_path_ok "$v"
   done
 
   # D6 and D20: the owner gate.
@@ -1485,6 +1533,107 @@ STUB
   drive --resume "$id" --opencode-bin "$tmp/dbin/opencode"
   assert "D45 a different client on resume is a usage error" test "$drv_rc" = 2
   assert "D45 the refused resume starts no phase" test ! -s "$sd/calls.log"
+
+  # D46: the light happy path. A two-line task naming one allowed file; the stub implementer commits
+  # a note, which stays inside the light limits.
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+echo "note" >notes.txt
+git add notes.txt
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add a note"
+handled=1
+HOOK
+  drv_extra=(FACTORY_MODEL_MAIN=main/model FACTORY_MODEL_HELPER=helper/model)
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  drv_extra=()
+  assert "D46 the light run exits 0" test "$drv_rc" = 0
+  assert "D46 the run records the light path" test "$(state_of path)" = light
+  assert "D46 no plan review runs" test "$(count_calls 'role=plan-reviewer')" = 0
+  assert "D46 the roles run in the light order" test "$(call_roles)" = "planner,implementer,code-reviewer,pr-writer"
+  assert "D46 exactly one code review" test "$(count_calls 'role=code-reviewer')" = 1
+  assert "D46 the planner runs on the helper model" has "$(argv_of planner)" ' --model helper/model '
+  assert "D46 the implementer runs on the main model" has "$(argv_of implementer)" ' --model main/model '
+  assert "D46 the planner reads the short template" has "$(cat "$sd/calls.log")" 'PROMPT .*Write a short implementation plan'
+  assert "D46 the review reads the short template" has "$(cat "$sd/calls.log")" 'PROMPT .*Read the one commit'
+  assert "D46 the summary names the light path" test "$(state_of path)" = light
+
+  # D46 dry run: the classifier reads a task file too.
+  new_case stub
+  printf 'Add /.serena/ to .gitignore\n' >"$clone/task.md"
+  drive --dry-run --backend claude --task-file task.md
+  assert "D46 the dry run classifies a task file" has "$drv_out" '^path: light \(1 file, 1 line\)$'
+  assert "D46 the dry run prints the light schedule" has "$drv_out" '^phases: plan, owner-gate, implement, code-review, final-gate, pr$'
+  assert "D46 the dry run called nothing" test ! -s "$sd/calls.log"
+
+  # D47: the real diff escalates a light run that turned out to touch code.
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+mkdir -p src
+echo "pub fn f() {}" >src/lib.rs
+git add src/lib.rs
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "feat: add a function"
+handled=1
+HOOK
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D47 the escalated run finishes" test "$drv_rc" = 0
+  assert "D47 the path escalated to full" test "$(state_of path)" = full
+  assert "D47 the escalation reason is kept" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D47 the escalation names the path" has "$(cat "$(run_dir_of)/light-escalation.txt")" 'src/lib\.rs'
+  assert "D47 the review is the full template" has "$(cat "$sd/calls.log")" 'PROMPT .*Review the commits on branch'
+  refute "D47 the review is not the light template" has "$(cat "$sd/calls.log")" 'PROMPT .*Read the one commit'
+  assert "D47 the run reviews once" test "$(count_calls 'role=code-reviewer')" = 1
+
+  # D48: a light review that asks for changes escalates, and the next round is the full review.
+  new_case stub
+  printf 'VERDICT: CHANGES NEEDED\n' >"$sd/q-code"
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+echo "note" >notes.txt
+git add notes.txt
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add a note"
+handled=1
+HOOK
+  drive --backend opencode $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D48 the escalated run finishes" test "$drv_rc" = 0
+  assert "D48 the fix phase ran" test "$(count_calls 'role=implementer')" = 2
+  assert "D48 two code reviews" test "$(count_calls 'role=code-reviewer')" = 2
+  assert "D48 the path escalated to full" test "$(state_of path)" = full
+  d48light=$(grep -n '^PROMPT .*Read the one commit' "$sd/calls.log" | cut -d: -f1)
+  d48full=$(grep -n '^PROMPT .*Review the commits on branch' "$sd/calls.log" | cut -d: -f1)
+  assert "D48 the first review reads the light template" test -n "$d48light"
+  assert "D48 the second review reads the full template" test -n "$d48full"
+  assert "D48 the light review comes first" test "$d48light" -lt "$d48full"
+  assert "D48 the code round is two" test "$(state_of code_round)" = 2
+
+  # D55: --stop-after implement measures the diff before it stops.
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+mkdir -p src
+echo "pub fn f() {}" >src/lib.rs
+git add src/lib.rs
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "feat: add a function"
+handled=1
+HOOK
+  drive --backend opencode --stop-after implement $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D55 a rejected diff stops 0" test "$drv_rc" = 0
+  assert "D55 a rejected diff escalates the path" test "$(state_of path)" = full
+  assert "D55 a rejected diff writes the escalation file" test -s "$(run_dir_of)/light-escalation.txt"
+  assert "D55 nothing is reviewed after the stop" test "$(count_calls 'role=code-reviewer')" = 0
+  new_case stub
+  cat >"$sd/hook-implement.sh" <<'HOOK'
+echo "note" >notes.txt
+git add notes.txt
+scripts/gate.sh --commit >/dev/null
+git commit -q -m "docs: add a note"
+handled=1
+HOOK
+  drive --backend opencode --stop-after implement $'Add /.serena/ to .gitignore.\nKeep the rest.'
+  assert "D55 a light diff stops 0" test "$drv_rc" = 0
+  assert "D55 a light diff keeps the path" test "$(state_of path)" = light
+  assert "D55 a light diff writes no escalation file" test ! -e "$(run_dir_of)/light-escalation.txt"
 
   # D13: dry run.
   new_case stub

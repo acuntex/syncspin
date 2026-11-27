@@ -66,6 +66,26 @@ whole set on every pull request, so a step the local gate skipped cannot reach `
 The Claude Code `/factory` command is prompt-driven: the same procedure, but the caps and checks are
 instructions to a model. Prefer the driver when the outcome matters.
 
+## Light path
+
+A trivial task does not need the full path. The driver classifies the task text itself, in shell code
+and without a model:
+
+- **light** when the text is at most 1200 bytes and 12 lines, names one to three files, names no
+  directory, and every named file is `.gitignore` or has a `.md` or `.txt` name. A light run writes a
+  short plan on the helper model, skips the plan review, makes one implementer call and then measures
+  the real diff: it stays light while that diff touches at most three such files, adds and deletes at
+  most 80 lines and is a single commit.
+- **full** otherwise, including a task that names no file, names only a directory, names more than
+  three files, or mentions `scripts`, `crates`, `src`, `.github`, `Cargo.toml` or any other protected
+  path or code. Anything unclear is full.
+
+A light run that leaves those limits after the implementer call — a code file, a protected path, too
+many lines — escalates: `light-escalation.txt` in the run directory records why, the state says
+`path=full`, and the run continues on the full path from the code review on. The skipped plan review
+cannot be added back, which is why the classifier is conservative: the owner gate, the one review and
+CI remain. `--dry-run` prints the path, its reason and the light schedule.
+
 ```sh
 scripts/factory.sh --backend claude "add a --list flag to the player example"
 scripts/factory.sh --backend opencode --no-push --stop-after review --task-file task.md
@@ -99,8 +119,8 @@ the crate or file if you know it, and what must not change. Put long requests in
 
 `.factory/runs/<run id>/` is gitignored and holds `task.md`, `plan.md`, `review-plan-N.md`,
 `review-plan-post.md`, `decisions.md`, `review-code-N.md`, `pr.md`, `blocked.md`, `handoff.md`,
-`state` and `logs/<phase>.log`. Logs can contain paths and model provider output: never attach them
-to a public issue.
+`state`, `light-escalation.txt` and `logs/<phase>.log`. Logs can contain paths and model provider
+output: never attach them to a public issue.
 
 ## Exit codes
 
@@ -121,11 +141,13 @@ to a public issue.
 ## Model and cost
 
 The Claude agents use `sonnet`. For OpenCode no model is committed: set `FACTORY_MODEL_HELPER` (the
-reviewers and the pull request writer) and `FACTORY_MODEL_MAIN` (planner and implementer) or the flags
-above; without a helper model the driver warns once and the reviewers use the session default. A
-run makes one planner call, one to five plan reviews, one implementer call, one to three code reviews
-(plus fixes) and one pull request writer call. Phases time out after 45 minutes (implement and fix:
-two hours) unless `--phase-timeout` says otherwise.
+reviewers, the pull request writer and the light planner) and `FACTORY_MODEL_MAIN` (planner and
+implementer) or the flags above; without a helper model the driver warns once and the reviewers use
+the session default. A full run makes one planner call, one to five plan reviews, one implementer
+call, one to three code reviews (plus fixes) and one pull request writer call; a light run makes one
+planner call on the helper model, no plan review, one implementer call and at most one short review.
+Phases time out after 45 minutes (implement and fix: two hours) unless `--phase-timeout` says
+otherwise.
 
 ### Reasoning variant (OpenCode)
 
