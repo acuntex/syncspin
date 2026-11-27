@@ -280,6 +280,11 @@ servers.
   phase: exit 20, resumable. Plain-HTTP basic auth over a network is unencrypted. See the README for
   the by-hand check and the recommended use.
 
+Every phase prompt starts with a header line, `Factory <slug>: <phase> <round>`, followed by one blank
+line; `<round>` is the phase's round, or 1 where it has none. That line names the session: the driver
+passes no `--title`, and a client that derives a session title from the first prompt line shows it.
+Reasoned, not run: that OpenCode derives the title from the prompt, and how it abbreviates it.
+
 ## The launcher and the OpenCode commands
 
 A run takes tens of minutes, so an OpenCode client starts it through `scripts/factory-launch.sh`

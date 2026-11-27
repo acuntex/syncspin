@@ -830,13 +830,14 @@ art=${FACTORY_ARTIFACT:-}
 n=$(($(cat "$d/count" 2>/dev/null || echo 0) + 1))
 echo "$n" >"$d/count"
 kind=""
+body=${prompt#*$'\n'$'\n'}
 case "$art" in
-  */plan.md) case "$prompt" in "Revise the plan"*) kind=plan-revise ;; *) kind=plan ;; esac ;;
+  */plan.md) case "$body" in "Revise the plan"*) kind=plan-revise ;; *) kind=plan ;; esac ;;
   */review-plan-post.md) kind=plan-review-post ;;
   */review-plan-*.md) kind=plan-review ;;
   */review-code-*.md) kind=code-review ;;
   */pr.md) kind=pr ;;
-  "") case "$prompt" in "Address the findings"*) kind=fix ;; *) kind=implement ;; esac ;;
+  "") case "$body" in "Address the findings"*) kind=fix ;; *) kind=implement ;; esac ;;
 esac
 {
   echo "CALL $n $name role=$role kind=$kind artifact=$art"
@@ -1715,6 +1716,33 @@ HOOK
   printf '1\n' >"$sd/exit-plan"
   drive --backend opencode "t"
   assert "D52 a non-zero exit without artifact makes one call" test "$(count_calls 'role=planner')" = 1
+
+  # D53: the session name comes from the first line of the prompt, and no call passes --title.
+  prompt_of() { sed -n 's/^PROMPT //p' "$sd/calls.log" | sed -n "$1p"; }
+  new_case stub
+  drive --backend opencode "t"
+  assert "D53 the run finishes" test "$drv_rc" = 0
+  refute "D53 no call passes --title" grep -q -- '--title' "$sd/calls.log"
+  assert "D53 the plan prompt is named after the run and the phase" has "$(prompt_of 1)" '^Factory t: plan 1~'
+  assert "D53 the plan review prompt names its round" has "$(prompt_of 2)" '^Factory t: plan-review 1~'
+  assert "D53 the code review prompt names its round" has "$(prompt_of 4)" '^Factory t: code-review 1~'
+  assert "D53 the header is followed by a blank line" has "$(prompt_of 1)" '^Factory t: plan 1~~[^~]'
+  new_case stub
+  printf 'VERDICT: CHANGES NEEDED\n' >"$sd/q-plan-review"
+  drive --backend opencode "t"
+  assert "D53 a plan revision keeps its kind" test "$(count_calls 'kind=plan-revise')" = 1
+  assert "D53 the revision prompt names the phase" has "$(prompt_of 3)" '^Factory t: plan-revise 1~'
+  assert "D53 the second review prompt names round 2" has "$(prompt_of 4)" '^Factory t: plan-review 2~'
+  new_case stub
+  printf 'VERDICT: CHANGES NEEDED\n' >"$sd/q-code"
+  drive --backend opencode "t"
+  assert "D53 a fix keeps its kind" test "$(count_calls 'kind=fix')" = 1
+  assert "D53 the fix prompt names its round" has "$(prompt_of 5)" '^Factory t: fix 1~'
+  new_case stub
+  drive --backend opencode --opencode-bin "$oc2" "t"
+  assert "D53 the 2.x run finishes" test "$drv_rc" = 0
+  refute "D53 no 2.x call passes --title" grep -q -- '--title' "$sd/calls.log"
+  assert "D53 the 2.x prompt carries the same header" has "$(prompt_of 1)" '^Factory t: plan 1~'
 
   # D13: dry run.
   new_case stub

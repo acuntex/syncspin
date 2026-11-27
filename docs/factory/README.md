@@ -283,10 +283,10 @@ systemd loads it for the unit (`EnvironmentFile`), or the detached shell sources
 After the questions the agent reports the launcher's summary: the launch id, `journalctl --user -u
 factory-<id> -f` (or the log path), `scripts/factory-launch.sh --status`, `scripts/factory-launch.sh
 --stop <launch id>`, and where the run directory appears (`.factory/runs/`). With an attached server,
-every phase is also a session in that server. `--status` lists the five newest launches and runs;
-phase durations are the last log header (`== <phase> HH:MM:SS`, UTC) against the log's last write.
-`--stop` ends the systemd unit or the fallback process group; an agent phase of the fallback may run
-on until its own timeout.
+every phase is also a session in that server, named `Factory <slug>: <phase> <round>` after the first
+line of its prompt. `--status` lists the five newest launches and runs; phase durations are the last
+log header (`== <phase> HH:MM:SS`, UTC) against the log's last write. `--stop` ends the systemd unit or
+the fallback process group; an agent phase of the fallback may run on until its own timeout.
 
 ### Limits
 

@@ -771,8 +771,9 @@ check_variant_models() {
 }
 
 # build_cmd_opencode1: the 1.x shape. --dir names the working directory and --variant is its own flag.
+# The session name comes from the first line of the prompt (run_phase writes it): no --title is passed.
 build_cmd_opencode1() {
-  local role=$1 phase=$3 prompt=$4 model variant
+  local role=$1 prompt=$4 model variant
   model=$(model_for "$role")
   cmd=("$opencode_bin" run)
   if [ -n "$opencode_attach" ]; then cmd+=(--attach "$opencode_attach"); fi
@@ -780,7 +781,7 @@ build_cmd_opencode1() {
   if [ -n "$model" ]; then cmd+=(--model "$model"); fi
   variant=$(variant_for "$role")
   if [ -n "$variant" ]; then cmd+=(--variant "$variant"); fi
-  cmd+=(--title "${run_id:-RUN_ID}:$phase" --dir "$PWD" "$prompt")
+  cmd+=(--dir "$PWD" "$prompt")
 }
 
 # build_cmd_opencode2: the 2.x shape. No --dir (the phase runs in the repository root the driver has
@@ -788,7 +789,7 @@ build_cmd_opencode1() {
 # starts a private one otherwise, and --archived keeps the scripted sessions of a private server out of
 # session lists (an attached run is not archived: it is meant to be followed).
 build_cmd_opencode2() {
-  local role=$1 phase=$3 prompt=$4 model
+  local role=$1 prompt=$4 model
   model=$(opencode_model "$role")
   cmd=("$opencode_bin" run)
   if [ -n "$opencode_attach" ]; then cmd+=(--server "$opencode_attach"); else cmd+=(--standalone); fi
@@ -796,7 +797,7 @@ build_cmd_opencode2() {
   if [ -n "$model" ]; then cmd+=(--model "$model"); fi
   # An attached session stays visible in the server's lists so that a run can be followed there.
   if [ -z "$opencode_attach" ]; then cmd+=(--archived); fi
-  cmd+=(--title "${run_id:-RUN_ID}:$phase" "$prompt")
+  cmd+=("$prompt")
 }
 
 build_cmd_claude() {
@@ -1264,6 +1265,9 @@ run_phase() {
   P_RUN_DIR=$(rel "$run_dir")
   P_TASK_FILE=$(rel "$run_dir")/task.md
   prompt=$(render <"docs/factory/phases/$template.md")
+  # The first line names the session: OpenCode derives a title from the prompt, so the driver passes
+  # no --title. One blank line follows the header.
+  prompt=$(printf 'Factory %s: %s %s\n\n%s' "$slug" "$name" "${P_ROUND:-1}" "$prompt")
   build_cmd "$role" "$access" "$name" "$prompt" "$artifact"
   secs=$(timeout_for "$tkind")
   phase_secs=$secs
