@@ -103,12 +103,15 @@ must equal exactly `VERDICT: APPROVED` or `VERDICT: CHANGES NEEDED`. Anything el
 file, wrong case, trailing text, verdict not last) counts as `CHANGES NEEDED`.
 
 Owner gate: the lines after `## Owner decisions` in `plan.md` up to the next line starting with `## `
-(or the end of the file), blank lines dropped, must be exactly `None.`. Otherwise the run stops with
-exit 10, the owner writes `decisions.md`, and `--resume` revises the plan. The revision is material
-when the plan body changed outside `## Owner decisions` and `## Changelog` (trailing whitespace
-ignored, blank lines squeezed); only then does exactly one `plan-review-post` round run, otherwise the
-driver says the plan did not change materially and continues. A material revision on the light path
-escalates to the full path first.
+(or the end of the file), blank lines dropped, must be exactly `None.`. Only a question that blocks
+the work belongs there, written `- BLOCKING: <question>`; everything else goes under `## Notes` and
+does not stop the run. Otherwise the run stops with exit 10, the owner writes `decisions.md`, and
+`--resume` revises the plan. The stop still lists every question and names each section line that is
+not marked `BLOCKING`: the marker is reported, not trusted, because a section of unmarked lines stops
+the run too. The revision is material when the plan body changed outside `## Owner decisions` and
+`## Changelog` (trailing whitespace ignored, blank lines squeezed); only then does exactly one
+`plan-review-post` round run, otherwise the driver says the plan did not change materially and
+continues. A material revision on the light path escalates to the full path first.
 
 ## Exit codes
 

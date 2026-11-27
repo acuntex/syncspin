@@ -110,11 +110,14 @@ the crate or file if you know it, and what must not change. Put long requests in
 
 ## What the human decides
 
-- Owner decisions: when the plan lists open questions (public API, breaking changes, scope, limits)
-  the run stops with exit 10. Write the answers to `decisions.md` in the run directory and run
-  `scripts/factory.sh --resume <run id>`. The plan is revised, and reviewed once more only when the
-  revision changed the plan outside the owner decisions and the changelog; answering a question in
-  place is not a change. On the light path such a change also escalates the run to the full path.
+- Owner decisions: the planner asks only questions that change what will be built, each written
+  `- BLOCKING: <question>`; everything else goes under `## Notes` and runs on. When the section is not
+  `None.` the run stops with exit 10; write the answers to `decisions.md` in the run directory and run
+  `scripts/factory.sh --resume <run id>`. The stop lists the questions and names any line that is not
+  marked blocking, so a misplaced non-blocking question costs a stop rather than passing silently. The
+  plan is revised, and reviewed once more only when the revision changed the plan outside the owner
+  decisions and the changelog; answering a question in place is not a change. On the light path such a
+  change also escalates the run to the full path.
 - Everything after a stop that is not resumable (exit 11 to 16): read `handoff.md`, then fix by hand
   or start a new run.
 - The pull request: read it, in particular the protected-path diff, and merge it yourself.

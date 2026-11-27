@@ -104,6 +104,13 @@ owner_section_closed() {
   [ "$(owner_section "$1")" = "None." ]
 }
 
+# The lines of `## Owner decisions` that are not marked `BLOCKING`, so the exit-10 report can name a
+# question that would otherwise stop the run without saying why. The marker is reported, not trusted:
+# `owner_section_closed` still requires exactly `None.`.
+unmarked_owner_lines() {
+  owner_section "$1" | grep -Ev '^(None\.$|([[:space:]]*-[[:space:]]+)?BLOCKING:[[:space:]]*[^[:space:]])' || true
+}
+
 # plan_body <file>: the plan without its `## Owner decisions` and `## Changelog` sections, with
 # trailing whitespace stripped and blank lines squeezed, so a revision that merely answers a question
 # hashes the same as before.
@@ -1563,7 +1570,12 @@ while :; do
         step=implement
       else
         step=revise
-        stop 10 "owner decisions are open; answer them in $decisions_file and run scripts/factory.sh --resume $run_id. Questions: $(owner_section "$ROOT/$plan_file" | tr '\n' ' ')"
+        reason="owner decisions are open; answer them in $decisions_file and run scripts/factory.sh --resume $run_id. Questions: $(owner_section "$ROOT/$plan_file" | tr '\n' ' ')"
+        unmarked=$(unmarked_owner_lines "$ROOT/$plan_file")
+        if [ -n "$unmarked" ]; then
+          reason="$reason Unmarked lines (only a '- BLOCKING:' question belongs in ## Owner decisions): $(tr '\n' ' ' <<<"$unmarked")"
+        fi
+        stop 10 "$reason"
       fi
       ;;
     owner-gate:revise)

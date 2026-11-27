@@ -4,6 +4,8 @@ Revise the plan in `{{PLAN}}` using the review findings in `{{REVIEW}}`. This is
 Rewrite the plan file in place, keeping the required headings. Address every finding, and append one
 `## Changelog` entry per finding saying what changed or why you disagree. When owner decisions are
 recorded in `{{DECISIONS}}`, apply them and update `## Owner decisions` accordingly (an empty path
-means there are no review findings: apply the owner decisions in `{{DECISIONS}}`).
+means there are no review findings: apply the owner decisions in `{{DECISIONS}}`). Keep `## Owner
+decisions` current: only `- BLOCKING:` questions that still block the work stay there, everything else
+moves to `## Notes`, and change the body only where an answer forces it.
 
 {{RESUME_CONTEXT}}

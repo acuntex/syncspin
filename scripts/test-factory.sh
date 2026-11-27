@@ -687,11 +687,21 @@ section_sync() {
   assert "sync: the launcher role names the exact call form" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'exactly the form each command template names'
   assert "sync: the launcher role says it cannot start a subagent" has "$(cat "$repo/docs/factory/roles/launcher.md")" 'cannot start a subagent'
   # The light templates. Phase templates are not generated, so they are checked directly.
-  local light_plan=$repo/docs/factory/phases/plan-light.md light_review=$repo/docs/factory/phases/code-review-light.md
-  for h in '## Goal' '## Constraints' '## Files' '## Commit breakdown' '## Test plan' '## Docs to update' '## Risks' '## Owner decisions'; do
+  local light_plan=$repo/docs/factory/phases/plan-light.md light_review=$repo/docs/factory/phases/code-review-light.md plan_headings light_headings
+  for h in '## Goal' '## Constraints' '## Files' '## Commit breakdown' '## Test plan' '## Docs to update' '## Notes' '## Risks' '## Owner decisions'; do
     assert "sync: plan-light.md names $h" grep -qF -- "$h" "$light_plan"
   done
   assert "sync: plan-light.md plans one commit" grep -q 'one commit' "$light_plan"
+  # The light template and the planner's heading list must agree heading by heading, `## Notes`
+  # included, so a short plan has the same shape as a full one.
+  # The backticks are literal Markdown markers in the heading lists, not commands.
+  # shellcheck disable=SC2016
+  plan_headings=$(awk '/exactly these headings/ { f = 1 } f && /^3\. / { exit } f' "$repo/docs/factory/roles/planner.md" |
+    grep -o '`## [^`]*`' | tr -d '`' | tr '\n' ' ')
+  # shellcheck disable=SC2016
+  light_headings=$(awk '/exactly these headings/ { f = 1 } f && /^$/ { exit } f' "$light_plan" |
+    grep -o '`## [^`]*`' | tr -d '`' | tr '\n' ' ')
+  assert "sync: plan-light.md headings match the planner's list" test "$plan_headings" = "$light_headings"
   # shellcheck disable=SC2016  # a literal backtick in the template text
   assert "sync: code-review-light.md names the observed section" grep -qF -- '`## Observed`' "$light_review"
   assert "sync: code-review-light.md runs the gate through the wrapper" grep -qF -- 'scripts/timed.sh 600 -- {{GATE_CMD}}' "$light_review"
@@ -1231,6 +1241,25 @@ section_driver() {
   assert "D6 round 4 plus decisions finishes" test "$drv_rc" = 0
   assert "D6 round 4 still gets the post review" test "$(count_calls 'kind=plan-review-post')" = 1
   assert "D6 the plan reviewer ran 4 plus 1 times" test "$(count_calls 'role=plan-reviewer')" = 5
+
+  # D6 and D20: the gate reports a question that is not marked BLOCKING and does not report one that
+  # is. The marker is reported, not trusted: the run still stops while the section is not `None.`.
+  new_case stub
+  cat >"$sd/hook-plan.sh" <<'HOOK'
+printf '# Plan\n\n## Goal\n\nDo it.\n\n## Owner decisions\n\n- BLOCKING: Which licence?\n' >"$FACTORY_ARTIFACT"
+handled=1
+HOOK
+  drive --backend opencode "t"
+  assert "D6 a marked question still stops the gate" test "$drv_rc" = 10
+  refute "D6 a marked question is not reported as unmarked" has "$drv_out" 'Unmarked lines'
+  new_case stub
+  cat >"$sd/hook-plan.sh" <<'HOOK'
+printf '# Plan\n\n## Goal\n\nDo it.\n\n## Owner decisions\n\n- Which licence?\n' >"$FACTORY_ARTIFACT"
+handled=1
+HOOK
+  drive --backend opencode "t"
+  assert "D6 an unmarked question still stops the gate" test "$drv_rc" = 10
+  assert "D6 an unmarked question is named" has "$drv_out" 'Unmarked lines.*Which licence\?'
 
   # D7: a readonly phase changes state.
   local -a mutations=(

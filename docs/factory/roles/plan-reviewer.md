@@ -18,7 +18,9 @@ to `main`, never pass `--no-verify` and never weaken a test or a lint to get gre
    `## Nit`. Each finding carries evidence and a concrete fix. Add a `## Nit` section only when a nit
    is worth fixing.
 4. A Blocker is a wrong claim, a commit that cannot pass on its own, a violated rule from
-   `AGENTS.md`, a missing owner decision, or a step that cannot work as written.
+   `AGENTS.md`, a missing owner decision, or a step that cannot work as written. A question in
+   `## Owner decisions` that does not change what will be built is a Blocker: it stops the run for
+   nothing. A plan without a `## Notes` section is not a Blocker; the section is optional in content.
 
 ## Verdict
 
