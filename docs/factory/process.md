@@ -15,7 +15,7 @@ agent files, and `scripts/factory.sh` fills in the phase templates. The human pa
 | `docs/factory/roles/*.md`                    | Role system prompts (source of truth).                                                                          |
 | `docs/factory/phases/*.md`                   | Per-phase user-prompt templates, filled in by the driver; `plan-light` and `code-review-light` for a light run. |
 | `docs/factory/meta/*.conf`                   | Per-role metadata: name, description, access class, model class.                                                |
-| `scripts/gate.sh`                            | Tool-independent gate: `--commit`, standard, `--full`, `--list`; path-selected steps.                           |
+| `scripts/gate.sh`                            | Tool-independent gate: `--commit`, `--since REF`, standard, `--full`, `--list`; path-selected steps.            |
 | `.githooks/pre-commit`, `.githooks/pre-push` | Driver-only hooks, activated through environment variables.                                                     |
 | `scripts/factory-sync.sh`                    | Generates the agent files for both tools from the sources; `--check`.                                           |
 | `.opencode/agents/`, `.claude/agents/`       | Generated agent files. Never edit them by hand.                                                                 |
@@ -57,7 +57,7 @@ the command and its result under `## Risks` before calling it external.
 | ------------- | --- | ------------------------------------------------------------------------------------ |
 | `plan`        | -   | The planner writes `plan.md`.                                                        |
 | `plan-review` | 4   | A fresh plan reviewer per round; the plan is revised between rounds.                 |
-| `owner-gate`  | -   | Open owner decisions stop the run; after the answer, one extra review (outside cap). |
+| `owner-gate`  | -   | Open owner decisions stop the run; only a material answer is reviewed (outside cap). |
 | `implement`   | -   | The implementer makes one commit per plan commit, gate-checked.                      |
 | `code-review` | 3   | A fresh code reviewer per round; `fix` commits between rounds.                       |
 | `final-gate`  | -   | The driver runs `scripts/gate.sh --full`.                                            |
@@ -67,10 +67,11 @@ The caps are constants; flags can only lower them. Agents never merge. The owner
 
 The light path plans a trivial task with `phases/plan-light.md` instead of `phases/plan.md`, skips
 `plan-review` entirely (`plan_round` is still 1, so an owner-gate revision renders round 1) and
-reviews the single commit with `phases/code-review-light.md` at round 1. A full change is unchanged.
-The classification is conservative shell code: a task that names no file, names only a directory,
-names more than three files, or names a protected path, code or a directory the allowlist does not
-know is full. The README describes the allowlist.
+reviews the single commit with `phases/code-review-light.md` at round 1. The phase sequence of a full
+change is unchanged. The classification is conservative shell code: a task that names no file, names
+only directories, names more than three files, or names a protected path or code is full. A directory
+mention beside a named file does not by itself make the task full unless it is protected. The README
+describes the allowlist.
 
 Escalation is state only: `escalate_light` sets `path=full`, writes `light-escalation.txt` and saves
 the state, and each caller picks the next step. After the implementer call the driver measures the
@@ -136,8 +137,9 @@ continues. A material revision on the light path escalates to the full path firs
 Exit 10 and exit 20 are resumable. Every other stop ends the run: the human starts a new run or
 fixes the branch by hand.
 
-`--stop-after plan` stops after the reviewed plan. The branch created by preflight stays behind in
-the local repository; delete it by hand when you abandon the run.
+`--stop-after plan` stops after the plan: reviewed on the full path, and unreviewed and short on the
+light path, where the driver says so. The branch created by preflight stays behind in the local
+repository; delete it by hand when you abandon the run.
 
 ## State and handoff
 
@@ -161,8 +163,9 @@ exit code stays 20.
 A phase that exits **0** without its artifact is retried once, with `# retry: the phase exited 0
 without its artifact` appended to its log and one line on stderr; a second clean miss stops the run
 with `ended without its report`. A non-zero exit is not retried. A plan revision that leaves the plan
-byte-identical counts as a miss and follows the same rule. A light-path timeout escalates instead and
-runs the unit again on the full template (see "Caps and phases").
+byte-identical counts as a miss and follows the same rule. A light-path timeout follows the split in
+"Caps and phases": an artifact phase retries the unit once on the full template in process, a code
+phase escalates and stops resumable.
 
 Run directory files: `task.md plan.md review-plan-N.md review-plan-post.md decisions.md
 review-code-N.md pr.md blocked.md handoff.md state phases.tsv light-escalation.txt logs/<phase>.log`.
@@ -238,10 +241,14 @@ Redirection is not covered. Command-prefix rules match the command text, so `cat
 planner and the reviewers does not rest on the allow list: it rests on the driver's post-phase
 snapshot check (a changed file is exit 13) and on the artifact-only `Edit` grant.
 
-`scripts/timed.sh SECONDS -- command` is the only timed form an agent may use, and it is allowed
-through `scripts/*`; a bare `timeout` is not, because a `timeout *` rule would also allow
-`timeout 1 rm -rf ...`. The wrapper refuses `0` and any limit above `7200` (the longest phase
-budget), so a wrapped command cannot outlive every phase budget.
+`scripts/timed.sh SECONDS -- command` is the only timed form an agent may use. It is allowed through
+`scripts/*`, but the wrapper itself accepts only a fixed allowlist: `cargo` and the factory's own
+deterministic scripts (`scripts/gate.sh`, `scripts/test-factory.sh`, `scripts/factory-sync.sh`,
+`scripts/check-roles.sh`, `scripts/check-example-versions.sh`). Any other command is refused with a
+usage error before it runs, so the wrapper cannot carry a deny-listed command such as `git push`,
+`gh pr merge` or `rm` past the permission rules. A bare `timeout` is not allowed, because a
+`timeout *` rule would also allow `timeout 1 rm -rf ...`. The wrapper refuses `0` and any limit above
+`7200` (the longest phase budget), so a wrapped command cannot outlive every phase budget.
 
 How the layers merge, and how sure we are.
 

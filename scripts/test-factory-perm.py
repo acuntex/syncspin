@@ -216,6 +216,9 @@ orchestrator_only = ["git fetch origin main", "git switch -c factory/x", "gh pr 
 never = [
     "rm x", "git push origin factory/x", "tee x", "cp a b", "mv a b", "touch x", "dd if=a of=b",
     "sed -i s/a/b/ x", "git branch -D x", "timeout 600 cargo test",
+    "scripts/timed.sh 1 -- git push origin main", "scripts/timed.sh 1 -- git commit --no-verify -m x",
+    "scripts/timed.sh 1 -- gh pr merge 1", "scripts/timed.sh 1 -- rm x",
+    "scripts/timed.sh 1 -- git config user.name x", "scripts/timed.sh 1 -- bash -c true",
 ]
 
 # The OpenCode factory agents: the project rules, then the agent's own rules.

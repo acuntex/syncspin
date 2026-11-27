@@ -22,7 +22,8 @@
 #     --code-rounds N               lower the code review cap (3) to N
 #     --model-helper M              model for the reviewers, the pr-writer and the light planner
 #                                   ($FACTORY_MODEL_HELPER)
-#     --model-main M                model for the planner and the implementer ($FACTORY_MODEL_MAIN)
+#     --model-main M                model for the full-path planner and the implementer
+#                                   ($FACTORY_MODEL_MAIN)
 #     --variant-helper V            OpenCode reasoning variant for the helper roles ($FACTORY_VARIANT_HELPER)
 #     --variant-main V              OpenCode reasoning variant for the main roles ($FACTORY_VARIANT_MAIN)
 #     --opencode-bin PATH           the OpenCode client to run (default $FACTORY_OPENCODE_BIN, else
@@ -170,7 +171,17 @@ scrub() {
 
 slugify() {
   local words slug
-  words=$(printf '%s' "$1" | tr '\n' ' ' | awk '{ for (i = 1; i <= 4 && i <= NF; i++) printf "%s ", $i }')
+  # The first four words, skipping a path-like token (a slash, a tilde, an at sign or a backslash):
+  # a task that starts with `/home/<name>/...` or a secret-shaped token must not put it in a branch
+  # name, a session title or a run header.
+  words=$(printf '%s' "$1" | tr '\n' ' ' | awk '{
+    n = 0
+    for (i = 1; i <= NF; i++) {
+      if ($i ~ /\// || $i ~ /~/ || $i ~ /@/ || $i ~ /\\/) continue
+      printf "%s ", $i
+      if (++n == 4) break
+    }
+  }')
   slug=$(printf '%s' "$words" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-*//' -e 's/-*$//' | cut -c1-30 | sed -e 's/-*$//')
   printf '%s' "${slug:-task}"
 }
@@ -244,7 +255,7 @@ light_size_reason() {
 # are not part of the text (command substitution drops them), so a 13-line text without a final
 # newline is 13 lines. Never calls a model and never touches the tree.
 classify_task() {
-  local text bytes lines word w tok esc entry first_dir="" files=0 reject="" oldifs=$IFS
+  local text bytes lines word w tok esc entry first_dir="" files=0 reject="" oldifs=$IFS had_glob=0
   text=$(cat)
   class_path=full
   bytes=$(printf '%s' "$text" | wc -c)
@@ -263,6 +274,7 @@ classify_task() {
       return 0
     fi
   done
+  case $- in *f*) had_glob=1 ;; esac
   IFS=$' \t\n'
   set -f
   for word in $text; do
@@ -285,6 +297,13 @@ classify_task() {
         ;;
       *)
         if [[ "$w" == */* ]] || [[ "$w" =~ ^[[:alnum:]_.+-]*\.[[:alpha:]][[:alnum:]]{0,9}$ ]]; then
+          # A URL is not a repository file, however much it looks like one.
+          case "$w" in
+            *://* | //*)
+              reject=$w
+              break
+              ;;
+          esac
           if light_path_ok "$w"; then
             files=$((files + 1))
           elif [ -z "$reject" ]; then
@@ -295,7 +314,7 @@ classify_task() {
     esac
   done
   IFS=$oldifs
-  set +f
+  if [ "$had_glob" = 0 ]; then set +f; fi
   if [ -n "$reject" ]; then
     class_reason="the task text names $reject"
   elif [ "$files" = 0 ]; then
@@ -310,6 +329,68 @@ classify_task() {
     class_path=light
     class_reason=$(light_size_reason "$files" "$lines")
   fi
+}
+
+# light_diff_check: prints nothing and returns 0 when the real diff since the base stays within the
+# light limits, otherwise prints one reason and returns 1. `--no-renames` keeps both sides of a
+# rename visible, so a code or script file renamed to a `.md` name is still caught. NUL-separated
+# names keep a name with a space or a newline in one piece, and a failed git command escalates.
+light_diff_check() {
+  local base=$base_sha p lines=0 commits numstat names_file
+  local -a changed_names=() untracked_names=()
+  names_file="${run_dir:-${TMPDIR:-/tmp}}/light-diff.$$"
+  if ! git diff --name-only -z --no-renames --diff-filter=ACMRD "$base" >"$names_file" 2>/dev/null; then
+    rm -f "$names_file"
+    printf 'the diff against %s could not be read' "$base"
+    return 1
+  fi
+  while IFS= read -r -d '' p; do
+    if [ -n "$p" ]; then changed_names+=("$p"); fi
+  done <"$names_file"
+  if ! git ls-files -z --others --exclude-standard >"$names_file" 2>/dev/null; then
+    rm -f "$names_file"
+    printf 'the untracked files could not be read'
+    return 1
+  fi
+  while IFS= read -r -d '' p; do
+    if [ -n "$p" ]; then
+      changed_names+=("$p")
+      untracked_names+=("$p")
+    fi
+  done <"$names_file"
+  rm -f "$names_file"
+  if [ "${#changed_names[@]}" = 0 ]; then
+    printf 'the change touched no file'
+    return 1
+  fi
+  for p in "${changed_names[@]}"; do
+    if ! light_path_ok "$p"; then
+      printf 'the change touches %s' "$p"
+      return 1
+    fi
+  done
+  if [ "${#changed_names[@]}" -gt "$LIGHT_MAX_FILES" ]; then
+    printf 'the change touches %s files' "${#changed_names[@]}"
+    return 1
+  fi
+  if ! numstat=$(git diff --numstat --no-renames "$base" 2>/dev/null); then
+    printf 'the diff against %s could not be read' "$base"
+    return 1
+  fi
+  lines=$(awk '{ a += $1; d += $2 } END { print a + d }' <<<"$numstat")
+  for p in "${untracked_names[@]}"; do
+    if [ -f "$p" ]; then lines=$((lines + $(awk 'END { print NR }' "$p"))); fi
+  done
+  if [ "$lines" -gt "$LIGHT_MAX_DIFF_LINES" ]; then
+    printf 'the change is %s added and deleted lines' "$lines"
+    return 1
+  fi
+  commits=$(git rev-list --count "$base..HEAD")
+  if [ "$commits" -gt "$LIGHT_MAX_COMMITS" ]; then
+    printf 'the change is %s commits' "$commits"
+    return 1
+  fi
+  return 0
 }
 
 # detect_opencode_generation <bin>: print the major version (1 or 2) from `<bin> --version`, and fail
@@ -986,48 +1067,6 @@ escalate_light() {
   printf 'factory: the light path escalated to full: %s\n' "$1"
 }
 
-# light_diff_check: prints nothing and returns 0 when the real diff since the base stays within the
-# light limits, otherwise prints one reason and returns 1. NUL-separated names keep a name with a
-# space or a newline in one piece.
-light_diff_check() {
-  local base=$base_sha p lines=0 commits
-  local -a names=()
-  while IFS= read -r -d '' p; do
-    if [ -n "$p" ]; then names+=("$p"); fi
-  done < <({
-    git diff --name-only -z --diff-filter=ACMRD "$base"
-    git ls-files -z --others --exclude-standard
-  })
-  if [ "${#names[@]}" = 0 ]; then
-    printf 'the change touched no file'
-    return 1
-  fi
-  for p in "${names[@]}"; do
-    if ! light_path_ok "$p"; then
-      printf 'the change touches %s' "$p"
-      return 1
-    fi
-  done
-  if [ "${#names[@]}" -gt "$LIGHT_MAX_FILES" ]; then
-    printf 'the change touches %s files' "${#names[@]}"
-    return 1
-  fi
-  lines=$(git diff --numstat "$base" | awk '{ a += $1; d += $2 } END { print a + d }')
-  while IFS= read -r -d '' p; do
-    if [ -n "$p" ]; then lines=$((lines + $(wc -l <"$p"))); fi
-  done < <(git ls-files -z --others --exclude-standard)
-  if [ "$lines" -gt "$LIGHT_MAX_DIFF_LINES" ]; then
-    printf 'the change is %s added and deleted lines' "$lines"
-    return 1
-  fi
-  commits=$(git rev-list --count "$base..HEAD")
-  if [ "$commits" -gt "$LIGHT_MAX_COMMITS" ]; then
-    printf 'the change is %s commits' "$commits"
-    return 1
-  fi
-  return 0
-}
-
 last_review_file() {
   local f newest=""
   for f in "$run_dir"/review-*.md; do
@@ -1103,8 +1142,8 @@ print_summary() {
     done <"$run_dir/phases.tsv"
   fi
   if [ -f "$run_dir/light-escalation.txt" ]; then escalated=" (escalated)"; fi
-  printf 'factory: summary: path %s%s, %s phase runs, %s\n' "${path:-full}" "$escalated" "$runs" \
-    "$(fmt_duration "$total")"
+  printf 'factory: summary: path %s%s, %s phase run%s, %s\n' "${path:-full}" "$escalated" "$runs" \
+    "$([ "$runs" = 1 ] || printf s)" "$(fmt_duration "$total")"
   if [ -s "$run_dir/phases.tsv" ]; then
     while IFS=$'\t' read -r tname tsecs trc; do
       printf '  %s %s\n' "$tname" "$(fmt_duration "$tsecs")"
@@ -1241,7 +1280,9 @@ else
   load_state
   # A state written by an older driver carries none of these keys.
   path=${path:-full}
-  plan_material=${plan_material:-0}
+  # A missing plan_material may sit at owner-gate:post after a material revision: run the review
+  # rather than skip it. Only an explicit 0 written after a revision skips it.
+  if ! grep -q '^plan_material=' "$run_dir/state"; then plan_material=1; fi
   slug=${slug:-$(slugify "$(cat "$run_dir/task.md")")}
   if [ "$status" != stopped ] || { [ "$exit_code" != 10 ] && [ "$exit_code" != 20 ]; }; then
     die_usage "run $resume_id cannot be resumed (status $status, exit code ${exit_code:-none}); see $(rel "$run_dir")/handoff.md"
@@ -1639,10 +1680,11 @@ while :; do
       P_MAX=$code_cap
       P_GATE="scripts/gate.sh"
       review_template=code-review
-      # One short review of a light change; every later round is the full one.
+      # One short review of a light change; every later round is the full one. Its index is clean,
+      # so the gate reads the committed range instead of falling back to the unknown full set.
       if [ "$path" = light ] && [ "$code_round" = 1 ]; then
         review_template=code-review-light
-        P_GATE="scripts/gate.sh --commit"
+        P_GATE="scripts/gate.sh --since $base_sha"
       fi
       review_file=$(rel "$run_dir")/review-code-$code_round.md
       artifact_phase code-reviewer code-review "$review_template" "$review_file" || continue

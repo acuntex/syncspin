@@ -153,15 +153,18 @@ What the suites do not cover:
 
 `scripts/gate.sh` runs the steps the changed paths need, or every step of the mode when the change set
 is unknown, and prints a PASS, FAIL or SKIP line per step (logs in `target/gate/`). The steps come from
-the staged index under `--commit` and from the branch since `origin/main` plus untracked files
-otherwise; Rust paths select the cargo steps, shell paths shellcheck, factory paths the generator check
-and the factory tests. `--commit` is the per-commit check, the standard mode covers the CI lint, test,
-docs and arm steps, `--full` adds MSRV, `cargo deny`, `cargo package` for Rust paths and gitleaks, and
-`--list` prints the change set and the steps without running them. A step whose input is absent (a
-script, a package, an installed target) is skipped with its reason; `--require-all` turns every skip
-into a failure. `deny` is skipped with `deny.toml not present` when the policy file is absent, because
-`cargo deny check` fetches the advisory database: that keeps the factory suite offline. Prettier is a
-local pre-commit hook, not a CI job, so the gate marks that step as local only.
+the staged index under `--commit`, from the range since a ref under `--since REF`, and from the branch
+since `origin/main` plus untracked files otherwise; a rename keeps both sides visible, and a path
+outside every class (Rust, shell, factory, docs or ignore files) leaves the set unknown. Rust paths
+select the cargo steps, shell paths shellcheck, factory paths the generator check and the factory
+tests. `--commit` is the per-commit check, the standard mode covers the CI lint, test, docs and arm
+steps, `--full` adds MSRV, `cargo deny`, `cargo package` for Rust paths and gitleaks, and `--list`
+prints the change set and the steps without running them. A step whose input is absent (a script, a
+package, an installed target) is skipped with its reason; a tracked input that was deleted is a
+failure. `--require-all` turns every skip into a failure. `deny` is skipped with `deny.toml not
+present` when the policy file was never tracked, because `cargo deny check` fetches the advisory
+database: that keeps the factory suite offline. Prettier is a local pre-commit hook, not a CI job, so
+the gate marks that step as local only.
 
 `scripts/test-factory.sh` tests the gate and the driver-only hooks under `.githooks/` without a
 network and without a model: the tools the factory could start are stubs on `PATH`, and one test

@@ -59,9 +59,12 @@ code reviews, flags can only lower them), the verdict parsing, the snapshot chec
 pull request text checks and the push are shell code with tests. The agents do the thinking.
 
 `scripts/gate.sh` runs only the steps the changed paths need: Rust paths select the cargo steps,
-shell paths `shellcheck`, factory paths the generator check and the factory tests, and an unknown
-change set (a failed `merge-base`, an empty index) selects every step of the mode. CI still runs the
-whole set on every pull request, so a step the local gate skipped cannot reach `main` unchecked.
+shell paths `shellcheck`, factory paths (including `.github/`, `.mcp.json` and the ignore files) the
+generator check and the factory tests, while a docs or markup path selects no cargo step. A rename
+keeps both sides visible. A path in no class, a failed `merge-base` or an empty index leaves the set
+unknown, which selects every step of the mode. `--since REF` selects the per-commit steps for a
+committed range; the light code review uses it because its index is clean. CI still runs the whole set
+on every pull request, so a step the local gate skipped cannot reach `main` unchecked.
 
 The Claude Code `/factory` command is prompt-driven: the same procedure, but the caps and checks are
 instructions to a model. Prefer the driver when the outcome matters.
@@ -71,14 +74,15 @@ instructions to a model. Prefer the driver when the outcome matters.
 A trivial task does not need the full path. The driver classifies the task text itself, in shell code
 and without a model:
 
-- **light** when the text is at most 1200 bytes and 12 lines, names one to three files, names no
-  directory, and every named file is `.gitignore` or has a `.md` or `.txt` name. A light run writes a
-  short plan on the helper model, skips the plan review, makes one implementer call and then measures
-  the real diff: it stays light while that diff touches at most three such files, adds and deletes at
-  most 80 lines and is a single commit.
-- **full** otherwise, including a task that names no file, names only a directory, names more than
+- **light** when the text is at most 1200 bytes and 12 lines, names one to three files, and every
+  named file is `.gitignore` or has a `.md` or `.txt` name. A URL or a directory mention is not a
+  named file. A light run writes a short plan on the helper model, skips the plan review, makes one
+  implementer call and then measures the real diff: it stays light while that diff touches at most
+  three such files, adds and deletes at most 80 lines and is a single commit.
+- **full** otherwise, including a task that names no file, names only directories, names more than
   three files, or mentions `scripts`, `crates`, `src`, `.github`, `Cargo.toml` or any other protected
-  path or code. Anything unclear is full.
+  path or code. A directory mention beside a named file does not by itself make the task full unless
+  it is protected. Anything unclear is full.
 
 A light run that leaves those limits after the implementer call — a code file, a protected path, too
 many lines — escalates: `light-escalation.txt` in the run directory records why, the state says
@@ -99,8 +103,9 @@ scripts/factory.sh --dry-run --backend claude "anything"   # print the phases an
 the variables to pass to the agent (for a model provider key); everything else is removed from its
 environment.
 
-`--stop-after plan` stops after the reviewed plan and leaves the branch that preflight created in the
-local repository. Delete it by hand when you abandon the run.
+`--stop-after plan` stops after the plan: reviewed on the full path, unreviewed and short on the light
+path, where the driver says so. It leaves the branch that preflight created in the local repository.
+Delete it by hand when you abandon the run.
 
 ## Writing a task text
 
@@ -148,11 +153,12 @@ provider output: never attach them to a public issue.
 ## Model and cost
 
 The Claude agents use `sonnet`. For OpenCode no model is committed: set `FACTORY_MODEL_HELPER` (the
-reviewers, the pull request writer and the light planner) and `FACTORY_MODEL_MAIN` (planner and
-implementer) or the flags above; without a helper model the driver warns once and the reviewers use
-the session default. A full run makes one planner call, one to five plan reviews, one implementer
-call, one to three code reviews (plus fixes) and one pull request writer call; a light run makes one
-planner call on the helper model, no plan review, one implementer call and at most one short review.
+reviewers, the pull request writer and the light planner) and `FACTORY_MODEL_MAIN` (the full-path
+planner and the implementer) or the flags above; without a helper model the driver warns once and the
+reviewers use the session default. A full run makes one planner call, one to five plan reviews, one
+implementer call, one to three code reviews (plus fixes) and one pull request writer call; a light run
+makes one planner call on the helper model, no plan review, one implementer call and at most one short
+review.
 Every phase kind has its own budget: 20 minutes for the plan, 15 for a plan revision and a plan
 review, 10 for the post-decision review and the pull request text, two hours for the implementer,
 90 minutes for a fix, 25 for a code review and two hours for the final gate, 45 minutes for anything
@@ -161,8 +167,9 @@ else. `--phase-timeout SECS` overrides every one of them.
 ### Reasoning variant (OpenCode)
 
 `opencode run --variant` selects a provider-specific reasoning effort (for example `minimal`, `high` or
-`max`). Set `FACTORY_VARIANT_MAIN` (planner and implementer) and `FACTORY_VARIANT_HELPER` (reviewers and
-pull request writer), or `--variant-main V` and `--variant-helper V`. A variant is passed as
+`max`). Set `FACTORY_VARIANT_MAIN` (the full-path planner and the implementer) and
+`FACTORY_VARIANT_HELPER` (reviewers and pull request writer), or `--variant-main V` and
+`--variant-helper V`. A variant is passed as
 `--variant V` to the OpenCode backend only, and only when set; it must match `^[a-z0-9][a-z0-9._-]*$`, so
 nothing else can reach the command line. The Claude backend ignores it with a one-line warning. The
 driver does not know which variants a model supports: an unsupported one fails in OpenCode. `--dry-run`
@@ -289,10 +296,11 @@ systemd loads it for the unit (`EnvironmentFile`), or the detached shell sources
 After the questions the agent reports the launcher's summary: the launch id, `journalctl --user -u
 factory-<id> -f` (or the log path), `scripts/factory-launch.sh --status`, `scripts/factory-launch.sh
 --stop <launch id>`, and where the run directory appears (`.factory/runs/`). With an attached server,
-every phase is also a session in that server, named `Factory <slug>: <phase> <round>` after the first
-line of its prompt. The driver prints one line per phase with its duration and its exit code, and ends
-every run — finished, stopped or interrupted by a signal — with a summary: the path, the number of
-phase runs and the time spent inside them, then one line per phase. It also records every phase in
+every phase is also a session in that server; a client that derives the title from the first prompt
+line shows `Factory <slug>: <phase> <round>` (reasoned, not run). The driver prints one line per phase
+with its duration and its exit code, and ends every run — finished, stopped or interrupted by a signal
+— with a summary: the path, the number of phase runs and the time spent inside them, then one line per
+phase. It also records every phase in
 `phases.tsv` in the run directory. `--status` lists the five newest launches and runs and reads
 `phases.tsv` when the driver wrote one; without it, the durations fall back to the last log header
 (`== <phase> HH:MM:SS`, UTC) against the log's last write. `--stop` ends the systemd unit or
@@ -403,8 +411,9 @@ asks for the artifact first, so this should be rare: read the log for a command 
   `-anm`): a glob cannot tell flag letters from a commit message.
 - The gate selects its steps from the changed paths, so a change that looks unrelated to the step it
   would have needed can skip it locally. `.gitignore` keeps the generator check and the factory tests
-  for that reason. The CI jobs always run the whole set on the pull request, so nothing skipped
-  locally reaches `main` unchecked; `deny` also skips when `deny.toml` is absent.
+  for that reason, and a path outside every class selects every step of the mode. The CI jobs always
+  run the whole set on the pull request, so nothing skipped locally reaches `main` unchecked; `deny`
+  skips only when `deny.toml` was never tracked, and deleting a tracked policy fails the gate.
 - The snapshot ignores ignored paths on purpose (`target/`, `mutants.out*`, identity files): a new
   file in some other ignored location is invisible to it.
 - The deny lists also block the `--output` option of `git diff`, `git log` and `git show`, which
@@ -442,6 +451,12 @@ Not yet verified against a live model. What runs in CI and locally is the hermet
 versions used and the result of each of these checks:
 
 - a tiny task on each backend with `--no-push`;
+- one real light run (`--no-push --stop-after review`) on a Markdown-only task: one planner call, no
+  plan review, one implementer call, one light review, and a summary line;
+- one run ended by a signal (or stopped through the launcher) prints the `factory: summary:` line;
+- `opencode debug agent factory-planner` and `opencode debug agent factory-launcher` on an
+  installation that has the client, to confirm both resolve with `task: "deny"` and that a session
+  title comes out readable;
 - `gh pr merge` and `git push origin main` refused inside both tools;
 - a readonly OpenCode role cannot edit `src/` but can write its artifact (this confirms the `edit`
   path form and the rule order on OpenCode 1.x);

@@ -3,17 +3,24 @@
 # The tool-independent gate: one command that runs what CI runs, in a fixed order, with a stable
 # output format. The code factory, the code reviewer and a human all call it.
 #
-# The steps are selected from the paths a run has to consider: the staged index with `--commit`, and
-# the branch since `origin/main` plus untracked files otherwise. Rust paths add the cargo steps, shell
-# paths shellcheck, factory paths the generator check and the factory tests, and prettier runs in
-# every mode (staged markup with `--commit`, the whole tree otherwise). `--full` adds msrv, deny and
-# package for Rust paths and always runs secrets. A failing `merge-base`, a missing `origin/main` or an
-# empty change set means the set is unknown, and every step the mode can select is selected.
+# The steps are selected from the paths a run has to consider: the staged index with `--commit`, the
+# range since the given ref with `--since`, and the branch since `origin/main` plus untracked files
+# otherwise. Rust paths add the cargo steps, shell paths shellcheck, factory paths (including
+# `.github/`, `.mcp.json` and the ignore files) the generator check and the factory tests, and a
+# docs/markup path keeps the set known without selecting a cargo step; prettier runs in every mode
+# (the changed or staged markup with `--commit`/`--since`, the whole tree otherwise). `--full` adds
+# msrv, deny and package for Rust paths and always runs secrets. A failing change-set command, a
+# missing `origin/main`, a path outside every class or an empty change set means the set is unknown,
+# and every step the mode can select is selected.
 #
 #   scripts/gate.sh --commit       per-commit check: fmt, clippy, example versions, tests and
 #                                  doc-default for Rust paths, shellcheck for shell files, the factory
 #                                  steps for factory paths, prettier for staged markup, and deny and
-#                                  MSRV when a Cargo manifest is staged
+#                                  MSRV for a staged Cargo manifest (and every one of these when the
+#                                  change set is unknown)
+#   scripts/gate.sh --since REF    the per-commit check for the paths changed since REF plus untracked
+#                                  files; the driver uses it for a light code review, whose index is
+#                                  clean
 #   scripts/gate.sh                standard: the CI lint, test, docs and arm steps the paths need
 #   scripts/gate.sh --full         standard plus msrv, deny, package (Rust paths) and secrets
 #   scripts/gate.sh --list         print the change set, the selected steps and why, run nothing
@@ -28,9 +35,9 @@
 # Output: `==> <step> (<command>)` per step, a log per step in target/gate/<step>.log, the last 40 lines
 # of a failing step, and a final table of PASS, FAIL and SKIP lines. A step whose input is absent is
 # skipped with its reason, never failed (which is why the deny step skips without `deny.toml`: the
-# advisory database is fetched over the network, and the factory tests must stay offline). Exit 0
-# without a FAIL (and without a SKIP under --require-all), 1 on a failure, 2 on bad usage. The gate
-# never formats or edits files.
+# advisory database is fetched over the network, and the factory tests must stay offline). A tracked
+# input that was deleted is a failure, not an absent input. Exit 0 without a FAIL (and without a SKIP
+# under --require-all), 1 on a failure, 2 on bad usage. The gate never formats or edits files.
 #
 # A passing run stamps the index tree hash in `.git/syncspin-gate-ok` when the worktree matches the
 # index; `.githooks/pre-commit` compares it. The stamp is a speed bump, not a control: it lives in
@@ -41,28 +48,43 @@ set -euo pipefail
 cd "${GATE_ROOT:-$(dirname "$0")/..}"
 
 usage() {
-  printf 'usage: %s [--commit | --full] [--list] [--keep-going] [--require-all]\n' "$0" >&2
+  printf 'usage: %s [--commit | --full | --since REF] [--list] [--keep-going] [--require-all]\n' "$0" >&2
   exit 2
 }
 
 mode=standard
 mode_set=0
+since=""
 list=0
 keep_going=0
 require_all=0
-for arg in "$@"; do
-  case "$arg" in
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --commit | --full)
-      if [ "$mode_set" = 1 ]; then usage; fi
+      if [ "$mode_set" = 1 ] || [ -n "$since" ]; then usage; fi
       mode_set=1
-      mode="${arg#--}"
+      mode="${1#--}"
+      ;;
+    --since)
+      [ "$#" -ge 2 ] || usage
+      since=$2
+      shift
+      ;;
+    --since=*)
+      since=${1#--since=}
       ;;
     --list) list=1 ;;
     --keep-going) keep_going=1 ;;
     --require-all) require_all=1 ;;
     *) usage ;;
   esac
+  shift
 done
+if [ -n "$since" ]; then
+  if [ "$mode_set" = 1 ]; then usage; fi
+  case "$since" in -*) usage ;; esac
+  mode=commit
+fi
 
 if ! git rev-parse --git-dir >/dev/null 2>&1; then
   printf '%s: not a git repository: %s\n' "$0" "$PWD" >&2
@@ -73,67 +95,112 @@ arm_target=armv7-unknown-linux-gnueabihf
 prettier_cmd="${GATE_PRETTIER_CMD:-npx --yes prettier@3.9.10}"
 
 staged=""
-if [ "$mode" = commit ]; then
-  staged=$(git diff --cached --name-only --diff-filter=ACMRD || true)
+if [ "$mode" = commit ] && [ -z "$since" ]; then
+  staged=$(git diff --cached --name-only --no-renames --diff-filter=ACMRD || true)
 fi
-staged_match() {
-  grep -Eq "$1" <<<"$staged"
+manifest_match() {
+  grep -Eq "$1" <<<"$changed"
 }
 
 # The change set: the paths this run has to consider, one per line, and where they came from.
-# `--commit` looks at the staged index. Standard and `--full` look at everything since the merge base
-# with `origin/main` (committed, staged and unstaged) plus the untracked files. A failing merge-base
-# (no `origin/main`) and an empty set leave the selection unknown.
+# `--commit` looks at the staged index, `--since REF` at the range from REF plus untracked files.
+# Standard and `--full` look at everything since the merge base with `origin/main` (committed,
+# staged and unstaged) plus the untracked files. `--no-renames` keeps both sides of a rename visible.
+# A failing command, a failing merge-base (no `origin/main`) and an empty set leave the selection
+# unknown.
 changed=""
 paths_state=unknown
 paths_src="commit index"
 if [ "$mode" = commit ]; then
-  changed=$staged
+  if [ -n "$since" ]; then
+    paths_src="range since $since"
+    diff_rc=0
+    changed=$(git diff --name-only --no-renames --diff-filter=ACMRD "$since" 2>/dev/null) || diff_rc=$?
+    untracked=$(git ls-files --others --exclude-standard 2>/dev/null) || diff_rc=$?
+    if [ "$diff_rc" = 0 ]; then
+      changed=$(printf '%s\n%s\n' "$changed" "$untracked" | LC_ALL=C sort -u)
+    else
+      changed=""
+    fi
+  else
+    changed=$staged
+  fi
   if [ -n "$changed" ]; then paths_state=known; fi
 else
   paths_src="branch since origin/main"
   merge_base=$(git merge-base HEAD refs/remotes/origin/main 2>/dev/null) || merge_base=""
   if [ -n "$merge_base" ]; then
-    changed=$({
-      git diff --name-only --diff-filter=ACMRD "$merge_base" || true
-      git ls-files --others --exclude-standard || true
-    } | LC_ALL=C sort -u)
+    diff_rc=0
+    changed=$(git diff --name-only --no-renames --diff-filter=ACMRD "$merge_base" 2>/dev/null) || diff_rc=$?
+    untracked=$(git ls-files --others --exclude-standard 2>/dev/null) || diff_rc=$?
+    if [ "$diff_rc" = 0 ]; then
+      changed=$(printf '%s\n%s\n' "$changed" "$untracked" | LC_ALL=C sort -u)
+    else
+      changed=""
+    fi
     if [ -n "$changed" ]; then paths_state=known; fi
   fi
 fi
 
-# The path classes the selection is built from.
+# The path classes the selection is built from. A path in no class leaves the set unknown: the gate
+# cannot know what a new build entry point, workflow file or licence change needs, so it runs every
+# step of the mode. The docs class keeps a prose or ignore-only change cheap.
 class_rust=0
 class_shell=0
 class_factory=0
 if [ "$paths_state" = known ]; then
   while IFS= read -r path; do
     [ -n "$path" ] || continue
+    classed=0
     case "$path" in
       *.rs | Cargo.toml | */Cargo.toml | Cargo.lock | */Cargo.lock | rust-toolchain.toml | */rust-toolchain.toml | .cargo/* | deny.toml | crates/* | examples/*)
         class_rust=1
+        classed=1
         ;;
     esac
     case "$path" in
-      *.sh | .githooks/*) class_shell=1 ;;
+      *.sh | .githooks/*)
+        class_shell=1
+        classed=1
+        ;;
     esac
     case "$path" in
-      scripts/* | docs/factory/* | .githooks/* | .opencode/* | .claude/* | opencode.json | opencode.jsonc | AGENTS.md | CLAUDE.md | .gitignore)
+      scripts/* | docs/factory/* | .githooks/* | .opencode/* | .claude/* | .github/* | .mcp.json | opencode.json | opencode.jsonc | AGENTS.md | CLAUDE.md | .gitignore)
         class_factory=1
+        classed=1
         ;;
     esac
+    # The docs/ignore class: a cheap, known set that selects no cargo or factory step.
+    case "$path" in
+      *.md | *.txt | docs/* | .gitignore | .gitattributes)
+        classed=1
+        ;;
+    esac
+    if [ "$classed" = 0 ]; then
+      paths_state=unknown
+      break
+    fi
   done <<<"$changed"
 fi
 
-# Staged markdown, yaml and json files that exist and are not symlinks (prettier refuses an
-# explicit symlink argument).
+# Markdown, yaml and json files that exist and are not symlinks (prettier refuses an explicit
+# symlink argument). `--commit` and `--since` use the staged or ranged paths; the other modes run
+# prettier over the whole tree and never call this.
 prettier_files() {
   local f
+  if [ -n "$since" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      [[ "$f" =~ \.(md|ya?ml|json|json5)$ ]] || continue
+      if [ -f "$f" ] && [ ! -L "$f" ]; then printf '%s\n' "$f"; fi
+    done <<<"$changed"
+    return 0
+  fi
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     [[ "$f" =~ \.(md|ya?ml|json|json5)$ ]] || continue
     if [ -f "$f" ] && [ ! -L "$f" ]; then printf '%s\n' "$f"; fi
-  done < <(git diff --cached --name-only --diff-filter=ACMR)
+  done < <(git diff --cached --no-renames --name-only --diff-filter=ACMR)
 }
 
 sel_names=()
@@ -179,8 +246,9 @@ if [ "$mode" = full ]; then
   fi
   add secrets "CI secrets: gitleaks over the history"
 elif [ "$mode" = commit ]; then
-  # A staged Cargo manifest keeps today's deny and MSRV steps; an unknown index selects them too.
-  if [ "$paths_state" = unknown ] || staged_match '(^|/)Cargo\.(toml|lock)$'; then
+  # A changed Cargo manifest keeps today's deny and MSRV steps; an unknown change set selects them
+  # too, because the gate cannot know that the manifest is unchanged.
+  if [ "$paths_state" = unknown ] || manifest_match '(^|/)Cargo\.(toml|lock)$'; then
     add deny "licences, advisories, sources"
     add msrv "tests on Rust 1.85"
   fi
@@ -285,7 +353,11 @@ skip_reason() {
       elif ! command -v "$first" >/dev/null 2>&1; then
         printf '%s not found' "$first"
       elif [ "$mode" = commit ] && [ -z "$(prettier_files)" ]; then
-        printf 'no md, yaml or json files staged'
+        if [ -n "$since" ]; then
+          printf 'no md, yaml or json files changed'
+        else
+          printf 'no md, yaml or json files staged'
+        fi
       fi
       ;;
     msrv)
@@ -294,7 +366,10 @@ skip_reason() {
       fi
       ;;
     deny)
-      if [ ! -f deny.toml ]; then
+      if [ ! -f deny.toml ] && [ -n "$(git log -1 --format=%H -- deny.toml 2>/dev/null || true)" ]; then
+        # The policy was tracked and is now gone: that is a change, not an absent input.
+        printf 'fail:deny.toml was deleted'
+      elif [ ! -f deny.toml ]; then
         printf 'deny.toml not present'
       elif ! command -v cargo-deny >/dev/null 2>&1; then
         printf 'cargo-deny not installed'
@@ -333,6 +408,17 @@ skipped=0
 for i in "${!sel_names[@]}"; do
   name="${sel_names[$i]}"
   reason=$(skip_reason "$name")
+  case "$reason" in
+    fail:*)
+      # A tracked input that is gone is a failure, not an absent input.
+      detail=${reason#fail:}
+      printf 'FAIL %s %s\n' "$name" "$detail"
+      results+=("FAIL|$name|0|$detail")
+      failed=1
+      if [ "$keep_going" = 0 ]; then break; fi
+      continue
+      ;;
+  esac
   if [ -n "$reason" ]; then
     printf 'SKIP %s %s\n' "$name" "$reason"
     results+=("SKIP|$name|0|$reason")
