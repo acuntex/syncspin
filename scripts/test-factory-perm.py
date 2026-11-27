@@ -458,4 +458,31 @@ for name, readonly in roles.items():
             continue
         agent_checks("resolved " + name + ":", resolved, readonly)
 
+# The launcher's resolved rules too: its edit and read allowlists differ from the roles', so the
+# role probes above do not fit; apply the overlay probes to what OpenCode actually resolved.
+if agent_json_dir:
+    name = "factory-launcher"
+    path = agent_json_dir + "/" + name + ".json"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        raw = data if isinstance(data, list) else data.get("permission")
+        resolved = [(r["permission"], r["pattern"], r["action"]) for r in raw]
+    except Exception:
+        results.append("SKIP resolved rules of " + name + ": unrecognised output shape")
+    else:
+        for cmd in launcher_calls:
+            check("resolved " + name + " allows: " + cmd, decide(resolved, "bash", cmd) == "allow")
+        for cmd in launcher_denied:
+            check("resolved " + name + " denies: " + cmd, decide(resolved, "bash", cmd) == "deny")
+        for p in launcher_edit_ok:
+            check("resolved " + name + " may edit: " + p, decide(resolved, "edit", p) == "allow")
+        for p in launcher_edit_no:
+            check("resolved " + name + " may not edit: " + p, decide(resolved, "edit", p) == "deny")
+        for p in launcher_read_ok:
+            check("resolved " + name + " may read: " + p, decide(resolved, "read", p) == "allow")
+        for p in launcher_read_no:
+            check("resolved " + name + " may not read: " + p, decide(resolved, "read", p) == "deny")
+        check("resolved " + name + " denies: task", decide(resolved, "task", "*") == "deny")
+
 print("\n".join(results))

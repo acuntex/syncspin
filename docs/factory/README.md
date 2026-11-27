@@ -62,9 +62,11 @@ pull request text checks and the push are shell code with tests. The agents do t
 shell paths `shellcheck`, factory paths (including `.github/`, `.mcp.json` and the ignore files) the
 generator check and the factory tests, while a docs or markup path selects no cargo step. A rename
 keeps both sides visible. A path in no class, a failed `merge-base` or an empty index leaves the set
-unknown, which selects every step of the mode. `--since REF` selects the per-commit steps for a
-committed range; the light code review uses it because its index is clean. CI still runs the whole set
-on every pull request, so a step the local gate skipped cannot reach `main` unchecked.
+unknown, which selects every step of the mode. A changed `deny.toml` selects the `deny` step in every
+mode, so deleting the policy fails the gate instead of skipping the step. `--since REF` selects the
+per-commit steps for a committed range; the light code review uses it because its index is clean. CI
+still runs the whole set on every pull request, so a step the local gate skipped cannot reach `main`
+unchecked.
 
 The Claude Code `/factory` command is prompt-driven: the same procedure, but the caps and checks are
 instructions to a model. Prefer the driver when the outcome matters.
@@ -75,10 +77,12 @@ A trivial task does not need the full path. The driver classifies the task text 
 and without a model:
 
 - **light** when the text is at most 1200 bytes and 12 lines, names one to three files, and every
-  named file is `.gitignore` or has a `.md` or `.txt` name. A URL or a directory mention is not a
-  named file. A light run writes a short plan on the helper model, skips the plan review, makes one
-  implementer call and then measures the real diff: it stays light while that diff touches at most
-  three such files, adds and deletes at most 80 lines and is a single commit.
+  named file is `.gitignore` or has a `.md` or `.txt` name. A URL with a scheme, a `//host` path or a
+  directory mention is not a named file. The names are normalised first, so `./AGENTS.md`,
+  `docs/./factory/process.md` and `docs//factory/process.md` are the protected paths they name. A
+  light run writes a short plan on the helper model, skips the plan review, makes one implementer call
+  and then measures the real diff: it stays light while that diff touches at most three such files,
+  adds and deletes at most 80 lines and is a single commit.
 - **full** otherwise, including a task that names no file, names only directories, names more than
   three files, or mentions `scripts`, `crates`, `src`, `.github`, `Cargo.toml` or any other protected
   path or code. A directory mention beside a named file does not by itself make the task full unless

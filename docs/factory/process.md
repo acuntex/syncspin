@@ -243,12 +243,13 @@ snapshot check (a changed file is exit 13) and on the artifact-only `Edit` grant
 
 `scripts/timed.sh SECONDS -- command` is the only timed form an agent may use. It is allowed through
 `scripts/*`, but the wrapper itself accepts only a fixed allowlist: `cargo` and the factory's own
-deterministic scripts (`scripts/gate.sh`, `scripts/test-factory.sh`, `scripts/factory-sync.sh`,
-`scripts/check-roles.sh`, `scripts/check-example-versions.sh`). Any other command is refused with a
-usage error before it runs, so the wrapper cannot carry a deny-listed command such as `git push`,
-`gh pr merge` or `rm` past the permission rules. A bare `timeout` is not allowed, because a
-`timeout *` rule would also allow `timeout 1 rm -rf ...`. The wrapper refuses `0` and any limit above
-`7200` (the longest phase budget), so a wrapped command cannot outlive every phase budget.
+deterministic scripts (`scripts/gate.sh`, `scripts/test-factory.sh`, `scripts/factory-sync.sh` with
+only `--check` or `--list`, `scripts/check-roles.sh`, `scripts/check-example-versions.sh`). Any other
+command is refused with a usage error before it runs, so the wrapper cannot carry a deny-listed
+command such as `git push`, `gh pr merge` or `rm` past the permission rules. A bare `timeout` is not
+allowed, because a `timeout *` rule would also allow `timeout 1 rm -rf ...`. The wrapper refuses `0`
+and any limit above `7200` (the longest phase budget), so a wrapped command cannot outlive every
+phase budget.
 
 How the layers merge, and how sure we are.
 

@@ -159,12 +159,12 @@ outside every class (Rust, shell, factory, docs or ignore files) leaves the set 
 select the cargo steps, shell paths shellcheck, factory paths the generator check and the factory
 tests. `--commit` is the per-commit check, the standard mode covers the CI lint, test, docs and arm
 steps, `--full` adds MSRV, `cargo deny`, `cargo package` for Rust paths and gitleaks, and `--list`
-prints the change set and the steps without running them. A step whose input is absent (a script, a
-package, an installed target) is skipped with its reason; a tracked input that was deleted is a
-failure. `--require-all` turns every skip into a failure. `deny` is skipped with `deny.toml not
-present` when the policy file was never tracked, because `cargo deny check` fetches the advisory
-database: that keeps the factory suite offline. Prettier is a local pre-commit hook, not a CI job, so
-the gate marks that step as local only.
+prints the change set and the steps without running them. A changed `deny.toml` selects the `deny`
+step in every mode. A step whose input is absent (a script, a package, an installed target) is skipped
+with its reason; a tracked script or policy input that was deleted is a failure. `--require-all` turns
+every skip into a failure. `deny` is skipped with `deny.toml not present` when the policy file was
+never tracked, because `cargo deny check` fetches the advisory database: that keeps the factory suite
+offline. Prettier is a local pre-commit hook, not a CI job, so the gate marks that step as local only.
 
 `scripts/test-factory.sh` tests the gate and the driver-only hooks under `.githooks/` without a
 network and without a model: the tools the factory could start are stubs on `PATH`, and one test

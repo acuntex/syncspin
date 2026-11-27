@@ -408,6 +408,10 @@ section_gate() {
   assert "G21 an unreadable range is unknown" has "$gate_out" '^paths: unknown \(every step of this mode\)$'
   run_gate "$root" --since HEAD~1 --commit --list
   assert "G21 --since and --commit are mutually exclusive" test "$gate_rc" = 2
+  run_gate "$root" --since "" --list
+  assert "G21 an empty --since is a usage error" test "$gate_rc" = 2
+  run_gate "$root" --since= --list
+  assert "G21 an empty --since= is a usage error" test "$gate_rc" = 2
 
   # G22: a deny.toml that was tracked and is now deleted is a failure, not an absent input.
   root=$tmp/g22
@@ -422,6 +426,49 @@ section_gate() {
   run_gate "$root" --commit
   assert "G22 a deleted deny.toml fails the gate" test "$gate_rc" = 1
   assert "G22 the failure names the deletion" has "$gate_out" '^FAIL +deny +deny.toml was deleted$'
+
+  # A pure deny.toml deletion has no Cargo manifest in the change set: the policy change itself
+  # selects the step, so --commit and the standard mode both fail instead of skipping it.
+  root=$tmp/g22b
+  new_repo "$root"
+  printf '# policy\n' >"$root/deny.toml"
+  git -C "$root" add deny.toml
+  git -C "$root" commit -q -m "chore: add a policy"
+  git -C "$root" update-ref refs/remotes/origin/main "$(git -C "$root" rev-parse HEAD)"
+  git -C "$root" rm -q deny.toml
+  run_gate "$root" --commit
+  assert "G22 a pure deny deletion fails the commit gate" test "$gate_rc" = 1
+  assert "G22 the commit failure names the deletion" has "$gate_out" '^FAIL +deny +deny.toml was deleted$'
+  run_gate "$root" --list
+  assert "G22 the standard change set is known" has "$gate_out" '^paths: 1 changed \(branch since origin/main\)$'
+  assert "G22 the standard mode selects deny for a changed policy" has "$gate_out" '^deny '
+  run_gate "$root"
+  assert "G22 the standard gate fails on the deleted policy" test "$gate_rc" = 1
+  assert "G22 the standard failure names the deletion" has "$gate_out" '^FAIL +deny +deny.toml was deleted$'
+
+  # G23: a tracked script that was deleted fails its step instead of turning it into a SKIP; neither
+  # change set holds a Cargo manifest, so only the script paths decide the selection.
+  root=$tmp/g23
+  new_repo "$root"
+  mkdir -p "$root/scripts"
+  printf '#!/usr/bin/env bash\n' >"$root/scripts/test-factory.sh"
+  git -C "$root" add scripts/test-factory.sh
+  git -C "$root" commit -q -m "chore: add the factory tests"
+  git -C "$root" rm -q scripts/test-factory.sh
+  run_gate "$root" --commit
+  assert "G23 a deleted factory test script fails the gate" test "$gate_rc" = 1
+  assert "G23 the failure names the deleted script" has "$gate_out" '^FAIL +factory-tests +scripts/test-factory\.sh was deleted$'
+  assert "G23 a never-tracked script is still a skip" has "$gate_out" '^SKIP +factory-sync +not present$'
+  root=$tmp/g23b
+  new_repo "$root"
+  mkdir -p "$root/scripts"
+  printf '#!/usr/bin/env bash\n' >"$root/scripts/factory-sync.sh"
+  git -C "$root" add scripts/factory-sync.sh
+  git -C "$root" commit -q -m "chore: add the generator"
+  git -C "$root" rm -q scripts/factory-sync.sh
+  run_gate "$root" --commit
+  assert "G23 a deleted generator script fails the gate" test "$gate_rc" = 1
+  assert "G23 the failure names the deleted generator" has "$gate_out" '^FAIL +factory-sync +scripts/factory-sync\.sh was deleted$'
 
   # G5: a script-backed step with an absent script is SKIP not present, and runs once it exists.
   root=$tmp/g5
@@ -689,7 +736,8 @@ STUB
   # T5: the wrapper refuses a command outside its allowlist before it runs, so `scripts/*` cannot
   # carry a denied command (a push, a --no-verify commit, a merge, rm) past the permission layer.
   for c in 'git push origin main' 'git commit --no-verify -m x' 'gh pr merge 1' 'rm x' \
-    'bash -c true' 'timeout 1 true' './scripts/gate.sh --list' '/usr/bin/cargo test' 'scripts/nope.sh'; do
+    'bash -c true' 'timeout 1 true' './scripts/gate.sh --list' '/usr/bin/cargo test' 'scripts/nope.sh' \
+    'scripts/factory-sync.sh' 'scripts/factory-sync.sh --write' 'scripts/factory-sync.sh --check extra'; do
     rc=0
     # shellcheck disable=SC2086  # the case is a word list on purpose
     out=$(cd "$repo" && PATH="$tmp/timed-bin:$PATH" scripts/timed.sh 1 -- $c 2>&1) || rc=$?
@@ -704,6 +752,13 @@ STUB
   rc=0
   (cd "$repo" && scripts/timed.sh 5 -- scripts/gate.sh --list >/dev/null) || rc=$?
   assert "T5 scripts/gate.sh is allowed" test "$rc" = 0
+  # factory-sync is read-only through the wrapper: --check and --list are accepted, a write is not.
+  rc=0
+  (cd "$repo" && scripts/timed.sh 5 -- scripts/factory-sync.sh --check >/dev/null) || rc=$?
+  assert "T5 scripts/factory-sync.sh --check is allowed" test "$rc" = 0
+  rc=0
+  (cd "$repo" && scripts/timed.sh 5 -- scripts/factory-sync.sh --list >/dev/null) || rc=$?
+  assert "T5 scripts/factory-sync.sh --list is allowed" test "$rc" = 0
 }
 
 # The prettier command the tests may use, or nothing: an explicit FACTORY_TEST_PRETTIER_CMD, a
@@ -1307,15 +1362,32 @@ section_driver() {
   assert "classify: notes.markdown is refused" has "$(lib classify_probe 'Add notes.markdown')" '^full|.*notes\.markdown$'
   assert "classify: a URL is not a file" has "$(lib classify_probe 'Update https://example.com/README.md')" '^full|.*https://example\.com/README\.md$'
   assert "classify: a file URL is not a file" has "$(lib classify_probe 'Read file:///tmp/README.md')" '^full|.*file:///tmp/README\.md$'
+  assert "classify: a scheme without slashes is refused" has "$(lib classify_probe 'Read file:/notes/README.md')" '^full|.*file:/notes/README\.md$'
+  # A `./` prefix, `//` and `/./` name the same protected path: the classifier normalises the token
+  # before the allowlist, so none of them is a light-path bypass.
+  assert "classify: ./AGENTS.md is refused" has "$(lib classify_probe 'Change ./AGENTS.md')" '^full|.*\./AGENTS\.md$'
+  assert "classify: ./CLAUDE.md is refused" has "$(lib classify_probe 'Change ./CLAUDE.md')" '^full|.*\./CLAUDE\.md$'
+  assert "classify: docs/./factory is refused" has "$(lib classify_probe 'Update docs/./factory/process.md')" '^full|.*docs/\./factory/process\.md$'
+  assert "classify: docs//factory is refused" has "$(lib classify_probe 'Update docs//factory/process.md')" '^full|.*docs//factory/process\.md$'
+  assert "classify: ./README.md stays light" test "$(lib classify_probe 'Update ./README.md.')" = 'light|1 file, 1 line'
+  assert "classify: ./scripts is refused" has "$(lib classify_probe 'Change ./scripts/x.sh')" '^full|.*\./scripts/x\.sh$'
   assert "classify: an oversize text is full" has "$(lib classify_probe "$(printf 'x%.0s' $(seq 1 1500))")" '^full|.*too large'
   assert "classify: 13 lines are too many" has "$(lib classify_probe "$(printf 'line %s\n' $(seq 1 12))"$'\n'"README.md")" '^full|.*13 lines'
   assert "classify: 12 lines with a final newline are light" test "$(lib classify_probe "$(printf 'line %s\n' $(seq 1 11))"$'\n'"README.md"$'\n')" = 'light|1 file, 12 lines'
 
-  # A path-like token is dropped from the slug, so a home path or a secret-shaped first word does not
-  # reach a branch name or a session title.
+  # A path-like token is dropped from the slug, and so is a bare secret-shaped token or the current
+  # user name, so none of them reaches a branch name or a session title. The tokens are built at run
+  # time so that this file holds no credential-shaped literal.
+  local sprefix=gh sbody=p_ sbody32=abcdefghijklmnopqrstuvwxyzabcdef suser=quasi
+  sbody+=abcdefghijklmnop
+  suser+=owner
   assert "slug: a path-like first word is dropped" test "$(lib slugify "$hm/quasi/Projects/x/README.md")" = task
   assert "slug: a path in the middle is dropped" test "$(lib slugify "Fix $hm/quasi/x and notes.md")" = fix-and-notes-md
   refute "slug: the home path does not survive" has "$(lib slugify "Fix $hm/quasi/x")" 'quasi'
+  assert "slug: a bare credential token is dropped" test "$(lib slugify "Fix $sprefix$sbody notes.md")" = fix-notes-md
+  assert "slug: a long opaque token is dropped" test "$(lib slugify "Fix $sbody32 notes.md")" = fix-notes-md
+  assert "slug: the current user name is dropped" test "$(FACTORY_SCRUB_USER=$suser lib slugify "Fix $suser notes.md")" = fix-notes-md
+  assert "slug: the current host name is dropped" test "$(FACTORY_SCRUB_HOST=$suser lib slugify "Fix $suser notes.md")" = fix-notes-md
 
   # A failed diff is an escalation, not a silent pass with a half-read change set.
   local ld_out ld_rc
@@ -1769,7 +1841,7 @@ HOOK
   d46review=$(grep '^PROMPT .*Read the one commit' "$sd/calls.log")
   assert "D46 the light review runs the per-commit gate on the branch" has "$d46review" 'scripts/timed\.sh 600 -- scripts/gate\.sh --since [0-9a-f]{7,}'
   refute "D46 the light review does not fall back to the empty index" has "$d46review" 'scripts/timed\.sh 600 -- scripts/gate\.sh --commit'
-  assert "D46 the summary names the light path" test "$(state_of path)" = light
+  assert "D46 the summary names the light path" has "$drv_out" '^factory: summary: path light, '
 
   # D46 dry run: the classifier reads a task file too.
   new_case stub

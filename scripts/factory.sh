@@ -170,18 +170,31 @@ scrub() {
 }
 
 slugify() {
-  local words slug
-  # The first four words, skipping a path-like token (a slash, a tilde, an at sign or a backslash):
-  # a task that starts with `/home/<name>/...` or a secret-shaped token must not put it in a branch
-  # name, a session title or a run header.
-  words=$(printf '%s' "$1" | tr '\n' ' ' | awk '{
-    n = 0
-    for (i = 1; i <= NF; i++) {
-      if ($i ~ /\// || $i ~ /~/ || $i ~ /@/ || $i ~ /\\/) continue
-      printf "%s ", $i
-      if (++n == 4) break
+  local words slug user host
+  # The first four words, skipping a path-like token, a secret-shaped token and the current user or
+  # host name (unless it is a generic word): a task that starts with `/home/<name>/...`, carries a
+  # token such as `ghp_...` or names the user must not put any of them in a branch name, a session
+  # title or a run header.
+  user=${FACTORY_SCRUB_USER-$(id -un 2>/dev/null || true)}
+  host=${FACTORY_SCRUB_HOST-$(hostname -s 2>/dev/null || true)}
+  words=$(printf '%s' "$1" | tr '\n' ' ' | awk -v user="$user" -v host="$host" -v generic="$GENERIC_NAMES" '
+    function private(word, w) {
+      w = tolower(word)
+      if (word ~ /[\/~@\\]/) return 1
+      if (length(word) >= 32 && word ~ /^[A-Za-z0-9_-]+$/) return 1
+      if (word ~ /(^|[^A-Za-z0-9])(sk-|ghp_|gho_|github_pat_|xox)/) return 1
+      if (length(user) > 4 && w == tolower(user) && index(generic, " " w " ") == 0) return 1
+      if (length(host) > 4 && w == tolower(host) && index(generic, " " w " ") == 0) return 1
+      return 0
     }
-  }')
+    {
+      n = 0
+      for (i = 1; i <= NF; i++) {
+        if (private($i)) continue
+        printf "%s ", $i
+        if (++n == 4) break
+      }
+    }')
   slug=$(printf '%s' "$words" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-*//' -e 's/-*$//' | cut -c1-30 | sed -e 's/-*$//')
   printf '%s' "${slug:-task}"
 }
@@ -204,12 +217,31 @@ fmt_duration() {
 # The light path: whether a task is trivial enough for the short plan, the missing plan review and
 # the one short code review. The classification is conservative: anything unclear is full.
 
+# normalize_path <path>: print the path with a leading `./`, repeated slashes and `/./` removed, so
+# `./AGENTS.md`, `docs//factory/x` and `docs/./factory/x` are the paths they name. Return 1 for an
+# absolute or `~` path and for any empty, `.` or `..` segment: a caller that treats anything unclear
+# as full never sees a normalised form of an unsafe path.
+normalize_path() {
+  local p=$1 prev
+  case "$p" in /* | "~"* ) return 1 ;; esac
+  while [ "$p" != "${p#./}" ]; do p=${p#./}; done
+  while :; do
+    prev=$p
+    p=${p//\/.\//\/}
+    p=${p//\/\//\/}
+    [ "$p" = "$prev" ] && break
+  done
+  case "/$p/" in */../* | */./*) return 1 ;; esac
+  case "$p" in "" | */) return 1 ;; esac
+  printf '%s' "$p"
+}
+
 # light_path_ok <path>: the allowlist of the light path. A file whose basename ends in `.md` or
-# `.txt`, and `.gitignore`, may change; prosa and nothing else.
+# `.txt`, and `.gitignore`, may change; prosa and nothing else. The path is normalised first, so
+# `./AGENTS.md`, `docs/./factory/x` and `docs//factory/x` are the protected paths they name.
 light_path_ok() {
   local p=$1 entry base
-  case "$p" in /* | "~"* ) return 1 ;; esac
-  case "/$p/" in */../*) return 1 ;; esac
+  p=$(normalize_path "$1") || return 1
   for entry in "${PROTECTED[@]}"; do
     case "$p" in "$entry" | "$entry"/*) return 1 ;; esac
   done
@@ -255,7 +287,7 @@ light_size_reason() {
 # are not part of the text (command substitution drops them), so a 13-line text without a final
 # newline is 13 lines. Never calls a model and never touches the tree.
 classify_task() {
-  local text bytes lines word w tok esc entry first_dir="" files=0 reject="" oldifs=$IFS had_glob=0
+  local text bytes lines word w w_norm tok esc entry first_dir="" files=0 reject="" oldifs=$IFS had_glob=0
   text=$(cat)
   class_path=full
   bytes=$(printf '%s' "$text" | wc -c)
@@ -282,7 +314,21 @@ classify_task() {
     [ -n "$w" ] || continue
     case "$w" in
       */)
-        # A directory mention: unsafe immediately, otherwise remembered and ignored.
+        # A directory mention: normalise a relative one first, so `./scripts/` and
+        # `docs/./factory/` are the protected directories they name. An absolute or home-path
+        # mention is not a repository directory and stays a mention; anything unclear is full.
+        case "$w" in
+          /* | "~"*) ;;
+          *)
+            if w_norm=$(normalize_path "${w%/}"); then
+              w=$w_norm/
+            else
+              reject=${w%/}
+              break
+            fi
+            ;;
+        esac
+        # A normalised directory mention: unsafe immediately, otherwise remembered and ignored.
         case "$w" in
           scripts/* | crates/* | examples/* | src/* | docs/factory/* | .github/* | .githooks/* | .opencode/* | .claude/* | .factory/* | .superpowers/* | .git/* | target/*)
             reject=$w
@@ -297,13 +343,12 @@ classify_task() {
         ;;
       *)
         if [[ "$w" == */* ]] || [[ "$w" =~ ^[[:alnum:]_.+-]*\.[[:alpha:]][[:alnum:]]{0,9}$ ]]; then
-          # A URL is not a repository file, however much it looks like one.
-          case "$w" in
-            *://* | //*)
-              reject=$w
-              break
-              ;;
-          esac
+          # A URL is not a repository file, however much it looks like one: a token with a scheme
+          # (`https:`, `file:`) or a protocol-relative `//host` path.
+          if [[ "$w" =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]] || [[ "$w" == //* ]]; then
+            reject=$w
+            break
+          fi
           if light_path_ok "$w"; then
             files=$((files + 1))
           elif [ -z "$reject" ]; then

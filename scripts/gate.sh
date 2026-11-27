@@ -15,13 +15,14 @@
 #
 #   scripts/gate.sh --commit       per-commit check: fmt, clippy, example versions, tests and
 #                                  doc-default for Rust paths, shellcheck for shell files, the factory
-#                                  steps for factory paths, prettier for staged markup, and deny and
-#                                  MSRV for a staged Cargo manifest (and every one of these when the
-#                                  change set is unknown)
+#                                  steps for factory paths, prettier for staged markup, deny for a
+#                                  staged deny.toml, and deny and MSRV for a staged Cargo manifest (and
+#                                  every one of these when the change set is unknown)
 #   scripts/gate.sh --since REF    the per-commit check for the paths changed since REF plus untracked
 #                                  files; the driver uses it for a light code review, whose index is
 #                                  clean
-#   scripts/gate.sh                standard: the CI lint, test, docs and arm steps the paths need
+#   scripts/gate.sh                standard: the CI lint, test, docs and arm steps the paths need,
+#                                  plus deny when deny.toml changes
 #   scripts/gate.sh --full         standard plus msrv, deny, package (Rust paths) and secrets
 #   scripts/gate.sh --list         print the change set, the selected steps and why, run nothing
 #   scripts/gate.sh --keep-going   do not stop at the first failing step
@@ -36,8 +37,9 @@
 # of a failing step, and a final table of PASS, FAIL and SKIP lines. A step whose input is absent is
 # skipped with its reason, never failed (which is why the deny step skips without `deny.toml`: the
 # advisory database is fetched over the network, and the factory tests must stay offline). A tracked
-# input that was deleted is a failure, not an absent input. Exit 0 without a FAIL (and without a SKIP
-# under --require-all), 1 on a failure, 2 on bad usage. The gate never formats or edits files.
+# script or policy input that was deleted is a failure, not an absent input. Exit 0 without a FAIL
+# (and without a SKIP under --require-all), 1 on a failure, 2 on bad usage. The gate never formats or
+# edits files.
 #
 # A passing run stamps the index tree hash in `.git/syncspin-gate-ok` when the worktree matches the
 # index; `.githooks/pre-commit` compares it. The stamp is a speed bump, not a control: it lives in
@@ -67,11 +69,13 @@ while [ "$#" -gt 0 ]; do
       ;;
     --since)
       [ "$#" -ge 2 ] || usage
+      [ -n "$2" ] || usage
       since=$2
       shift
       ;;
     --since=*)
       since=${1#--since=}
+      [ -n "$since" ] || usage
       ;;
     --list) list=1 ;;
     --keep-going) keep_going=1 ;;
@@ -148,9 +152,11 @@ fi
 class_rust=0
 class_shell=0
 class_factory=0
+deny_changed=0
 if [ "$paths_state" = known ]; then
   while IFS= read -r path; do
     [ -n "$path" ] || continue
+    case "$path" in deny.toml | */deny.toml) deny_changed=1 ;; esac
     classed=0
     case "$path" in
       *.rs | Cargo.toml | */Cargo.toml | Cargo.lock | */Cargo.lock | rust-toolchain.toml | */rust-toolchain.toml | .cargo/* | deny.toml | crates/* | examples/*)
@@ -239,18 +245,28 @@ if [ "$class_factory" = 1 ] || [ "$paths_state" = unknown ]; then
 fi
 add prettier "LOCAL ONLY: a pre-commit hook, not a CI job"
 if [ "$mode" = full ]; then
-  if [ "$class_rust" = 1 ] || [ "$paths_state" = unknown ]; then
+  if [ "$class_rust" = 1 ] || [ "$paths_state" = unknown ] || [ "$deny_changed" = 1 ]; then
     add msrv "CI msrv: tests on Rust 1.85"
     add deny "CI deny: licences, advisories, sources"
     add package "CI package: cargo package for syncspin-core"
   fi
   add secrets "CI secrets: gitleaks over the history"
 elif [ "$mode" = commit ]; then
-  # A changed Cargo manifest keeps today's deny and MSRV steps; an unknown change set selects them
-  # too, because the gate cannot know that the manifest is unchanged.
-  if [ "$paths_state" = unknown ] || manifest_match '(^|/)Cargo\.(toml|lock)$'; then
+  # A changed Cargo manifest keeps today's deny and MSRV steps; a changed deny policy selects deny
+  # too, so deleting it cannot turn the step into an absent input; an unknown change set selects
+  # both, because the gate cannot know that the manifest is unchanged.
+  if [ "$paths_state" = unknown ] || [ "$deny_changed" = 1 ] ||
+    manifest_match '(^|/)Cargo\.(toml|lock)$'; then
     add deny "licences, advisories, sources"
+  fi
+  if [ "$paths_state" = unknown ] || manifest_match '(^|/)Cargo\.(toml|lock)$'; then
     add msrv "tests on Rust 1.85"
+  fi
+else
+  # The deny policy is crate-wide: a changed policy file selects its step in the standard mode as
+  # well (a deletion then fails instead of skipping).
+  if [ "$deny_changed" = 1 ]; then
+    add deny "CI deny: licences, advisories, sources"
   fi
 fi
 
@@ -303,15 +319,28 @@ have_pkg() {
   cargo pkgid -p "$1" >/dev/null 2>&1
 }
 
+# tracked_then_deleted <path>: true when the path is absent now but a commit touches it. Its step
+# cannot run although it was expected, so the step fails; an absent path that was never tracked is an
+# absent input and stays a skip.
+tracked_then_deleted() {
+  [ ! -e "$1" ] && [ -n "$(git log -1 --format=%H -- "$1" 2>/dev/null || true)" ]
+}
+
 # Prints the reason to skip a step, or nothing when it runs.
 skip_reason() {
   local first
   case "$1" in
     example-versions)
-      [ -f scripts/check-example-versions.sh ] || printf 'not present'
+      if tracked_then_deleted scripts/check-example-versions.sh; then
+        printf 'fail:scripts/check-example-versions.sh was deleted'
+      elif [ ! -f scripts/check-example-versions.sh ]; then
+        printf 'not present'
+      fi
       ;;
     roles)
-      if [ ! -f scripts/check-roles.sh ]; then
+      if tracked_then_deleted scripts/check-roles.sh; then
+        printf 'fail:scripts/check-roles.sh was deleted'
+      elif [ ! -f scripts/check-roles.sh ]; then
         printf 'not present'
       elif ! have_pkg syncspin-client; then
         printf 'package not present'
@@ -341,10 +370,18 @@ skip_reason() {
       fi
       ;;
     factory-sync)
-      [ -f scripts/factory-sync.sh ] || printf 'not present'
+      if tracked_then_deleted scripts/factory-sync.sh; then
+        printf 'fail:scripts/factory-sync.sh was deleted'
+      elif [ ! -f scripts/factory-sync.sh ]; then
+        printf 'not present'
+      fi
       ;;
     factory-tests)
-      [ -f scripts/test-factory.sh ] || printf 'not present'
+      if tracked_then_deleted scripts/test-factory.sh; then
+        printf 'fail:scripts/test-factory.sh was deleted'
+      elif [ ! -f scripts/test-factory.sh ]; then
+        printf 'not present'
+      fi
       ;;
     prettier)
       read -r first _ <<<"$prettier_cmd"
@@ -366,7 +403,7 @@ skip_reason() {
       fi
       ;;
     deny)
-      if [ ! -f deny.toml ] && [ -n "$(git log -1 --format=%H -- deny.toml 2>/dev/null || true)" ]; then
+      if tracked_then_deleted deny.toml; then
         # The policy was tracked and is now gone: that is a change, not an absent input.
         printf 'fail:deny.toml was deleted'
       elif [ ! -f deny.toml ]; then
@@ -410,7 +447,7 @@ for i in "${!sel_names[@]}"; do
   reason=$(skip_reason "$name")
   case "$reason" in
     fail:*)
-      # A tracked input that is gone is a failure, not an absent input.
+      # A tracked script or policy input that is gone is a failure, not an absent input.
       detail=${reason#fail:}
       printf 'FAIL %s %s\n' "$name" "$detail"
       results+=("FAIL|$name|0|$detail")
